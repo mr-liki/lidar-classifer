@@ -1,5 +1,6 @@
 #include "naksha/core/vulkan/VulkanFrameManager.h"
 #include <vector>
+#include <stdexcept>
 
 namespace naksha {
 namespace vulkan {
@@ -88,6 +89,15 @@ void VulkanFrameManager::BeginFrame() {
     auto& frame = frames_[currentFrame_];
     vkWaitForFences(device_, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX);
     frame.frameInFlight = true;
+}
+
+bool VulkanFrameManager::AllFramesComplete() const {
+    for(const auto& frame:frames_){
+        VkResult status=vkGetFenceStatus(device_,frame.inFlightFence);
+        if(status==VK_NOT_READY)return false;
+        if(status!=VK_SUCCESS)throw std::runtime_error("GPU frame fence failed");
+    }
+    return true;
 }
 
 void VulkanFrameManager::ResetFence() {

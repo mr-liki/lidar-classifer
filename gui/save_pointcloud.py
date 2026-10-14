@@ -1,5 +1,6 @@
 import os
 import json
+import weakref
 import shutil
 import tempfile
 import numpy as np
@@ -7,17 +8,288 @@ import laspy
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 from PySide6.QtCore import Qt
 
+# LAS versions this app can write. LAS 1.0 is written through the identical
+# 1.1 header layout with the version bytes stamped back afterwards, because
+# laspy can read a 1.0 header but refuses to create one.
+LAS_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4")
+
+_LAS_VERSION_RANK = {version: rank for rank, version in enumerate(LAS_VERSIONS)}
+_LAS_VERSION_BYTE_OFFSET = 24  # header version major byte; minor follows
+
+
+def _version_rank(las_version: str) -> int:
+    return _LAS_VERSION_RANK.get(str(las_version or "").strip(), len(LAS_VERSIONS) - 1)
+
+
+def _version_supports_rgb(las_version: str) -> bool:
+    """RGB channels (point format 2) only exist from LAS 1.2 onwards."""
+    return _version_rank(las_version) >= _LAS_VERSION_RANK["1.2"]
+
+
+def _las_version_of(las) -> str:
+    version = las.header.version
+    return f"{int(version.major)}.{int(version.minor)}"
+
+
+def _writable_header_version(las_version: str) -> str:
+    """Header version laspy accepts; LAS 1.0 borrows the 1.1 layout."""
+    text = str(las_version or "").strip()
+    return "1.1" if text == "1.0" else text
+
+
 def _parse_filter(selected_filter: str):
-    sf = (selected_filter or "").lower()
-    if "laz" in sf and "1.2" in sf:
-        return ".laz", "1.2"
-    if "laz" in sf and "1.4" in sf:
-        return ".laz", "1.4"
-    if "las" in sf and "1.2" in sf:
-        return ".las", "1.2"
-    if "las" in sf and "1.4" in sf:
-        return ".las", "1.4"
-    return ".laz", "1.4"
+    """Map a 'LAZ 1.2 (*.laz)' style filter to (extension, LAS version)."""
+    sf = (selected_filter or "").strip().lower()
+    if "laz" in sf:
+        ext = ".laz"
+    elif "las" in sf:
+        ext = ".las"
+    else:
+        ext = ".laz"
+    for version in LAS_VERSIONS:
+        if version in sf:
+            return ext, version
+    return ext, "1.4"
+
+# Display Mode class table columns: Show, Code, Description, Draw, Lvl, Color, Weight.
+_CLASS_TABLE_COLOR_COLUMN = 5
+
+
+def _table_row_color(table, row):
+    """RGB tuple from a Display Mode class row's Color column, else None."""
+    try:
+        item = table.item(row, _CLASS_TABLE_COLOR_COLUMN)
+        if item is None:
+            return None
+        brush = item.background()
+        if brush.style() == Qt.NoBrush:
+            # Never colored: leave the row unswatched instead of drawing black.
+            return None
+        qcolor = brush.color()
+        if not qcolor.isValid():
+            return None
+        return tuple(int(channel) for channel in qcolor.getRgb()[:3])
+    except Exception:
+        return None
+
+
+def _unique_point_source_ids(source_ids):
+    """Sorted unique Point Source IDs in one linear pass.
+
+    ``np.unique`` sorts every point (about a second on tens of millions of
+    them). Point Source IDs are unsigned 16-bit, so a bincount returns the same
+    sorted list far cheaper; anything unexpected falls back to ``np.unique``.
+    """
+    arr = np.asarray(source_ids)
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    if arr.size == 0:
+        return []
+    try:
+        if np.issubdtype(arr.dtype, np.integer):
+            counts = np.bincount(arr)
+            return [int(value) for value in np.nonzero(counts)[0]]
+    except Exception:
+        pass
+    return [int(value) for value in np.unique(arr)]
+
+
+def _remember_line_ids(app, source_ids, line_ids):
+    """Cache a scan for this exact array (weak ref: holds no extra memory)."""
+    try:
+        app._save_points_line_ids_cache = (weakref.ref(source_ids), list(line_ids))
+    except TypeError:
+        # Arrays are weak-referenceable; a plain sequence is not, so hold it.
+        app._save_points_line_ids_cache = (source_ids, list(line_ids))
+
+
+def _cached_line_ids(app, source_ids):
+    """Previously scanned ids for this array, or None when not scanned yet."""
+    cache = getattr(app, "_save_points_line_ids_cache", None)
+    if not cache:
+        return None
+    reference, line_ids = cache
+    try:
+        stored = reference()
+    except TypeError:
+        stored = reference
+    return list(line_ids) if stored is source_ids else None
+
+
+def _flight_line_color(line_id):
+    """Same stable high-contrast RGB Display Mode's Line rendering uses."""
+    lid = int(line_id)
+    return (
+        (lid * 67 + 53) % 256,
+        (lid * 131 + 97) % 256,
+        (lid * 193 + 181) % 256,
+    )
+
+
+def _line_items_with_colors(app, line_ids):
+    """(line_id, "Line N", (r, g, b)) entries with the Line swatch colors."""
+    colors = dict(getattr(app, "flight_line_colors", {}) or {})
+    items = []
+    for line_id in sorted(int(value) for value in line_ids):
+        color = colors.get(line_id)
+        if color is None:
+            color = _flight_line_color(line_id)
+        items.append((line_id, f"Line {line_id}", tuple(color)))
+    return items
+
+
+def _loaded_las_path(app):
+    """Existing LAS/LAZ file behind the loaded dataset, or None."""
+    for candidate in (
+        getattr(app, "loaded_file", None),
+        getattr(app, "last_save_path", None),
+    ):
+        if (
+            candidate
+            and str(candidate).lower().endswith((".las", ".laz"))
+            and os.path.exists(str(candidate))
+        ):
+            return str(candidate)
+    return None
+
+
+def _remember_no_line_file(app, path, mtime, n_points):
+    """Remember that this file has no usable ids for this dataset."""
+    try:
+        app._save_points_no_line_file = (path, mtime, n_points)
+    except Exception:
+        pass
+
+
+def _recover_point_source_array(app, data):
+    """Point Source ID column read straight from the loaded LAS/LAZ file.
+
+    Legacy load paths leave it out of ``data``; the array is installed only
+    when its length matches the in-memory xyz, so a filtered import can never
+    be paired with unfiltered ids. A negative result is remembered per file
+    (path + mtime + point count) so the file is opened at most once until it
+    or the dataset changes. Display Mode's list is never consulted.
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+        existing = data.get("point_source_id")
+        if existing is not None:
+            return existing
+        xyz = data.get("xyz")
+        if xyz is None:
+            return None
+        path = _loaded_las_path(app)
+        if path is None:
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        blocked = getattr(app, "_save_points_no_line_file", None)
+        if blocked == (path, mtime, len(xyz)):
+            return None
+        chunks = []
+        with laspy.open(path) as reader:
+            dims = {
+                str(d).lower()
+                for d in reader.header.point_format.dimension_names
+            }
+            if "point_source_id" not in dims:
+                _remember_no_line_file(app, path, mtime, len(xyz))
+                return None
+            for points in reader.chunk_iterator(2_000_000):
+                chunks.append(
+                    np.asarray(points.point_source_id, dtype=np.uint16).copy()
+                )
+        recovered = (
+            np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint16)
+        )
+        if len(recovered) != len(xyz):
+            print(
+                "Save points: flight-line recovery skipped, file/data lengths "
+                f"differ ({len(recovered):,} != {len(xyz):,})"
+            )
+            _remember_no_line_file(app, path, mtime, len(xyz))
+            return None
+        data["point_source_id"] = recovered
+        return recovered
+    except Exception as exc:
+        print(f"Save points: could not read flight lines from the file: {exc}")
+        return None
+
+
+def _available_line_items(app, data=None):
+    """Flight lines for Save points, read straight from the loaded dataset.
+
+    The source is the Point Source ID array in the loaded data (the same
+    values Display Mode's Lines button reads), recovered from the loaded
+    LAS/LAZ file when a legacy load path omitted it. Display Mode's computed
+    list is never consulted, so Save points does not depend on that window.
+    Scans are cached per array; the popup stays independent of the dataset
+    size because the work is deferred (see _line_items_plan).
+    """
+    try:
+        source_ids = None
+        if isinstance(data, dict):
+            source_ids = data.get("point_source_id")
+        if source_ids is None:
+            source_ids = _recover_point_source_array(app, data)
+            if source_ids is None:
+                return []
+        try:
+            if not len(source_ids):
+                return []
+        except TypeError:
+            return []
+        line_ids = _cached_line_ids(app, source_ids)
+        if line_ids is None:
+            line_ids = _unique_point_source_ids(source_ids)
+            _remember_line_ids(app, source_ids, line_ids)
+        return _line_items_with_colors(app, line_ids)
+    except Exception as exc:
+        print(f"Save points: could not read flight lines: {exc}")
+        return []
+
+
+def _line_items_plan(app, data):
+    """(items, provider) for the Line field, without walking every point.
+
+    Items come back directly when the Point Source IDs are already in the
+    loaded data (the loader stores them, or an earlier scan cached them).
+    When a legacy load path left them out, a provider is returned that reads
+    the column straight from the loaded LAS/LAZ file the first time the Line
+    list is opened: the same source Display Mode's Lines button uses, but
+    never that window's computed list, so opening Save points stays
+    independent of the dataset size.
+    """
+    source_ids = None
+    if isinstance(data, dict):
+        source_ids = data.get("point_source_id")
+    if source_ids is None:
+        if _loaded_las_path(app) is None:
+            # No readable LAS/LAZ file behind this dataset: keep it disabled.
+            return [], None
+        return None, (lambda: _available_line_items(app, data))
+    try:
+        if not len(source_ids):
+            return [], None
+    except TypeError:
+        return [], None
+    cached = _cached_line_ids(app, source_ids)
+    if cached is not None:
+        return _line_items_with_colors(app, cached), None
+    return None, (lambda: _available_line_items(app, data))
+
+
+def _format_filters() -> str:
+    """QFileDialog filter list: every LAS/LAZ version, grouped by container."""
+    return ";;".join(
+        f"{container} {version} (*.{container.lower()})"
+        for container in ("LAS", "LAZ")
+        for version in LAS_VERSIONS
+    )
+
 
 def _ensure_ext(path: str, ext: str) -> str:
     root, cur_ext = os.path.splitext(path)
@@ -61,13 +333,35 @@ def _intensity_to_uint16(intensity_arr, n_points: int):
 
 def _choose_point_format(las_version: str, has_rgb: bool) -> int:
     """
-    Use point formats valid for the chosen LAS version:
-      - LAS 1.2: 0 (no RGB) or 2 (RGB)
+    Smallest point format valid for the chosen LAS version:
       - LAS 1.4: 6 (no RGB) or 7 (RGB)
+      - LAS 1.2/1.3: 0 (no RGB) or 2 (RGB)
+      - LAS 1.0/1.1: 0 - point format 2 (RGB) arrived with LAS 1.2, so those
+        versions fall back to format 0 and the caller drops the colour data.
     """
-    if las_version == "1.4":
+    if _version_rank(las_version) == _LAS_VERSION_RANK["1.4"]:
         return 7 if has_rgb else 6
-    return 2 if has_rgb else 0
+    if has_rgb and _version_supports_rgb(las_version):
+        return 2
+    return 0
+
+
+def _apply_rgb(las, rgb16, las_version: str) -> bool:
+    """Write RGB into ``las`` when the target version carries colour.
+
+    Point format 2 (the first format with colour) arrived with LAS 1.2, so
+    1.0/1.1 targets keep the geometry and drop the colour with a notice.
+    """
+    if rgb16 is None:
+        return False
+    if not _version_supports_rgb(las_version):
+        print(
+            f"⚠️ RGB dropped: LAS {las_version} has no colour channels "
+            "(colour needs LAS 1.2 or newer)"
+        )
+        return False
+    las.red, las.green, las.blue = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
+    return True
 
 
 def _import_options_reduce_points(import_options) -> bool:
@@ -106,6 +400,86 @@ def _assign_classification_to_las(las, classes_u8: np.ndarray) -> None:
         return
 
     las.classification = np.clip(classes_u8, 0, 31).astype(np.uint8, copy=False)
+
+
+# "Attributes to save" label -> LAS dimensions cleared in the written file
+# when the label is unchecked.  Easting/Northing/Elevation are deliberately
+# absent: a LAS point cannot exist without coordinates, and the dialog marks
+# those rows always available.  "Description" follows "Class" - it is derived
+# from the classification code rather than stored per point.  "Time" and
+# "Date" share gps_time and are cleared only when neither is chosen.  "Echo"
+# also clears Number of Returns because both describe the return pattern.
+# A dimension with no row here - scan angle, shown as "Angle" in View
+# Fields - keeps its source values.
+_ATTRIBUTE_WRITE_DIMS = {
+    "Class": ("classification",),
+    "Line": ("point_source_id",),
+    "Echo": ("return_number", "number_of_returns"),
+    "Amplitude": ("amplitude",),
+    "Intensity": ("intensity",),
+    "Reflectance": ("reflectance",),
+    "Deviation": ("deviation",),
+    "Reliability": ("reliability",),
+    "Color RGB": ("red", "green", "blue"),
+}
+
+
+def _attr_selected(selection, label):
+    """True when the label is checked, or when no Attributes choice was made."""
+    return selection is None or label in selection
+
+
+def _apply_attribute_selection(las, selection):
+    """Clear every LAS dimension the user unchecked in "Attributes to save".
+
+    Runs on both write paths - the source-preserving rewrite (which copies
+    every source field) and the synthesized save - just before the file is
+    written, so unchecked attributes carry no values in the saved file.
+    Coordinates are never touched, and neither is a dimension with no row
+    in the list (scan angle).  Returns the cleared labels for the log.
+    """
+    if selection is None or las is None:
+        return []
+    checked = set(selection)
+    dim_names = [str(d) for d in las.point_format.dimension_names]
+    dims = {name.casefold() for name in dim_names}
+    cleared = set()
+
+    def clear(names, label):
+        for name in names:
+            if name.casefold() not in dims:
+                continue
+            try:
+                current = np.asarray(getattr(las, name))
+                setattr(las, name, np.zeros_like(current))
+                cleared.add(label)
+            except Exception as exc:
+                print(f"⚠️ Could not clear {label} ({name}): {exc}")
+
+    for label, names in _ATTRIBUTE_WRITE_DIMS.items():
+        if label not in checked:
+            clear(names, label)
+
+    if "Image" not in checked:
+        # Vendor extra-byte dimension ("imageid", "photo", ...) discovered
+        # exactly the way View Fields discovers it.
+        try:
+            from gui.dialogs.view_fields_dialog import find_image_dimension_name
+
+            image_name = find_image_dimension_name(dim_names)
+        except Exception:
+            image_name = None
+        if image_name is not None:
+            clear((image_name,), "Image")
+    if "Time" not in checked and "Date" not in checked:
+        # One gps_time field backs both the Time and the Date column.
+        clear(("gps_time",), "Time/Date")
+    if cleared:
+        print(
+            "Save points: cleared unchecked attribute(s): "
+            + ", ".join(sorted(cleared))
+        )
+    return sorted(cleared)
 
 
 def _try_build_preserved_las(
@@ -174,9 +548,9 @@ def _try_build_preserved_las(
     try:
         import pyproj
         if crs_wkt:
-            las.header.parse_crs(pyproj.CRS.from_wkt(crs_wkt))
+            las.header.add_crs(pyproj.CRS.from_wkt(crs_wkt))
         elif crs_epsg:
-            las.header.parse_crs(pyproj.CRS.from_epsg(crs_epsg))
+            las.header.add_crs(pyproj.CRS.from_epsg(crs_epsg))
     except Exception as exc:
         print(f"⚠️ Preserved-save CRS update skipped: {exc}")
 
@@ -281,7 +655,14 @@ def _inspect_fenced_parent_session(app):
 
 def has_fenced_parent_writeback(app) -> bool:
     session, _error, is_fence_mode = _inspect_fenced_parent_session(app)
-    return bool(is_fence_mode and session is not None)
+    # Ordinary Load-by-Fence sessions are subset-only and must never trigger
+    # an implicit write into their complete source tiles. Buffered-grid loads
+    # retain their explicit multi-parent ownership workflow.
+    return bool(
+        is_fence_mode
+        and session is not None
+        and session.get("operation") == "buffered_grid"
+    )
 
 
 def save_current_pointcloud_in_place(app) -> bool:
@@ -296,6 +677,10 @@ def save_current_pointcloud_in_place(app) -> bool:
             if error:
                 print(f"Fence in-place save skipped: {error}")
             return False
+        if session.get("operation") != "buffered_grid":
+            # A fenced subset has no safe single in-place destination. Require
+            # an explicit subset Save As instead of modifying full parents.
+            return False
         return _save_fenced_parent_files(
             app, session, output_dir=None, in_place=True, show_messages=False,
         )
@@ -305,42 +690,32 @@ def save_current_pointcloud_in_place(app) -> bool:
 
 
 def _prompt_fenced_save_mode(app, session):
+    if session.get("operation") != "buffered_grid":
+        return "subset"
+
     source_count = len(session.get("source_files") or [])
     first_source = os.path.basename(session["source_files"][0]) if source_count else "parent file"
 
     box = QMessageBox(app)
     box.setIcon(QMessageBox.Question)
-    is_buffered_grid = session.get("operation") == "buffered_grid"
-    box.setWindowTitle("Save Buffered Grid" if is_buffered_grid else "Save Fenced Data")
-    box.setText(
-        "Choose how to save the buffered grid edits."
-        if is_buffered_grid else
-        "Choose how to save the fenced SNT load."
+    box.setWindowTitle("Save Buffered Grid")
+    box.setText("Choose how to save the buffered grid edits.")
+    box.setInformativeText(
+        f"Source grid files: {source_count}\n"
+        f"Primary grid: {session.get('primary_grid') or first_source}\n"
+        f"Buffer width: {float(session.get('buffer_width') or 0.0):.2f}\n\n"
+        "Original source files: writes each edited point back to its own LAS/LAZ file.\n"
+        "Full parent copies: creates separately saved complete tile copies.\n"
+        "Buffered subset only: saves all displayed points into one combined file."
     )
-    if is_buffered_grid:
-        box.setInformativeText(
-            f"Source grid files: {source_count}\n"
-            f"Primary grid: {session.get('primary_grid') or first_source}\n"
-            f"Buffer width: {float(session.get('buffer_width') or 0.0):.2f}\n\n"
-            "Original source files: writes each edited point back to its own LAS/LAZ file.\n"
-            "Full parent copies: creates separately saved complete tile copies.\n"
-            "Buffered subset only: saves all displayed points into one combined file."
-        )
-    else:
-        box.setInformativeText(
-            f"Fence source files: {source_count}\n"
-            f"First source: {first_source}\n\n"
-            "Fenced subset only: saves just the visible fenced points into one output file.\n"
-            "Full parent files: writes the fence edits back into full source tiles."
-        )
     subset_btn = box.addButton(
-        "Buffered Subset Only" if is_buffered_grid else "Fenced Subset Only",
+        "Buffered Subset Only",
         QMessageBox.AcceptRole,
     )
     parents_btn = box.addButton("Full Parent Files", QMessageBox.ActionRole)
     originals_btn = (
         box.addButton("Save to Original Source Files", QMessageBox.DestructiveRole)
-        if is_buffered_grid else None
+        if session.get("operation") == "buffered_grid" else None
     )
     cancel_btn = box.addButton(QMessageBox.Cancel)
     box.exec()
@@ -547,7 +922,7 @@ def _save_fenced_parent_files(app, session, output_dir=None, in_place=True, show
             )
             os.close(fd)
             try:
-                las.write(tmp_path)
+                _write_las_for_version(las, tmp_path)
                 os.replace(tmp_path, target_path)
             finally:
                 if os.path.exists(tmp_path):
@@ -802,7 +1177,31 @@ def _attach_drawings_storage(las, las_path: str, drawing_data: bytes, descriptio
     return None
 
 
-def _atomic_write_las(las, path: str) -> None:
+def _write_las_for_version(las, path: str, las_version: str | None = None) -> None:
+    """Write ``las`` to ``path``, including LAS 1.0 targets.
+
+    laspy reads a LAS 1.0 header but refuses to create one, and the 1.0/1.1
+    headers share a layout (1.1 only pinned down the file-source-id and
+    global-encoding fields, both written as 0 here). So a 1.0 target is
+    written as 1.1 and its two version bytes are stamped to (1, 0).
+    """
+    target = str(las_version or _las_version_of(las)).strip()
+    if target != "1.0":
+        las.write(path)
+        return
+
+    if _las_version_of(las) == "1.0":
+        # Object read from a 1.0 source: convert to the equivalent 1.1 first
+        # (same point format, same dimensions) so laspy will write it.
+        las = laspy.convert(las, file_version="1.1")
+    las.write(path)
+    with open(path, "r+b") as handle:
+        handle.seek(_LAS_VERSION_BYTE_OFFSET)
+        handle.write(bytes((1, 0)))
+    print(f"📌 LAS 1.0 written over the identical 1.1 header layout: {os.path.basename(path)}")
+
+
+def _atomic_write_las(las, path: str, las_version: str | None = None) -> None:
     """
     Write to a temp file in the same directory and replace the destination only
     after a successful full write so failures cannot truncate the live file.
@@ -812,7 +1211,7 @@ def _atomic_write_las(las, path: str) -> None:
     fd, tmp_path = tempfile.mkstemp(prefix=".naksha_save_", suffix=suffix, dir=out_dir)
     os.close(fd)
     try:
-        las.write(tmp_path)
+        _write_las_for_version(las, tmp_path, las_version)
         os.replace(tmp_path, path)
     except Exception:
         try:
@@ -1095,7 +1494,8 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
     fence_session, fence_error, is_fence_mode = _inspect_fenced_parent_session(app)
     if is_fence_mode and fence_session is not None:
-        if show_dialog:
+        is_buffered_grid = fence_session.get("operation") == "buffered_grid"
+        if is_buffered_grid and show_dialog:
             save_mode = _prompt_fenced_save_mode(app, fence_session)
             if save_mode is None:
                 return False
@@ -1124,7 +1524,7 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
                     in_place=False,
                     show_messages=True,
                 )
-        else:
+        elif is_buffered_grid:
             return _save_fenced_parent_files(
                 app,
                 fence_session,
@@ -1152,8 +1552,13 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     else:
         classes = np.asarray(classes)
 
-    rgb16 = _rgb_to_las16(data.get("rgb"))
-    intensity16 = _intensity_to_uint16(data.get("intensity"), n_points=n)
+    # RGB/intensity conversion walks every point, so it waits until after the
+    # options popup and the file browser: opening Save points must not depend
+    # on how many points are loaded.
+    save_classes = None
+    save_lines = None
+    save_fences = None
+    save_attributes = None
 
     # ---------------------------------------------------------
     # ✅ Save As dialog
@@ -1178,7 +1583,7 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
         default_path = os.path.join(start_dir, base_name) if start_dir else base_name
 
-        filters = "LAZ 1.2 (*.laz);;LAZ 1.4 (*.laz);;LAS 1.2 (*.las);;LAS 1.4 (*.las)"
+        filters = _format_filters()
         default_filter = "LAZ 1.4 (*.laz)"
 
         try:
@@ -1191,12 +1596,15 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
                 if src_ver is None and loaded_ext in (".las", ".laz") and os.path.exists(loaded):
                     try:
-                        hdr = laspy.read(loaded).header
+                        # Header only: laspy.read() would decode every point
+                        # before the popup could appear.
+                        with laspy.open(loaded) as reader:
+                            hdr = reader.header
                         src_ver = f"{hdr.version.major}.{hdr.version.minor}"
                     except Exception:
                         src_ver = None
 
-                if src_ver not in ("1.2", "1.4"):
+                if src_ver not in LAS_VERSIONS:
                     src_ver = "1.4"
 
                 if loaded_ext == ".las":
@@ -1206,6 +1614,95 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
         except Exception:
             pass
+
+        # Options popup first; the file browser opens only after OK.
+        from .save_points_dialog import (
+            SavePointsDialog,
+            collect_save_fences,
+        )
+
+        # Class choices are exactly the classes listed in the Display Mode
+        # class table (loaded PTC plus any rows the user added there). The app
+        # keeps default palettes even with no PTC, so those are NOT used: with
+        # an empty table the Save class box stays blank.
+        class_items = []
+        try:
+            table = getattr(getattr(app, "display_mode_dialog", None), "table", None)
+            if table is not None:
+                seen = set()
+                for row in range(table.rowCount()):
+                    code_item = table.item(row, 1)
+                    if code_item is None:
+                        continue
+                    try:
+                        code = int(code_item.text())
+                    except (TypeError, ValueError):
+                        continue
+                    if code in seen:
+                        continue
+                    seen.add(code)
+                    desc_item = table.item(row, 2)
+                    lvl_item = table.item(row, 4)
+                    desc = str(
+                        (lvl_item.text() if lvl_item else "")
+                        or (desc_item.text() if desc_item else "")
+                    ).strip()
+                    entry = (code, f"{code} - {desc}" if desc else str(code))
+                    color = _table_row_color(table, row)
+                    if color is not None:
+                        # Same color the Display Mode table shows for the class.
+                        entry = entry + (color,)
+                    class_items.append(entry)
+                class_items.sort(key=lambda item: item[0])
+        except Exception as exc:
+            print(f"Save points: could not read Display Mode class table: {exc}")
+            class_items = []
+
+        app_data = getattr(app, "data", None)
+
+        # Line choices: read straight from the loaded dataset's Point Source
+        # IDs (recovered from the LAS/LAZ file when a legacy load path left
+        # them out). Display Mode's own list is never consulted.
+        line_items, line_provider = _line_items_plan(app, app_data)
+
+        options_dlg = SavePointsDialog(
+            app,
+            class_items,
+            default_format=default_filter.split(" (")[0],
+            filename=getattr(app, "loaded_file", None),
+            available_dimensions=app_data.keys() if isinstance(app_data, dict) else (),
+            line_items=line_items,
+            line_provider=line_provider,
+            fence_items=collect_save_fences(app),
+        )
+        if options_dlg.exec() != SavePointsDialog.Accepted:
+            return False
+        save_classes = options_dlg.selected_classes()
+        save_lines = options_dlg.selected_lines()
+        save_attributes = options_dlg.selected_attributes()
+        # Older callers/tests replace the popup, so read the fence choice
+        # defensively: no fence attribute means no fence filter.
+        save_fences = (
+            options_dlg.selected_fences()
+            if hasattr(options_dlg, "selected_fences")
+            else None
+        )
+        if save_lines is not None:
+            print(
+                "Save points: flight lines selected for save: "
+                f"{', '.join(str(line) for line in save_lines)}"
+            )
+        if save_attributes is not None:
+            print(
+                "Save points: attributes selected for save: "
+                f"{', '.join(save_attributes) or '(none)'}"
+            )
+        if save_fences:
+            print(
+                "Save points: fence filter on: "
+                f"{len(save_fences)} fence(s) selected"
+            )
+        default_filter = f"{options_dlg.selected_format()} (*.{'laz' if options_dlg.selected_format().startswith('LAZ') else 'las'})"
 
         picked_path, selected_filter = QFileDialog.getSaveFileName(
             app,
@@ -1232,8 +1729,90 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         print(f"⚠️ Unsupported extension: {ext}")
         return False
 
+    rgb16 = _rgb_to_las16(data.get("rgb"))
+    intensity16 = _intensity_to_uint16(data.get("intensity"), n_points=n)
+
     source_path = getattr(app, "loaded_file", None)
     import_options = data.get("import_options") if isinstance(data, dict) else None
+
+    # Flight-line ids (Point Source ID) travel with the subset so a save that
+    # only wrote certain lines still identifies them after reload.
+    point_source = None
+    if isinstance(data, dict) and data.get("point_source_id") is not None:
+        candidate = np.asarray(data.get("point_source_id"))
+        if candidate.ndim == 1 and candidate.shape[0] == n:
+            point_source = candidate
+    if point_source is None and save_lines is not None:
+        # The Line options come straight from the loaded file; recover the
+        # array the same way when the popup's provider never ran (custom or
+        # older dialogs), so the selection can still be applied.
+        recovered = _recover_point_source_array(app, data)
+        if recovered is not None:
+            candidate = np.asarray(recovered)
+            if candidate.ndim == 1 and candidate.shape[0] == n:
+                point_source = candidate
+
+    # "Save class" from the options popup: keep only the chosen classes. A
+    # subset no longer matches the source file's point count, so the
+    # source-preserving rewrite is skipped and the synthesized path is used.
+    keep = None
+    if save_classes is not None:
+        keep = np.isin(np.asarray(classes), np.asarray(save_classes))
+        if not keep.any():
+            QMessageBox.warning(app, "Save As", f"No points in class(es) {save_classes}.")
+            return False
+        print(f"Save class filter: classes {save_classes} -> {int(keep.sum()):,} of {keep.size:,} points")
+
+    # "Line" from the options popup: keep only the chosen flight lines, i.e.
+    # the same Point Source IDs Display Mode's Lines button lists.
+    if save_lines is not None:
+        if point_source is None:
+            QMessageBox.warning(
+                app,
+                "Save As",
+                "Flight-line data is not available for the loaded dataset, "
+                "so the Line selection cannot be applied.",
+            )
+            return False
+        line_keep = np.isin(point_source, np.asarray(save_lines))
+        if not line_keep.any():
+            QMessageBox.warning(app, "Save As", f"No points in line(s) {save_lines}.")
+            return False
+        keep = line_keep if keep is None else (keep & line_keep)
+        print(
+            f"Save line filter: lines {save_lines} -> "
+            f"{int(keep.sum()):,} of {keep.size:,} points"
+        )
+
+    # "Inside fence only" from the options popup: keep the points inside
+    # the fence(s) picked from the fence tool's By Class list, joined with
+    # the Save class and Line choices above.
+    if save_fences:
+        from .save_points_dialog import fence_inside_mask
+
+        fence_keep = fence_inside_mask(
+            xyz, save_fences, digitizer=getattr(app, "digitizer", None)
+        )
+        if not fence_keep.any():
+            QMessageBox.warning(
+                app, "Save As", "No points inside the selected fence(s)."
+            )
+            return False
+        keep = fence_keep if keep is None else (keep & fence_keep)
+        print(
+            f"Save fence filter: {len(save_fences)} selected fence(s) -> "
+            f"{int(keep.sum()):,} of {keep.size:,} points"
+        )
+
+    if keep is not None:
+        xyz = xyz[keep]
+        classes = np.asarray(classes)[keep]
+        if rgb16 is not None:
+            rgb16 = rgb16[keep]
+        if intensity16 is not None:
+            intensity16 = intensity16[keep]
+        if point_source is not None:
+            point_source = point_source[keep]
 
     # Infer version if needed
     if las_version is None:
@@ -1264,20 +1843,21 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         return False
 
     # ✅ LAS 1.2: 5-bit classification (0-31). For codes > 31, use user_data
-    # field (Nakshatech/Nakshatech approach) — never remap or truncate.
+    # field (MicroStation/TerraScan approach) — never remap or truncate.
     classes_u8 = np.asarray(classes).astype(np.uint8, copy=False)
     max_cls = int(classes_u8.max()) if classes_u8.size else 0
 
     pack_class_into_flags = False
-    if max_cls > 31 and las_version == "1.2":
-        # Nakshatech/Nakshatech compatible: pack the full code straight into
-        # the raw classification byte using the synthetic/key_point/withheld
-        # flag bits. The on-disk byte then EQUALS the real code (0-255).
+    if max_cls > 31 and las_version != "1.4":
+        # Point formats 0-5 (LAS 1.0-1.3) store a 5-bit classification plus the
+        # synthetic/key_point/withheld flag bits. MicroStation/TerraScan
+        # compatible packing writes the full code straight into that byte, so
+        # the on-disk byte EQUALS the real code (0-255).
         pack_class_into_flags = True
         print(f"\n{'='*60}")
-        print(f"📌 LAS 1.2 with extended classes (max={max_cls})")
+        print(f"📌 LAS {las_version} with extended classes (max={max_cls})")
         print(f"   Packing full code into classification byte via flag bits")
-        print(f"   (Nakshatech/Nakshatech compatible)")
+        print(f"   (MicroStation/TerraScan compatible)")
         print(f"{'='*60}\n")
 
     xyz_to_write, save_crs_wkt, save_crs_epsg = _coordinates_for_las_output(app, data, xyz)
@@ -1295,6 +1875,9 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         crs_epsg=save_crs_epsg,
     )
     if preserved_las is not None:
+        # "Attributes to save": the rewrite copies every source field, so the
+        # unchecked ones are cleared here, just before the file is written.
+        _apply_attribute_selection(preserved_las, save_attributes)
         try:
             drawing_data = _serialize_drawings(app)
             if drawing_data:
@@ -1341,21 +1924,26 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
     print(f"ℹ️ Falling back to synthesized save path: {preserve_reason}")
 
-    major, minor = map(int, las_version.split("."))
-
-    point_format_id = _choose_point_format(las_version, has_rgb=(rgb16 is not None))
-    header = laspy.LasHeader(point_format=point_format_id, version=f"{major}.{minor}")
+    point_format_id = _choose_point_format(
+        las_version,
+        has_rgb=(rgb16 is not None)
+        and _attr_selected(save_attributes, "Color RGB"),
+    )
+    header = laspy.LasHeader(
+        point_format=point_format_id,
+        version=_writable_header_version(las_version),
+    )
 
     # Embed CRS
     try:
         import pyproj
         if save_crs_wkt:
             crs = pyproj.CRS.from_wkt(save_crs_wkt)
-            header.parse_crs(crs)
+            header.add_crs(crs)
             print("📌 Embedded output CRS from WKT into LAS header")
         elif save_crs_epsg:
             crs = pyproj.CRS.from_epsg(save_crs_epsg)
-            header.parse_crs(crs)
+            header.add_crs(crs)
             print(f"📌 Embedded output CRS EPSG:{save_crs_epsg} into LAS header")
     except Exception as e:
         print(f"⚠️ Failed to embed CRS into {ext.upper()} header: {e}")
@@ -1367,23 +1955,33 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     if las_version == "1.4":
         las.classification = np.clip(classes_u8, 0, 255).astype(np.uint8, copy=False)
     elif pack_class_into_flags:
-        # LAS 1.2 with codes > 31: write the raw classification byte exactly
-        # the way Nakshatech/Nakshatech does. laspy exposes the byte as four
+        # Codes > 31 on LAS 1.0-1.3: write the raw classification byte exactly
+        # the way TerraScan/MicroStation does. laspy exposes the byte as four
         # bit-packed sub-fields on point formats 0-5, so the on-disk byte ends
-        # up bit-for-bit equal to the real code (0-255). Nakshatech reads the
+        # up bit-for-bit equal to the real code (0-255). MicroStation reads the
         # whole byte and shows the correct value — no VLR, no user_data needed.
         las.classification = (classes_u8 & 0x1F).astype(np.uint8, copy=False)
         las.synthetic = ((classes_u8 >> 5) & 1).astype(bool)
         las.key_point = ((classes_u8 >> 6) & 1).astype(bool)
         las.withheld  = ((classes_u8 >> 7) & 1).astype(bool)
     else:
-        # LAS 1.2: safe, all codes <= 31
+        # Codes <= 31 fit the plain 5-bit classification field
         las.classification = np.clip(classes_u8, 0, 31).astype(np.uint8, copy=False)
 
-    if rgb16 is not None:
-        las.red, las.green, las.blue = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
+    _apply_rgb(
+        las,
+        rgb16 if _attr_selected(save_attributes, "Color RGB") else None,
+        las_version,
+    )
     if intensity16 is not None:
         las.intensity = intensity16
+    if point_source is not None:
+        # Keep flight-line identity: Point Source ID is what Display Mode's
+        # Lines button reads back after the file is loaded again.
+        las.point_source_id = np.asarray(point_source, dtype=np.uint16)
+
+    # "Attributes to save": clear every unchecked attribute before writing.
+    _apply_attribute_selection(las, save_attributes)
 
 
     # ---------------------------------------------------------
@@ -1412,7 +2010,7 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     except Exception as e:
         print(f"⚠️ Failed to save drawings: {e}")
 
-    _atomic_write_las(las, path)
+    _atomic_write_las(las, path, las_version)
     print(f"💾 Saved {ext.upper()} {las_version}, Point Format {point_format_id}: {path}")
 
     # .prj sidecar
@@ -1479,12 +2077,12 @@ def save_pointcloud_quick(app, path):
         las_version = getattr(app, "last_save_version", None)
         try:
             v = data.get("input_format_version", None)
-            if las_version not in ("1.2", "1.4") and isinstance(v, tuple) and len(v) >= 2:
+            if las_version not in LAS_VERSIONS and isinstance(v, tuple) and len(v) >= 2:
                 las_version = f"{int(v[0])}.{int(v[1])}"
         except Exception:
             pass
 
-        if las_version not in ("1.2", "1.4"):
+        if las_version not in LAS_VERSIONS:
             probe = getattr(app, "loaded_file", None)
             if probe and os.path.exists(probe):
                 try:
@@ -1494,7 +2092,7 @@ def save_pointcloud_quick(app, path):
                 except Exception as e:
                     print(f"⚠️ Could not infer LAS version for backup: {e}")
 
-        if las_version not in ("1.2", "1.4"):
+        if las_version not in LAS_VERSIONS:
             las_version = "1.4"
 
         source_path = getattr(app, "loaded_file", None)
@@ -1513,6 +2111,12 @@ def save_pointcloud_quick(app, path):
 
         rgb16 = _rgb_to_las16(data.get("rgb"))
         intensity16 = _intensity_to_uint16(data.get("intensity"), n_points=n)
+
+        point_source = None
+        if data.get("point_source_id") is not None:
+            candidate = np.asarray(data.get("point_source_id"))
+            if candidate.ndim == 1 and candidate.shape[0] == n:
+                point_source = candidate
 
         xyz_to_write, save_crs_wkt, save_crs_epsg = _coordinates_for_las_output(app, data, xyz)
 
@@ -1549,17 +2153,20 @@ def save_pointcloud_quick(app, path):
         print(f"ℹ️ Auto-backup fallback to synthesized save path: {preserve_reason}")
 
         max_cls = int(classes_u8.max()) if classes_u8.size else 0
-        use_user_data_for_class = (max_cls > 31 and las_version == "1.2")
+        use_user_data_for_class = (max_cls > 31 and las_version != "1.4")
 
         point_format = _choose_point_format(las_version, has_rgb=(rgb16 is not None))
-        header = laspy.LasHeader(point_format=point_format, version=las_version)
+        header = laspy.LasHeader(
+            point_format=point_format,
+            version=_writable_header_version(las_version),
+        )
 
         try:
             import pyproj
             if save_crs_wkt:
-                header.parse_crs(pyproj.CRS.from_wkt(save_crs_wkt))
+                header.add_crs(pyproj.CRS.from_wkt(save_crs_wkt))
             elif save_crs_epsg:
-                header.parse_crs(pyproj.CRS.from_epsg(save_crs_epsg))
+                header.add_crs(pyproj.CRS.from_epsg(save_crs_epsg))
         except Exception as e:
             print(f"⚠️ CRS embedding skipped: {e}")
 
@@ -1569,21 +2176,22 @@ def save_pointcloud_quick(app, path):
         if las_version == "1.4":
             las.classification = np.clip(classes_u8, 0, 255).astype(np.uint8, copy=False)
         elif use_user_data_for_class:
-            # LAS 1.2 with codes > 31: pack full code into the raw classification
-            # byte via flag bits (Nakshatech/Nakshatech compatible). On-disk byte
+            # Codes > 31 on LAS 1.0-1.3: pack full code into the raw classification
+            # byte via flag bits (TerraScan/MicroStation compatible). On-disk byte
             # == real code (0-255). No VLR / user_data needed.
             las.classification = (classes_u8 & 0x1F).astype(np.uint8, copy=False)
             las.synthetic = ((classes_u8 >> 5) & 1).astype(bool)
             las.key_point = ((classes_u8 >> 6) & 1).astype(bool)
             las.withheld  = ((classes_u8 >> 7) & 1).astype(bool)
         else:
-            # LAS 1.2: safe, all codes <= 31
+            # Codes <= 31 fit the plain 5-bit classification field
             las.classification = np.clip(classes_u8, 0, 31).astype(np.uint8, copy=False)
 
-        if rgb16 is not None:
-            las.red, las.green, las.blue = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
+        _apply_rgb(las, rgb16, las_version)
         if intensity16 is not None:
             las.intensity = intensity16
+        if point_source is not None:
+            las.point_source_id = np.asarray(point_source, dtype=np.uint16)
 
         # ✅ Save drawings in backup
         try:
@@ -1599,7 +2207,7 @@ def save_pointcloud_quick(app, path):
         except Exception as e:
             print(f"⚠️ Backup: failed to save drawings: {e}")
 
-        _atomic_write_las(las, path)
+        _atomic_write_las(las, path, las_version)
         print(f"💾 Auto-backup saved → {path} (version={las_version}, point_format={point_format})")
         return True
 

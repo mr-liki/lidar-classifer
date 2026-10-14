@@ -582,7 +582,7 @@ class LatencyProbe:
             except Exception:
                 pass
             try:
-                from gui.naksha_cache import frame_timings as _ft
+                from gui import frame_timings as _ft
                 note = getattr(_ft, "gpu_note", "")
                 out["gpu_timestamp_available"] = bool(
                     note and "NOT available" not in str(note))

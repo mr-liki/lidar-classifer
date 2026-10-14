@@ -262,7 +262,7 @@
 # def _snt_polygon_interior_point(polygon: list) -> Tuple[float, float]:
 #     """Return a point that is reliably inside the polygon, even for thin diagonal strips.
 
-#     Nakshatech block polygons are often long narrow strip shapes (flight-line corridors).
+#     TerraScan block polygons are often long narrow strip shapes (flight-line corridors).
 #     Their arithmetic centroid frequently falls *outside* the boundary, which causes
 #     both PRJ-stage-1 (SNT centroid vs PRJ poly) and PRJ-stage-2 (PRJ centroid vs SNT
 #     poly) to fail, leaving the polygon matched only by the text-label fallback.
@@ -509,7 +509,7 @@
 
 # def _normalise_snt_level_name(layer_name: str) -> str:
 #     """
-#     Normalize a Nakshatech/SNT level name without regex.
+#     Normalize a MicroStation/SNT level name without regex.
 
 #     Examples:
 #         " New   Level "   -> "NEW LEVEL"
@@ -522,7 +522,7 @@
 
 # def _is_default_placeholder_block_level(layer_name: str) -> bool:
 #     """
-#     Return True only for the known Nakshatech placeholder levels.
+#     Return True only for the known MicroStation placeholder levels.
 
 #     This must remain separate from _is_block_boundary_layer_name().
 #     Globally treating every 'New Level' entity as a block boundary would
@@ -837,7 +837,7 @@
 #     # Real named block boundaries.
 #     explicit_block_polys: list = []
 
-#     # Possible real boundaries stored on Nakshatech's default level.
+#     # Possible real boundaries stored on MicroStation's default level.
 #     placeholder_polys: list = []
 
 #     # Small index tiles. These are used only when no real blocks exist.
@@ -2233,7 +2233,7 @@
 
 #     ``entities`` contains logical drawable SNT records and remains authoritative
 #     for rendering and the file-wide entity badge. CONNECT bridge SNTs also carry
-#     ``source_layer_counts``: Nakshatech's physical per-level counts, including
+#     ``source_layer_counts``: MicroStation's physical per-level counts, including
 #     stored complex components. Those declared counts are authoritative for the
 #     Level Manager. A drawable baseline captured at load time lets subsequent
 #     in-memory add/delete/move operations appear as deltas over the declaration.
@@ -2262,7 +2262,7 @@
 #             ordered_names.append(lname)
 
 #     # Keep entities/layers created by the application visible even though they
-#     # naturally have no Nakshatech declaration.
+#     # naturally have no MicroStation declaration.
 #     for lname in actual_counts:
 #         if lname not in stats:
 #             stats[lname] = {"count": 0, "color": _DEFAULT_COLOR}
@@ -12692,7 +12692,7 @@
 #         is_snt_binary = entity.get("snt_binary", False)
 
 #         if is_snt_binary:
-#             # CONNECT-native SNT stores the real Nakshatech text height in
+#             # CONNECT-native SNT stores the real MicroStation text height in
 #             # world units.  Do not normalise it: doing so reduced labels such
 #             # as NST/UMA from hundreds of metres to 2.5m while enlarging 0.1m
 #             # plan-title text to 1m.  That made every text entity visually
@@ -13277,7 +13277,7 @@ def _snt_polygon_centroid_2d(polygon: list) -> Tuple[float, float]:
 def _snt_polygon_interior_point(polygon: list) -> Tuple[float, float]:
     """Return a point that is reliably inside the polygon, even for thin diagonal strips.
 
-    Nakshatech block polygons are often long narrow strip shapes (flight-line corridors).
+    TerraScan block polygons are often long narrow strip shapes (flight-line corridors).
     Their arithmetic centroid frequently falls *outside* the boundary, which causes
     both PRJ-stage-1 (SNT centroid vs PRJ poly) and PRJ-stage-2 (PRJ centroid vs SNT
     poly) to fail, leaving the polygon matched only by the text-label fallback.
@@ -13652,7 +13652,7 @@ _DEFAULT_PLACEHOLDER_BLOCK_LEVELS = frozenset({
 
 def _normalise_snt_level_name(layer_name: str) -> str:
     """
-    Normalize a Nakshatech/SNT level name without regex.
+    Normalize a MicroStation/SNT level name without regex.
 
     Examples:
         " New   Level "   -> "NEW LEVEL"
@@ -13665,7 +13665,7 @@ def _normalise_snt_level_name(layer_name: str) -> str:
 
 def _is_default_placeholder_block_level(layer_name: str) -> bool:
     """
-    Return True only for the known Nakshatech placeholder levels.
+    Return True only for the known MicroStation placeholder levels.
 
     This must remain separate from _is_block_boundary_layer_name().
     Globally treating every 'New Level' entity as a block boundary would
@@ -14167,7 +14167,7 @@ def build_snt_block_polygons(
     # Real named block boundaries.
     explicit_block_polys: list = []
 
-    # Possible real boundaries stored on Nakshatech's default level.
+    # Possible real boundaries stored on MicroStation's default level.
     placeholder_polys: list = []
 
     # Small index tiles. These are used only when no real blocks exist.
@@ -15109,7 +15109,13 @@ def _snt_push_border_uniforms(app) -> None:
     unified point-cloud actor right now, before the impending render.
     """
     try:
-        from gui.unified_actor_manager import _push_uniforms_direct
+        from gui.unified_actor_manager import _push_uniforms_direct, _main_tile_all_actor_items, _is_main_tiled
+        if _is_main_tiled(app):
+            for _, ua in _main_tile_all_actor_items(app):
+                ctx = getattr(ua, '_naksha_shader_ctx', None)
+                if ctx is not None:
+                    _push_uniforms_direct(ua, ctx)
+            return
         ua = getattr(app, '_unified_actor', None)
         if ua is None:
             return
@@ -15777,7 +15783,7 @@ def _snt_layer_stats_from_parsed(parsed) -> List[Tuple[str, int, Tuple[int, int,
 
     ``entities`` contains logical drawable SNT records and remains authoritative
     for rendering and the file-wide entity badge. CONNECT bridge SNTs also carry
-    ``source_layer_counts``: Nakshatech's physical per-level counts, including
+    ``source_layer_counts``: MicroStation's physical per-level counts, including
     stored complex components. Those declared counts are authoritative for the
     Level Manager. A drawable baseline captured at load time lets subsequent
     in-memory add/delete/move operations appear as deltas over the declaration.
@@ -15806,7 +15812,7 @@ def _snt_layer_stats_from_parsed(parsed) -> List[Tuple[str, int, Tuple[int, int,
             ordered_names.append(lname)
 
     # Keep entities/layers created by the application visible even though they
-    # naturally have no Nakshatech declaration.
+    # naturally have no MicroStation declaration.
     for lname in actual_counts:
         if lname not in stats:
             stats[lname] = {"count": 0, "color": _DEFAULT_COLOR}
@@ -16531,6 +16537,8 @@ def rebuild_snt_attachment(app, attachment):
         for lname, actors in list(item.actor_cache.items()):
             for actor in actors:
                 try:
+                    if hasattr(actor, "dispose"):
+                        actor.dispose()
                     renderer.RemoveActor(actor)
                 except Exception:
                     pass
@@ -19531,6 +19539,8 @@ def _remove_snt_actor_from_caches(app, attachment, actor):
     renderer = getattr(getattr(app, "vtk_widget", None), "renderer", None)
     if renderer is not None:
         try:
+            if hasattr(actor, "dispose"):
+                actor.dispose()
             renderer.RemoveActor(actor)
         except Exception:
             pass
@@ -19726,6 +19736,8 @@ def _delete_snt_entities_local(app, attachment, deleted_entities):
         elif kind == "point":
             if not _update_snt_point_actor_entities(actor, survivors):
                 return False
+        elif kind == "text_instances":
+            actor.update_entities(survivors)
         else:
             return False
 
@@ -22559,6 +22571,8 @@ class SNTFileItem(QWidget):
             removed_actor_ids.add(id(actor))
             if renderer is not None:
                 try:
+                    if hasattr(actor, "dispose"):
+                        actor.dispose()
                     renderer.RemoveActor(actor)
                 except Exception:
                     pass
@@ -24455,6 +24469,8 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                                 if actor is not None:
                                     removed_actor_ids.add(id(actor))
                                     if renderer is not None:
+                                        if hasattr(actor, "dispose"):
+                                            actor.dispose()
                                         renderer.RemoveActor(actor)
                             except Exception:
                                 pass
@@ -24502,6 +24518,8 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                             continue
                         seen_pairs.add(pair_key)
                         try:
+                            if hasattr(actor, "dispose"):
+                                actor.dispose()
                             vtk_renderer.RemoveActor(actor)
                         except Exception:
                             pass
@@ -26216,7 +26234,12 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                         for start in range(0, n, face_chunk_faces):
                             _build_face_outline_actor(color, layer_name, group[start:start + face_chunk_faces])
 
-            selected_text_ents, text_stats = _select_text_entities_for_render(text_ents)
+            from gui.snt_text_instances import text_instance_groups, SNTInstancedTextActor
+            text_groups = text_instance_groups(text_ents)
+            groups_by_representative = {id(group[0]): group for group in text_groups}
+            selected_text_ents, text_stats = _select_text_entities_for_render([group[0] for group in text_groups])
+            text_stats['total'] = len(text_ents)
+            text_stats['selected'] = sum(len(groups_by_representative[id(e)]) for e in selected_text_ents)
 
             # Compute a geographic cell-size hint for block-label sizing.
             # Aim for each FileNames/block label to be ~20% of a grid cell tall.
@@ -26242,7 +26265,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             for e in selected_text_ents:
                 a = self._create_text_actor(e, cell_size_hint=_cell_hint)
                 if a:
-                    _update_bounds_point(e.get("position", (0.0, 0.0, 0.0)))
+                    owned_text = groups_by_representative[id(e)]
+                    if len(owned_text) > 1:
+                        a = SNTInstancedTextActor(a, owned_text, renderer)
+                    for owned_entity in owned_text:
+                        _update_bounds_point(owned_entity.get("position", (0.0, 0.0, 0.0)))
                     mapper = getattr(a, "GetMapper", lambda: None)()
                     if mapper is not None:
                         mapper.SetResolveCoincidentTopologyToPolygonOffset()
@@ -26254,13 +26281,12 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     _apply_z_offset_to_actor(a, z_offset)
                     if self._labels_hidden:
                         a.SetVisibility(0)
-                    a._naksha_snt_entities = (e,)
-                    a._naksha_snt_group_kind = "text"
-                    a._naksha_snt_entity_keys = (
-                        ("snt", int(e["_snt_entity_id"]))
-                        if e.get("_snt_entity_id") is not None
-                        else ("obj", id(e)),
-                    )
+                    a._naksha_snt_entities = tuple(owned_text)
+                    a._naksha_snt_group_kind = "text_instances" if len(owned_text) > 1 else "text"
+                    a._naksha_snt_entity_keys = tuple(
+                        ("snt", int(entity["_snt_entity_id"]))
+                        if entity.get("_snt_entity_id") is not None else ("obj", id(entity))
+                        for entity in owned_text)
                     renderer.AddActor(a)
                     actors.append(a)
                     _cache(a, e.get("layer", "0"))
@@ -26464,7 +26490,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         is_snt_binary = entity.get("snt_binary", False)
 
         if is_snt_binary:
-            # CONNECT-native SNT stores the real Nakshatech text height in
+            # CONNECT-native SNT stores the real MicroStation text height in
             # world units.  Do not normalise it: doing so reduced labels such
             # as NST/UMA from hundreds of metres to 2.5m while enlarging 0.1m
             # plan-title text to 1m.  That made every text entity visually

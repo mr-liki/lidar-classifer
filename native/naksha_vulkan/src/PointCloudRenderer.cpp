@@ -328,14 +328,14 @@ int PointCloudRenderer::ReserveArena(std::size_t capacityPoints) {
 UploadStats PointCloudRenderer::UploadArenaTile(
     std::size_t first, std::size_t count, const double* xyzWorldF64,
     const RenderOrigin& origin, const uint8_t* classification,
-    const float* intensity, const uint8_t* normalsOct16) {
+    const float* intensity, const uint8_t* normalsOct16, const uint8_t* rgb8) {
     UploadStats stats;
     // xyzWorldF64 == nullptr means ATTRIBUTE-ONLY: the tile's positions are
     // already resident (a mode switch backfilling class / intensity / normals),
     // so they must not be sent again. Nothing to do if there is no stream at all.
     const bool hasXyz = (xyzWorldF64 != nullptr);
     if (!arenaMode_ || count == 0) return stats;
-    if (!hasXyz && !classification && !intensity && !normalsOct16) return stats;
+    if (!hasXyz && !classification && !intensity && !normalsOct16 && !rgb8) return stats;
     if (first + count > arenaCapacity_) return stats;     // never write past the arena
     if (!hasXyz && first + count > pointCount_) return stats;  // attributes need positions
 
@@ -344,6 +344,7 @@ UploadStats PointCloudRenderer::UploadArenaTile(
     const VkDeviceSize intBytes = intensity ? static_cast<VkDeviceSize>(count) * sizeof(float) : 0;
     const VkDeviceSize nrmBytes = normalsOct16
         ? static_cast<VkDeviceSize>(count) * kOct16BytesPerNormal : 0;
+    const VkDeviceSize rgbBytes = rgb8 ? static_cast<VkDeviceSize>(count) * 4 : 0;   // RGBA8
 
     std::vector<float> render;
     double t0 = NowMs();
@@ -368,10 +369,15 @@ UploadStats PointCloudRenderer::UploadArenaTile(
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         if (!normals_.IsValid()) return stats;
     }
+    if (rgb8) {
+        ensureBuffer(colors_, static_cast<VkDeviceSize>(arenaCapacity_) * 4,
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        if (!colors_.IsValid()) return stats;
+    }
 
     // ONE staged submit for every stream: the staging buffer is filled
     // consecutively and Execute() walks the regions in the same order.
-    const VkDeviceSize total = posBytes + clsBytes + intBytes + nrmBytes;
+    const VkDeviceSize total = posBytes + clsBytes + intBytes + nrmBytes + rgbBytes;
     uint8_t* dst = renderer_->GetUploadContext().Stage(total);
     if (!dst) return stats;
     double t2 = NowMs();
@@ -405,6 +411,19 @@ UploadStats PointCloudRenderer::UploadArenaTile(
         r.srcOffset = cursor; r.size = nrmBytes; regions.push_back(r);
         cursor += nrmBytes;
     }
+    if (rgb8) {
+        // RGB8 -> RGBA8 (the colour attribute is a 4-byte UNORM stream, alpha 255)
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[cursor + i * 4 + 0] = rgb8[i * 3 + 0];
+            dst[cursor + i * 4 + 1] = rgb8[i * 3 + 1];
+            dst[cursor + i * 4 + 2] = rgb8[i * 3 + 2];
+            dst[cursor + i * 4 + 3] = 255;
+        }
+        CopyRegion r; r.dst = colors_.buffer;
+        r.dstOffset = static_cast<VkDeviceSize>(first) * 4;
+        r.srcOffset = cursor; r.size = rgbBytes; regions.push_back(r);
+        cursor += rgbBytes;
+    }
     double t3 = NowMs();
     stats = renderer_->GetUploadContext().Execute(regions, t1 - t0, t3 - t2);
     if (stats.bytes == 0) return stats;
@@ -412,6 +431,7 @@ UploadStats PointCloudRenderer::UploadArenaTile(
     if (hasXyz) positionUploads_++;
     if (classification) { classificationUploads_++; classInArena_ = true; }
     if (intensity)      { intensityUploads_++;      intensityInArena_ = true; }
+    if (rgb8)           { colorUploads_++; }
     if (normalsOct16)   { normalUploads_++; normalCount_ = arenaCapacity_;
                           normalBytes_ = static_cast<VkDeviceSize>(arenaCapacity_) * kOct16BytesPerNormal; }
     if (hasXyz) {

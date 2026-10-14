@@ -240,6 +240,14 @@ class TempFenceTool:
         self._watch_timer = None   # conversion-completion poller
         self._prev_cursor = None
         self._redo_stack = []      # vertices removed by Ctrl+Z (for Ctrl+Y)
+        # Fence preview is a lightweight overlay transaction.  Keep one actor
+        # alive and update its VTK buffers in place; rebuilding/removing actors
+        # on every mouse move makes a 47M-point scene feel frozen.
+        self._pending_preview_xy = None
+        self._preview_interval_ms = 33  # bounded ~30 FPS interaction cadence
+        self._preview_timer = QTimer()
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._flush_preview)
 
     # ------------------------------------------------------------------
     # Widget / renderer resolution
@@ -430,13 +438,14 @@ class TempFenceTool:
             if not self._drawing or not self._points:
                 return
             x, y = self._event_pos(obj)
-            # ✅ Magnetic pick so the rubber-band preview tracks nearby
-            # geometry (falls back to the z-plane ray when nothing is
-            # picked) — matches the draw-tool polygon preview.
-            world = self._pick_to_plane(x, y)
+            # Mouse-move preview must never pick against 47M LiDAR points.
+            # Back-project to the fence plane (O(1)), then coalesce updates to
+            # a bounded frame cadence. Final click placement still gets the
+            # lightweight drawing-vertex snap in _pick_to_plane().
+            world = self._display_to_plane(x, y)
             if world is None:
                 return
-            self._rebuild_preview(cursor_xy=(world[0], world[1]))
+            self._schedule_preview((world[0], world[1]))
         except Exception:
             pass
 
@@ -567,37 +576,58 @@ class TempFenceTool:
             _builtin_print(f"⚠️ TempFenceTool: display→world failed: {e}")
             return None
 
-    def _pick_to_plane(self, x, y):
-        """Pick the nearest visible point/line under display (x, y) and project
-        it onto the drawing z-plane.
+    def _snap_world_to_drawings(self, world, screen_pixels=10):
+        """Snap only against lightweight digitizer geometry, never LiDAR props.
 
-        Mirrors the magnetic-snap fallback in the digitizer: first try a
-        vtkPropPicker against the renderer's visible props; if nothing is
-        picked, fall back to the viewing-ray intersection with the z-plane
-        (which is what the draw-tool polygon uses when there is nothing to
-        snap to). The result is always in world (x, y, z0) — the same shape
-        that _display_to_plane returns — so callers can use the two
-        interchangeably.
+        ``vtkPropPicker.Pick`` traverses the renderer and is extremely expensive
+        when the Main View contains tens of millions of point sprites.  A temp
+        fence only needs drawing-geometry magnetism, so use a zoom-aware world
+        tolerance against saved drawing vertices instead.
         """
-        ren = self._renderer()
-        w = self._vtk_widget()
-        if ren is None or w is None:
-            return self._display_to_plane(x, y)
+        if world is None:
+            return None
         try:
-            picker = vtk.vtkPropPicker()
-            picker.Pick(float(x), float(y), 0.0, ren)
-            wp = picker.GetPickPosition()
-            if wp is not None and len(wp) >= 3:
-                # vtkPropPicker returns (0,0,0) when nothing was picked —
-                # detect that by checking the picked Prop.
-                if picker.GetActor() is not None or picker.GetProp3D() is not None:
-                    z0 = self._plane_z
-                    if z0 is None:
-                        z0 = self._plane_z = self._resolve_plane_z()
-                    return (float(wp[0]), float(wp[1]), float(z0))
+            tol = self._screen_to_world_tolerance(screen_pixels=screen_pixels)
+            if tol is None or tol <= 0:
+                return world
+            best = None
+            best_d2 = float(tol) * float(tol)
+            digitizer = getattr(self.app, "digitizer", None)
+            drawings = getattr(digitizer, "drawings", None) if digitizer is not None else None
+            if drawings:
+                for drawing in drawings:
+                    coords = drawing.get("coords") if isinstance(drawing, dict) else None
+                    if not coords:
+                        continue
+                    for c in coords:
+                        try:
+                            dx = float(c[0]) - float(world[0])
+                            dy = float(c[1]) - float(world[1])
+                            d2 = dx * dx + dy * dy
+                            if d2 < best_d2:
+                                best_d2 = d2
+                                best = c
+                        except Exception:
+                            continue
+            if best is not None:
+                z0 = self._plane_z
+                if z0 is None:
+                    z0 = self._plane_z = self._resolve_plane_z()
+                return (float(best[0]), float(best[1]), float(z0))
         except Exception:
             pass
-        return self._display_to_plane(x, y)
+        return world
+
+    def _pick_to_plane(self, x, y):
+        """Fast display→plane placement with drawing-only magnetic snap.
+
+        Do not invoke vtkPropPicker against the LiDAR renderer here.  That pick
+        path is proportional to rendered scene complexity and was executed for
+        every mouse move, which is the primary cause of slow Fence drawing on
+        47M-point blocks.
+        """
+        world = self._display_to_plane(x, y)
+        return self._snap_world_to_drawings(world, screen_pixels=10)
 
     def _screen_to_world_tolerance(self, screen_pixels=15):
         """Convert a screen-pixel tolerance to world units at the current zoom.
@@ -718,6 +748,12 @@ class TempFenceTool:
         prop.SetLineWidth(width)
         prop.SetPointSize(6)
         prop.SetLighting(False)
+        # Mutable refs used by the in-place preview updater.
+        actor._temp_fence_poly = poly
+        actor._temp_fence_points = vpoints
+        actor._temp_fence_lines = lines
+        actor._temp_fence_verts = verts
+        actor._temp_fence_origin = (ox, oy, oz)
         return actor
 
     def _add_actor(self, actor):
@@ -749,21 +785,79 @@ class TempFenceTool:
         except Exception:
             pass
 
-    def _rebuild_preview(self, cursor_xy=None):
-        """Redraw the in-progress outline (rubber band to the cursor included)."""
+    def _update_line_actor(self, actor, pts):
+        """Update an existing temp-fence actor without renderer actor churn."""
+        if actor is None or not pts:
+            return False
         try:
-            if self._preview_actor is not None:
-                self._remove_actor(self._preview_actor)
-                self._preview_actor = None
+            poly = getattr(actor, "_temp_fence_poly", None)
+            vpoints = getattr(actor, "_temp_fence_points", None)
+            lines = getattr(actor, "_temp_fence_lines", None)
+            verts = getattr(actor, "_temp_fence_verts", None)
+            origin = getattr(actor, "_temp_fence_origin", None)
+            if poly is None or vpoints is None or lines is None or verts is None or origin is None:
+                return False
+            ox, oy, oz = origin
+            vpoints.Reset()
+            for p in pts:
+                vpoints.InsertNextPoint(float(p[0]) - ox, float(p[1]) - oy, float(p[2]) - oz)
+
+            lines.Reset()
+            if len(pts) >= 2:
+                line = vtk.vtkPolyLine()
+                line.GetPointIds().SetNumberOfIds(len(pts))
+                for i in range(len(pts)):
+                    line.GetPointIds().SetId(i, i)
+                lines.InsertNextCell(line)
+
+            verts.Reset()
+            for i in range(len(pts)):
+                cell = vtk.vtkVertex()
+                cell.GetPointIds().SetId(0, i)
+                verts.InsertNextCell(cell)
+
+            vpoints.Modified(); lines.Modified(); verts.Modified(); poly.Modified()
+            mapper = actor.GetMapper()
+            if mapper is not None:
+                mapper.Modified()
+            actor.Modified()
+            return True
+        except Exception:
+            return False
+
+    def _schedule_preview(self, cursor_xy):
+        self._pending_preview_xy = cursor_xy
+        try:
+            if not self._preview_timer.isActive():
+                self._preview_timer.start(self._preview_interval_ms)
+        except Exception:
+            self._flush_preview()
+
+    def _flush_preview(self):
+        xy = self._pending_preview_xy
+        self._pending_preview_xy = None
+        if xy is not None and self._drawing and self._points:
+            self._rebuild_preview(cursor_xy=xy)
+
+    def _rebuild_preview(self, cursor_xy=None):
+        """Update the in-progress rubber band using one persistent VTK actor."""
+        try:
             pts = list(self._points)
             if cursor_xy is not None and pts:
                 z = self._plane_z or 0.0
                 pts.append((float(cursor_xy[0]), float(cursor_xy[1]), float(z)))
             if not pts:
                 return
-            self._preview_actor = self._make_line_actor(pts, color=(0.4, 0.9, 1.0), width=2.0)
-            self._apply_fence_style(self._preview_actor)
-            self._add_actor(self._preview_actor)
+
+            if self._preview_actor is None:
+                self._preview_actor = self._make_line_actor(pts, color=(0.4, 0.9, 1.0), width=2.0)
+                self._apply_fence_style(self._preview_actor)
+                self._add_actor(self._preview_actor)
+            elif not self._update_line_actor(self._preview_actor, pts):
+                self._remove_actor(self._preview_actor)
+                self._preview_actor = self._make_line_actor(pts, color=(0.4, 0.9, 1.0), width=2.0)
+                self._apply_fence_style(self._preview_actor)
+                self._add_actor(self._preview_actor)
             self._render()
         except Exception as e:
             _builtin_print(f"⚠️ TempFenceTool: preview rebuild failed: {e}")
@@ -772,6 +866,11 @@ class TempFenceTool:
         self._drawing = False
         self._points = []
         self._redo_stack = []
+        self._pending_preview_xy = None
+        try:
+            self._preview_timer.stop()
+        except Exception:
+            pass
         if self._preview_actor is not None:
             self._remove_actor(self._preview_actor)
             self._preview_actor = None

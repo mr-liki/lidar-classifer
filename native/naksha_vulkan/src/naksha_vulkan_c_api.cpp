@@ -14,6 +14,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -382,6 +383,107 @@ NKV_API int nkv_set_instant_normal_source(NkvHandle handle, int screen_space) {
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->renderer.SetInstantNormalSource(screen_space);
+    return 1;
+}
+
+/* Cross-section clip volume. `planes` is plane_count (<= 4) consecutive A,B,C,D
+ * float quadruples in RENDER space (world minus the render origin); a point is
+ * kept when A*x + B*y + C*z + D >= 0 and discarded by the vertex stage otherwise.
+ * plane_count 0 (or planes NULL) switches clipping off. Changes one uniform block
+ * only: no point data is re-uploaded. */
+NKV_API int nkv_set_clip_volume(NkvHandle handle, const float* planes, uint32_t plane_count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) { SetError("invalid handle"); return 0; }
+    if (plane_count > 4) { SetError("at most 4 clip planes"); return 0; }
+    if (plane_count > 0 && !planes) { SetError("planes is NULL"); return 0; }
+    inst->renderer.SetClipVolume(planes, plane_count);
+    return 1;
+}
+
+// ---- shading modes ----------------------------------------------------------------
+// Colour ramps, t in [0,1]. Hue runs blue (low) -> green -> red (high): the HSV hue
+// circle from 240 deg down to 0 deg, so low and high elevations never wrap to the same
+// colour. BlueRed and LandTopo are straight two-stop blends. Mirrored by
+// lnt::evaluate_ramp (LNTShadingModes.h), which the verification suite compares
+// against rendered pixels.
+static void ShadingRamp(uint32_t ramp, float t, float out[3]) {
+    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+    switch (ramp) {
+        case 1: {                                   // Hue: blue -> green -> red
+            const float h6 = (1.0f - t) * 4.0f;
+            const float off[3] = {0.0f, 4.0f, 2.0f};
+            for (int i = 0; i < 3; ++i) {
+                float m = std::fmod(h6 + off[i], 6.0f);
+                out[i] = clamp01(std::fabs(m - 3.0f) - 1.0f);
+            }
+            break;
+        }
+        case 2:                                     // Blue / Red
+            out[0] = t; out[1] = 0.0f; out[2] = 1.0f - t;
+            break;
+        case 3: {                                   // Land Topo
+            const float a[3] = {0.1f, 0.5f, 0.1f}, b[3] = {0.9f, 0.8f, 0.5f};
+            for (int i = 0; i < 3; ++i) out[i] = a[i] + (b[i] - a[i]) * t;
+            break;
+        }
+        default:                                    // Grayscale
+            out[0] = out[1] = out[2] = t;
+            break;
+    }
+}
+
+NKV_API int nkv_set_shading_mode(NkvHandle handle, const NkvShadingUniforms* c) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) { SetError("invalid handle"); return 0; }
+    if (!c) { SetError("config is NULL"); return 0; }
+    if (c->display_mode > 4 || c->color_ramp > 3) { SetError("shading mode or ramp out of range"); return 0; }
+
+    // 1. the two 256-entry ramp tables (display bytes, as every other LUT here)
+    uint8_t lut[256 * 3];
+    for (int i = 0; i < 256; ++i) {
+        float rgb[3];
+        ShadingRamp(c->color_ramp, static_cast<float>(i) / 255.0f, rgb);
+        for (int k = 0; k < 3; ++k)
+            lut[i * 3 + k] = static_cast<uint8_t>(rgb[k] * 255.0f + 0.5f);
+    }
+    inst->renderer.SetPointLUTs(nullptr, lut, lut);
+
+    // 2. ranges. The ramp tables are indexed linearly, so gamma/contrast stay neutral.
+    inst->pointCloud.SetElevationRange(c->elevation_min, c->elevation_max, 1.0f);
+    inst->pointCloud.SetIntensityRange(c->intensity_min * 255.0f, c->intensity_max * 255.0f,
+                                       1.0f, 1.0f);
+
+    // 3. display mode (LNT enumeration -> engine enumeration)
+    int mode = NKV_DISPLAY_RGB;
+    switch (c->display_mode) {
+        case 0: mode = NKV_DISPLAY_RGB; break;
+        case 1: mode = NKV_DISPLAY_INTENSITY; break;
+        case 2: mode = NKV_DISPLAY_ELEVATION; break;
+        case 3: mode = NKV_DISPLAY_CLASSIFICATION; break;
+        default: mode = NKV_DISPLAY_SHADED_CLASS_INSTANT; break;
+    }
+    inst->pointCloud.SetDisplayMode(mode);
+    inst->renderer.SetInstantShadedActive(mode == NKV_DISPLAY_SHADED_CLASS_INSTANT);
+
+    // 4. lighting + EDL (used by NormalShading only). The vector is the direction the
+    //    light travels; the hillshade wants the direction TOWARD the light, as a compass
+    //    azimuth and an elevation above the horizon.
+    float tx = -c->light_direction[0], ty = -c->light_direction[1], tz = -c->light_direction[2];
+    const float len = std::sqrt(tx * tx + ty * ty + tz * tz);
+    if (len > 1e-6f) {
+        tx /= len; ty /= len; tz /= len;
+        const float kRad2Deg = 57.29577951308232f;
+        const float elev = std::asin(tz < -1.0f ? -1.0f : (tz > 1.0f ? 1.0f : tz)) * kRad2Deg;
+        // direction angle measured CCW from +X; compass azimuth is clockwise from north
+        float az = 450.0f - std::atan2(ty, tx) * kRad2Deg;
+        az = std::fmod(std::fmod(az, 360.0f) + 360.0f, 360.0f);
+        inst->renderer.SetInstantShading(az, elev, 0.2f);
+    }
+    inst->renderer.SetInstantNormalSource(1);      // an .lnt stores no normals: depth-reconstructed
+    inst->renderer.SetInstantEdl(c->edl_strength);
     return 1;
 }
 
@@ -901,10 +1003,87 @@ NKV_API int nkv_set_surface_indexed_blocks(NkvHandle handle, const double* posit
     } catch (const std::exception& error) { SetError(error.what()); return 0; }
 }
 
+NKV_API int nkv_set_surface_indexed_blocks_vc(NkvHandle handle, const double* positions,
+    uint64_t vertices, const uint32_t* indices, uint64_t triangles,
+    const uint8_t* vertex_rgb, const uint32_t* block_index_counts, uint32_t blocks,
+    uint64_t dataset_revision, uint64_t surface_revision) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || !positions || !indices || !vertex_rgb || !block_index_counts || !vertices || !triangles || !blocks) return 0;
+    try {
+        std::vector<float> local(vertices * 3);
+        for (uint64_t i = 0; i < vertices; ++i) {
+            double value[3]; inst->renderer.GetOrigin().WorldToRender(positions[i*3], positions[i*3+1], positions[i*3+2], value);
+            for (int k = 0; k < 3; ++k) {
+                if (!std::isfinite(value[k])) { SetError("nonfinite Surface position"); return 0; }
+                local[i*3+k] = static_cast<float>(value[k]);
+            }
+        }
+        std::vector<uint32_t> colors(vertices);
+        for (uint64_t i = 0; i < vertices; ++i)
+            colors[i] = vertex_rgb[i*3] | (uint32_t(vertex_rgb[i*3+1]) << 8) | (uint32_t(vertex_rgb[i*3+2]) << 16) | 0xff000000u;
+        std::vector<uint32_t> facet(triangles, 0xff000000u);
+        auto result = inst->surface.UploadIndexedBlocks(local.data(), vertices, indices, triangles*3,
+            facet.data(), block_index_counts, blocks, dataset_revision, surface_revision, colors.data());
+        if (!result.ok) { SetError(result.memoryRejected ? "Surface VRAM budget refused" : "indexed Surface upload failed"); return 0; }
+        return 1;
+    } catch (const std::exception& error) { SetError(error.what()); return 0; }
+}
+
+NKV_API int nkv_set_surface_complete(NkvHandle handle, const double* positions,
+    uint64_t vertices, const uint32_t* indices, uint64_t triangles,
+    const uint8_t* cell_rgb, const uint8_t* vertex_rgb,
+    const uint32_t* block_index_counts, uint32_t blocks,
+    const double* coverage_positions, const uint8_t* coverage_rgb, uint64_t coverage_count,
+    uint64_t dataset_revision, uint64_t surface_revision) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst=Resolve(handle);
+    if(!inst || (!triangles&&!coverage_count)) return 0;
+    if(coverage_count && (!coverage_positions || !coverage_rgb)) return 0;
+    try {
+        auto local_positions=[&](const double* world,uint64_t count) {
+            std::vector<float> local(count*3);
+            for(uint64_t i=0;i<count;++i) {
+                double p[3];inst->renderer.GetOrigin().WorldToRender(world[3*i],world[3*i+1],world[3*i+2],p);
+                for(int k=0;k<3;++k) {
+                    if(!std::isfinite(p[k])) throw std::runtime_error("nonfinite Surface position");
+                    local[3*i+k]=float(p[k]);
+                }
+            }
+            return local;
+        };
+        auto rgba=[](const uint8_t* rgb,uint64_t count) {
+            std::vector<uint32_t> out(count);
+            for(uint64_t i=0;i<count;++i) out[i]=rgb[3*i]|(uint32_t(rgb[3*i+1])<<8)|(uint32_t(rgb[3*i+2])<<16)|0xff000000u;
+            return out;
+        };
+        if(triangles) {
+            if(!positions||!indices||!cell_rgb||!vertices||!blocks||!block_index_counts) return 0;
+            auto local=local_positions(positions,vertices);auto cell=rgba(cell_rgb,triangles);
+            auto vertex=vertex_rgb?rgba(vertex_rgb,vertices):std::vector<uint32_t>();
+            auto result=inst->surface.UploadIndexedBlocks(local.data(),vertices,indices,triangles*3,
+                cell.data(),block_index_counts,blocks,dataset_revision,surface_revision,vertex.empty()?nullptr:vertex.data());
+            if(!result.ok) {SetError("complete Surface indexed upload refused; previous surface retained");return 0;}
+        }
+        if(coverage_count) {
+            if(!coverage_positions||!coverage_rgb) return 0;
+            auto local=local_positions(coverage_positions,coverage_count);auto colors=rgba(coverage_rgb,coverage_count);
+            if(!inst->surface.UploadPendingCoverage(local.data(),colors.data(),coverage_count,dataset_revision,surface_revision)) {
+                inst->surface.DiscardPending();
+                SetError("complete Surface point coverage upload refused; previous surface retained");return 0;
+            }
+        }
+        return 1;
+    } catch(const std::exception& e) {inst->surface.DiscardPending();SetError(e.what());return 0;}
+}
+
 NKV_API int nkv_set_streaming_surface_active(NkvHandle handle, int active) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
-    if (!inst || (active && !inst->surface.IsLoaded())) return 0;
+    // Shading may be selected before its first surface upload has finished.
+    // Enter surface-only presentation immediately: drawing the point renderer
+    // during that interval exposes square splats that are not the requested mode.
+    if (!inst) return 0;
     inst->streamingSurface = active ? 1 : 0;
     if (active) inst->renderer.SetInstantShadedActive(false);
     return 1;
@@ -1093,6 +1272,50 @@ NKV_API int nkv_set_shading_parameters(NkvHandle handle, int /*formula*/,
     return 1;
 }
 
+// Compact form of nkv_set_shaded_class_surface (same crisp-hybrid look, same inputs plus
+// the unmeshed coverage points): shared vertices and one index buffer, ~28 B per point of
+// VRAM instead of ~190 B, so a 50M-point full-detail cut fits a 4 GB GPU. Returns 0 (and
+// leaves nothing drawn) when the mesh cannot fit; nkv_get_last_error() says why.
+NKV_API int nkv_set_shaded_class_surface_blocks(NkvHandle handle,
+    const double* positions,uint64_t vertex_count,const int32_t* faces,
+    const uint32_t* block_counts,uint32_t block_count) {
+    std::lock_guard<std::mutex> lock(gMutex);Instance* inst=Resolve(handle);
+    if(!inst)return 0;
+    try{return inst->surface.SetCrispIndexBlocks(positions,vertex_count,faces,block_counts,block_count)?1:0;}
+    catch(const std::exception& e){SetError(e.what());return 0;}
+}
+NKV_API int nkv_set_shaded_class_surface_indexed(NkvHandle handle,
+                                                  const double* positions, uint64_t vertex_count,
+                                                  const int32_t* faces, uint64_t face_count,
+                                                  const uint8_t* vertex_class_id,
+                                                  const uint8_t* class_color_lut,
+                                                  const double* coverage_positions,
+                                                  const uint8_t* coverage_rgb,
+                                                  uint64_t coverage_count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || !positions || !faces || !vertex_class_id || !class_color_lut ||
+        vertex_count == 0 || face_count == 0) {
+        SetError("invalid handle or null/empty compact shaded-class arrays");
+        return 0;
+    }
+    try {
+        AutoDeriveRenderOrigin(inst->renderer, positions, vertex_count);
+        std::string error;
+        if (!inst->surface.UploadCrispIndexedMesh(positions, vertex_count, faces, face_count,
+                                                  vertex_class_id, class_color_lut,
+                                                  coverage_positions, coverage_rgb,
+                                                  coverage_count, &error)) {
+            SetError(error.c_str());
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        SetError(e.what());
+        return 0;
+    }
+    return 1;
+}
+
 NKV_API int nkv_set_shaded_class_surface(NkvHandle handle,
                                           const double* positions, uint64_t vertex_count,
                                           const int32_t* faces, uint64_t face_count,
@@ -1227,6 +1450,14 @@ NKV_API int nkv_set_shaded_class_surface(NkvHandle handle,
             mixCount > 0 ? ovPos.data() : nullptr, mixCount > 0 ? ovNrm.data() : nullptr,
             mixCount > 0 ? ovCol.data() : nullptr, mixCount * 3,
             mixCount > 0 ? ovIdx.data() : nullptr, ovIdx.size());
+        // This upload takes over presentation: the crisp mesh is drawn through
+        // SurfaceRenderer::Record()'s single-mesh branch, which is unreachable
+        // while a tiled (LOD/culling) set is live. Retiring the tiled sets here
+        // is what makes "switch Surface elevation -> Shaded Classification"
+        // show the crisp mesh instead of leaving the stale elevation surface on
+        // screen. Done AFTER the upload succeeded so a failed upload leaves the
+        // previously presented surface untouched.
+        inst->surface.RetireTiledSets();
     } catch (const std::exception& e) {
         SetError(e.what());
         return 0;
@@ -1241,6 +1472,80 @@ NKV_API int nkv_set_crisp_shading_parameters(NkvHandle handle,
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->surface.SetCrispShadingParams(azimuth_deg, sharpness_raw, ambient, key_intensity, fill_intensity);
+    return 1;
+}
+
+// ---- viewport-LOD surface tiles ---------------------------------------------------
+static_assert(sizeof(NkvSurfaceTileDesc) == sizeof(naksha::SurfaceRenderer::TileUploadDesc) &&
+              offsetof(NkvSurfaceTileDesc, result) == offsetof(naksha::SurfaceRenderer::TileUploadDesc, result),
+              "NkvSurfaceTileDesc must mirror SurfaceRenderer::TileUploadDesc");
+static_assert(sizeof(NkvSurfaceTileDraw) == sizeof(naksha::SurfaceRenderer::TileDrawItem),
+              "NkvSurfaceTileDraw must mirror SurfaceRenderer::TileDrawItem");
+
+NKV_API int nkv_surface_tiles_configure(NkvHandle handle, uint64_t vertex_capacity,
+                                        uint64_t face_capacity, uint64_t coverage_capacity) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) { SetError("invalid handle"); return 0; }
+    try {
+        std::string error;
+        if (!inst->surface.ConfigureTiles(vertex_capacity, face_capacity, coverage_capacity, &error)) {
+            SetError(error.c_str());
+            return 0;
+        }
+    } catch (const std::exception& e) { SetError(e.what()); return 0; }
+    return 1;
+}
+NKV_API int nkv_surface_tiles_release(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->surface.ReleaseTiles();
+    return 1;
+}
+NKV_API int nkv_surface_tiles_active(NkvHandle handle) {
+    Instance* inst = Resolve(handle);
+    return inst && inst->surface.TilesActive() ? 1 : 0;
+}
+NKV_API int nkv_surface_tiles_upload(NkvHandle handle, NkvSurfaceTileDesc* tiles, uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || (count && !tiles)) { SetError("invalid handle or tile array"); return 0; }
+    try {
+        std::string error;
+        const uint32_t n = inst->surface.UploadTiles(
+            reinterpret_cast<naksha::SurfaceRenderer::TileUploadDesc*>(tiles), count, &error);
+        if (!error.empty()) SetError(error.c_str());
+        return int(n);
+    } catch (const std::exception& e) { SetError(e.what()); return 0; }
+}
+NKV_API int nkv_surface_tiles_evict(NkvHandle handle, const uint64_t* keys, uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    return int(inst->surface.EvictTiles(keys, count));
+}
+NKV_API int nkv_surface_tiles_set_palette(NkvHandle handle, const uint8_t* lut_rgb, float coverage_shade) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    try {
+        std::string error;
+        if (!inst->surface.SetTilePalette(lut_rgb, coverage_shade, &error)) { SetError(error.c_str()); return 0; }
+    } catch (const std::exception& e) { SetError(e.what()); return 0; }
+    return 1;
+}
+NKV_API int nkv_surface_tiles_set_draw_list(NkvHandle handle, const NkvSurfaceTileDraw* items, uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    return inst->surface.SetTileDrawList(
+        reinterpret_cast<const naksha::SurfaceRenderer::TileDrawItem*>(items), count) ? 1 : 0;
+}
+NKV_API int nkv_surface_tiles_get_stats(NkvHandle handle, uint64_t* out, uint32_t count) {
+    Instance* inst = Resolve(handle);
+    if (!inst || !out) return 0;
+    inst->surface.GetTileStats(out, count);
     return 1;
 }
 
@@ -1354,8 +1659,8 @@ NKV_API int nkv_render(NkvHandle handle) {
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     try {
-        if (!inst->renderer.BeginFrame()) {
-            // Minimized / out-of-date: deliberately NOT reported as success.
+        if (!inst->renderer.BeginFrame(inst->streamingSurface==1&&inst->surface.IsCrispIndexedActive())) {
+            // Busy Shading GPU / minimized / out-of-date: no frame was submitted.
             // Callers must be able to tell "presented" from "skipped" - see
             // the return-code contract in the header.
             return 1;
@@ -1560,15 +1865,32 @@ NKV_API int nkv_reserve_point_capacity(NkvHandle handle, uint64_t capacity_point
     }
 }
 
+NKV_API int nkv_upload_point_tile_ex(NkvHandle handle, uint64_t first, uint64_t count,
+                                     const double* xyz_world_f64,
+                                     const uint8_t* classification,
+                                     const float* intensity,
+                                     const uint8_t* normals_oct16,
+                                     const uint8_t* rgb8);
+
 NKV_API int nkv_upload_point_tile(NkvHandle handle, uint64_t first, uint64_t count,
                                   const double* xyz_world_f64,
                                   const uint8_t* classification,
                                   const float* intensity,
                                   const uint8_t* normals_oct16) {
+    return nkv_upload_point_tile_ex(handle, first, count, xyz_world_f64, classification,
+                                    intensity, normals_oct16, nullptr);
+}
+
+NKV_API int nkv_upload_point_tile_ex(NkvHandle handle, uint64_t first, uint64_t count,
+                                     const double* xyz_world_f64,
+                                     const uint8_t* classification,
+                                     const float* intensity,
+                                     const uint8_t* normals_oct16,
+                                     const uint8_t* rgb8) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || count == 0 ||
-        (!xyz_world_f64 && !classification && !intensity && !normals_oct16)) {
+        (!xyz_world_f64 && !classification && !intensity && !normals_oct16 && !rgb8)) {
         SetError("invalid handle, zero count, or no stream to upload");
         return 0;
     }
@@ -1584,7 +1906,7 @@ NKV_API int nkv_upload_point_tile(NkvHandle handle, uint64_t first, uint64_t cou
         UploadStats st = inst->pointCloud.UploadArenaTile(
             static_cast<std::size_t>(first), static_cast<std::size_t>(count),
             xyz_world_f64, inst->renderer.GetOrigin(),
-            classification, intensity, normals_oct16);
+            classification, intensity, normals_oct16, rgb8);
         if (st.bytes == 0) {
             SetError("arena tile upload failed (no arena, or tile past capacity)");
             return 0;

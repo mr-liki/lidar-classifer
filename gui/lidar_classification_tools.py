@@ -5,11 +5,12 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QPushButton, QProgressDialog, QMessageBox, QApplication,
     QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
-    QSizePolicy, QWidget, QScrollArea, QTabWidget
+    QSizePolicy, QWidget, QScrollArea, QTabWidget, QLineEdit, QFileDialog
 )
 from PySide6.QtCore import Qt, QThread, Signal, QRect, QTimer, QEvent, QSize
 from PySide6.QtGui import QColor, QPixmap, QIcon, QPainter, QBrush, QPen
 from gui.app_icon import load_app_icon
+from gui.block_creation_settings_dialog import _is_snt_selectable_line_entity
 from gui.theme_manager import ThemeColors
 
 
@@ -1506,6 +1507,9 @@ class FenceSelectorWidget(QWidget):
                 stype = str(drawing.get('type', '')).strip().lower()
                 if self.allowed_shape_types and stype not in self.allowed_shape_types:
                     continue
+                if digitize.is_cell_creation_drawing(drawing):
+                    # Cell circles belong to Create > Cell — never fences.
+                    continue
                 if len(self._shape_coords(drawing)) < 3:
                     continue
                 valid.append(drawing)
@@ -1710,6 +1714,9 @@ class FenceSelectorWidget(QWidget):
                 for drawing in drawings:
                     stype = str(drawing.get('type', '')).strip().lower()
                     if self.allowed_shape_types and stype not in self.allowed_shape_types:
+                        continue
+                    if digitize.is_cell_creation_drawing(drawing):
+                        # Cell circles belong to Create > Cell — never fences.
                         continue
                     live_valid.append(drawing)
             if self.include_curve_fences and curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
@@ -2594,7 +2601,7 @@ class _ClassificationWorker(QThread):
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 1 — CLASSIFY LOW POINTS
-# Nakshatech-compatible: local minima among source points in a 2D radius
+# TerraScan-compatible: local minima among source points in a 2D radius
 # ═══════════════════════════════════════════════════════════════════════
 
 def classify_low_points(xyz, classification, from_classes, to_class,
@@ -2606,7 +2613,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
     """
     Classify source points/groups that form the lowest local elevation tier.
 
-    This follows Nakshatech's documented Low Points conditions:
+    This follows TerraScan's documented Low Points conditions:
     source classes, maximum group count, minimum vertical separation, a 2D
     search radius, and an optional fence.  ``ground_classes`` remains in the
     signature only for backward call compatibility and is intentionally
@@ -2903,7 +2910,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 2 — CLASSIFY ISOLATED POINTS
-# Nakshatech-compatible: 3D sphere, self-excluded, From and In may differ
+# TerraScan-compatible: 3D sphere, self-excluded, From and In may differ
 # ═══════════════════════════════════════════════════════════════════════
 def classify_isolated_points(xyz, classification, from_classes, to_class,
                              in_classes, if_fewer_than=1, within=5.0,
@@ -2918,7 +2925,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
 
     ``iterative``, ``max_iterations``, ``height_from_ground`` and
     ``ground_classes`` remain accepted for API compatibility but are not part
-    of Nakshatech's Isolated Points routine and therefore do not alter this
+    of TerraScan's Isolated Points routine and therefore do not alter this
     single-pass classification.
     """
     xyz = np.asarray(xyz)
@@ -3110,7 +3117,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             np.isfinite(distances), axis=1
         ).astype(np.intp, copy=False)
         # If the candidate itself belongs to In class, it occupies one slot
-        # but Nakshatech's condition counts only other points.
+        # but TerraScan's condition counts only other points.
         counts -= in_mask[current].astype(np.intp)
         # Counts are intentionally capped at the decision threshold; values
         # above it are equivalent for the isolated/not-isolated decision.
@@ -3235,26 +3242,95 @@ def _bounded_ground_seed_indices(points, ground_local_indices, max_points=150_00
     return np.asarray(selected[:limit], dtype=np.intp)
 
 
+def _spatial_cell_low_indices(points, candidate_indices, cell_size):
+    """Return one deterministic lowest point per XY cell from candidate indices."""
+    indices = np.asarray(candidate_indices, dtype=np.intp)
+    if not len(indices):
+        return indices
+    cell = max(float(cell_size), 1e-6)
+    pts = np.asarray(points)
+    xy = pts[indices, :2]
+    x_min = float(np.min(xy[:, 0])); y_min = float(np.min(xy[:, 1]))
+    nx = max(1, int(np.ceil(max(float(np.ptp(xy[:, 0])), 1e-9) / cell)))
+    ny = max(1, int(np.ceil(max(float(np.ptp(xy[:, 1])), 1e-9) / cell)))
+    cx = np.clip(((xy[:, 0] - x_min) / cell).astype(np.int64), 0, nx - 1)
+    cy = np.clip(((xy[:, 1] - y_min) / cell).astype(np.int64), 0, ny - 1)
+    cid = cx * ny + cy
+    cell_count = nx * ny
+    min_z = np.full(cell_count, np.inf, dtype=np.float64)
+    np.minimum.at(min_z, cid, pts[indices, 2])
+    is_low = pts[indices, 2] == min_z[cid]
+    low_pos = np.flatnonzero(is_low)
+    chosen = np.full(cell_count, len(indices), dtype=np.intp)
+    np.minimum.at(chosen, cid[low_pos], low_pos)
+    chosen_pos = chosen[chosen < len(indices)]
+    return np.asarray(indices[chosen_pos], dtype=np.intp)
+
+
+# Ground-classification presets deliberately separate the documented TerraScan
+# reference setup from Naksha terrain-specific starting points.  TerraScan's
+# current Ground guide describes iteration angle ~4 deg for flat terrain and
+# ~10 deg for mountainous terrain, iteration distance normally 0.5-1.5 m,
+# terrain angle 88-90 deg where man-made objects are present, and Max building
+# size close to the largest building edge.  A widely documented TerraScan
+# dialog/reference setup uses 60 m / 88 deg / 6 deg / 1.40 m with reduction at
+# 5 m.  The Rolling/Hilly/Mountain values below remain Naksha repeatable
+# starting presets; Auto-adaptive is preferred for mixed natural terrain.
 GROUND_TERRAIN_PRESETS = {
+    "terrascan_standard": {
+        "terrain_angle": 88.0,
+        "iteration_angle": 6.0,
+        "iteration_distance": 1.40,
+        "max_building_size": 60.0,
+        "reduce_angle_edge": True,
+        "edge_length_threshold": 5.0,
+        "stop_triangulation": False,
+        "stop_edge_length": 2.0,
+        "provenance": "TerraScan reference",
+    },
     "flat_urban": {
         "terrain_angle": 88.0,
         "iteration_angle": 4.0,
         "iteration_distance": 0.50,
+        "max_building_size": 60.0,
+        "reduce_angle_edge": True,
+        "edge_length_threshold": 5.0,
+        "stop_triangulation": False,
+        "stop_edge_length": 2.0,
+        "provenance": "TerraScan-guided",
     },
     "rolling": {
         "terrain_angle": 35.0,
         "iteration_angle": 6.0,
         "iteration_distance": 0.80,
+        "max_building_size": 60.0,
+        "reduce_angle_edge": True,
+        "edge_length_threshold": 5.0,
+        "stop_triangulation": False,
+        "stop_edge_length": 2.0,
+        "provenance": "Naksha / TerraScan-guided",
     },
     "hilly": {
         "terrain_angle": 55.0,
         "iteration_angle": 8.0,
         "iteration_distance": 1.10,
+        "max_building_size": 60.0,
+        "reduce_angle_edge": True,
+        "edge_length_threshold": 5.0,
+        "stop_triangulation": False,
+        "stop_edge_length": 2.0,
+        "provenance": "Naksha / TerraScan-guided",
     },
     "mountain": {
         "terrain_angle": 75.0,
         "iteration_angle": 10.0,
         "iteration_distance": 1.40,
+        "max_building_size": 60.0,
+        "reduce_angle_edge": True,
+        "edge_length_threshold": 5.0,
+        "stop_triangulation": False,
+        "stop_edge_length": 2.0,
+        "provenance": "Naksha / TerraScan-guided",
     },
 }
 
@@ -3270,6 +3346,10 @@ def _estimate_adaptive_ground_thresholds(seed_points):
     points = np.asarray(seed_points, dtype=np.float64)
     fallback = {
         "estimated_slope": None,
+        "slope_p50": None,
+        "slope_p90": None,
+        "slope_p95": None,
+        "terrain_profile_guess": "Unknown",
         "terrain_angle": 88.0,
         "iteration_angle": 6.0,
         "iteration_distance": 1.0,
@@ -3303,10 +3383,23 @@ def _estimate_adaptive_ground_thresholds(seed_points):
         slopes = slopes[np.isfinite(slopes)]
         if not len(slopes):
             return fallback
+        slope_p50 = float(np.percentile(slopes, 50.0))
         robust_slope = float(np.percentile(slopes, 90.0))
+        slope_p95 = float(np.percentile(slopes, 95.0))
     except Exception:
         return fallback
 
+    if robust_slope <= 8.0:
+        terrain_profile_guess = "Flat / Urban"
+    elif robust_slope <= 18.0:
+        terrain_profile_guess = "Rolling Terrain"
+    elif robust_slope <= 32.0:
+        terrain_profile_guess = "Hilly Terrain"
+    else:
+        terrain_profile_guess = "Mountain / Steep Terrain"
+
+    # Keep the established Naksha adaptive formula unchanged for compatibility.
+    # The additional percentiles/profile label are diagnostics only.
     terrain_angle = float(np.clip(robust_slope + 12.0, 15.0, 88.0))
     iteration_angle = float(np.clip(4.0 + 6.0 * robust_slope / 45.0, 4.0, 10.0))
     iteration_distance = float(
@@ -3314,6 +3407,10 @@ def _estimate_adaptive_ground_thresholds(seed_points):
     )
     return {
         "estimated_slope": robust_slope,
+        "slope_p50": slope_p50,
+        "slope_p90": robust_slope,
+        "slope_p95": slope_p95,
+        "terrain_profile_guess": terrain_profile_guess,
         "terrain_angle": terrain_angle,
         "iteration_angle": iteration_angle,
         "iteration_distance": iteration_distance,
@@ -3329,6 +3426,8 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
                         use_distance_as_rating=False, distance_weight=50.0,
                         add_only_upward=False, class0_holdout_percent=0.0,
                         adaptive_thresholds=False, fence_mask=None,
+                        terrascan_compatible_densification=False,
+                        complete_ground_from_final_tin=True,
                         progress_cb=None, abort_check=None):
     xyz = np.asarray(xyz)
     classification = np.asarray(classification)
@@ -3343,19 +3442,169 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
         from_mask = finite_mask.copy()
     else:
         from_mask = np.isin(classification, from_classes) & finite_mask
+    source_mask_unfenced = from_mask.copy()
+    seed_context_mask = np.zeros(len(classification), dtype=bool)
+    context_seed_count = 0
+    perimeter_seed_count = 0
 
-    if current_ground is None or (isinstance(current_ground, list) and (not current_ground or None in current_ground)):
+    use_current_ground = seed_method in ("aerial_low_ground", "ground_only")
+    if not use_current_ground:
+        # "Lowest point only" must genuinely ignore Current ground.  The old
+        # implementation still carried cg_mask into work_idx/in_ground, which
+        # silently treated those points as processed trusted ground despite the
+        # UI promising otherwise.
+        cg_mask = np.zeros(len(classification), dtype=bool)
+    elif current_ground is None or (isinstance(current_ground, list) and (not current_ground or None in current_ground)):
         cg_mask = finite_mask.copy()
     else:
         cg_mask = np.isin(classification, current_ground) & finite_mask
 
+    guide_halo_count = 0
+    guide_halo_margin = 0.0
     if fence_mask is not None:
         fence = np.asarray(fence_mask, dtype=bool)
         if len(fence) != len(classification):
             raise ValueError("fence_mask must match the point count")
+
+        # The fence defines which SOURCE points may change class.  It must not
+        # also clip the trusted Current-ground surface to the same polygon.
+        # Doing that starves a narrow/irregular fence of TIN support: a 60 m
+        # search cell can leave only 3-4 low seeds, whose convex hull covers
+        # only part of the fence, so find_simplex() never even evaluates large
+        # edge regions.  TerraScan-style editing uses the surrounding ground
+        # surface as context while changing only points inside the fence.
         from_mask &= fence
-        cg_mask   &= fence
-    work_idx = np.where(from_mask | cg_mask)[0]
+        if use_current_ground and np.any(from_mask):
+            candidate_xy = xyz[from_mask, :2]
+            guide_halo_margin = max(
+                float(max_building_size),
+                float(iteration_distance) * 4.0,
+                float(edge_length_threshold) * 2.0 if reduce_angle_edge else 0.0,
+                5.0,
+            )
+            xmin = float(np.min(candidate_xy[:, 0])) - guide_halo_margin
+            xmax = float(np.max(candidate_xy[:, 0])) + guide_halo_margin
+            ymin = float(np.min(candidate_xy[:, 1])) - guide_halo_margin
+            ymax = float(np.max(candidate_xy[:, 1])) + guide_halo_margin
+            guide_halo = (
+                finite_mask
+                & (xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax)
+                & (xyz[:, 1] >= ymin) & (xyz[:, 1] <= ymax)
+            )
+            cg_mask &= guide_halo
+
+            # A fence should limit OUTPUT classification, not starve the
+            # initial TIN of neighboring low-point context.  When TerraScan
+            # compatibility is enabled, take one local-low source point per
+            # search cell from the surrounding halo.  These context lows are
+            # seed-only: they are never reclassified because is_from_local is
+            # false for points outside the fence.  This gives the temporary TIN
+            # a hull around the selected area instead of a few isolated seed
+            # patches inside it.
+            if terrascan_compatible_densification:
+                context_candidates = (
+                    source_mask_unfenced & guide_halo & ~fence
+                )
+                context_idx = np.flatnonzero(context_candidates)
+                if len(context_idx):
+                    context_lows = _spatial_cell_low_indices(
+                        xyz, context_idx, max_building_size
+                    )
+                    seed_context_mask[context_lows] = True
+                    context_seed_count = int(len(context_lows))
+
+                # Add a small deterministic ring of low support seeds around the
+                # processing extent.  A coarse 60 m grid inside a long/narrow
+                # fence can otherwise produce only 3-4 seeds whose convex hull
+                # leaves large parts of the fence outside the temporary TIN.
+                # Each support seed is still a *local lowest* point in roughly a
+                # Max-building-sized neighborhood, so this improves hull coverage
+                # without turning arbitrary fence-edge points into ground.
+                support_pool = source_mask_unfenced & guide_halo
+                support_idx = np.flatnonzero(support_pool)
+                if len(support_idx):
+                    xm = 0.5 * (xmin + guide_halo_margin + xmax - guide_halo_margin)
+                    ym = 0.5 * (ymin + guide_halo_margin + ymax - guide_halo_margin)
+                    bx0 = xmin + guide_halo_margin
+                    bx1 = xmax - guide_halo_margin
+                    by0 = ymin + guide_halo_margin
+                    by1 = ymax - guide_halo_margin
+                    targets = (
+                        (bx0, by0), (xm, by0), (bx1, by0),
+                        (bx0, ym),              (bx1, ym),
+                        (bx0, by1), (xm, by1), (bx1, by1),
+                    )
+                    half = max(min(float(max_building_size) * 0.05, 5.0), 2.0)
+                    sx = xyz[support_idx, 0]
+                    sy = xyz[support_idx, 1]
+                    sz = xyz[support_idx, 2]
+                    perimeter = []
+                    for tx, ty in targets:
+                        near = (
+                            (np.abs(sx - tx) <= half)
+                            & (np.abs(sy - ty) <= half)
+                        )
+                        if not np.any(near):
+                            continue
+                        local_pos = np.flatnonzero(near)
+                        zvals = sz[local_pos]
+                        min_z = np.min(zvals)
+                        best_pos = local_pos[np.flatnonzero(zvals == min_z)[0]]
+                        perimeter.append(int(support_idx[best_pos]))
+                    if perimeter:
+                        perimeter_lows = np.unique(
+                            np.asarray(perimeter, dtype=np.intp)
+                        )
+                        seed_context_mask[perimeter_lows] = True
+                        perimeter_seed_count = int(len(perimeter_lows))
+
+            # Keep the working set bounded on already-classified projects.  The
+            # helper is spatially distributed and deterministic, so nearby
+            # trusted ground still surrounds the fence without pulling millions
+            # of Class-1 points into every local Ground run.
+            guide_idx = np.flatnonzero(cg_mask)
+            guide_halo_count = int(len(guide_idx))
+            if len(guide_idx) > 150_000:
+                bounded = _bounded_ground_seed_indices(
+                    xyz, guide_idx, max_points=150_000
+                )
+                cg_mask = np.zeros(len(classification), dtype=bool)
+                cg_mask[bounded] = True
+        else:
+            # Lowest-point-only ignores Current ground by construction.
+            cg_mask &= fence
+
+    # A point must never be both a source candidate and a trusted current-ground
+    # guide.  If that happens, the old code marked the whole overlap as
+    # ``in_ground`` before any slope/distance/angle test.  With From=0 and
+    # Current ground=0 this bypassed PTD completely: powerlines, cliffs and all
+    # other Class-0 points were accepted as seed ground (100% accepted,
+    # iterations=0).  Keep trusted ground authoritative and remove it from the
+    # source candidate set.  The dialog also blocks this configuration, while
+    # this guard protects programmatic/plugin calls.
+    guide_overlap_count = int(np.count_nonzero(from_mask & cg_mask))
+    if guide_overlap_count:
+        from_mask &= ~cg_mask
+
+    source_candidate_count_pre = int(np.count_nonzero(from_mask))
+    if source_candidate_count_pre == 0:
+        return {
+            "changed": 0,
+            "indices": np.array([], dtype=np.intp),
+            "source_candidates": 0,
+            "accepted_candidates": 0,
+            "ground_count": 0,
+            "class0_count": 0,
+            "seed_count": 0,
+            "iterations": 0,
+            "guide_overlap_count": guide_overlap_count,
+            "stop_reason": (
+                "no source candidates after excluding trusted current-ground guide"
+                if guide_overlap_count else "no eligible source points"
+            ),
+        }
+
+    work_idx = np.where(from_mask | cg_mask | seed_context_mask)[0]
     if not len(work_idx):
         return {
             "changed": 0,
@@ -3367,7 +3616,9 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
             "stop_reason": "no eligible points",
         }
     pts = xyz[work_idx]; n = len(pts)
-    is_from_local = from_mask[work_idx]; is_cg_local = cg_mask[work_idx]
+    is_from_local = from_mask[work_idx]
+    is_cg_local = cg_mask[work_idx]
+    is_context_local = seed_context_mask[work_idx]
 
     if progress_cb: progress_cb(2, "Phase 1 — Seeds …")
     seed_local = set()
@@ -3398,6 +3649,8 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
                 seed_local.add(seed_idx)
 
     if seed_method in ("aerial_low_ground","lowest_only"): _cell_seeds()
+    if np.any(is_context_local):
+        seed_local.update(np.flatnonzero(is_context_local).tolist())
     existing_ground_local = np.flatnonzero(is_cg_local)
     existing_ground_count = int(len(existing_ground_local))
     if seed_method in ("aerial_low_ground","ground_only"):
@@ -3446,11 +3699,15 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
                 if adaptive_result["estimated_slope"] is not None
                 else "unavailable"
             )
+            profile_text = adaptive_result.get("terrain_profile_guess", "Unknown")
+            p95 = adaptive_result.get("slope_p95")
+            p95_text = f"{float(p95):.1f}°" if p95 is not None else "n/a"
             progress_cb(
                 8,
                 "Auto terrain: "
-                f"slope {slope_text}, terrain {terrain_angle:.1f}°, "
-                f"iteration {iteration_angle:.1f}° / {iteration_distance:.2f} m",
+                f"{profile_text}; slope P90 {slope_text}, P95 {p95_text}; "
+                f"terrain {terrain_angle:.1f}°, iteration "
+                f"{iteration_angle:.1f}° / {iteration_distance:.2f} m",
             )
 
     if progress_cb: progress_cb(10, f"Phase 2 — TIN from {len(seed_local)} seeds …")
@@ -3464,6 +3721,13 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
         and existing_ground_count >= source_candidate_count
     )
     max_iterations = 1 if dense_ground_fast_path else 100
+    if terrascan_compatible_densification and progress_cb:
+        progress_cb(
+            10,
+            "TerraScan-compatible PTD — conservative TIN-anchor growth; "
+            "final surface completion will classify all remaining points that "
+            "fit the converged ground TIN",
+        )
     if dense_ground_fast_path and progress_cb:
         progress_cb(
             10,
@@ -3509,7 +3773,7 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
         # a bounded anchor subset is triangulated; mark every trusted-ground
         # point processed so millions of unsampled class-2 points do not enter
         # the expensive candidate query.
-        in_ground[:] = is_cg_local
+        in_ground[:] = is_cg_local | is_context_local
         in_ground[ga] = True
         ng=np.where(~in_ground)[0]
         if not len(ng):
@@ -3549,7 +3813,31 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
             act&=(1-w)*np.where(ea>0,alpha/ea,1.0)+w*(pd/iteration_distance if iteration_distance>0 else np.ones_like(pd))<=1.0
         else:
             act&=alpha<=ea
-        np_ = vng[act]
+        # TerraScan/Axelsson-style progressive densification is deliberately
+        # conservative inside each current TIN facet.  The legacy Naksha path
+        # accepted every passing point in the same facet at once, which can
+        # over-densify flat areas and makes a later percentage-based Class-0
+        # holdout look like random peppering.  In compatibility mode select at
+        # most ONE best passing candidate per simplex for this iteration.  The
+        # primary rank is iteration angle (TerraScan documents this as the main
+        # density control), then point-to-plane distance, then stable point id.
+        pass_pos = np.flatnonzero(act)
+        if terrascan_compatible_densification and len(pass_pos):
+            pass_sid = vsids[pass_pos]
+            order = np.lexsort((
+                vng[pass_pos],
+                pd[pass_pos],
+                alpha[pass_pos],
+                pass_sid,
+            ))
+            ordered_sid = pass_sid[order]
+            first = np.empty(len(order), dtype=bool)
+            first[0] = True
+            first[1:] = ordered_sid[1:] != ordered_sid[:-1]
+            chosen_pos = pass_pos[order[first]]
+            np_ = vng[chosen_pos]
+        else:
+            np_ = vng[pass_pos]
         if not len(np_):
             stop_reason = "thresholds reached"
             del tri
@@ -3558,14 +3846,152 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
         iterations_completed = iteration + 1
         del tri
 
+    # ------------------------------------------------------------------
+    # Final surface-completion pass
+    # ------------------------------------------------------------------
+    # ``one best point per facet`` is intentionally kept as the TIN-anchor
+    # growth rule because it prevents a low object cluster from changing the
+    # surface too aggressively in a single iteration.  It must NOT, however,
+    # become a rule that only those sparse anchor points receive the Ground
+    # class.  That was the reason Ground appeared as isolated patches: on the
+    # user's 376k-point fence only 710 points became anchors.
+    #
+    # Once the TIN has converged, perform one classification-only sweep against
+    # that final surface.  Every remaining source point that passes the exact
+    # same slope, plane-distance and iteration-angle tests is labelled Ground,
+    # but it is NOT inserted back into the TIN.  Therefore classification
+    # coverage improves without changing the stable topology/seed logic or
+    # allowing powerlines/vegetation to steer the surface.
+    surface_completion_local = np.array([], dtype=np.intp)
+    surface_completion_examined = 0
+    surface_completion_outside_tin = 0
+    if (
+        terrascan_compatible_densification
+        and complete_ground_from_final_tin
+        and stop_reason != "cancelled"
+        and len(ground_set) >= 3
+    ):
+        if progress_cb:
+            progress_cb(93, "Final ground-surface completion sweep …")
+        ga_final = np.asarray(sorted(ground_set), dtype=np.intp)
+        _, final_tri_points = _subsample_ground_tin_points(pts, ga_final)
+        if len(final_tri_points) >= 3:
+            xy_final = final_tri_points[:, :2]
+            if (
+                np.isfinite(xy_final).all()
+                and np.ptp(xy_final[:, 0]) > 1e-12
+                and np.ptp(xy_final[:, 1]) > 1e-12
+            ):
+                try:
+                    final_tri = Delaunay(xy_final)
+                    is_anchor = np.zeros(n, dtype=bool)
+                    is_anchor[ga_final] = True
+                    remain = np.flatnonzero(is_from_local & ~is_anchor)
+                    surface_completion_examined = int(len(remain))
+                    if len(remain):
+                        sids = final_tri.find_simplex(pts[remain, :2])
+                        valid = sids != -1
+                        surface_completion_outside_tin = int(
+                            np.count_nonzero(~valid)
+                        )
+                        if np.any(valid):
+                            vng = remain[valid]
+                            vsids = sids[valid]
+                            usids, inv = np.unique(vsids, return_inverse=True)
+                            sv = final_tri.simplices[usids]
+                            A3 = final_tri_points[sv[:, 0]]
+                            B3 = final_tri_points[sv[:, 1]]
+                            C3 = final_tri_points[sv[:, 2]]
+                            me = np.maximum(
+                                np.maximum(
+                                    np.linalg.norm(B3 - A3, axis=1),
+                                    np.linalg.norm(C3 - B3, axis=1),
+                                ),
+                                np.linalg.norm(A3 - C3, axis=1),
+                            )
+                            nor = np.cross(B3 - A3, C3 - A3)
+                            nl = np.linalg.norm(nor, axis=1, keepdims=True)
+                            good = nl[:, 0] > 1e-12
+                            nor = nor / np.where(nl > 0, nl, 1.0)
+                            nor[nor[:, 2] < 0] *= -1
+                            sl = np.arccos(np.clip(nor[:, 2], -1, 1))
+                            tok = good & (sl <= terrain_rad)
+                            pn = nor[inv]
+                            pme = me[inv]
+                            pto = tok[inv]
+                            pA = A3[inv]
+                            pa = pts[vng]
+                            act = pto.copy()
+                            if stop_triangulation:
+                                act &= pme >= stop_edge_length
+                            d = np.einsum('ij,ij->i', pn, pa - pA)
+                            pd = np.abs(d)
+                            act &= pd <= iteration_distance
+                            if add_only_upward:
+                                act &= d >= 0
+                            pp = pa - d[:, np.newaxis] * pn
+                            psv = sv[inv]
+                            nr = np.minimum(
+                                np.minimum(
+                                    np.linalg.norm(final_tri_points[psv[:, 0]] - pp, axis=1),
+                                    np.linalg.norm(final_tri_points[psv[:, 1]] - pp, axis=1),
+                                ),
+                                np.linalg.norm(final_tri_points[psv[:, 2]] - pp, axis=1),
+                            )
+                            alpha = np.where(
+                                nr < 1e-12,
+                                90.0,
+                                np.degrees(np.arctan2(pd, nr)),
+                            )
+                            ea = np.full(len(vng), iteration_angle, dtype=float)
+                            if reduce_angle_edge:
+                                sm = pme < edge_length_threshold
+                                ea[sm] = (
+                                    iteration_angle
+                                    * pme[sm]
+                                    / edge_length_threshold
+                                )
+                            if use_distance_as_rating:
+                                w = distance_weight / 100.0
+                                act &= (
+                                    (1 - w) * np.where(ea > 0, alpha / ea, 1.0)
+                                    + w * (
+                                        pd / iteration_distance
+                                        if iteration_distance > 0
+                                        else np.ones_like(pd)
+                                    )
+                                ) <= 1.0
+                            else:
+                                act &= alpha <= ea
+                            surface_completion_local = vng[act]
+                except Exception:
+                    # Completion is an additive classification stage only.  If
+                    # it cannot be built, retain the already-valid conservative
+                    # PTD result rather than failing the whole Ground run.
+                    surface_completion_local = np.array([], dtype=np.intp)
+                finally:
+                    try:
+                        del final_tri
+                    except Exception:
+                        pass
+
     gl=np.array(sorted(ground_set),dtype=np.intp)
-    rl=gl[is_from_local[gl]]
+    classification_local = (
+        np.union1d(gl, surface_completion_local)
+        if len(surface_completion_local)
+        else gl
+    )
+    rl=classification_local[is_from_local[classification_local]]
     accepted_global=work_idx[rl]
     before=classification[accepted_global].copy()
     classification[accepted_global]=to_class
 
     protected_global = work_idx[np.asarray(sorted(seed_local), dtype=np.intp)]
-    holdout_candidates = accepted_global[before != 0]
+    # QC holdout means: keep a deterministic percentage of *newly accepted*
+    # ground candidates in Class 0.  Most Ground runs are 0 -> Ground, so the
+    # previous ``before != 0`` filter accidentally excluded exactly the points
+    # the option is meant to reserve and always reported 0 held out.
+    holdout_candidates = accepted_global[before != int(to_class)]
     class0_indices = np.array([], dtype=np.intp)
     if float(class0_holdout_percent or 0.0) > 0.0 and int(to_class) != 0:
         class0_indices = _select_ground_class0_holdout(
@@ -3580,7 +4006,10 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
     changed_mask=after != before
     changed_indices=accepted_global[changed_mask]
     ground_count=int(np.count_nonzero(after[changed_mask] == int(to_class)))
-    class0_count=int(np.count_nonzero(after[changed_mask] == 0))
+    # Include points intentionally left at Class 0 by the QC sampler even when
+    # their source class was already 0 (there is no net classification delta for
+    # those points, but they are still a deliberate holdout and must be reported).
+    class0_count=int(len(class0_indices))
 
     if progress_cb:
         progress_cb(
@@ -3596,7 +4025,35 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
         "class0_count": class0_count,
         "seed_count": len(seed_local),
         "existing_ground_count": existing_ground_count,
+        "guide_overlap_count": guide_overlap_count,
+        "guide_halo_count": int(guide_halo_count),
+        "guide_halo_margin": float(guide_halo_margin),
+        "context_seed_count": int(context_seed_count),
+        "perimeter_seed_count": int(perimeter_seed_count),
         "dense_ground_fast_path": dense_ground_fast_path,
+        "terrascan_compatible_densification": bool(terrascan_compatible_densification),
+        "surface_completion_enabled": bool(
+            terrascan_compatible_densification
+            and complete_ground_from_final_tin
+        ),
+        "surface_completion_count": int(len(surface_completion_local)),
+        "surface_completion_examined": int(surface_completion_examined),
+        "surface_completion_outside_tin": int(surface_completion_outside_tin),
+        "tin_anchor_source_count": int(
+            np.count_nonzero(is_from_local[gl])
+        ),
+        "densification_mode": (
+            "conservative_anchors+final_surface_completion"
+            if (
+                terrascan_compatible_densification
+                and complete_ground_from_final_tin
+            )
+            else (
+                "one_best_per_triangle"
+                if terrascan_compatible_densification
+                else "all_passing_candidates"
+            )
+        ),
         "iterations": iterations_completed,
         "stop_reason": stop_reason,
         "adaptive_thresholds": bool(adaptive_thresholds),
@@ -3604,6 +4061,19 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
             adaptive_result.get("estimated_slope")
             if adaptive_result is not None
             else None
+        ),
+        "estimated_slope_p50": (
+            adaptive_result.get("slope_p50") if adaptive_result is not None else None
+        ),
+        "estimated_slope_p90": (
+            adaptive_result.get("slope_p90") if adaptive_result is not None else None
+        ),
+        "estimated_slope_p95": (
+            adaptive_result.get("slope_p95") if adaptive_result is not None else None
+        ),
+        "terrain_profile_guess": (
+            adaptive_result.get("terrain_profile_guess")
+            if adaptive_result is not None else None
         ),
         "effective_terrain_angle": float(terrain_angle),
         "effective_iteration_angle": float(iteration_angle),
@@ -3613,7 +4083,7 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 4 — CLASSIFY SURFACE POINTS
-# Nakshatech equivalent: locally smooth planar or rounded surfaces
+# TerraScan equivalent: locally smooth planar or rounded surfaces
 # ═══════════════════════════════════════════════════════════════════════
 def classify_surface_points(
         xyz, classification, from_classes, to_class,
@@ -3622,7 +4092,7 @@ def classify_surface_points(
     """
     Classify points that belong to a locally smooth 3D surface.
 
-    Nakshatech exposes only the surface tolerance for this routine.  The local
+    TerraScan exposes only the surface tolerance for this routine.  The local
     neighborhood is therefore deliberately an implementation detail.  A
     robust PCA tangent plane is fitted to nearby source points in full XYZ so
     horizontal ground, sloped roofs, rounded surfaces, and vertical walls are
@@ -3836,7 +4306,7 @@ def classify_surface_points(
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 5 — CLASSIFY BELOW SURFACE
-# Nakshatech equivalent: elevation tolerance + limit × standard deviation
+# TerraScan equivalent: elevation tolerance + limit × standard deviation
 # ═══════════════════════════════════════════════════════════════════════
 def classify_below_surface(xyz, classification, from_classes, to_class,
                            surface_type="planar", limit=4.0,
@@ -4765,8 +5235,20 @@ class _BaseClassifyDialog(QDialog):
                 f"({accepted_ratio:.1f}%), {ground_count:,} → ground, "
                 f"{class0_count:,} → class 0, "
                 f"seeds={int(result.get('seed_count', 0)):,}, "
+                f"anchors={int(result.get('tin_anchor_source_count', 0)):,}, "
+                f"completion={int(result.get('surface_completion_count', 0)):,}, "
                 f"iterations={int(result.get('iterations', 0))}, "
+                f"guide_overlap={int(result.get('guide_overlap_count', 0)):,}, "
+                f"guide_halo={int(result.get('guide_halo_count', 0)):,}, "
+                f"context_seeds={int(result.get('context_seed_count', 0)):,}, "
+                f"perimeter_seeds={int(result.get('perimeter_seed_count', 0)):,}, "
                 f"stop={result.get('stop_reason', 'unknown')}"
+            )
+            print(
+                "   PTD densification: "
+                f"{result.get('densification_mode', 'legacy')}"
+                f", TerraScan-compatible="
+                f"{bool(result.get('terrascan_compatible_densification', False))}"
             )
             if "effective_terrain_angle" in result:
                 slope = result.get("estimated_slope")
@@ -4780,9 +5262,15 @@ class _BaseClassifyDialog(QDialog):
                     if result.get("adaptive_thresholds")
                     else "fixed/custom"
                 )
+                p50 = result.get("estimated_slope_p50")
+                p95 = result.get("estimated_slope_p95")
+                p50_text = f"{float(p50):.1f}°" if p50 is not None else "n/a"
+                p95_text = f"{float(p95):.1f}°" if p95 is not None else "n/a"
+                profile_guess = result.get("terrain_profile_guess") or "n/a"
                 print(
                     "   Terrain thresholds: "
-                    f"mode={mode}, estimated slope={slope_text}, "
+                    f"mode={mode}, profile={profile_guess}, "
+                    f"slope P50/P90/P95={p50_text}/{slope_text}/{p95_text}, "
                     f"terrain={float(result['effective_terrain_angle']):.1f}°, "
                     f"iteration="
                     f"{float(result['effective_iteration_angle']):.1f}° / "
@@ -4900,11 +5388,17 @@ class _BaseClassifyDialog(QDialog):
             )
             message += (
                 f"\n\nGround accepted: {int(result.get('ground_count', 0)):,}"
-                f"\nReserved in Class 0: {int(result.get('class0_count', 0)):,}"
+                f"\nNaksha QC holdout to Class 0: {int(result.get('class0_count', 0)):,}"
                 f"\nAcceptance ratio: {accepted_count:,}/{source_count:,} "
                 f"({accepted_ratio:.1f}%)"
                 f"\nTIN seeds: {int(result.get('seed_count', 0)):,}"
+                f"\nTIN ground anchors: {int(result.get('tin_anchor_source_count', 0)):,}"
+                f"\nFinal-TIN completion: {int(result.get('surface_completion_count', 0)):,}"
+                f"\nGuide halo points: {int(result.get('guide_halo_count', 0)):,}"
+                f"\nNeighbor low-point seeds: {int(result.get('context_seed_count', 0)):,}"
+                f"\nFence-perimeter low seeds: {int(result.get('perimeter_seed_count', 0)):,}"
                 f"\nIterations: {int(result.get('iterations', 0))}"
+                f"\nDensification: {result.get('densification_mode', 'legacy')}"
                 f"\nStopped: {result.get('stop_reason', 'unknown')}"
             )
             if "effective_terrain_angle" in result:
@@ -4919,9 +5413,16 @@ class _BaseClassifyDialog(QDialog):
                     if result.get("adaptive_thresholds")
                     else "Fixed / custom"
                 )
+                p50 = result.get("estimated_slope_p50")
+                p95 = result.get("estimated_slope_p95")
+                p50_text = f"{float(p50):.1f}°" if p50 is not None else "n/a"
+                p95_text = f"{float(p95):.1f}°" if p95 is not None else "n/a"
+                profile_guess = result.get("terrain_profile_guess") or "n/a"
                 message += (
                     f"\n\nTerrain mode: {mode}"
-                    f"\nEstimated slope: {slope_text}"
+                    f"\nDetected terrain: {profile_guess}"
+                    f"\nSlope P50 / P90 / P95: "
+                    f"{p50_text} / {slope_text} / {p95_text}"
                     f"\nEffective thresholds: "
                     f"{float(result['effective_terrain_angle']):.1f}° terrain, "
                     f"{float(result['effective_iteration_angle']):.1f}° / "
@@ -5413,7 +5914,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._persist_spin(self.mt_spin, "more_than", 0.50)
         self.mt_spin.setToolTip(
             "Minimum vertical gap between the low point/group and every "
-            "higher surrounding source point. Nakshatech normally uses "
+            "higher surrounding source point. TerraScan normally uses "
             "0.3–1.0 m."
         )
         mr = QHBoxLayout()
@@ -5428,7 +5929,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._persist_spin(self.within_spin, "within", 5.00)
         self.within_spin.setToolTip(
             "Horizontal (2D) radius used to find surrounding From-class "
-            "points. Nakshatech normally uses 2–8 m."
+            "points. TerraScan normally uses 2–8 m."
         )
         wr = QHBoxLayout()
         wr.addWidget(self.within_spin)
@@ -5705,15 +6206,19 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             "Accepted candidates are assigned to this ground class."
         )
         _add_row(
-            f1, "Current ground:", _w(r3),
-            "Existing trusted ground points guide the TIN but are not "
-            "reclassified by this run."
+            f1, "Current ground (trusted):", _w(r3),
+            "Existing trusted ground points guide the TIN and bypass candidate "
+            "acceptance tests. This class must not overlap From class. For a "
+            "normal Class 0 -> Ground run, select the existing Ground class here."
         )
         detected_label = _get_las_classes(self.app).get(
             ground_default,
             str(ground_default),
         )
-        class_note = QLabel(f"Detected ground destination: {detected_label}")
+        class_note = QLabel(
+            f"Detected ground destination: {detected_label}\n"
+            "Safety: From class and Current ground (trusted) must not overlap."
+        )
         class_note.setWordWrap(True)
         class_note.setStyleSheet(
             f"color:{ThemeColors.get('text_muted')}; font-size:10px;"
@@ -5770,24 +6275,39 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
         ))
         _section(terrain, "Terrain Profile")
         self.terrain_profile_combo = QComboBox()
+        # Keep the original index order (Auto, Flat, Rolling, Hilly, Mountain,
+        # Custom) so previously persisted combo indexes keep their meaning.
+        # TerraScan Standard is appended as a new option rather than inserted.
         self.terrain_profile_combo.addItem(
-            "Auto-adaptive (Recommended)", "auto"
+            "Auto-adaptive — TerraScan-guided (Recommended)", "auto"
         )
-        self.terrain_profile_combo.addItem("Flat / Urban", "flat_urban")
-        self.terrain_profile_combo.addItem("Rolling Terrain", "rolling")
-        self.terrain_profile_combo.addItem("Hilly Terrain", "hilly")
         self.terrain_profile_combo.addItem(
-            "Mountain / Steep Terrain", "mountain"
+            "Flat / Urban — 88° / 4° / 0.50 m", "flat_urban"
+        )
+        self.terrain_profile_combo.addItem(
+            "Rolling Terrain — 35° / 6° / 0.80 m", "rolling"
+        )
+        self.terrain_profile_combo.addItem(
+            "Hilly Terrain — 55° / 8° / 1.10 m", "hilly"
+        )
+        self.terrain_profile_combo.addItem(
+            "Mountain / Steep — 75° / 10° / 1.40 m", "mountain"
         )
         self.terrain_profile_combo.addItem("Custom", "custom")
+        self.terrain_profile_combo.addItem(
+            "TerraScan Standard — 60 m / 88° / 6° / 1.40 m",
+            "terrascan_standard",
+        )
         self._persist_combo_index(
             self.terrain_profile_combo,
             "terrain_profile",
             0,
         )
         self.terrain_profile_combo.setToolTip(
-            "Auto estimates thresholds from the local-low seed TIN. Named "
-            "profiles apply locked repeatable values. Custom enables editing."
+            "TerraScan Standard exposes the commonly documented 60 m / 88° / "
+            "6° / 1.40 m baseline. Auto keeps Naksha's data-driven PTD thresholds "
+            "and reports the effective values used. Named terrain profiles are "
+            "repeatable starting points; Custom enables editing."
         )
         terrain.addWidget(self.terrain_profile_combo)
         self.terrain_profile_note = QLabel()
@@ -5859,6 +6379,46 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             "optional Naksha Class-0 quality-control sample."
         ))
         _section(strategy, "TIN Densification")
+        self.terra_compat_chk = QCheckBox(
+            "TerraScan-compatible progressive densification"
+        )
+        self._persist_checkbox(
+            self.terra_compat_chk,
+            "terrascan_compatible_densification",
+            True,
+        )
+        self.terra_compat_chk.setToolTip(
+            "Use conservative Axelsson/TerraScan-style PTD iteration: after "
+            "the slope, distance and iteration-angle tests, add at most one "
+            "best candidate per current TIN triangle per iteration. This "
+            "avoids the legacy all-passing-points over-densification. It does "
+            "not change the fence, source classes, or trusted ground classes."
+        )
+        strategy.addWidget(self.terra_compat_chk)
+        strategy.addWidget(_note(
+            "Recommended for TerraScan-like Ground behaviour. The conservative "
+            "anchor TIN controls geometry; a separate final-TIN completion pass "
+            "can fill all source points that genuinely lie on that surface.",
+        ))
+        self.surface_completion_chk = QCheckBox(
+            "Complete Ground class from final TIN"
+        )
+        self._persist_checkbox(
+            self.surface_completion_chk,
+            "complete_ground_from_final_tin",
+            True,
+        )
+        self.surface_completion_chk.setToolTip(
+            "After progressive TIN densification stabilizes, classify every "
+            "remaining source point inside the fence that passes the same "
+            "terrain-slope, point-to-plane distance and iteration-angle tests "
+            "against the final TIN. These extra points do not modify the TIN, "
+            "so coverage improves without letting vegetation, wires or roofs "
+            "steer the ground surface."
+        )
+        strategy.addWidget(self.surface_completion_chk)
+
+        _separator(strategy)
         self.reduce_chk = QCheckBox("Reduce angle in small triangles")
         self._persist_checkbox(self.reduce_chk, "reduce_angle_edge", True)
         self.reduce_chk.setToolTip(
@@ -5902,14 +6462,14 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
 
         _separator(strategy)
         self.dist_rating_chk = QCheckBox(
-            "Use Nakshatech distance attribute (not loaded)"
+            "Use TerraScan distance attribute (not loaded)"
         )
         self._persist_checkbox(self.dist_rating_chk, "use_distance_as_rating", False)
         self.dist_rating_chk.setToolTip(
-            "Nakshatech's option requires a stored vegetation-index, echo-"
+            "TerraScan's option requires a stored vegetation-index, echo-"
             "length, or deviation-distance attribute. Naksha currently loads "
             "only XYZ and Classification, so enabling a look-alike formula "
-            "would not provide Nakshatech parity."
+            "would not provide MicroStation parity."
         )
         self.dist_rating_chk.setChecked(False)
         self.dist_rating_chk.setEnabled(False)
@@ -5949,7 +6509,7 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
         self._persist_checkbox(
             self.class0_holdout_chk,
             "class0_holdout_enabled",
-            True,
+            False,
         )
         density_row = QHBoxLayout()
         density_row.addWidget(self.class0_holdout_chk)
@@ -5961,10 +6521,11 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
         self._persist_spin(self.class0_holdout_spin, "class0_holdout_percent", 5)
         density_row.addWidget(self.class0_holdout_spin)
         density_explanation = (
-            "After geometric classification, this deterministic spatial sample "
-            "moves the selected percentage of newly accepted points to Class 0. "
-            "Initial seeds and existing ground stay protected. Disable it for "
-            "strict Nakshatech parity."
+            "Naksha QA-only post-process; NOT part of TerraScan Ground. After "
+            "geometric classification it deliberately moves a percentage of "
+            "accepted points back to Class 0. Leave this OFF for production "
+            "or TerraScan parity. Use Reduce angle / Stop triangulation to "
+            "control ground density geometrically instead."
         )
         self.class0_holdout_chk.setToolTip(density_explanation)
         self.class0_holdout_spin.setToolTip(density_explanation)
@@ -5976,8 +6537,30 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
         self.class0_holdout_spin.setEnabled(
             self.class0_holdout_chk.isChecked()
         )
+
+        def _sync_terra_compat_qc(state):
+            enabled = bool(state)
+            if enabled and self.class0_holdout_chk.isChecked():
+                # Persist the safer production default.  TerraScan Ground does
+                # not create density by randomly/declaratively moving accepted
+                # points back to the source class.
+                self.class0_holdout_chk.setChecked(False)
+            self.class0_holdout_chk.setEnabled(not enabled)
+            self.class0_holdout_spin.setEnabled(
+                (not enabled) and self.class0_holdout_chk.isChecked()
+            )
+            self.surface_completion_chk.setEnabled(enabled)
+
+        self.terra_compat_chk.stateChanged.connect(_sync_terra_compat_qc)
+        _sync_terra_compat_qc(self.terra_compat_chk.isChecked())
         strategy.addStretch()
         self._tabs.addTab(strategy_page, "Strategy & QC")
+
+        # Terrain profile was initially applied before Strategy controls existed.
+        # Reapply now so a named full TerraScan-style preset also synchronizes
+        # search-cell/reduction/stop controls without changing Auto/Custom state.
+        if (self.terrain_profile_combo.currentData() or "auto") in GROUND_TERRAIN_PRESETS:
+            self._apply_terrain_profile()
 
         saved_tab = int(
             PersistentClassSettings.get_value(self._pk("active_tab"), 0)
@@ -6001,23 +6584,53 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             self.terrain_spin.setValue(values["terrain_angle"])
             self.ia_spin.setValue(values["iteration_angle"])
             self.id_spin.setValue(values["iteration_distance"])
+            # A named profile represents the complete TerraScan-style starting
+            # setup, not only the three acceptance thresholds.  QC holdout is
+            # intentionally NOT touched; it remains an explicit user choice.
+            self.max_bldg_spin.setValue(values.get("max_building_size", 60.0))
+            # _apply_terrain_profile() is first called while the Terrain tab is
+            # still being built, before Strategy widgets exist. Apply the full
+            # preset whenever those controls are available; a second call is
+            # made after Strategy construction below.
+            if hasattr(self, "reduce_chk"):
+                self.reduce_chk.setChecked(values.get("reduce_angle_edge", True))
+            if hasattr(self, "edge_spin"):
+                self.edge_spin.setValue(values.get("edge_length_threshold", 5.0))
+            if hasattr(self, "stop_chk"):
+                self.stop_chk.setChecked(values.get("stop_triangulation", False))
+            if hasattr(self, "stop_edge_spin"):
+                self.stop_edge_spin.setValue(values.get("stop_edge_length", 2.0))
+            if profile == "terrascan_standard" and hasattr(self, "terra_compat_chk"):
+                self.terra_compat_chk.setChecked(True)
 
         for spin in (self.terrain_spin, self.ia_spin, self.id_spin):
             spin.setEnabled(is_custom)
 
         if profile == "auto":
             note = (
-                "Thresholds are calculated for each run from the local-low "
-                "seed TIN inside the active fence. The effective values and "
-                "estimated slope are reported when classification finishes."
+                "TerraScan-guided Auto: thresholds are calculated for each run "
+                "from the local-low seed TIN inside the active fence. Naksha "
+                "keeps the existing adaptive formula and reports slope P50/P90/"
+                "P95 plus the exact effective terrain angle, iteration angle and "
+                "distance used. Search-cell size remains user-controlled because "
+                "TerraScan defines it from the largest building in the area."
             )
         elif profile in GROUND_TERRAIN_PRESETS:
             values = GROUND_TERRAIN_PRESETS[profile]
+            provenance = values.get("provenance", "Preset")
             note = (
-                "Locked values: terrain "
-                f"{values['terrain_angle']:.0f}°, iteration "
-                f"{values['iteration_angle']:.0f}°, distance "
-                f"{values['iteration_distance']:.2f} m."
+                f"{provenance}: search cell {values.get('max_building_size', 60.0):.0f} m; "
+                f"terrain {values['terrain_angle']:.0f}°; iteration "
+                f"{values['iteration_angle']:.0f}° / "
+                f"{values['iteration_distance']:.2f} m; reduce angle below "
+                f"{values.get('edge_length_threshold', 5.0):.1f} m. "
+                + (
+                    "This is the documented TerraScan reference baseline; it is "
+                    "a starting point, not a universal optimum."
+                    if profile == "terrascan_standard" else
+                    "This terrain preset is a repeatable starting point; use Auto "
+                    "for mixed natural terrain and Custom after QC."
+                )
             )
         else:
             note = (
@@ -6037,6 +6650,54 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             return
 
         to_class = int(to_codes[0])
+
+        # Current ground is a trusted TIN guide, not another source class.  If a
+        # user selects the same class in both rows (for example From=0 and
+        # Current ground=0), every overlapping point can bypass the PTD
+        # slope/distance/iteration tests.  Block that unsafe setup before any
+        # worker starts.  Lowest-point-only genuinely ignores Current ground and
+        # therefore does not need this restriction.
+        from_codes = self._get_from()
+        current_ground_codes = self._get_cur()
+        seed_uses_current_ground = self.select_combo.currentIndex() != 1
+        if seed_uses_current_ground:
+            from_is_any = (
+                from_codes is None
+                or not from_codes
+                or None in from_codes
+            )
+            current_is_any = (
+                current_ground_codes is None
+                or not current_ground_codes
+                or None in current_ground_codes
+            )
+            if from_is_any and not current_is_any:
+                overlap_codes = list(current_ground_codes)
+            elif current_is_any and not from_is_any:
+                overlap_codes = list(from_codes)
+            elif from_is_any and current_is_any:
+                overlap_codes = ["Any Class"]
+            else:
+                overlap_codes = sorted(
+                    set(int(c) for c in from_codes)
+                    & set(int(c) for c in current_ground_codes)
+                )
+            if overlap_codes:
+                QMessageBox.warning(
+                    self,
+                    "Unsafe Ground Seed Configuration",
+                    "Current ground is a TRUSTED TIN guide and cannot also be "
+                    "a From-class candidate.\n\n"
+                    f"Overlapping class(es): {', '.join(map(str, overlap_codes))}\n\n"
+                    "This setup bypasses the terrain-angle, iteration-angle and "
+                    "distance tests for those points and can classify cliffs, "
+                    "powerlines or structures as ground.\n\n"
+                    "For a normal Class 0 -> Ground run, set Current ground "
+                    f"(trusted) to {to_class} (Ground), or choose 'Lowest point "
+                    "only' if you do not want to use existing ground guides."
+                )
+                return
+
         detected_ground = int(
             getattr(self, "_detected_ground_class", to_class)
         )
@@ -6078,9 +6739,17 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             "distance_weight":       float(self.weight_spin.value()),
             "add_only_upward":       self.upward_chk.isChecked(),
             "adaptive_thresholds":   terrain_profile == "auto",
+            "terrascan_compatible_densification": self.terra_compat_chk.isChecked(),
+            "complete_ground_from_final_tin": (
+                self.terra_compat_chk.isChecked()
+                and self.surface_completion_chk.isChecked()
+            ),
             "class0_holdout_percent":(
                 float(self.class0_holdout_spin.value())
-                if self.class0_holdout_chk.isChecked()
+                if (
+                    self.class0_holdout_chk.isChecked()
+                    and not self.terra_compat_chk.isChecked()
+                )
                 else 0.0
             ),
             "fence_mask":            self._get_fence_mask(self._fence_sel),
@@ -6091,7 +6760,7 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
 # DIALOG 4 — CLASSIFY SURFACE POINTS
 # ═══════════════════════════════════════════════════════════════════════
 class ClassifySurfacePointsDialog(_BaseClassifyDialog):
-    """Nakshatech-style Surface Points tool with its published controls."""
+    """TerraScan-style Surface Points tool with its published controls."""
     _persist_prefix = "surface_points"
     _keep_visible_during_run = True
     _preserve_fence_on_restore = True
@@ -6161,7 +6830,7 @@ class ClassifySurfacePointsDialog(_BaseClassifyDialog):
         explanation.setWordWrap(True)
         explanation.setStyleSheet(_note_text_style())
         explanation.setToolTip(
-            "Nakshatech/Nakshatech Surface Points uses From class, To class, "
+            "MicroStation/TerraScan Surface Points uses From class, To class, "
             "Tolerance, and Inside fence only. The local neighborhood is "
             "selected automatically."
         )
@@ -6291,7 +6960,7 @@ class ClassifyBelowSurfaceDialog(_BaseClassifyDialog):
         info = QLabel(
             "ℹ️ Fits local surface through K neighbors.\n"
             "   Flags points below surface by > limit × standard deviation.\n"
-            "   Nakshatech equivalent: post-ground cleanup.")
+            "   MicroStation equivalent: post-ground cleanup.")
         info.setStyleSheet(_note_text_style())
         info.setWordWrap(True)
         ol.addWidget(info)
@@ -6324,6 +6993,816 @@ class ClassifyBelowSurfaceDialog(_BaseClassifyDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+
+
+# MicroStation-style utility classifiers added for By Class ribbon.
+def _line_distance_station_xy(points_xy, coords_xy):
+    line = np.asarray(coords_xy, dtype=np.float64)
+    pts = np.asarray(points_xy, dtype=np.float64)
+    if line.ndim != 2 or len(line) < 2:
+        return np.full(len(pts), np.inf), np.zeros(len(pts), dtype=np.float64)
+    samples = []
+    stations = []
+    cumulative = 0.0
+    for a, b in zip(line[:-1, :2], line[1:, :2]):
+        vec = b - a
+        seg_len = float(np.linalg.norm(vec))
+        if seg_len <= 1e-9:
+            continue
+        steps = max(1, int(np.ceil(seg_len / 0.75)))
+        t = np.linspace(0.0, 1.0, steps + 1)
+        samples.append(a[None, :] + t[:, None] * vec[None, :])
+        stations.append(cumulative + t * seg_len)
+        cumulative += seg_len
+    if not samples:
+        return np.full(len(pts), np.inf), np.zeros(len(pts), dtype=np.float64)
+    sample_xy = np.vstack(samples)
+    sample_station = np.concatenate(stations)
+    tree = cKDTree(sample_xy)
+    dist, nn = tree.query(pts[:, :2], k=1, workers=-1)
+    return np.asarray(dist, dtype=np.float64), sample_station[np.asarray(nn)]
+
+
+def _normalize_line_coords(obj):
+    if not isinstance(obj, dict):
+        return None
+    coords = None
+    for key in ("coords", "points", "vertices", "coordinates", "boundary_coords"):
+        val = obj.get(key)
+        if val is None:
+            continue
+        try:
+            if len(val) < 2:
+                continue
+        except Exception:
+            continue
+        coords = val
+        break
+    if coords is None:
+        return None
+    try:
+        arr = np.asarray(coords, dtype=np.float64)
+    except Exception:
+        return None
+    if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) < 2:
+        return None
+    arr = arr[:, :3] if arr.shape[1] >= 3 else np.column_stack([arr[:, :2], np.zeros(len(arr))])
+    if not np.all(np.isfinite(arr)) or np.linalg.norm(np.diff(arr[:, :2], axis=0), axis=1).sum() <= 0:
+        return None
+    return arr
+
+
+def _collect_alignment_sources(app):
+    sources = []
+    seen = set()
+
+    def add(label, obj, source):
+        coords = _normalize_line_coords(obj)
+        if coords is None:
+            return
+        key = tuple(np.round(coords[:, :2].ravel(), 3))
+        if key in seen:
+            return
+        seen.add(key)
+        sources.append({"label": label, "coords": coords, "source": source, "key": key})
+
+    for attachment in getattr(app, "snt_attachments", []) or []:
+        if not isinstance(attachment, dict):
+            continue
+        parsed = attachment.get("parsed") or {}
+        name = str(attachment.get("filename") or "SNT").replace(chr(92), "/").split("/")[-1]
+        for i, ent in enumerate(parsed.get("entities") or [], 1):
+            if not _is_snt_selectable_line_entity(ent):
+                continue
+            layer = str(ent.get("layer", "")).strip()
+            layer_label = f" - {layer}" if layer else ""
+            add(f"SNT {name}{layer_label} - line {i}", ent, "snt")
+
+    digitizer = getattr(app, "digitizer", None)
+    drawing_stores = [("Drawing", list(getattr(digitizer, "drawings", []) or []))]
+    for attr in (
+        "_pending_drawings_restore", "_restored_drawings", "loaded_drawings",
+        "drawing_data", "las_drawings", "embedded_drawings", "saved_drawings",
+    ):
+        vals = getattr(app, attr, None)
+        if vals is None:
+            continue
+        try:
+            has_vals = len(vals) > 0
+        except Exception:
+            has_vals = False
+        if has_vals:
+            drawing_stores.append((attr, list(vals.values()) if isinstance(vals, dict) else list(vals)))
+    for store_name, drawings in drawing_stores:
+        for i, d in enumerate(drawings, 1):
+            if not isinstance(d, dict):
+                continue
+            dtype = str(d.get("type") or d.get("entity_type") or d.get("geometry_type") or "").lower()
+            if dtype in {"line", "line_segment", "smartline", "smart_line", "polyline", "centerline", "freehand", "polyline3d", "lwpolyline"}:
+                add(f"{store_name} {i}: {dtype or 'line'}", d, "drawing")
+
+    return sources
+
+
+def _make_alignment_highlight_actor(dialog, coords):
+    digitizer = getattr(dialog.app, "digitizer", None)
+    if digitizer is None:
+        return None
+    try:
+        import vtk
+        poly = digitizer._build_styled_polydata_world(
+            np.asarray(coords, dtype=np.float64).tolist(), line_style="solid"
+        )
+        origin = getattr(poly, "_world_origin", None)
+        if origin is None:
+            origin = np.zeros(3, dtype=np.float64)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.0, 0.85, 1.0)
+        actor.GetProperty().SetLineWidth(6.0)
+        actor.PickableOff()
+        actor.SetPosition(float(origin[0]), float(origin[1]), float(origin[2]))
+        digitizer._add_actor_to_overlay(actor)
+        return actor
+    except Exception as exc:
+        print(f"CL highlight could not be drawn: {exc}")
+        return None
+
+
+def _clear_alignment_highlight(dialog):
+    actor = getattr(dialog, "_alignment_highlight_actor", None)
+    if actor is None:
+        return
+    digitizer = getattr(dialog.app, "digitizer", None)
+    if digitizer is not None:
+        try:
+            digitizer._remove_actor_from_overlay(actor)
+        except Exception:
+            pass
+    dialog._alignment_highlight_actor = None
+    try:
+        dialog.app.vtk_widget.render()
+    except Exception:
+        pass
+
+
+def _show_alignment_highlight(dialog, coords):
+    _clear_alignment_highlight(dialog)
+    if coords is None or len(coords) < 2:
+        return False
+    actor = _make_alignment_highlight_actor(dialog, coords)
+    if actor is None:
+        return False
+    dialog._alignment_highlight_actor = actor
+    try:
+        dialog.app.vtk_widget.render()
+    except Exception:
+        pass
+    return True
+
+
+def _points_within_line_corridor(points_xy, line_xy, half_width):
+    """Exact XY point-to-segment distances, with a sampled index for speed."""
+    line = np.asarray(line_xy, dtype=np.float64)[:, :2]
+    segments = np.diff(line, axis=0)
+    lengths = np.linalg.norm(segments, axis=1)
+    valid = lengths > 1e-9
+    starts = line[:-1][valid]
+    segments = segments[valid]
+    lengths = lengths[valid]
+    if not len(starts):
+        return np.zeros(len(points_xy), dtype=bool)
+
+    # Nearby samples identify candidate segments; the final test projects onto
+    # the original segments, so the selected width remains exact.
+    step = 0.25
+    samples = []
+    sample_segment = []
+    for i, (start, vec, length) in enumerate(zip(starts, segments, lengths)):
+        count = max(1, int(np.ceil(length / step)))
+        t = np.linspace(0.0, 1.0, count + 1)
+        samples.append(start + t[:, None] * vec)
+        sample_segment.extend([i] * len(t))
+    tree = cKDTree(np.vstack(samples))
+    sample_segment = np.asarray(sample_segment, dtype=np.intp)
+    result = np.zeros(len(points_xy), dtype=bool)
+    k = min(8, len(sample_segment))
+    for begin in range(0, len(points_xy), 100000):
+        end = min(begin + 100000, len(points_xy))
+        points = np.asarray(points_xy[begin:end], dtype=np.float64)
+        nearby_dist, nearest_sample = tree.query(points, k=k, workers=-1)
+        if k == 1:
+            nearby_dist = nearby_dist[:, None]
+            nearest_sample = nearest_sample[:, None]
+        possible = nearby_dist[:, 0] <= half_width + step / 2.0
+        if not np.any(possible):
+            continue
+        candidate_points = points[possible]
+        ids = sample_segment[nearest_sample[possible]]
+        a = starts[ids]
+        v = segments[ids]
+        v2 = lengths[ids] ** 2
+        t = np.clip(np.sum((candidate_points[:, None, :] - a) * v, axis=2) / v2, 0.0, 1.0)
+        closest = a + t[:, :, None] * v
+        d2 = np.sum((candidate_points[:, None, :] - closest) ** 2, axis=2)
+        accepted = np.any(d2 <= half_width ** 2, axis=1)
+        uncertain = np.flatnonzero(~accepted)
+        if len(uncertain):
+            nearby_samples = tree.query_ball_point(
+                candidate_points[uncertain], r=half_width + step / 2.0, workers=-1)
+            for index, hits in zip(uncertain, nearby_samples):
+                if not hits:
+                    continue
+                segment_ids = np.unique(sample_segment[hits])
+                delta = candidate_points[index] - starts[segment_ids]
+                vectors = segments[segment_ids]
+                projection = np.clip(
+                    np.sum(delta * vectors, axis=1) / lengths[segment_ids] ** 2, 0.0, 1.0)
+                residual = delta - projection[:, None] * vectors
+                accepted[index] = np.any(np.sum(residual ** 2, axis=1) <= half_width ** 2)
+        result[np.arange(begin, end)[possible]] = accepted
+    return result
+
+
+def _normalize_centerline_collection(coords):
+    if coords is None:
+        return []
+    try:
+        array = np.asarray(coords, dtype=np.float64)
+        if array.ndim == 2:
+            line = _normalize_line_coords({"coords": array})
+            return [line] if line is not None else []
+    except (ValueError, TypeError):
+        pass
+    lines = []
+    for coords_for_line in coords:
+        line = _normalize_line_coords({"coords": coords_for_line})
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
+def classify_find_wires(xyz, classification, from_classes, to_class,
+                        alignment_coords, corridor_width=3.0,
+                        min_height_above_ground=15.0, fence_mask=None,
+                        progress_cb=None, abort_check=None):
+    xyz = np.asarray(xyz)
+    cls = np.asarray(classification)
+    empty = np.empty(0, dtype=np.intp)
+    base = {"routine": "find_wires", "changed": 0, "indices": empty}
+    lines = _normalize_centerline_collection(alignment_coords)
+    if not lines:
+        return {**base, "stop_reason": "no centerline selected"}
+    if not np.isfinite(corridor_width) or corridor_width <= 0:
+        return {**base, "stop_reason": "invalid corridor width"}
+    if not np.isfinite(min_height_above_ground) or min_height_above_ground < 0:
+        return {**base, "stop_reason": "invalid height threshold"}
+    if abort_check and abort_check():
+        return {**base, "stop_reason": "cancelled"}
+
+    valid = np.all(np.isfinite(xyz[:, :3]), axis=1)
+    source = valid & np.isin(cls, list(from_classes))
+    if fence_mask is not None:
+        source &= np.asarray(fence_mask, dtype=bool)
+    candidates = np.flatnonzero(source)
+    if not len(candidates):
+        return base
+    if progress_cb:
+        progress_cb(10, f"Checking {len(candidates):,} source points against centerline")
+
+    half_width = float(corridor_width) / 2.0
+    inside = np.zeros(len(candidates), dtype=bool)
+    xy = xyz[candidates, :2]
+    for number, line in enumerate(lines, 1):
+        if abort_check and abort_check():
+            return {**base, "stop_reason": "cancelled"}
+        bounds = (
+            (xy[:, 0] >= np.min(line[:, 0]) - half_width)
+            & (xy[:, 0] <= np.max(line[:, 0]) + half_width)
+            & (xy[:, 1] >= np.min(line[:, 1]) - half_width)
+            & (xy[:, 1] <= np.max(line[:, 1]) + half_width)
+            & ~inside
+        )
+        if np.any(bounds):
+            inside[bounds] = _points_within_line_corridor(
+                xy[bounds], line[:, :2], half_width)
+        if progress_cb:
+            progress_cb(min(60, int(60 * number / len(lines))),
+                        f"Checking centerline {number:,}/{len(lines):,}")
+    candidates = candidates[inside]
+    if not len(candidates):
+        return base
+    if abort_check and abort_check():
+        return {**base, "stop_reason": "cancelled"}
+
+    ground = np.flatnonzero(valid & (cls == 2))
+    if not len(ground):
+        return {**base, "stop_reason": "class-2 ground points required"}
+    if progress_cb:
+        progress_cb(70, f"Checking height above ground for {len(candidates):,} corridor points")
+    ground_tree = cKDTree(xyz[ground, :2])
+    _, nearest = ground_tree.query(xyz[candidates, :2], k=1, workers=-1)
+    height = xyz[candidates, 2] - xyz[ground[np.asarray(nearest)], 2]
+    changed = candidates[height >= float(min_height_above_ground)].astype(np.intp, copy=False)
+    if abort_check and abort_check():
+        return {**base, "stop_reason": "cancelled"}
+    cls[changed] = int(to_class)
+    if progress_cb:
+        progress_cb(100, f"Find Wires complete - {len(changed):,} points -> class {to_class}")
+    return {"routine": "find_wires", "changed": int(len(changed)), "indices": changed}
+
+
+
+def classify_poles_by_centerline(xyz, classification, from_classes, to_class,
+                                 centerline_coords, radius=1.0, down_height=5.0,
+                                 fence_mask=None, progress_cb=None,
+                                 abort_check=None):
+    xyz = np.asarray(xyz)
+    cls = np.asarray(classification)
+    empty = np.empty(0, dtype=np.intp)
+    base = {"routine": "classify_centerline_poles", "changed": 0, "indices": empty}
+    lines = _normalize_centerline_collection(centerline_coords)
+    if not lines:
+        return {**base, "stop_reason": "no centerline selected"}
+    if not np.isfinite(radius) or radius <= 0 or not np.isfinite(down_height) or down_height < 0:
+        return {**base, "stop_reason": "invalid radius or downward height"}
+    if abort_check and abort_check():
+        return {**base, "stop_reason": "cancelled"}
+
+    source = np.all(np.isfinite(xyz[:, :3]), axis=1) & np.isin(cls, list(from_classes))
+    if fence_mask is not None:
+        source &= np.asarray(fence_mask, dtype=bool)
+    candidates = np.flatnonzero(source)
+    if not len(candidates):
+        return base
+
+    tree = cKDTree(xyz[candidates, :2])
+    selected = np.zeros(len(candidates), dtype=bool)
+    vertex_xy = np.unique(np.vstack([line[:, :2] for line in lines]), axis=0)
+    for i, vertex in enumerate(vertex_xy):
+        if abort_check and abort_check():
+            return {**base, "stop_reason": "cancelled"}
+        nearby = tree.query_ball_point(vertex, r=float(radius))
+        if not nearby:
+            continue
+        local = np.asarray(nearby, dtype=np.intp)
+        z = xyz[candidates[local], 2]
+        top = float(np.max(z))
+        selected[local[z >= top - float(down_height)]] = True
+        if progress_cb and i % 100 == 0:
+            progress_cb(min(95, int(95 * (i + 1) / len(vertex_xy))),
+                        f"Checking centerline vertex {i + 1:,}/{len(vertex_xy):,}")
+
+    changed = candidates[selected].astype(np.intp, copy=False)
+    if abort_check and abort_check():
+        return {**base, "stop_reason": "cancelled"}
+    cls[changed] = int(to_class)
+    if progress_cb:
+        progress_cb(100, f"Classify by Centerline complete - {len(changed):,} points -> class {to_class}")
+    return {"routine": "classify_centerline_poles", "changed": int(len(changed)),
+            "indices": changed}
+
+
+
+class _CanvasLinePicker:
+    def _init_line_picker(self, row, label="Select CL"):
+        self._pick_active = False
+        self._pick_sources = []
+        self._selected_lines = {}
+        self._selected_line_actors = {}
+        self._hover_source = None
+        self.select_line_button = QPushButton(label)
+        self.select_line_button.setObjectName("selectClButton")
+        self.select_line_button.setCheckable(True)
+        self.select_line_button.setStyleSheet(
+            "QPushButton#selectClButton { background: #303238; color: #e8edf1; "
+            "border: 1px solid #555b61; padding: 5px 12px; }"
+            "QPushButton#selectClButton:hover { background: #41474d; }"
+            "QPushButton#selectClButton:checked { background: #087fc0; "
+            "color: white; border: 1px solid #22b4ee; }"
+            "QPushButton#selectClButton:checked:hover { background: #0994da; }"
+        )
+        self.select_line_button.toggled.connect(self._toggle_line_picker)
+        row.addWidget(self.select_line_button)
+
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(4)
+        header = QHBoxLayout()
+        self.picked_line_label = QLabel("No centerlines selected")
+        header.addWidget(self.picked_line_label, 1)
+        self.done_line_button = QPushButton("Done")
+        self.done_line_button.clicked.connect(lambda: self._toggle_line_picker(False))
+        self.done_line_button.hide()
+        header.addWidget(self.done_line_button)
+        panel_layout.addLayout(header)
+        self.selected_lines_list = QListWidget()
+        self.selected_lines_list.setFixedHeight(90)
+        self.selected_lines_list.setToolTip("Double-click a line to remove it")
+        self.selected_lines_list.itemDoubleClicked.connect(self._remove_selected_line_item)
+        panel_layout.addWidget(self.selected_lines_list)
+        self.remove_line_button = QPushButton("Remove selected")
+        self.remove_line_button.setEnabled(False)
+        self.remove_line_button.clicked.connect(self._remove_current_line)
+        self.selected_lines_list.currentItemChanged.connect(
+            lambda current, _previous: self.remove_line_button.setEnabled(current is not None))
+        panel_layout.addWidget(self.remove_line_button)
+        row.addWidget(panel, 1)
+
+    def _refresh_selected_lines(self):
+        self.selected_lines_list.clear()
+        for number, (key, source) in enumerate(self._selected_lines.items(), 1):
+            item = QListWidgetItem(f"Line {number}: {source['label']}")
+            item.setData(Qt.UserRole, number - 1)
+            item.setToolTip(source["label"])
+            self.selected_lines_list.addItem(item)
+        count = len(self._selected_lines)
+        self.selected_lines_list.setFixedHeight(min(180, max(90, count * 24 + 8)))
+        self.picked_line_label.setText(
+            f"{count} centerline{'s' if count != 1 else ''} selected"
+            if count else "No centerlines selected")
+
+    def _remove_selected_line_item(self, item):
+        if item is None:
+            return
+        index = item.data(Qt.UserRole)
+        keys = list(self._selected_lines)
+        if isinstance(index, int) and 0 <= index < len(keys):
+            self._remove_selected_line(keys[index])
+
+    def _remove_current_line(self):
+        self._remove_selected_line_item(self.selected_lines_list.currentItem())
+
+    def _remove_selected_line(self, key):
+        self._selected_lines.pop(key, None)
+        actor = self._selected_line_actors.pop(key, None)
+        if actor is not None:
+            digitizer = getattr(self.app, "digitizer", None)
+            if digitizer is not None:
+                digitizer._remove_actor_from_overlay(actor)
+        self._refresh_selected_lines()
+        self._render_selected_lines()
+
+    def _toggle_selected_line(self, source):
+        key = source["key"]
+        if key in self._selected_lines:
+            self._remove_selected_line(key)
+            return
+        self._selected_lines[key] = source
+        actor = _make_alignment_highlight_actor(self, source["coords"])
+        if actor is not None:
+            self._selected_line_actors[key] = actor
+        self._refresh_selected_lines()
+        self._render_selected_lines()
+
+    def _render_selected_lines(self):
+        try:
+            self.app.vtk_widget.render()
+        except Exception:
+            pass
+
+    def _deactivate_other_tools_for_line_pick(self):
+        app = self.app
+
+        def call(target, method, *args, **kwargs):
+            fn = getattr(target, method, None)
+            if callable(fn):
+                try:
+                    fn(*args, **kwargs)
+                except Exception as exc:
+                    print(f"Select CL could not deactivate {method}: {exc}")
+
+        if getattr(app, "cross_section_active", False):
+            call(app, "deactivate_cross_section_tool")
+        if getattr(app, "cut_section_mode_on", False):
+            call(app, "_deactivate_pending_cut_section_tool", "selecting centerline")
+        if getattr(app, "active_classify_tool", None) is not None:
+            call(app, "deactivate_classification_tool",
+                 preserve_cross_section=True, cancel_pending_brush=True)
+
+        digitizer = getattr(app, "digitizer", None)
+        element_select = getattr(digitizer, "_element_select_tool", None)
+        if (
+            getattr(digitizer, "active_tool", None) is not None
+            or getattr(getattr(digitizer, "accudraw_tool", None), "active", False)
+            or getattr(element_select, "_active", False)
+        ):
+            call(app, "_deactivate_digitize_tool")
+        else:
+            call(app, "_deactivate_selection_tools", "selecting centerline")
+
+        for name in ("measurement_tool", "zoom_rectangle_tool", "grid_tool",
+                     "temp_fence_tool", "point_sync_tool", "snt_layer_pick_tool"):
+            tool = getattr(app, name, None)
+            if tool is not None and (
+                getattr(tool, "active", False) or getattr(tool, "is_measuring", False)
+            ):
+                call(tool, "deactivate")
+        curve = getattr(app, "curve_tool", None)
+        if curve is not None and getattr(curve, "active", False):
+            if callable(getattr(curve, "suspend", None)):
+                call(curve, "suspend")
+            else:
+                call(curve, "deactivate")
+        call(app, "_deactivate_active_identification_tools_for_escape")
+        for attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
+            dialog = getattr(app, attr, None)
+            if dialog is not None and getattr(dialog, "_select_mode", False):
+                call(dialog, "close")
+
+    def _toggle_line_picker(self, active):
+        widget = getattr(self.app, "vtk_widget", None)
+        if widget is None:
+            self.select_line_button.blockSignals(True)
+            self.select_line_button.setChecked(False)
+            self.select_line_button.blockSignals(False)
+            return
+        active = bool(active)
+        if active == self._pick_active:
+            return
+        if active:
+            self._deactivate_other_tools_for_line_pick()
+        self._pick_active = active
+        self.select_line_button.blockSignals(True)
+        self.select_line_button.setChecked(active)
+        self.select_line_button.blockSignals(False)
+        self.done_line_button.setVisible(active)
+        application = QApplication.instance()
+        if active:
+            for attr in ("_find_wires_dlg", "_classify_by_centerline_dlg"):
+                other = getattr(self.app, attr, None)
+                if other is not None and other is not self and getattr(other, "_pick_active", False):
+                    other._toggle_line_picker(False)
+            self._pick_sources = _collect_alignment_sources(self.app)
+            self._prior_mouse_tracking = widget.hasMouseTracking()
+            self._prior_hover_events = widget.testAttribute(Qt.WA_Hover)
+            widget.setMouseTracking(True)
+            widget.setAttribute(Qt.WA_Hover, True)
+            if application is not None:
+                application.installEventFilter(self)
+            widget.setCursor(Qt.PointingHandCursor)
+            if hasattr(self.app, "statusBar"):
+                self.app.statusBar().showMessage(
+                    f"Select CL: click an SNT CL or drawing line ({len(self._pick_sources)} available); press Done when finished", 0)
+        else:
+            if application is not None:
+                application.removeEventFilter(self)
+            widget.setMouseTracking(getattr(self, "_prior_mouse_tracking", False))
+            widget.setAttribute(Qt.WA_Hover, getattr(self, "_prior_hover_events", False))
+            widget.setCursor(Qt.ArrowCursor)
+            self._hover_source = None
+            self._highlight_picked_line()
+            if hasattr(self.app, "statusBar"):
+                self.app.statusBar().showMessage("Select CL finished", 2000)
+
+    def _other_canvas_tool_active(self):
+        app = self.app
+        if getattr(app, "cross_section_active", False) or getattr(app, "cut_section_mode_on", False):
+            return True
+        if getattr(app, "active_classify_tool", None) is not None:
+            return True
+        digitizer = getattr(app, "digitizer", None)
+        if digitizer is not None and getattr(digitizer, "active_tool", None) is not None:
+            return True
+        for name in (
+            "measurement_tool", "identification_tool", "point_sync_tool",
+            "snt_layer_pick_tool", "select_rectangle_tool",
+            "zoom_rectangle_tool", "grid_tool", "curve_tool", "temp_fence_tool",
+        ):
+            tool = getattr(app, name, None)
+            if tool is not None and (
+                getattr(tool, "active", False) or getattr(tool, "is_measuring", False)
+            ):
+                return True
+        return False
+
+    def _line_at_event(self, event, tolerance=25.0):
+        digitizer = getattr(self.app, "digitizer", None)
+        renderer = getattr(digitizer, "renderer", None)
+        if renderer is None:
+            return None
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        widget = self.app.vtk_widget
+        mouse = np.array([float(pos.x()), float(widget.height() - pos.y())])
+        nearest = None
+        best = float(tolerance)
+        for source in self._pick_sources:
+            coords = source["coords"]
+            for p1, p2 in zip(coords[:-1], coords[1:]):
+                renderer.SetWorldPoint(float(p1[0]), float(p1[1]), float(p1[2]), 1.0)
+                renderer.WorldToDisplay()
+                a = np.asarray(renderer.GetDisplayPoint()[:2], dtype=float)
+                renderer.SetWorldPoint(float(p2[0]), float(p2[1]), float(p2[2]), 1.0)
+                renderer.WorldToDisplay()
+                b = np.asarray(renderer.GetDisplayPoint()[:2], dtype=float)
+                ab = b - a
+                length2 = float(ab @ ab)
+                t = float(np.clip(((mouse - a) @ ab) / length2, 0.0, 1.0)) if length2 > 0 else 0.0
+                distance = float(np.linalg.norm(mouse - (a + t * ab)))
+                if distance < best:
+                    best, nearest = distance, source
+        return nearest
+
+    def _highlight_picked_line(self):
+        source = self._hover_source
+        if source is None or source["key"] in self._selected_lines:
+            _clear_alignment_highlight(self)
+        else:
+            _show_alignment_highlight(self, source["coords"])
+
+    def eventFilter(self, obj, event):
+        if not getattr(self, "_pick_active", False):
+            return super().eventFilter(obj, event)
+        kind = event.type()
+        if self._other_canvas_tool_active():
+            self._toggle_line_picker(False)
+            return False
+        widget = getattr(self.app, "vtk_widget", None)
+        if kind == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            self._toggle_line_picker(False)
+            return True
+        if kind == QEvent.MouseButtonPress and obj is not widget:
+            if isinstance(obj, QWidget) and not (obj is self or self.isAncestorOf(obj)):
+                self._toggle_line_picker(False)
+            return False
+        if obj is not widget:
+            return False
+        if kind in (QEvent.MouseMove, QEvent.HoverMove):
+            source = self._line_at_event(event)
+            if source is not self._hover_source:
+                self._hover_source = source
+                self._highlight_picked_line()
+            return False
+        if kind == QEvent.Leave:
+            self._hover_source = None
+            self._highlight_picked_line()
+            return False
+        if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            source = self._line_at_event(event)
+            if source is not None:
+                self._hover_source = None
+                _clear_alignment_highlight(self)
+                self._toggle_selected_line(source)
+                return True
+            return False
+        return False
+
+    def _selected_lines_coords(self):
+        return [source["coords"].copy() for source in self._selected_lines.values()]
+
+    def _close_line_picker(self):
+        if getattr(self, "_pick_active", False):
+            self._toggle_line_picker(False)
+        _clear_alignment_highlight(self)
+        for key in list(self._selected_line_actors):
+            actor = self._selected_line_actors.pop(key)
+            digitizer = getattr(self.app, "digitizer", None)
+            if digitizer is not None:
+                digitizer._remove_actor_from_overlay(actor)
+        self._render_selected_lines()
+
+
+class FindWiresDialog(_CanvasLinePicker, _BaseClassifyDialog):
+    _persist_prefix = "find_wires"
+    _keep_visible_during_run = True
+
+    def __init__(self, app, parent=None):
+        super().__init__(app, "Find Wires", parent)
+        self.setWindowModality(Qt.NonModal)
+        self._build_ui()
+        self.setMinimumSize(520, 360)
+        self.resize(600, 420)
+
+    def _build_ui(self):
+        layout = self._content_layout
+        settings = QGroupBox("")
+        form = QFormLayout(settings)
+        form.setLabelAlignment(Qt.AlignRight)
+        from_row, self._get_from = _make_class_row(
+            self.app, [4], multi=True, persist_key=self._pk("from_class"), extended=True)
+        to_row, self._get_to = _make_class_row(
+            self.app, [14], multi=False, single_default=14, persist_key=self._pk("to_class"))
+        form.addRow("From class:", _w(from_row))
+        form.addRow("To class:", _w(to_row))
+        line_row = QHBoxLayout()
+        self._init_line_picker(line_row)
+        form.addRow("Centerline:", _w(line_row))
+
+        self.width_spin = QDoubleSpinBox()
+        self.width_spin.setDecimals(2)
+        self.width_spin.setRange(0.01, 1000.0)
+        self.width_spin.setSuffix(" m")
+        self.width_spin.setToolTip("Total corridor width, shared equally on both sides of the selected centerline")
+        self._persist_spin(self.width_spin, "corridor_width", 3.0)
+        form.addRow("Total width:", self.width_spin)
+
+        self.height_spin = QDoubleSpinBox()
+        self.height_spin.setDecimals(2)
+        self.height_spin.setRange(0.0, 1000.0)
+        self.height_spin.setSuffix(" m")
+        self.height_spin.setToolTip("Minimum height above the nearest class-2 ground point")
+        self._persist_spin(self.height_spin, "height_above_ground", 15.0)
+        form.addRow("Height above ground:", self.height_spin)
+        layout.addWidget(settings)
+        layout.addStretch()
+        self._make_buttons()
+
+    def closeEvent(self, event):
+        self._close_line_picker()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._close_line_picker()
+        super().reject()
+
+    def _on_ok(self):
+        alignments = self._selected_lines_coords()
+        if not alignments:
+            QMessageBox.warning(self, "No Centerline", "Select an SNT CL or drawing line in the view first.")
+            return
+        data = getattr(self.app, "data", None)
+        classes = data.get("classification") if isinstance(data, dict) else None
+        if classes is not None and not np.any(np.asarray(classes) == 2):
+            QMessageBox.warning(self, "No Ground", "Class-2 ground points are required to measure height above ground.")
+            return
+        self._run_algorithm(classify_find_wires, {
+            "from_classes": self._get_from(),
+            "to_class": self._get_to()[0],
+            "alignment_coords": alignments,
+            "corridor_width": self.width_spin.value(),
+            "min_height_above_ground": self.height_spin.value(),
+        }, "Find Wires")
+
+
+class ClassifyByCenterlineDialog(_CanvasLinePicker, _BaseClassifyDialog):
+    _persist_prefix = "classify_centerline"
+    _keep_visible_during_run = True
+
+    def __init__(self, app, parent=None):
+        super().__init__(app, "Classify by Centerline", parent)
+        self.setWindowModality(Qt.NonModal)
+        self._build_ui()
+        self.setMinimumSize(520, 360)
+        self.resize(600, 420)
+
+    def _build_ui(self):
+        layout = self._content_layout
+        settings = QGroupBox("")
+        form = QFormLayout(settings)
+        form.setLabelAlignment(Qt.AlignRight)
+        from_row, self._get_from = _make_class_row(
+            self.app, [3, 4], multi=True, persist_key=self._pk("from_class"), extended=True)
+        to_row, self._get_to = _make_class_row(
+            self.app, [16], multi=False, single_default=16, persist_key=self._pk("to_class"))
+        form.addRow("From class:", _w(from_row))
+        form.addRow("To class:", _w(to_row))
+        line_row = QHBoxLayout()
+        self._init_line_picker(line_row)
+        form.addRow("Centerline:", _w(line_row))
+
+        self.radius_spin = QDoubleSpinBox()
+        self.radius_spin.setDecimals(2)
+        self.radius_spin.setRange(0.01, 1000.0)
+        self.radius_spin.setSuffix(" m")
+        self.radius_spin.setToolTip("Horizontal radius around each vertex of the selected centerline")
+        self._persist_spin(self.radius_spin, "vertex_radius", 1.0)
+        form.addRow("Vertex radius:", self.radius_spin)
+
+        self.depth_spin = QDoubleSpinBox()
+        self.depth_spin.setDecimals(2)
+        self.depth_spin.setRange(0.0, 1000.0)
+        self.depth_spin.setSuffix(" m")
+        self.depth_spin.setToolTip("Classify downward from the highest source-class point within each vertex radius")
+        self._persist_spin(self.depth_spin, "down_height", 5.0)
+        form.addRow("Height down from top:", self.depth_spin)
+        layout.addWidget(settings)
+        layout.addStretch()
+        self._make_buttons()
+
+    def closeEvent(self, event):
+        self._close_line_picker()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._close_line_picker()
+        super().reject()
+
+    def _on_ok(self):
+        centerlines = self._selected_lines_coords()
+        if not centerlines:
+            QMessageBox.warning(self, "No Centerline", "Select an SNT CL or drawing line in the view first.")
+            return
+        self._run_algorithm(classify_poles_by_centerline, {
+            "from_classes": self._get_from(),
+            "to_class": self._get_to()[0],
+            "centerline_coords": centerlines,
+            "radius": self.radius_spin.value(),
+            "down_height": self.depth_spin.value(),
+        }, "Classify by Centerline")
+
 # PUBLIC API  — restore-aware open helpers
 # ═══════════════════════════════════════════════════════════════════════
 def _open_or_restore(app, attr: str, cls):
@@ -6394,3 +7873,9 @@ def open_classify_below_surface(app):
         '_classify_below_surface_dlg',
         ClassifyBelowSurfaceDialog,
     )
+
+def open_find_wires(app):
+    return _open_or_restore(app, '_find_wires_dlg', FindWiresDialog)
+
+def open_classify_by_centerline(app):
+    return _open_or_restore(app, '_classify_by_centerline_dlg', ClassifyByCenterlineDialog)

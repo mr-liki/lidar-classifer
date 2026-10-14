@@ -60,6 +60,28 @@ layout(push_constant) uniform PushConstant {
 
 layout(location = 0) out vec4 outColor;
 
+#ifdef CRISP_INDEXED
+layout(location = 3) flat in uint vTriangleBase;
+// ---------------------------------------------------------------------------
+// COMPACT CRISP VARIANT (compiled from this same file with -DCRISP_INDEXED into
+// surface_crisp_indexed.frag.spv). The mesh is drawn ONCE from shared vertices
+// (position + class colour) and one index buffer - ~28 B per point instead of
+// the 96 B per triangle the two-pass soup needs - so a 50M-point full-detail
+// cut fits a 4 GB GPU. Per fragment, the triangle's three vertices are fetched
+// by gl_PrimitiveID, which gives back exactly what the two passes had:
+//   * the flat face normal (cross(p1 - p0, p2 - p0), same render-space floats),
+//   * "mixed" = the three display colours differ -> PASS 2 (mode 5) with the
+//     interpolated per-vertex colour; otherwise PASS 1 (mode 4) with vertex 0's
+//     colour, i.e. _build_crisp_base_face_colors / the blend overlay.
+layout(set = 1, binding = 0, std430) readonly buffer CrispIndices { uint crispIdx[]; };
+layout(set = 1, binding = 1, std430) readonly buffer CrispPositions { float crispPos[]; };
+layout(set = 1, binding = 2, std430) readonly buffer CrispColors { uint crispCol[]; };
+
+vec3 crispVertex(uint i) {
+    return vec3(crispPos[3u * i], crispPos[3u * i + 1u], crispPos[3u * i + 2u]);
+}
+#endif
+
 // ---- constants mirrored from gui/shading_display.py ------------------------
 const float SHARP_LEGACY_MAX = 90.0;              // _SHADING_SHARPNESS_LEGACY_MAX
 const float SHARP_MAX = 999.0;                    // _SHADING_SHARPNESS_MAX
@@ -181,6 +203,22 @@ void main() {
     int mode = int(pc.elevRangeMode.z + 0.5);
     int stage = int(pc.shadeParamsB.z + 0.5);
     vec3 albedo = vColor.rgb;
+#ifdef CRISP_INDEXED
+    vec3 crispFaceNormal;
+    {
+        const uint t = uint(gl_PrimitiveID) + vTriangleBase;
+        const uint i0 = crispIdx[3u * t], i1 = crispIdx[3u * t + 1u], i2 = crispIdx[3u * t + 2u];
+        const vec3 p0 = crispVertex(i0);
+        // Same as the soup upload's CPU face normal: a degenerate face reads as +Z.
+        vec3 c = cross(crispVertex(i1) - p0, crispVertex(i2) - p0);
+        crispFaceNormal = length(c) < 1e-12 ? vec3(0.0, 0.0, 1.0) : c;
+        const uint c0 = crispCol[i0] & 0x00ffffffu;
+        const bool mixedFace = c0 != (crispCol[i1] & 0x00ffffffu) ||
+                               c0 != (crispCol[i2] & 0x00ffffffu);
+        mode = mixedFace ? 5 : 4;
+        if (!mixedFace) albedo = unpackUnorm4x8(crispCol[i0]).rgb;
+    }
+#endif
 
     if (mode == 3) {              // colours already fully baked by the CPU
         outColor = vec4(present(albedo), 1.0);
@@ -191,7 +229,11 @@ void main() {
     if (mode == 0) {
         n = normalize(cross(dFdx(vLocalPos), dFdy(vLocalPos)));
     } else if (mode == 4 || mode == 5) {
+#ifdef CRISP_INDEXED
+        n = faceNormal(crispFaceNormal);
+#else
         n = faceNormal(vNormal);   // flat cell normal + the CPU hemisphere fix
+#endif
     } else {
         n = normalize(vNormal);
     }

@@ -84,8 +84,8 @@ def _runtime_self_check(win):
     mods = {
         "app_window": _mod("gui.app_window"),
         "render_backend": _mod("gui.render_backend"),
-        "stream_manager": _mod("gui.naksha_cache.stream_manager"),
-        "app_streaming": _mod("gui.naksha_cache.app_streaming"),
+        "lnt_native": _mod("gui.lnt_native"),
+        "lnt_open": _mod("gui.lnt_open"),
         "zoom_navigation": _mod("gui.zoom_navigation"),
     }
     root_norm = os.path.normcase(PROJECT_ROOT)
@@ -171,7 +171,8 @@ def _runtime_self_check(win):
           f"{'render_backend._VulkanSurfaceWidget' if _vk_vis else 'app_window vtk_widget'}")
     print(f"  camera input owner:     gui/app_window.py")
     print(f"  camera mirror owner:    gui/render_backend.py")
-    print(f"  stream manager:         gui/naksha_cache/stream_manager.py")
+    print(f"  point loader:           gui/lnt_open.py")
+    print(f"  surface LOD:            native/lnt/include/LNTSurfaceLod.h")
 
     print("[NAKSHA BUILD]")
     print(f"  python_build: {PROJECT_ROOT}")

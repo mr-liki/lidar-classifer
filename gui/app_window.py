@@ -28,7 +28,7 @@ from .session_manager import SESSION
 from gui.minimize_chip import MinimizableDialogMixin, close_all_chips
 
 
-# âœ… imports from your project
+# ✅ imports from your project
 from .views import set_view
 from .cross_section.cut_section_controller import CutSectionController
 from .cross_section.interactor_slice import CrossSectionInteractor
@@ -43,7 +43,7 @@ from .clear_project import clear_project, clear_point_cloud
 from .shortcut_manager import ShortcutManager
 from .global_shortcuts import GlobalShortcutFilter
 from gui.digitize_tools import DigitizeManager
-from .classification_fast import UltraFastClassifier  # âœ… CORRECT - relative import
+from .classification_fast import UltraFastClassifier  # ✅ CORRECT - relative import
 from PySide6.QtWidgets import QApplication
 from .spatial_index import build_spatial_index_auto
 from pyproj import CRS  
@@ -89,10 +89,10 @@ def patch_pyvistaqt_close():
         
         # Replace close method
         QtInteractor.close = safe_close
-        print("âœ… PyVistaQt close() method patched")
+        print("✅ PyVistaQt close() method patched")
         
     except Exception as e:
-        print(f"âš ï¸ PyVistaQt patch failed (not critical): {e}")
+        print(f"⚠️ PyVistaQt patch failed (not critical): {e}")
 
 # Apply patch immediately
 patch_pyvistaqt_close()
@@ -143,11 +143,11 @@ class MainWheelZoomEventFilter(QObject):
         # release instead of leaking an unmatched release into VTK.
         self._owns_main_pan = False
         self._owned_main_pan_button = None
-        # Nakshatech-style "tap-tap" (dynamic) pan state: one tap starts
+        # MicroStation-style "tap-tap" (dynamic) pan state: one tap starts
         # panning, the view follows the cursor without holding any button,
         # and a second tap / Esc / right-click ends it. The toggle flips on
-        # PRESS, unconditionally - matching Nakshatech's own toggle-pan,
-        # confirmed against Nakshatech's docs (state flips on the button-down
+        # PRESS, unconditionally - matching MicroStation's own toggle-pan,
+        # confirmed against Bentley's docs (state flips on the button-down
         # itself, no distance/timing check). No press-position or arm-time
         # tracking is needed for that model.
         self._tap_session = False
@@ -246,6 +246,10 @@ class MainWheelZoomEventFilter(QObject):
         for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
             dialog = getattr(app, dialog_attr, None)
             if dialog is not None and getattr(dialog, "_select_mode", False):
+                return True
+        for dialog_attr in ("_find_wires_dlg", "_classify_by_centerline_dlg"):
+            dialog = getattr(app, dialog_attr, None)
+            if dialog is not None and getattr(dialog, "_pick_active", False):
                 return True
         return False
 
@@ -386,11 +390,11 @@ class MainWheelZoomEventFilter(QObject):
                                 self._finish_tap_session(app)
                             return False
                         if self._tap_session:
-                            # Second tap immediately ends the Nakshatech-
+                            # Second tap immediately ends the MicroStation-
                             # style pan. No distance/timing check: real
-                            # Nakshatech flips its toggle-pan state on
+                            # MicroStation flips its toggle-pan state on
                             # every button-down, unconditionally (confirmed
-                            # against Nakshatech's own docs) - trying to infer
+                            # against Bentley's own docs) - trying to infer
                             # "was that really a deliberate second tap" from
                             # movement or timing was the source of every
                             # tap-tap bug this session chased (DblClick
@@ -440,7 +444,7 @@ class MainWheelZoomEventFilter(QObject):
                     if pan_button is None:
                         return False
                     if self._tap_session:
-                        # Nakshatech dynamic pan: no button needs to stay
+                        # MicroStation dynamic pan: no button needs to stay
                         # held - the view keeps following the cursor until the
                         # second tap / Esc / right-click / key ends the
                         # session. Tap-Tap arms this at press time (see the
@@ -838,24 +842,24 @@ class _VTKCrosshair:
     """VTK-native crosshair drawn as a 2D overlay actor in display coords.
 
     Uses the same coordinate space as interactor.GetEventPosition(),
-    so there is zero Qt â†” VTK coordinate translation.
+    so there is zero Qt ↔ VTK coordinate translation.
     """
 
     def __init__(self, renderer):
         self._renderer = renderer
 
-        # 4 points â†’ 2 line segments (H + V)
+        # 4 points → 2 line segments (H + V)
         self._points = vtk.vtkPoints()
         self._points.SetNumberOfPoints(4)
         for i in range(4):
             self._points.SetPoint(i, 0, 0, 0)
 
         lines = vtk.vtkCellArray()
-        # horizontal line: point 0 â†’ 1
+        # horizontal line: point 0 → 1
         lines.InsertNextCell(2)
         lines.InsertCellPoint(0)
         lines.InsertCellPoint(1)
-        # vertical line: point 2 â†’ 3
+        # vertical line: point 2 → 3
         lines.InsertNextCell(2)
         lines.InsertCellPoint(2)
         lines.InsertCellPoint(3)
@@ -910,10 +914,10 @@ class _VTKCrosshair:
             pass
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════
 #  ADD THIS CLASS RIGHT BEFORE "class NakshaApp(QMainWindow):"
 #  (after the _VTKCrosshair class, around line 178)
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# ═══════════════════════════════════════════════════════════════════════
 
 class _CRSStatusClickFilter(QObject):
     """Make the footer CRS badge a discoverable project-CRS control."""
@@ -1036,9 +1040,9 @@ class _BackupWorker(QThread):
             try:
                 import pyproj
                 if self._crs_wkt:
-                    header.parse_crs(pyproj.CRS.from_wkt(self._crs_wkt))
+                    header.add_crs(pyproj.CRS.from_wkt(self._crs_wkt))
                 elif self._crs_epsg:
-                    header.parse_crs(pyproj.CRS.from_epsg(self._crs_epsg))
+                    header.add_crs(pyproj.CRS.from_epsg(self._crs_epsg))
             except Exception:
                 pass
 
@@ -1107,45 +1111,45 @@ class NakshaApp(QMainWindow):
             from gui.app_icon import apply_window_icon, resolve_app_icon_path
 
             if apply_window_icon(self):
-                print(f"âœ… Window icon loaded: {resolve_app_icon_path()}")
+                print(f"✅ Window icon loaded: {resolve_app_icon_path()}")
             else:
-                print("âš ï¸ Window icon not found in known icon locations")
+                print("⚠️ Window icon not found in known icon locations")
         except Exception as e:
-            print(f"âš ï¸ Failed to set window icon: {e}")
+            print(f"⚠️ Failed to set window icon: {e}")
             import traceback
             traceback.print_exc()
  
         # ===== GPU SUPPORT INITIALIZATION =====
         from gui.gpu_support import init_gpu_support
         gpu_support = init_gpu_support()
-        print(f"ðŸ–¥ï¸ Rendering backend: {gpu_support.rendering_backend}")
+        print(f"🖥️ Rendering backend: {gpu_support.rendering_backend}")
  
         # ===== GPU RENDER OPTIMIZATION =====
         from gui.gpu_render_manager import GPURenderManager
         self.gpu_render_manager = GPURenderManager(self)
         self.gpu_render_manager.install()
 
-        # Phase 4: Global Signal Bus â€” connect classification_finished
+        # Phase 4: Global Signal Bus — connect classification_finished
         self.classification_finished.connect(self._on_classification_finished)
  
-        # âœ… NEW: Auto-configure render delay based on GPU
+        # ✅ NEW: Auto-configure render delay based on GPU
         recommended_delay = gpu_support.get_recommended_render_delay()
         self.gpu_render_manager.set_render_delay(recommended_delay)
-        print(f"â±ï¸  Render delay: {recommended_delay}ms (auto-configured for {gpu_support.gpu_name})")
+        print(f"⏱️  Render delay: {recommended_delay}ms (auto-configured for {gpu_support.gpu_name})")
  
-        # âœ… Load theme FIRST
+        # ✅ Load theme FIRST
         try:
             from gui.theme_manager import ThemeManager
             saved_theme = ThemeManager.load_saved_theme()
             ThemeManager.apply_theme(self, saved_theme)
         except Exception as e:
-            print(f"âš ï¸ Failed to apply theme: {e}")
+            print(f"⚠️ Failed to apply theme: {e}")
 
         self._compact_dock_separator_style = _CompactDockSeparatorStyle()
         self.setStyle(self._compact_dock_separator_style)
  
         # Settings
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
         self.settings = settings 
         self.default_cut_width = settings.value("cut_section_width", 2.0, type=float)
         self.zoom_behavior = settings.value("view_zoom_behavior", "cursor", type=str)
@@ -1161,18 +1165,12 @@ class NakshaApp(QMainWindow):
         # Re-armed by the Pan tool shortcut, an explicit settings save, or restart.
         self._pan_nav_suspended_button = None
 
-        # â”€â”€ Smooth (eased) mouse-wheel zoom state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Smooth (eased) mouse-wheel zoom state ──────────────────────────
         # Each wheel notch nudges a *target* zoom multiplier; a short-lived
         # timer eases the camera toward it in bounded steps so zoom stays
         # responsive even when the main actor contains tens of millions of
         # points.
         self._zoom_target_factor = 1.0      # accumulated product of pending notches
-        # PART 11/14: camera transaction + pan scale lock.
-        # True while a Naksha pan/zoom handler is writing the camera, so the
-        # VTK ModifiedEvent observer cannot start a second change; the pan lock
-        # holds the ParallelScale that was current at pan start.
-        self._camera_mutation_in_progress = False
-        self._pan_lock_scale = None
         self._zoom_anim_timer = None        # QTimer driving the easing loop
         self._zoom_anim_active = False
         self._zoom_anchor_pending = None    # (anchor_world) for picked_point mode
@@ -1219,7 +1217,7 @@ class NakshaApp(QMainWindow):
             self.setWindowTitle("NakshaAI-Lidar [CPU Mode]")
        
         self.resize(1400, 900)  # Bigger window
-        # âœ… ADD THESE 3 LINES HERE:
+        # ✅ ADD THESE 3 LINES HERE:
         self._canvas_cursor_filter = CanvasCursorEventFilter(self)
         self._canvas_tool_cursor = self._create_canvas_tool_cursor()
         self._cursor_state = False
@@ -1230,7 +1228,7 @@ class NakshaApp(QMainWindow):
         # The cached GeoTIFFs back the Edit-ribbon preview and export actions.
         self.elevation_models = {}
         self._elevation_model_jobs = {}
-        self.display_mode = "neutral"
+        self.display_mode = "rgb"
         self.section_controller = SectionController(self)
         self.active_mode = None          
         self.last_classify_tool = None
@@ -1239,14 +1237,6 @@ class NakshaApp(QMainWindow):
         self.current_view = "top"
         self.class_palette = {}
         self.view_palettes = {}     # per-view palette isolation
-        # Load-state marker surfaced during dataset bring-up; see
-        # _set_loading_state(). "IDLE" until a load starts.
-        self._vulkan_loading_state = "IDLE"
-        # DATA STATE MACHINE: EMPTY -> LOADING -> FIRST_FRAME_READY -> READY.
-        # Distinct from _vulkan_loading_state (a human-readable stage label).
-        # The loading overlay may ONLY be shown while this is LOADING.
-        self._data_state = "EMPTY"
-        self._last_startup_ptc = ""
 
         self.is_3d_mode = False
         # Persistent authority for perspective/orbit mode. This is set only
@@ -1292,7 +1282,7 @@ class NakshaApp(QMainWindow):
         self.dwg_actors      = []   # Store DWG VTK actor groups
         self.dwg_dialog      = None # DWG dialog reference
  
-        # â”€â”€ SNT state (mirrors DWG pattern exactly) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── SNT state (mirrors DWG pattern exactly) ──────────────
         self.snt_attachments = []        # Store SNT attachment metadata
         self.snt_actors = []             # Store SNT VTK actor groups
         self.snt_dialog = None           # SNT dialog reference
@@ -1309,23 +1299,14 @@ class NakshaApp(QMainWindow):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
 
-        # self.frame is the REAL central-viewport widget: it is added to
-        # self.splitter below, which is nested (via _create_menus()) inside
-        # main_row -> container, alongside top_bar/ribbon_container, and is
-        # what properly constrains it to the area under the ribbon/toolbar
-        # and above the status bar. An earlier round introduced an extra
-        # "viewport_container" QWidget + QStackedLayout wrapper here that
-        # measured as covering the FULL main window instead of just this
-        # cell (root cause unconfirmed - an isolated repro of the same
-        # pattern did NOT reproduce it, but the live measurement did) - so
-        # that wrapper is gone. self.viewport_container is kept as a plain
-        # alias to self.frame so any code/diagnostics written against that
-        # name keep working; it is not a separate widget any more.
         self.vtk_widget = QtInteractor(self.frame)
+        # The native .lnt loader attaches to this owner's Vulkan viewport.
+        # Create it once with the main widget, before any file can be opened.
+        from gui.render_backend import AppRenderBackendOwner
+        self.render_backend = AppRenderBackendOwner(self, self.vtk_widget)
         self._setup_interactor_swapper(self.vtk_widget.interactor)
         self.layout.addWidget(self.vtk_widget.interactor)
-        self.viewport_container = self.frame
-        # âœ… Disable double-click switching to 3D on MAIN viewer only
+        # ✅ Disable double-click switching to 3D on MAIN viewer only
         if not hasattr(self, "_disable_3d_dblclick_filter"):
             self._disable_3d_dblclick_filter = Disable3DDoubleClickFilter(self)
 
@@ -1350,18 +1331,8 @@ class NakshaApp(QMainWindow):
             iren = self.vtk_widget.interactor
             iren.AddObserver("KeyPressEvent", self._on_main_interactor_keypress)
         except Exception as e:
-            print(f"âš ï¸ Failed to install ESC observer: {e}")
-
-        # â”€â”€ Render backend owner (VTK default; NAKSHA_RENDER_BACKEND=vulkan
-        # opt-in). Never allowed to affect startup: any exception here is
-        # caught and logged, the app continues on the existing VTK path.
-        self.render_backend = None
-        try:
-            from gui.render_backend import AppRenderBackendOwner
-            self.render_backend = AppRenderBackendOwner(self, self.vtk_widget)
-        except Exception as _rb_err:
-            print(f"âš ï¸ Render backend owner init skipped (VTK unaffected): {_rb_err}")
-
+            print(f"⚠️ Failed to install ESC observer: {e}")
+        
 
         self.section_frame = QWidget()
         self.section_layout = QVBoxLayout(self.section_frame)
@@ -1389,60 +1360,12 @@ class NakshaApp(QMainWindow):
         self.section_frame.hide()          # hide right panel initially
         self.setCentralWidget(self.splitter)
 
-        # â”€â”€ Native Vulkan viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Default (no env vars set): VTK stays the ONLY visible viewport,
-        # every overlay (SNT/digitizer/grid/measurements/text/vectors) stays
-        # intact. This was restored this round to the last user-approved
-        # state after a prior cut-off session had silently flipped the
-        # default to Vulkan-hides-VTK - see vulkan_viewport_enabled()'s
-        # docstring in gui/render_backend.py for the full change note.
-        #   NAKSHA_VULKAN_PREVIEW=1       -> legacy side-by-side split (VTK
-        #                                     left with ALL overlays, Vulkan
-        #                                     right in its own pane)
-        #   NAKSHA_VULKAN_MAIN_VIEWPORT=1 -> explicit opt-in: Vulkan becomes
-        #                                     THE main viewport (opaque HWND
-        #                                     raised over the VTK slot). VTK
-        #                                     itself is NOT hidden - only its
-        #                                     LiDAR actors are switched off,
-        #                                     so ribbons/menus/overlays keep
-        #                                     rendering underneath.
-        try:
-            from gui.render_backend import (
-                preview_enabled as _vulkan_preview_enabled,
-                vulkan_viewport_enabled as _vulkan_viewport_enabled,
-            )
-            _rb = getattr(self, "render_backend", None)
-            if _rb is not None:
-                if _vulkan_preview_enabled():
-                    _rb.setup_split_preview()
-                elif _vulkan_viewport_enabled():
-                    # Do NOT create/rebind the Vulkan swapchain here. At this
-                    # point in __init__ the window has not been shown AND the
-                    # Naksha chrome is still being assembled further down this
-                    # same method (ribbon, toolbar, status bar and the
-                    # setCentralWidget(container) re-parent happen AFTER this
-                    # line). Installing here would attach the surface to a
-                    # viewer host that still spans the whole window, which is
-                    # what produced a full-window black area and a swapchain
-                    # at the wrong extent.
-                    #
-                    # Only record the request; showEvent() performs the
-                    # install once the window is up and the layout settled.
-                    self._vulkan_main_viewport_requested = True
-                else:
-                    print("[render_backend] Vulkan viewport takeover NOT requested "
-                          "(default) - VTK is the visible main viewport, all overlays "
-                          "intact. Set NAKSHA_VULKAN_PREVIEW=1 for the split preview or "
-                          "NAKSHA_VULKAN_MAIN_VIEWPORT=1 to opt into full takeover.")
-        except Exception as _pv_err:
-            print(f"âš ï¸ Vulkan viewport setup skipped (VTK unaffected): {_pv_err}")
-
         # VTK widget exists now: ensure GPU render hooks that were deferred
         # during early app bootstrap are installed.
         if hasattr(self, "gpu_render_manager") and self.gpu_render_manager is not None:
             self.gpu_render_manager.install()
         
-        # âœ… Load backup settings and start timer
+        # ✅ Load backup settings and start timer
 
         # Set default view
         set_view(self, "top")
@@ -1452,9 +1375,9 @@ class NakshaApp(QMainWindow):
         self.section_vtks = {}      # QtInteractor objects per view
         self.cross_action = None
         self.current_saturation = 1.0   # 100% = normal
-        self.current_sharpness = 1.0  # Amplifier removed â€” always 1.0 (no scaling)
+        self.current_sharpness = 1.0  # Amplifier removed — always 1.0 (no scaling)
 
-        # â”€â”€ Nakshatech-style display stretch defaults â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── MicroStation-style display stretch defaults ─────────────────
         self.current_saturation = 1.0
         self.current_sharpness = 1.0
 
@@ -1498,10 +1421,10 @@ class NakshaApp(QMainWindow):
         self._main_view_2d_locked = True
         self._install_main_view_2d_policy_guard()
         # self.vtk_widget.interactor.AddObserver("RightButtonPressEvent", self.on_grid_label_right_click)
-        print("âœ… Grid label detection enabled (right-click)")
+        print("✅ Grid label detection enabled (right-click)")
         
 
-        print("ðŸ”’ Main viewer locked to 2D Plan View")
+        print("🔒 Main viewer locked to 2D Plan View")
 
         
 
@@ -1509,14 +1432,14 @@ class NakshaApp(QMainWindow):
         # 1. CREATE shortcuts dict FIRST
         # ========================================================================
         self.shortcuts = {}
-        print("ðŸ” Initializing shortcuts dict")
+        print("🔍 Initializing shortcuts dict")
 
         # ========================================================================
         # 2. REGISTER Shift+1, Shift+2 FIRST (before filter)
         # ========================================================================
         self.shortcuts[('shift', '!')] = {'tool': 'cut_section', 'from': None, 'to': None}
         self.shortcuts[('shift', '@')] = {'tool': 'cut_section_nested', 'from': None, 'to': None}
-        print("âœ… Shift+1='cut_section', Shift+2='cut_section_nested' REGISTERED")
+        print("✅ Shift+1='cut_section', Shift+2='cut_section_nested' REGISTERED")
 
         # ========================================================================
         # 3. CREATE GlobalShortcutFilter AFTER shortcuts exist
@@ -1524,7 +1447,7 @@ class NakshaApp(QMainWindow):
         from .global_shortcuts import GlobalShortcutFilter
 
         self.short_cut_filter = GlobalShortcutFilter(self)
-        print("âœ… GlobalShortcutFilter created")
+        print("✅ GlobalShortcutFilter created")
 
         # ========================================================================
         # 4. INSTALL filter SAFELY
@@ -1532,12 +1455,12 @@ class NakshaApp(QMainWindow):
         self.installEventFilter(self.short_cut_filter)
         if hasattr(self, 'vtk_widget') and self.vtk_widget and hasattr(self.vtk_widget, 'interactor'):
             self.vtk_widget.interactor.installEventFilter(self.short_cut_filter)
-            print("âœ… Filter installed on VTK interactor")
+            print("✅ Filter installed on VTK interactor")
         else:
-            print("âš ï¸ VTK widget not ready - will retry")
+            print("⚠️ VTK widget not ready - will retry")
             QTimer.singleShot(1000, self._install_vtk_filter)
 
-        print("ðŸ” ALL SHORTCUTS:", {k: v['tool'] for k, v in self.shortcuts.items()})
+        print("🔍 ALL SHORTCUTS:", {k: v['tool'] for k, v in self.shortcuts.items()})
               
         if not hasattr(self, 'brush_radius'):
                     self.brush_radius = 1.0  # World units (for classification)
@@ -1550,7 +1473,7 @@ class NakshaApp(QMainWindow):
 # ===================================================================================================================================
         from PySide6.QtCore import QMutex
         self._render_mutex = QMutex()
-        print("âœ… Render mutex initialized")
+        print("✅ Render mutex initialized")
 
         # ===== INITIALIZE DIGITIZER =====
         from gui.digitize_tools import DigitizeManager
@@ -1559,45 +1482,45 @@ class NakshaApp(QMainWindow):
         from gui.scene_render_pipeline import ensure_scene_render_pipeline
         ensure_scene_render_pipeline(self)
         self._install_canvas_axis_render_observer()
-        print("âœ… Digitizer initialized")   
+        print("✅ Digitizer initialized")   
         
         # ===== GRID LABEL HYPERLINK SYSTEM =====
         from gui.grid_label_system import add_grid_label_system_to_app
         add_grid_label_system_to_app(self)
-        print("âœ… Grid label hyperlink system initialized")
+        print("✅ Grid label hyperlink system initialized")
 
         from gui.select_rectangle_tool import SelectRectangleTool
         self.select_rectangle_tool = SelectRectangleTool(self)
-        print("âœ… Select Rectangle tool initialized")           
+        print("✅ Select Rectangle tool initialized")           
         
         # ----------------------------------------------------------------------------------------------------------------------------------
         from gui.measurement_tools import MeasurementTool
         self.measurement_tool = MeasurementTool(self.digitizer)
-        print("âœ… Measurement tool initialized")
+        print("✅ Measurement tool initialized")
 
         from gui.identification_tool import IdentificationTool
         self.identification_tool = IdentificationTool(self)
-        print("âœ… Identification tool initialized")
+        print("✅ Identification tool initialized")
 
         from gui.cross_section_measurement_tool import CrossSectionMeasurementTool
         self.cross_section_measurement_tool = CrossSectionMeasurementTool(self)
-        print("âœ… Cross-section measurement tool initialized")
+        print("✅ Cross-section measurement tool initialized")
 
         from gui.point_sync_tool import PointSyncTool
         self.point_sync_tool = PointSyncTool(self)
-        print("âœ… Point sync tool initialized")
+        print("✅ Point sync tool initialized")
 
         from gui.snt_layer_pick_tool import SNTLayerPickTool
         self.snt_layer_pick_tool = SNTLayerPickTool(self)
-        print("âœ… SNT layer pick tool initialized")
+        print("✅ SNT layer pick tool initialized")
 
         from gui.zoom_rectangle_tool import ZoomRectangleTool
         self.zoom_rectangle_tool = ZoomRectangleTool(self)
-        print("âœ… Zoom rectangle tool initialized")
+        print("✅ Zoom rectangle tool initialized")
 
         from gui.curve_tools import CurveTool
         self.curve_tool = CurveTool(self)
-        print("âœ… Curve tool initialized") 
+        print("✅ Curve tool initialized") 
 
         # ===== CREATE MENUS FIRST =====
         self._create_menus()
@@ -1611,12 +1534,12 @@ class NakshaApp(QMainWindow):
         try:
             self.plugin_manager.load_all()
         except Exception as e:
-            print(f"âš ï¸ Failed to load startup plugins: {e}")
+            print(f"⚠️ Failed to load startup plugins: {e}")
                 
         # ========================================
         # TEST BORDER CONNECTION - after ribbon_manager setup
         # ========================================
-        # âœ… Performance monitoring
+        # ✅ Performance monitoring
 
 
         self._perf_timers = {}
@@ -1629,7 +1552,7 @@ class NakshaApp(QMainWindow):
             """End timing and print result."""
             if name in self._perf_timers:
                 elapsed = (time.time() - self._perf_timers[name]) * 1000
-                print(f"â±ï¸ {name}: {elapsed:.1f}ms")
+                print(f"⏱️ {name}: {elapsed:.1f}ms")
                 del self._perf_timers[name]
 
         # Attach to app
@@ -1809,21 +1732,6 @@ class NakshaApp(QMainWindow):
 
         self.status.addPermanentWidget(self.epsg_widget)
 
-        # Render backend status indicator (Vulkan/VTK) - single small label,
-        # reads AppRenderBackendOwner as the sole source of truth (see
-        # gui/render_backend.py BackendState). Polled on a lightweight timer
-        # rather than wired via Qt signals, since render_backend.py is
-        # deliberately Qt-signal-free / decoupled from app_window.py.
-        self.render_backend_status_label = QLabel("VTK â€¢ FALLBACK")
-        self.render_backend_status_label.setObjectName("renderBackendStatusLabel")
-        self.render_backend_status_label.setToolTip("Render backend: VTK/PyVista")
-        self.status.addPermanentWidget(self.render_backend_status_label)
-        self._update_render_backend_status_label()
-        self._render_backend_status_timer = QTimer(self)
-        self._render_backend_status_timer.setInterval(1000)
-        self._render_backend_status_timer.timeout.connect(self._update_render_backend_status_label)
-        self._render_backend_status_timer.start()
-
         # Hook up mouse scrolling to update the magnifier UI smoothly
         def _sync_magnifier_from_scroll(obj, event):
             if not hasattr(self, "_current_zoom_level"):
@@ -1845,13 +1753,9 @@ class NakshaApp(QMainWindow):
             self.vtk_widget.interactor.AddObserver("MouseWheelForwardEvent", _sync_magnifier_from_scroll, 0.5)
             self.vtk_widget.interactor.AddObserver("MouseWheelBackwardEvent", _sync_magnifier_from_scroll, 0.5)
         except Exception as e:
-            print(f"âš ï¸ Failed to bind mouse wheel to magnifier: {e}")
+            print(f"⚠️ Failed to bind mouse wheel to magnifier: {e}")
 
         try:
-            # The Qt wheel event filter owns all main-view 2D zoom mutations.
-            # Keep a legacy VTK wheel observer only as a non-mutating guard so
-            # stray native wheel events are consumed without starting a second
-            # camera mutation path.
             self.vtk_widget.interactor.AddObserver("MouseWheelForwardEvent", self._on_main_mouse_wheel, 10.0)
             self.vtk_widget.interactor.AddObserver("MouseWheelBackwardEvent", self._on_main_mouse_wheel, 10.0)
             self.vtk_widget.interactor.AddObserver("LeftButtonPressEvent", self._on_main_left_press_2d_guard, 50.0)
@@ -1868,7 +1772,7 @@ class NakshaApp(QMainWindow):
         self._update_window_title(None, None)
         self.status.showMessage("Ready", 3000)
 
-        # ===== SHORTCUTS (global install â€” filter already created above) =====
+        # ===== SHORTCUTS (global install — filter already created above) =====
         try:
             app = QApplication.instance()
             if app is not None:
@@ -1879,7 +1783,7 @@ class NakshaApp(QMainWindow):
         # Temporary test shortcut - Remove after testing
         self.shortcut_backup = QShortcut(QKeySequence("Ctrl+B"), self)
         self.shortcut_backup.activated.connect(self.open_backup_settings)
-        print("ðŸ§ª Press Ctrl+B to open Backup Settings")
+        print("🧪 Press Ctrl+B to open Backup Settings")
 
         # self._shortcut_alt_f4 = QShortcut(QKeySequence("Alt+F4"), self)
         # self._shortcut_alt_f4.setContext(Qt.ApplicationShortcut)
@@ -1888,10 +1792,10 @@ class NakshaApp(QMainWindow):
         self._soak_telemetry = None
         self.shortcut_soak_telemetry = QShortcut(QKeySequence("Ctrl+Shift+T"), self)
         self.shortcut_soak_telemetry.activated.connect(self.open_soak_telemetry)
-        print("ðŸ§ª Press Ctrl+Shift+T to open Soak Telemetry")
+        print("🧪 Press Ctrl+Shift+T to open Soak Telemetry")
         self._start_soak_telemetry_on_startup()
 
-        # â”€â”€ GIS overlay layers (imported .shp / .tif / .geojson) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── GIS overlay layers (imported .shp / .tif / .geojson) ─────────────
         # Managed by the Overlay Control Center dock (Global-Mapper style).
         self.gis_layers = []                 # registry of imported overlay layers
         self._gis_layers_dock = None         # lazily created QDockWidget
@@ -1900,12 +1804,7 @@ class NakshaApp(QMainWindow):
 
         self.shortcut_project_crs = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
         self.shortcut_project_crs.activated.connect(self.open_project_crs_dialog)
-        print("ðŸŒ Press Ctrl+Shift+P to select/view the Project CRS")
-
-        # Performance phase: print the live [VULKAN PERFORMANCE] block.
-        self.shortcut_vulkan_perf = QShortcut(QKeySequence("Ctrl+Shift+V"), self)
-        self.shortcut_vulkan_perf.activated.connect(self._print_vulkan_performance)
-        print("ðŸ“Š Press Ctrl+Shift+V for the Vulkan performance report")
+        print("🌐 Press Ctrl+Shift+P to select/view the Project CRS")
 
         # Allow GIS files to be dropped straight onto the window (Global-Mapper style).
         self.setAcceptDrops(True)
@@ -1917,10 +1816,10 @@ class NakshaApp(QMainWindow):
         self._last_changed_indices = None
         self.classification_revision = 0
         self._max_undo_steps = 30  # Global cap for classification undo/redo
-        # Aliases â€” point to the SAME list objects (never reassign, always use .clear())
+        # Aliases — point to the SAME list objects (never reassign, always use .clear())
         self.undostack = self.undo_stack
         self.redostack = self.redo_stack
-        print("âœ… Undo/Redo stacks initialized (0 steps)")
+        print("✅ Undo/Redo stacks initialized (0 steps)")
 
         self._pending_view_updates = set()
         self._update_debounce_timer = QTimer(self)
@@ -1934,7 +1833,7 @@ class NakshaApp(QMainWindow):
         self.auto_backup_timer.timeout.connect(self._auto_backup)
         self._backup_worker_running = False
         self._active_backup_worker = None
-        # âœ… Load settings and start timer with user's interval
+        # ✅ Load settings and start timer with user's interval
         self._load_backup_settings()
 
         # Color thread
@@ -1942,14 +1841,14 @@ class NakshaApp(QMainWindow):
         self.color_thread.setObjectName("NakshaColorThread")
         self.color_thread.start()
         self.color_workers = []
-        print("âœ… Application initialized successfully")  
+        print("✅ Application initialized successfully")  
 
         #Added by bala
         # ============================================================
         # MEMORY / SESSION MAINTENANCE (VERY IMPORTANT)
         # ============================================================
         self.__session_maintenance_timer = QTimer(self)
-        self.__session_maintenance_timer.setInterval(30_000)  # 30s â€” SESSION only acts every 120s
+        self.__session_maintenance_timer.setInterval(30_000)  # 30s — SESSION only acts every 120s
         self.__session_maintenance_timer.timeout.connect(self._on_session_tick)
 
         QTimer.singleShot(
@@ -1964,331 +1863,10 @@ class NakshaApp(QMainWindow):
             self._mem_guard = MemoryLeakGuard(self)
             self._mem_guard.start()
         except Exception as e:
-            print(f"âš ï¸ MemoryLeakGuard init failed (non-critical): {e}")
+            print(f"⚠️ MemoryLeakGuard init failed (non-critical): {e}")
             self._mem_guard = None
 
 
-
-    def _naksha_chrome_is_settled(self, viewer_w: int, viewer_h: int) -> bool:
-        """True when the Naksha chrome exists AND the viewer host is smaller
-        than the main window.
-
-        Both conditions are required, and they are independent:
-
-        * The ribbon/toolbar/status bar must exist as widgets. Before
-          _create_menus() runs they are simply absent, and the viewer host is
-          the whole central area.
-        * The viewer host must be strictly smaller than the main window in at
-          least one axis. This proves the chrome has actually CLAIMED space
-          (ribbon above, status bar below) rather than merely existing with a
-          zero height. A ribbon that exists but is collapsed reports 1400x0
-          and still leaves the viewer filling the window.
-        """
-        if getattr(self, "ribbon_container", None) is None:
-            return False
-        if getattr(self, "top_bar", None) is None:
-            return False
-        if getattr(self, "status", None) is None:
-            return False
-        try:
-            return (int(viewer_h) < int(self.height())
-                    or int(viewer_w) < int(self.width()))
-        except Exception:
-            return False
-
-    def _naksha_ui_ready_check(self) -> str:
-        """[NAKSHA READY CHECK] - is the full Naksha chrome built and settled?
-
-        Printed immediately before the Vulkan install so a failure is
-        self-describing: it shows whether the ribbon/toolbar/status bar
-        exist, and whether the viewer host has actually been carved out of
-        the main window. Without this, "Vulkan covers the whole app area"
-        is indistinguishable from "the UI never finished building".
-        """
-        def _geo(w):
-            try:
-                return f"{int(w.width())}x{int(w.height())}" if w is not None else "None"
-            except Exception:
-                return "?"
-
-        def _yn(w):
-            return "YES" if w is not None else "NO"
-
-        ribbon = getattr(self, "ribbon_container", None)
-        top_bar = getattr(self, "top_bar", None)
-        status = getattr(self, "status", None)
-        host = None
-        try:
-            _rb0 = getattr(self, "render_backend", None)
-            host = _rb0.vulkan_viewer_host() if _rb0 is not None else None
-        except Exception:
-            host = None
-        viewer = host if host is not None else getattr(self, "frame", None)
-
-        return "\n".join([
-            "[NAKSHA READY CHECK]",
-            "",
-            "Ribbon exists:",
-            _yn(ribbon),
-            "",
-            "Toolbar exists:",
-            _yn(top_bar),
-            "",
-            "Status exists:",
-            _yn(status),
-            "",
-            "Viewer frame:",
-            _geo(viewer),
-            "",
-            "Main window:",
-            _geo(self),
-            "",
-            f"Ribbon geometry:        {_geo(ribbon)}",
-            f"Toolbar geometry:       {_geo(top_bar)}",
-            f"Status bar geometry:    {_geo(status)}",
-        ])
-
-    def showEvent(self, event):
-        """Arm the Vulkan main-viewport install on the FIRST show.
-
-        The install must not happen during __init__: at that point the
-        Naksha chrome (ribbon, toolbar, status bar) and the
-        setCentralWidget(container) re-parent have not run yet, so the
-        viewer host still spans the entire window. Waiting for the first
-        show guarantees the whole hierarchy exists and has been laid out.
-        """
-        super().showEvent(event)
-        try:
-            if not getattr(self, "_vulkan_main_viewport_requested", False):
-                return
-            if getattr(self, "_vulkan_install_armed", False):
-                return
-            self._vulkan_install_armed = True
-            # singleShot rather than install inline: showEvent is delivered
-            # before the layout has finished its first pass, so the viewer
-            # host is still at its pre-layout size here. The readiness poll
-            # takes over from the next event-loop turn.
-            QTimer.singleShot(0, self._install_vulkan_main_viewport_when_ready)
-        except Exception:
-            self._vulkan_install_armed = False
-
-    def _install_vulkan_main_viewport_when_ready(self, attempt: int = 0, prev_wh=None) -> None:
-        """Install Vulkan as the main viewport only once the REAL viewer host
-        - vtk_widget.interactor.parentWidget() - is visible and has settled
-        at a real size.
-
-        The target is resolved from the live Qt hierarchy through
-        AppRenderBackendOwner.vulkan_viewer_host(), not from app.frame /
-        app.viewport_container / app.ribbon_container / app.top_bar /
-        app.status. Those attributes are None at runtime in this app, so
-        every gate that consulted them (the old "chrome_reserved" test that
-        required the viewport to be strictly smaller than the window) could
-        never be satisfied and the install was silently skipped.
-
-        Readiness therefore requires exactly:
-          1. the viewer host is visible, and
-          2. it is larger than 100px in both directions (rejects Qt's
-             not-yet-laid-out default of 100x30), and
-          3. that size is unchanged from the previous poll, so we never
-             install into a transient mid-layout frame.
-
-        Polls for up to ~3s (60 x 50ms) after the initial 0ms deferral used
-        to get past __init__. A window that never settles in that window
-        aborts rather than creating the swapchain at a wrong geometry.
-        """
-        _rb = getattr(self, "render_backend", None)
-        if _rb is None:
-            return
-        if attempt == 0:
-            self._dump_naksha_ui_tree()
-        try:
-            # The readiness gate reads the REAL viewer host (the interactor's
-            # own parentWidget) via the backend owner, never app.frame /
-            # viewport_container. Those are only the right answer by
-            # construction, and were None in some startup orders.
-            if not hasattr(_rb, "vulkan_viewer_host_is_ready"):
-                ready = False
-                host = getattr(self, "frame", None)
-                w = int(host.width()) if host is not None else 0
-                h = int(host.height()) if host is not None else 0
-                stable = prev_wh == (w, h)
-                chrome_ready = False
-            else:
-                host = _rb.vulkan_viewer_host()
-                w = int(host.width()) if host is not None else 0
-                h = int(host.height()) if host is not None else 0
-                # Stability: the host size must repeat across two polls, so we
-                # never install into a transient mid-layout frame.
-                stable = prev_wh == (w, h)
-                # The Naksha chrome must exist AND have actually claimed space.
-                # If the ribbon/toolbar/status bar are still missing, the
-                # viewer host is the whole window and installing now is exactly
-                # the full-window-black-area bug.
-                chrome_ready = self._naksha_chrome_is_settled(w, h)
-                ready = _rb.vulkan_viewer_host_is_ready(min_size=100) \
-                    and bool(self.isVisible()) and stable and chrome_ready
-        except Exception:
-            ready = False
-            w = h = 0
-            stable = False
-            chrome_ready = False
-            host = None
-        if not ready:
-            if attempt == 60:
-                print(self._naksha_ui_ready_check())
-            if attempt < 60:
-                QTimer.singleShot(
-                    50, lambda: self._install_vulkan_main_viewport_when_ready(attempt + 1, (w, h))
-                )
-            else:
-                print("[render_backend] Vulkan main viewport install ABORTED: "
-                      f"layout never settled to a real central-viewport size "
-                      f"(last seen viewport={w}x{h} window={self.width()}x{self.height()})")
-                self._dump_naksha_ui_tree()
-            return
-        print(self._naksha_ui_ready_check())
-        _rb.install_as_main_viewport()
-
-    def _dump_naksha_ui_tree(self) -> None:
-        """[NAKSHA UI TREE] - the REAL widget ancestry from
-        vtk_widget.interactor up to the QMainWindow, with each ancestor's
-        class, object name, geometry and visibility. This is ground truth
-        for where the Vulkan surface will actually end up once parented next
-        to vtk_widget.interactor - printed instead of assumed."""
-        def _describe(w):
-            if w is None:
-                return "None"
-            try:
-                name = w.objectName() or ""
-            except Exception:
-                name = ""
-            cls = type(w).__name__
-            try:
-                geo = w.geometry()
-                wh = f"{geo.width()}x{geo.height()}"
-            except Exception:
-                wh = "?x?"
-            try:
-                vis = w.isVisible()
-            except Exception:
-                vis = "?"
-            label = cls + (f"#{name}" if name else "")
-            return f"{label}  {wh}  visible={vis}"
-
-        lines = ["[NAKSHA UI TREE]", "", "Ancestor chain (vtk_widget.interactor -> MainWindow):"]
-        w = getattr(getattr(self, "vtk_widget", None), "interactor", None) or getattr(self, "vtk_widget", None)
-        chain = []
-        seen = set()
-        while w is not None and id(w) not in seen:
-            seen.add(id(w))
-            chain.append(w)
-            try:
-                w = w.parentWidget()
-            except Exception:
-                break
-        for depth, widget in enumerate(chain):
-            lines.append(("  " * depth) + "- " + _describe(widget))
-        lines += [
-            "",
-            "MainWindow:",
-            _describe(self),
-            "",
-            "CentralWidget:",
-            _describe(self.centralWidget() if hasattr(self, "centralWidget") else None),
-            "",
-            "Viewer container (self.frame):",
-            _describe(getattr(self, "frame", None)),
-            "",
-            "Ribbon (self.ribbon_container):",
-            _describe(getattr(self, "ribbon_container", None)),
-            "",
-            "Toolbar (self.top_bar):",
-            _describe(getattr(self, "top_bar", None)),
-            "",
-            "Status bar (self.status):",
-            _describe(getattr(self, "status", None)),
-        ]
-        print("\n".join(lines))
-
-    def _print_vulkan_performance(self):
-        """Ctrl+Shift+V - dump the live [VULKAN PERFORMANCE] block.
-
-        Everything comes from the engine's own counters, so the upload counts
-        are proof of whether the GPU buffers are persistent (STEP 3): pan/zoom
-        must not advance them.
-        """
-        rb = getattr(self, "render_backend", None)
-        if rb is None:
-            print("[VULKAN PERFORMANCE] no render backend")
-            return
-        try:
-            if hasattr(rb, "_log_vulkan_ui_geometry"):
-                rb._log_vulkan_ui_geometry()
-                print()
-            # PERFORMANCE PHASE 1: prove Vulkan is the sole LiDAR renderer.
-            if hasattr(rb, "_log_vulkan_lidar_ownership"):
-                rb._log_vulkan_lidar_ownership()
-                print()
-            rb.print_vulkan_ownership_report()
-            print()
-            rb.print_ownership_report()
-            print()
-            rb.print_performance_report()
-            print()
-            if hasattr(rb, "upload_counters_report"):
-                print(rb.upload_counters_report(), flush=True)
-                print()
-            if hasattr(rb, "interaction_mode_report"):
-                print(rb.interaction_mode_report(), flush=True)
-                print()
-            if hasattr(rb, "refinement_report"):
-                print(rb.refinement_report(), flush=True)
-                print()
-            if hasattr(rb, "memory_report"):
-                print(rb.memory_report(), flush=True)
-                print()
-            if hasattr(rb, "lod_runtime_report"):
-                print(rb.lod_runtime_report(), flush=True)
-                print()
-            if hasattr(rb, "interaction_report"):
-                print(rb.interaction_report(), flush=True)
-                print()
-            _lp = getattr(self, "load_pipeline_report", None)
-            if _lp is not None:
-                print(_lp(), flush=True)
-                print()
-            if hasattr(rb, "frame_report"):
-                print(rb.frame_report(), flush=True)
-                print()
-            if hasattr(rb, "frame_timing_report"):
-                print(rb.frame_timing_report(), flush=True)
-                print()
-            try:
-                from gui.shading_display import shading_performance_report
-                print(shading_performance_report(), flush=True)
-                print()
-            except Exception as _se:
-                print(f"[SHADING PERFORMANCE] unavailable: {_se!r}")
-                print()
-            if hasattr(rb, "gpu_persistence_report"):
-                print(rb.gpu_persistence_report(), flush=True)
-                print()
-            if hasattr(rb, "gpu_memory_report"):
-                print(rb.gpu_memory_report(), flush=True)
-        except Exception as e:
-            print(f"[VULKAN PERFORMANCE] failed: {e!r}")
-
-    def _toggle_vtk_lidar_rendering(self):
-        """Debug aid: flip VTK's LiDAR rendering on/off (overlays unaffected).
-
-        Not bound to a key by default - it exists so the effect of STEP 1 can be
-        A/B'd in a running session without restarting.
-        """
-        rb = getattr(self, "render_backend", None)
-        if rb is None:
-            return
-        rb.set_vtk_lidar_rendering(not rb.vtk_lidar_rendering_enabled())
-        rb.print_performance_report()
 
     def update_total_points_label(self, total_points=None):
         if not hasattr(self, "total_points_label"):
@@ -2296,24 +1874,6 @@ class NakshaApp(QMainWindow):
 
         if total_points is None:
             total_points = 0
-            # STREAMING: app.data is intentionally EMPTY (points live in the
-            # resident GPU buffer), so len(app.data["xyz"]) always yields 0.
-            # The authoritative count is the cache metadata.
-            try:
-                from gui.naksha_cache.dataset_mode import is_streaming_dataset
-                if is_streaming_dataset(self):
-                    mgr = getattr(self, "naksha_stream", None)
-                    if mgr is not None:
-                        src = getattr(mgr, "source_point_count", None)
-                        if src is None:
-                            try:
-                                src = int(mgr.idx.header["source_point_count"])
-                            except Exception:
-                                src = None
-                        if src:
-                            total_points = int(src)
-            except Exception:
-                pass
             data = getattr(self, "data", None)
             xyz = data.get("xyz") if isinstance(data, dict) else None
             if xyz is not None:
@@ -2743,7 +2303,7 @@ class NakshaApp(QMainWindow):
         return False
 
     # ------------------------------------------------------------------
-    # VTK-native crosshair (vtkActor2D in display coords â€” like Nakshatech)
+    # VTK-native crosshair (vtkActor2D in display coords — like MicroStation)
     # ------------------------------------------------------------------
 
     def _install_canvas_axis_render_observer(self):
@@ -2793,7 +2353,7 @@ class NakshaApp(QMainWindow):
             return
 
         try:
-            # Get VTK display coordinates â€” exact pixel position, no Qt offset
+            # Get VTK display coordinates — exact pixel position, no Qt offset
             iren = self.vtk_widget.interactor
             rw = iren.GetRenderWindow()
             if rw is None:
@@ -2802,8 +2362,8 @@ class NakshaApp(QMainWindow):
             w, h = rw.GetSize()
             ch.update(x, y, w, h)
 
-            # âœ… Skip the extra crosshair render while a camera interaction
-            # (pan/zoom/rotate) is active â€” the render manager already drives
+            # ✅ Skip the extra crosshair render while a camera interaction
+            # (pan/zoom/rotate) is active — the render manager already drives
             # the repaint on every interaction tick, so a second rw.Render()
             # here would double the per-move cost. The crosshair still follows
             # because ch.update() ran above; it repaints on the next render.
@@ -2914,7 +2474,7 @@ class NakshaApp(QMainWindow):
 
         # Activate / deactivate the crosshair cursor alongside the guides.
         # Uses "axis_guides" as tool name so it stacks with classification
-        # tool cursors â€” cursor stays active while either source is on.
+        # tool cursors — cursor stays active while either source is on.
         self.set_cross_cursor_active(checked, tool_name="axis_guides")
 
         if not checked:
@@ -3007,7 +2567,7 @@ class NakshaApp(QMainWindow):
                 iren.SetInteractorStyle(vtkInteractorStyleImage())
 
         except Exception as e:
-            print(f"âš ï¸ Failed to restore interactor style: {e}")
+            print(f"⚠️ Failed to restore interactor style: {e}")
 
         # Clear any ongoing preview lines
         if hasattr(self, 'section_controller') and self.section_controller:
@@ -3033,7 +2593,7 @@ class NakshaApp(QMainWindow):
                 sc.clear_locate_state()
         except Exception:
             pass
-        # âœ… FIX: Also clear classify interactor's locate line in cross-section views
+        # ✅ FIX: Also clear classify interactor's locate line in cross-section views
         try:
             ci = getattr(self, 'classify_interactor', None)
             if ci is not None and hasattr(ci, '_clear_locate_state'):
@@ -3064,7 +2624,7 @@ class NakshaApp(QMainWindow):
             hasattr(self, 'vtk_widget') and
             self.vtk_widget.interactor):
             self.vtk_widget.interactor.installEventFilter(self.short_cut_filter)
-            print("âœ… VTK filter installed (delayed)")
+            print("✅ VTK filter installed (delayed)")
 
     #Added by bala
     def _on_session_tick(self):
@@ -3081,7 +2641,7 @@ class NakshaApp(QMainWindow):
         """
         Safely clear the current project from the NakshaApp instance.
         Resets all viewers, layers, drawings, and temporary states.
-        âœ… FIXED: Now properly closes all cross-section windows
+        ✅ FIXED: Now properly closes all cross-section windows
         """
         reply = QMessageBox.question(
             app,
@@ -3097,7 +2657,7 @@ class NakshaApp(QMainWindow):
 
         try:
             print("\n" + "="*60)
-            print("ðŸ§¹ CLEARING PROJECT")
+            print("🧹 CLEARING PROJECT")
             print("="*60)
 
             # --- Hide the classification count label in the top bar ---
@@ -3110,9 +2670,9 @@ class NakshaApp(QMainWindow):
             if hasattr(app, "vtk_widget") and app.vtk_widget:
                 app.vtk_widget.clear()
                 app.vtk_widget.render()
-                print("âœ… Main viewer cleared")
+                print("✅ Main viewer cleared")
 
-            # --- âœ… Close ALL cross-section dock windows (Views 1-4) ---
+            # --- ✅ Close ALL cross-section dock windows (Views 1-4) ---
             if hasattr(app, "section_docks") and app.section_docks:
                 for view_idx, dock in list(app.section_docks.items()):
                     try:
@@ -3120,23 +2680,23 @@ class NakshaApp(QMainWindow):
                         dock.setVisible(False)  # Hide first
                         dock.close()            # Then close
                         dock.deleteLater()      # Schedule deletion
-                        print(f"   âœ… Closed Cross Section View {view_idx + 1}")
+                        print(f"   ✅ Closed Cross Section View {view_idx + 1}")
                     except Exception as e:
-                        print(f"   âš ï¸ Failed to close View {view_idx + 1}: {e}")
+                        print(f"   ⚠️ Failed to close View {view_idx + 1}: {e}")
                 
                 # Clear the dictionaries
                 app.section_docks.clear()
-                print("âœ… All cross-section docks closed")
+                print("✅ All cross-section docks closed")
 
-            # --- âœ… Clear cross-section VTK widgets ---
+            # --- ✅ Clear cross-section VTK widgets ---
             if hasattr(app, "section_vtks") and app.section_vtks:
                 for view_idx, vtk_widget in list(app.section_vtks.items()):
                     try:
                         vtk_widget.clear()
                         vtk_widget.render()
-                        print(f"âœ… Cleared VTK widget for View {view_idx + 1}")
+                        print(f"✅ Cleared VTK widget for View {view_idx + 1}")
                     except Exception as e:
-                        print(f"âš ï¸ Failed to clear VTK View {view_idx + 1}: {e}")
+                        print(f"⚠️ Failed to clear VTK View {view_idx + 1}: {e}")
                 
                 app.section_vtks.clear()
 
@@ -3144,9 +2704,9 @@ class NakshaApp(QMainWindow):
             if hasattr(app, "sec_vtk") and app.sec_vtk:
                 app.sec_vtk.clear()
                 app.sec_vtk.render()
-                print("âœ… Legacy section view cleared")
+                print("✅ Legacy section view cleared")
 
-            # --- âœ… Clear section controller ---
+            # --- ✅ Clear section controller ---
             if hasattr(app, "section_controller") and app.section_controller:
                 try:
                     app.section_controller.clear()
@@ -3154,31 +2714,31 @@ class NakshaApp(QMainWindow):
                     app.section_controller.current_vtk = None
                     if hasattr(app.section_controller, 'view_vtks'):
                         app.section_controller.view_vtks.clear()
-                    print("âœ… Section controller cleared")
+                    print("✅ Section controller cleared")
                 except Exception as e:
-                    print(f"âš ï¸ Section controller clear failed: {e}")
+                    print(f"⚠️ Section controller clear failed: {e}")
 
-            # --- âœ… Clear cut section if active ---
+            # --- ✅ Clear cut section if active ---
             if hasattr(app, "cut_section_controller") and app.cut_section_controller:
                 try:
                     if hasattr(app.cut_section_controller, 'clear'):
                         app.cut_section_controller.clear()
                     app.cut_section_controller.cut_points = None
-                    print("âœ… Cut section cleared")
+                    print("✅ Cut section cleared")
                 except Exception as e:
-                    print(f"âš ï¸ Cut section clear failed: {e}")
+                    print(f"⚠️ Cut section clear failed: {e}")
 
             # --- Clear layers ---
             if hasattr(app, "layers"):
                 app.layers.clear()
-                print("âœ… Layers cleared")
+                print("✅ Layers cleared")
 
             # --- Clear digitizer drawings ---
             if hasattr(app, "digitizer"):
                 app.digitizer.clear_drawings()
-                print("âœ… Drawings cleared")
+                print("✅ Drawings cleared")
 
-            # --- âœ… Clear stored section data ---
+            # --- ✅ Clear stored section data ---
             for i in range(4):
                 for attr in [f"section_{i}_core_points", f"section_{i}_buffer_points",
                             f"section_{i}_core_mask", f"section_{i}_buffer_mask"]:
@@ -3187,14 +2747,14 @@ class NakshaApp(QMainWindow):
                             delattr(app, attr)
                         except Exception:
                             pass
-            print("âœ… Section data cleared")
+            print("✅ Section data cleared")
 
-            # --- âœ… Close Display Mode dialog ---
+            # --- ✅ Close Display Mode dialog ---
             if hasattr(app, "display_dialog") and app.display_dialog:
                 try:
                     app.display_dialog.close()
                     app.display_dialog = None
-                    print("âœ… Display Mode dialog closed")
+                    print("✅ Display Mode dialog closed")
                 except Exception:
                     pass
 
@@ -3205,11 +2765,11 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
 
-            # --- âœ… Close Class Picker ---
+            # --- ✅ Close Class Picker ---
             if hasattr(app, "class_picker") and app.class_picker:
                 try:
                     app.class_picker.close()
-                    print("âœ… Class Picker closed")
+                    print("✅ Class Picker closed")
                 except Exception:
                     pass
                 finally:
@@ -3220,7 +2780,7 @@ class NakshaApp(QMainWindow):
                 from .unified_actor_manager import reset_uam
                 reset_uam(app)
             except Exception as e:
-                print(f"âš ï¸ UAM reset failed: {e}")
+                print(f"⚠️ UAM reset failed: {e}")
 
             app.data = None
             # Reset the authoritative canvas CRS and every compatibility field
@@ -3239,21 +2799,21 @@ class NakshaApp(QMainWindow):
             app._main_global_mask = None
             app._main_lod_step = None
 
-            # --- âœ… Clear view palettes ---
+            # --- ✅ Clear view palettes ---
 
             if hasattr(app, "view_palettes"):
                 app.view_palettes.clear()
 
-            # --- âœ… Clear undo/redo ---
+            # --- ✅ Clear undo/redo ---
             if hasattr(app, "undo_stack"):
                 app.undo_stack.clear()
             if hasattr(app, "redo_stack"):
                 app.redo_stack.clear()
 
-            # --- âœ… Deactivate classification tools ---
+            # --- ✅ Deactivate classification tools ---
             app.active_classify_tool = None
 
-            # --- âœ… Deactivate footer click tools ---
+            # --- ✅ Deactivate footer click tools ---
             try:
                 if hasattr(app, "point_sync_tool") and app.point_sync_tool is not None:
                     app.point_sync_tool.deactivate()
@@ -3272,38 +2832,17 @@ class NakshaApp(QMainWindow):
 
             # --- Reset window title ---
             app._update_window_title(None, None)
-            app.statusBar().showMessage("ðŸ§¹ Project cleared successfully.", 3000)
+            app.statusBar().showMessage("🧹 Project cleared successfully.", 3000)
             
             print("="*60)
-            print("âœ… PROJECT CLEARED SUCCESSFULLY")
+            print("✅ PROJECT CLEARED SUCCESSFULLY")
             print("="*60 + "\n")
 
         except Exception as e:
-            print(f"âš ï¸ Error while clearing project: {e}")
+            print(f"⚠️ Error while clearing project: {e}")
             import traceback
             traceback.print_exc()
             QMessageBox.critical(app, "Error", f"Failed to clear project:\n{e}")
-
-    def _update_render_backend_status_label(self):
-        """Refresh the small Vulkan/VTK status-bar label from
-        AppRenderBackendOwner - the single authoritative source (see
-        gui/render_backend.py). Never invents its own state."""
-        label = getattr(self, "render_backend_status_label", None)
-        if label is None:
-            return
-        rb = getattr(self, "render_backend", None)
-        if rb is None:
-            label.setText("VTK â€¢ FALLBACK")
-            label.setToolTip("Backend: vtk\nState: FALLBACK")
-            return
-        try:
-            text = rb.status_label_text()
-            tooltip = rb.status_tooltip_text()
-        except Exception:
-            text, tooltip = "VTK â€¢ FALLBACK", "Backend: vtk"
-        if label.text() != text:
-            label.setText(text)
-        label.setToolTip(tooltip)
 
     def _update_epsg_style(self):
         if not hasattr(self, "epsg_label") or self.epsg_label is None:
@@ -3620,7 +3159,7 @@ class NakshaApp(QMainWindow):
                 from gui.gis.gis_layers import unified_import_overlay
                 unified_import_overlay(self)
             except Exception as exc:
-                print(f"âš ï¸ Overlay import failed: {exc}")
+                print(f"⚠️ Overlay import failed: {exc}")
                 import traceback
                 traceback.print_exc()
         elif chosen == zoom_action:
@@ -3628,7 +3167,7 @@ class NakshaApp(QMainWindow):
                 from gui.gis.gis_layers import zoom_to_gis_entries
                 zoom_to_gis_entries(self, list(reg or []))
             except Exception as exc:
-                print(f"âš ï¸ GIS zoom failed: {exc}")
+                print(f"⚠️ GIS zoom failed: {exc}")
                 import traceback
                 traceback.print_exc()
         elif chosen == gdb_action:
@@ -3814,10 +3353,10 @@ class NakshaApp(QMainWindow):
                 if getattr(self.snt_layer_pick_tool, "active", False):
                     self.snt_layer_pick_tool.deactivate()
             self.point_sync_tool.activate()
-            self.statusBar().showMessage("ðŸŽ¯ Point target sync enabled", 2000)
+            self.statusBar().showMessage("🎯 Point target sync enabled", 2000)
         else:
             self.point_sync_tool.deactivate()
-            self.statusBar().showMessage("ðŸŽ¯ Point target sync disabled", 2000)
+            self.statusBar().showMessage("🎯 Point target sync disabled", 2000)
 
     def _toggle_snt_layer_pick_from_footer(self, enabled):
         if not hasattr(self, "snt_layer_pick_tool") or self.snt_layer_pick_tool is None:
@@ -3841,11 +3380,11 @@ class NakshaApp(QMainWindow):
 
         if enabled:
             self.snt_layer_pick_tool.activate()
-            self.statusBar().showMessage("ðŸŽ¯ Layer identifier enabled (click SNT, DXF, or GIS features in main view)", 2500)
+            self.statusBar().showMessage("🎯 Layer identifier enabled (click SNT, DXF, or GIS features in main view)", 2500)
         else:
             self.snt_layer_pick_tool.deactivate()
             self._set_snt_layer_pick_footer_text(None, None, None)
-            self.statusBar().showMessage("ðŸŽ¯ Layer identifier disabled", 2000)
+            self.statusBar().showMessage("🎯 Layer identifier disabled", 2000)
 
     def open_global_settings(self):
         """Open the consolidated global settings dialog."""
@@ -3872,7 +3411,6 @@ class NakshaApp(QMainWindow):
         top_bar = QWidget()
         top_bar.setObjectName("TopBar")
         top_bar.setFixedHeight(34)
-        self.top_bar = top_bar  # exposed for render_backend's [VULKAN UI GEOMETRY] diagnostic
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(4, 2, 4, 2)
         top_layout.setSpacing(2)
@@ -3902,7 +3440,7 @@ class NakshaApp(QMainWindow):
         add_menu_button("By Class", "by_class")
         add_menu_button("Draw", "draw")
         add_menu_button("AI", "ai")
-        add_menu_button("Block", "block")
+        add_menu_button("Create", "block")
         add_menu_button("Plugins", "plugins")
 
         # --- Centered classification count label (exact middle of top bar) ---
@@ -3940,9 +3478,9 @@ class NakshaApp(QMainWindow):
             self.stats_btn.clicked.connect(lambda: self.point_count_widget.toggle_panel(self.stats_btn))
             top_layout.addWidget(self.stats_btn)
             
-            print("ðŸ“Š Embedded Point Stats button inside Top Menu")
+            print("📊 Embedded Point Stats button inside Top Menu")
         except Exception as e:
-            print(f"âš ï¸ Failed to init Point Stats: {e}")
+            print(f"⚠️ Failed to init Point Stats: {e}")
             self.point_count_widget = None
 
         self.settings_btn = QToolButton()
@@ -3958,7 +3496,7 @@ class NakshaApp(QMainWindow):
         self._update_settings_icon()
 
         # --- Ribbon container (below top bar) ---
-        self.ribbon_container = QWidget()  # âœ… Changed from sidebar_container
+        self.ribbon_container = QWidget()  # ✅ Changed from sidebar_container
         self.ribbon_container.setObjectName("RibbonContainer")
         self.ribbon_container.setFixedHeight(0)  # hidden until needed
 
@@ -4025,7 +3563,7 @@ class NakshaApp(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(top_bar)
-        layout.addWidget(self.ribbon_container)  # âœ… Changed
+        layout.addWidget(self.ribbon_container)  # ✅ Changed
         layout.addWidget(main_row, 1)
         self.setCentralWidget(container)
 
@@ -4085,7 +3623,7 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass
 
-    # â”€â”€ Interaction LOD (delegates to unified_actor_manager) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Interaction LOD (delegates to unified_actor_manager) ──────────────────
     # These are called by GPURenderManager during pan/zoom/rotate so the main
     # cloud draws a precomputed coarse subset while interacting and restores
     # full detail on release. They are safe no-ops when LOD isn't available
@@ -4745,21 +4283,21 @@ class NakshaApp(QMainWindow):
             try:
                 self.deactivate_classification_tool(preserve_cross_section=True)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate classification for Draw tab: {e}")
+                print(f"⚠️ Failed to deactivate classification for Draw tab: {e}")
 
         # Deactivate measurement tool
         if hasattr(self, "measurement_tool"):
             try:
                 self.measurement_tool.deactivate()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate measurement tool for Draw tab: {e}")
+                print(f"⚠️ Failed to deactivate measurement tool for Draw tab: {e}")
 
         # Deactivate identification tool (via ribbon so button states also reset)
         self._deactivate_identify_tab_tools()
 
         if hasattr(self, "digitizer") and self.digitizer:
             self.digitizer.enabled = True
-            print("âœ… Draw tab active - digitizer enabled")
+            print("✅ Draw tab active - digitizer enabled")
 
     def _enter_classify_tab_mode(self):
         """Disable draw/measure/identify tooling so classification tools own interaction."""
@@ -4767,10 +4305,10 @@ class NakshaApp(QMainWindow):
             try:
                 self.digitizer.set_tool(None)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate draw tool for Classify tab: {e}")
+                print(f"⚠️ Failed to deactivate draw tool for Classify tab: {e}")
 
             self.digitizer.enabled = False
-            print("ðŸš« Classify tab active - digitizer disabled")
+            print("🚫 Classify tab active - digitizer disabled")
 
         curve_tool = getattr(self, "curve_tool", None)
         if curve_tool:
@@ -4783,14 +4321,14 @@ class NakshaApp(QMainWindow):
                 elif getattr(curve_tool, "_select_mode", False):
                     curve_tool.deactivate_select_mode()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate curve tool for Classify tab: {e}")
+                print(f"⚠️ Failed to deactivate curve tool for Classify tab: {e}")
 
         # Deactivate measurement tool
         if hasattr(self, "measurement_tool"):
             try:
                 self.measurement_tool.deactivate()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate measurement tool for Classify tab: {e}")
+                print(f"⚠️ Failed to deactivate measurement tool for Classify tab: {e}")
 
         # Deactivate identification tool (via ribbon so button states also reset)
         self._deactivate_identify_tab_tools()
@@ -4802,14 +4340,14 @@ class NakshaApp(QMainWindow):
             if hasattr(self, "digitizer") and self.digitizer:
                 self.digitizer.deactivate_element_select_tool()
         except Exception as e:
-            print(f"âš ï¸ Failed to deactivate element select for Measure tab: {e}")
+            print(f"⚠️ Failed to deactivate element select for Measure tab: {e}")
 
         # Deactivate draw tools
         if hasattr(self, "digitizer") and self.digitizer:
             try:
                 self.digitizer.set_tool(None)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate draw tool for Measure tab: {e}")
+                print(f"⚠️ Failed to deactivate draw tool for Measure tab: {e}")
             self.digitizer.enabled = False
 
         # Deactivate curve tool
@@ -4824,19 +4362,19 @@ class NakshaApp(QMainWindow):
                 elif getattr(curve_tool, "_select_mode", False):
                     curve_tool.deactivate_select_mode()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate curve tool for Measure tab: {e}")
+                print(f"⚠️ Failed to deactivate curve tool for Measure tab: {e}")
 
         # Deactivate classification
         if getattr(self, "active_classify_tool", None):
             try:
                 self.deactivate_classification_tool(preserve_cross_section=True)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate classification for Measure tab: {e}")
+                print(f"⚠️ Failed to deactivate classification for Measure tab: {e}")
 
         # Deactivate identification tool (via ribbon so button states also reset)
         self._deactivate_identify_tab_tools()
 
-        print("ðŸ“ Measure tab active - other tools disabled")
+        print("📏 Measure tab active - other tools disabled")
 
     def _enter_identify_tab_mode(self):
         """Deactivate draw/classify/measure tools so identification tools own interaction."""
@@ -4845,14 +4383,14 @@ class NakshaApp(QMainWindow):
             if hasattr(self, "digitizer") and self.digitizer:
                 self.digitizer.deactivate_element_select_tool()
         except Exception as e:
-            print(f"âš ï¸ Failed to deactivate element select for Identify tab: {e}")
+            print(f"⚠️ Failed to deactivate element select for Identify tab: {e}")
 
         # Deactivate draw tools
         if hasattr(self, "digitizer") and self.digitizer:
             try:
                 self.digitizer.set_tool(None)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate draw tool for Identify tab: {e}")
+                print(f"⚠️ Failed to deactivate draw tool for Identify tab: {e}")
             self.digitizer.enabled = False
 
         # Deactivate curve tool
@@ -4867,23 +4405,23 @@ class NakshaApp(QMainWindow):
                 elif getattr(curve_tool, "_select_mode", False):
                     curve_tool.deactivate_select_mode()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate curve tool for Identify tab: {e}")
+                print(f"⚠️ Failed to deactivate curve tool for Identify tab: {e}")
 
         # Deactivate classification
         if getattr(self, "active_classify_tool", None):
             try:
                 self.deactivate_classification_tool(preserve_cross_section=True)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate classification for Identify tab: {e}")
+                print(f"⚠️ Failed to deactivate classification for Identify tab: {e}")
 
         # Deactivate measurement tool
         if hasattr(self, "measurement_tool"):
             try:
                 self.measurement_tool.deactivate()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate measurement tool for Identify tab: {e}")
+                print(f"⚠️ Failed to deactivate measurement tool for Identify tab: {e}")
 
-        print("ðŸ” Identify tab active - other tools disabled")
+        print("🔍 Identify tab active - other tools disabled")
 
     def _deactivate_identify_tab_tools(self):
         """Deactivate all Identify-tab tools and reset their ribbon button states."""
@@ -4892,7 +4430,7 @@ class NakshaApp(QMainWindow):
         try:
             self.ribbon_manager.ribbons['identify'].deactivate_all_tools()
         except Exception as e:
-            print(f"âš ï¸ Failed to deactivate identify tab tools: {e}")
+            print(f"⚠️ Failed to deactivate identify tab tools: {e}")
 
     def _deactivate_active_identification_tools_for_escape(self) -> bool:
         """Turn off active click-identification modes on a single Escape."""
@@ -4908,9 +4446,9 @@ class NakshaApp(QMainWindow):
             try:
                 tool.deactivate()
                 deactivated = True
-                print(f"   âœ… {tool_name} deactivated by ESC")
+                print(f"   ✅ {tool_name} deactivated by ESC")
             except Exception as exc:
-                print(f"   âš ï¸ ESC could not deactivate {tool_name}: {exc}")
+                print(f"   ⚠️ ESC could not deactivate {tool_name}: {exc}")
 
         if deactivated:
             try:
@@ -4958,7 +4496,7 @@ class NakshaApp(QMainWindow):
 
         if getattr(self, "cross_section_active", False) or "cross_section" in active_tools:
             try:
-                print("ðŸ›‘ Switching from cross-section to element selection")
+                print("🛑 Switching from cross-section to element selection")
                 self.deactivate_cross_section_tool()
             except Exception:
                 try:
@@ -4968,7 +4506,7 @@ class NakshaApp(QMainWindow):
 
         if getattr(self, "cut_section_mode_on", False) or "cut_section" in active_tools:
             try:
-                print("ðŸ›‘ Switching from cut-section to element selection")
+                print("🛑 Switching from cut-section to element selection")
                 self._deactivate_pending_cut_section_tool("switching to element selection")
             except Exception:
                 try:
@@ -4980,10 +4518,10 @@ class NakshaApp(QMainWindow):
         classify_tool = getattr(self, "active_classify_tool", None)
         if classify_tool and classify_tool not in ("cross_section", "cut_section"):
             try:
-                print(f"ðŸ›‘ Switching from {classify_tool} classification to element selection")
+                print(f"🛑 Switching from {classify_tool} classification to element selection")
                 self.deactivate_classification_tool(preserve_cross_section=True)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate classification before element select: {e}")
+                print(f"⚠️ Failed to deactivate classification before element select: {e}")
 
         # Stand down identification tool so its click observer doesn't fight the
         # element-select observer. Use the ribbon path so its button state resets too.
@@ -4998,9 +4536,9 @@ class NakshaApp(QMainWindow):
                     identify_ribbon.deactivate_all_tools()
                 else:
                     identify_tool.deactivate()
-                print("ðŸ›‘ Identification tool deactivated for element selection")
+                print("🛑 Identification tool deactivated for element selection")
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate identification before element select: {e}")
+                print(f"⚠️ Failed to deactivate identification before element select: {e}")
 
         dlg = getattr(self, "_element_selection_dialog", None)
         if dlg is None:
@@ -5019,23 +4557,23 @@ class NakshaApp(QMainWindow):
     # ------------------------------------------------------------
     def _prompt_cut_width(self):
         """Popup for global persistent cut section width."""
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
         current_val = getattr(self, "default_cut_width", 2.0)
         val, ok = QInputDialog.getDouble(
             self, "Set Default Cut Width",
-            f"Current cut width: Â±{current_val:.2f} m",
+            f"Current cut width: ±{current_val:.2f} m",
             current_val, 0.05, 10.0, 2
         )
         if ok:
             self.default_cut_width = val
             settings.setValue("cut_section_width", val)
             settings.sync()
-            print(f"ðŸ’¾ Saved persistent default cut width: Â±{val:.2f} m")
-            self.statusBar().showMessage(f"âœ… Default cut width set to Â±{val:.2f} m", 3000)
+            print(f"💾 Saved persistent default cut width: ±{val:.2f} m")
+            self.statusBar().showMessage(f"✅ Default cut width set to ±{val:.2f} m", 3000)
 
     def open_next_cross_section_view(self):
         """
-        âœ… AUTO-INCREMENT VIEW OPENING FOR SHORTCUT
+        ✅ AUTO-INCREMENT VIEW OPENING FOR SHORTCUT
         - Opens View 1 if none are open
         - Opens next available view (2, 3, 4) if views already exist
         - Shows message if all 4 views are open
@@ -5047,10 +4585,10 @@ class NakshaApp(QMainWindow):
             QMessageBox.warning(self, "Cross Section", "Cross Section works only in Top View.")
             return
 
-        # âœ… Sync palette FIRST
+        # ✅ Sync palette FIRST
         if hasattr(self, 'display_dialog') and self.display_dialog:
             print(f"\n{'='*60}")
-            print(f"ðŸ”„ SYNCING PALETTE BEFORE CROSS-SECTION")
+            print(f"🔄 SYNCING PALETTE BEFORE CROSS-SECTION")
             dialog = self.display_dialog
             current_slot = dialog.current_slot
             if hasattr(dialog, 'view_palettes') and 0 in dialog.view_palettes:
@@ -5058,28 +4596,28 @@ class NakshaApp(QMainWindow):
                 # Cross-section slots (1..4) must remain isolated in view_palettes.
                 from gui.display_mode import clone_palette
                 self.class_palette = clone_palette(dialog.view_palettes[0])
-                print(f"  âœ… Synced {len(self.class_palette)} MAIN-view classes from Display Mode")
+                print(f"  ✅ Synced {len(self.class_palette)} MAIN-view classes from Display Mode")
                 if current_slot != 0:
-                    print(f"  â„¹ï¸ Active slot is {current_slot}; preserved class_palette from slot 0")
+                    print(f"  ℹ️ Active slot is {current_slot}; preserved class_palette from slot 0")
             elif hasattr(dialog, 'view_palettes') and current_slot in dialog.view_palettes:
                 # Do not overwrite class_palette from non-main slots.
-                print(f"  â„¹ï¸ Slot 0 palette unavailable; keeping existing class_palette unchanged")
+                print(f"  ℹ️ Slot 0 palette unavailable; keeping existing class_palette unchanged")
             print(f"{'='*60}\n")
         
-        # âœ… Ensure dictionaries exist
+        # ✅ Ensure dictionaries exist
         if not hasattr(self, "section_docks"):
             self.section_docks = {}
         if not hasattr(self, "section_vtks"):
             self.section_vtks = {}
         
-        # âœ… Find next available view (0-3 = Views 1-4)
+        # ✅ Find next available view (0-3 = Views 1-4)
         next_view = None
         for i in range(4):
             if i not in self.section_docks or not self.section_docks[i].isVisible():
                 next_view = i
                 break
         
-        # âœ… All 4 views already open
+        # ✅ All 4 views already open
         if next_view is None:
             QMessageBox.information(
                 self, 
@@ -5087,7 +4625,7 @@ class NakshaApp(QMainWindow):
                 "All 4 cross-section views are already active.\n\n"
                 "Close one to open a new view."
             )
-            self.statusBar().showMessage("âš ï¸ All 4 cross-section views already open", 3000)
+            self.statusBar().showMessage("⚠️ All 4 cross-section views already open", 3000)
             return
 
         # Cross-section owns the main-canvas interaction while it is active.
@@ -5098,12 +4636,12 @@ class NakshaApp(QMainWindow):
             resume_after_switch=False,
         )
         
-        # âœ… Open the next view directly
-        print(f"âœ… Auto-opening Cross Section View {next_view + 1}")
+        # ✅ Open the next view directly
+        print(f"✅ Auto-opening Cross Section View {next_view + 1}")
         self._open_specific_cross_section_view(next_view)
         
         self.statusBar().showMessage(
-            f"âœ… Cross Section View {next_view + 1} opened - Draw line on main view", 
+            f"✅ Cross Section View {next_view + 1} opened - Draw line on main view", 
             3000
         )
 
@@ -5139,7 +4677,7 @@ class NakshaApp(QMainWindow):
             pass
 
         if disabled:
-            print("ðŸš« Point-pick tools auto-disabled (Cross/Cut Section activated)")
+            print("🚫 Point-pick tools auto-disabled (Cross/Cut Section activated)")
         return disabled
 
     def enable_cross_section_mode(self):   #Added by bala
@@ -5148,10 +4686,21 @@ class NakshaApp(QMainWindow):
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
             return
 
-        # âœ… MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
+        # ✅ MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
         # pick) collide with Cross Section on the same views, so disable them
         # automatically when Cross Section is activated (no popup needed).
         self._deactivate_point_pick_tools()
+
+        # ✅ MUTUAL EXCLUSION: the Measure ▸ Cross Section (XS) measuring tool
+        # keeps its own click observers on the cross-section views this tool's
+        # line creates, so the two would fight over the same section-view
+        # clicks if both stayed armed. Stand XS down (and untoggle its ribbon
+        # button) now that drawing really started. Deliberately placed AFTER
+        # the Top-View guard above: when activation is rejected there is
+        # nothing to be exclusive with, so the measuring session is untouched.
+        self._stand_down_cross_section_measurement_tool(
+            "cross-section drawing activated"
+        )
 
         # Cross-section and Curve are mutually exclusive canvas tools. Keep
         # any unfinished curve available for a later manual Curve activation,
@@ -5164,7 +4713,7 @@ class NakshaApp(QMainWindow):
         # Deactivate any active digitize tool before enabling cross-section
         self._deactivate_digitize_tool()
 
-        # âœ… Stand down the temp fence tool â€” its main-view VTK observers
+        # ✅ Stand down the temp fence tool — its main-view VTK observers
         # would otherwise keep capturing clicks during cross-section drawing.
         try:
             _tft = getattr(self, "temp_fence_tool", None)
@@ -5172,12 +4721,12 @@ class NakshaApp(QMainWindow):
                 _tft.deactivate()
                 if getattr(self, "active_classify_tool", None) == "temp_fence":
                     self.active_classify_tool = None
-                print("ðŸš§ Temp fence stood down for cross-section mode")
+                print("🚧 Temp fence stood down for cross-section mode")
         except Exception as _e:
-            print(f"âš ï¸ Temp fence stand-down failed: {_e}")
+            print(f"⚠️ Temp fence stand-down failed: {_e}")
 
 
-        # âœ… Create NON-BLOCKING view selector (only once)
+        # ✅ Create NON-BLOCKING view selector (only once)
         if not hasattr(self, '_view_selector_dialog') or self._view_selector_dialog is None:
             from gui.theme_manager import get_dialog_stylesheet
 
@@ -5203,7 +4752,7 @@ class NakshaApp(QMainWindow):
             layout.setContentsMargins(10, 8, 10, 10)  # tighter padding
             layout.setSpacing(0)                       # no gap needed with single widget
 
-            # Dropdown only â€” no empty label
+            # Dropdown only — no empty label
             combo = QComboBox()
             combo.addItems(["View 1", "View 2", "View 3", "View 4"])
             combo.setCurrentIndex(0)
@@ -5215,14 +4764,14 @@ class NakshaApp(QMainWindow):
 
             self._view_selector_dialog.view_combo = combo
             self._view_selector_dialog.setLayout(layout)
-            self._view_selector_dialog.setFixedSize(180, 58)  # âœ… tight: just title bar + combo
+            self._view_selector_dialog.setFixedSize(180, 58)  # ✅ tight: just title bar + combo
            
             # Connect dropdown change
             def on_view_changed(index):
-                print(f"ðŸ”„ Target view changed to: View {index + 1}")
+                print(f"🔄 Target view changed to: View {index + 1}")
                 self.section_controller.active_view = index
                 self.statusBar().showMessage(
-                    f"âœ… Target: View {index + 1} - Draw line on main view",
+                    f"✅ Target: View {index + 1} - Draw line on main view",
                     3000
                 )
             combo.currentIndexChanged.connect(on_view_changed)
@@ -5248,7 +4797,7 @@ class NakshaApp(QMainWindow):
         from gui.theme_manager import get_dialog_stylesheet
         self._view_selector_dialog.setStyleSheet(get_dialog_stylesheet())
        
-        # âœ… ALWAYS SHOW AND BRING TO FRONT (even if already open!)
+        # ✅ ALWAYS SHOW AND BRING TO FRONT (even if already open!)
         # Also un-minimize: the dialog may have been minimized natively
         # (windowState == WindowMinimized), in which case _is_minimized_to_chip
         # is False and a plain show() would leave it minimized.
@@ -5261,7 +4810,7 @@ class NakshaApp(QMainWindow):
         else:
             _vs_dlg.show()
         self._view_selector_dialog.raise_()
-        self._view_selector_dialog.activateWindow()  # âœ… Force focus
+        self._view_selector_dialog.activateWindow()  # ✅ Force focus
        
         # Get selected index
         if hasattr(self._view_selector_dialog, 'view_combo'):
@@ -5272,7 +4821,7 @@ class NakshaApp(QMainWindow):
         # Set active view in controller
         self.section_controller.active_view = selected_index
         print(
-            f"âœ… Cross-section mode enabled - "
+            f"✅ Cross-section mode enabled - "
             f"Target: View {selected_index + 1}"
         )
 
@@ -5303,18 +4852,18 @@ class NakshaApp(QMainWindow):
 
                 if restored:
                     print(
-                        "âœ… CrossSectionRect locate restored on Cut View"
+                        "✅ CrossSectionRect locate restored on Cut View"
                     )
 
         except Exception as e:
             print(
-                f"âš ï¸ Cut View locate restoration skipped: {e}"
+                f"⚠️ Cut View locate restoration skipped: {e}"
             )
 
         self.set_cross_cursor_active(True, "cross_section")
 
         self.statusBar().showMessage(
-            f"âœ… Ready: Draw line â†’ View {selected_index + 1} "
+            f"✅ Ready: Draw line → View {selected_index + 1} "
             "(change dropdown to switch)",
             5000
         )
@@ -5367,7 +4916,7 @@ class NakshaApp(QMainWindow):
 
     def _open_specific_cross_section_view(self, view_index):
         """
-        âœ… INTERNAL METHOD - Creates/activates a specific cross-section view
+        ✅ INTERNAL METHOD - Creates/activates a specific cross-section view
         Called by both:
         - enable_cross_section_mode() (manual dialog selection)
         - open_next_cross_section_view() (auto-increment shortcut)
@@ -5399,9 +4948,9 @@ class NakshaApp(QMainWindow):
             if view_index in self.section_vtks:
                 self.section_controller.current_vtk = self.section_vtks[view_index]
                 
-            print(f"ðŸ” View {view_index + 1} already open. Activated.")
+            print(f"🔁 View {view_index + 1} already open. Activated.")
             
-            # âœ… CRITICAL: Still need to attach main interactor even for existing views
+            # ✅ CRITICAL: Still need to attach main interactor even for existing views
             self._attach_cross_section_interactor()
             return
 
@@ -5455,20 +5004,20 @@ class NakshaApp(QMainWindow):
         
         dock.setAllowedAreas(Qt.NoDockWidgetArea)
         
-        # âœ… CORRECT: Restore individual dock geometry
+        # ✅ CORRECT: Restore individual dock geometry
         dock_geo_key = f"CrossSectionDock_{view_index}_geometry"
         saved_geometry = self.settings.value(dock_geo_key)
         
         if saved_geometry is not None:
             # Restore saved position and size
             dock.restoreGeometry(saved_geometry)
-            print(f"âœ… Restored dock {view_index + 1} geometry (position + size)")
+            print(f"✅ Restored dock {view_index + 1} geometry (position + size)")
         else:
             # First time - use default offset position
             offset = 40 * len(self.section_docks)
             dock.move(self.x() + self.width() - 400 + offset, self.y() + 120 + offset)
             dock.resize(500, 400)
-            print(f"â†’ No saved geometry - using default position for dock {view_index + 1}")
+            print(f"→ No saved geometry - using default position for dock {view_index + 1}")
         
         dock.show()
         ThemeManager.apply_native_window_theme(dock)
@@ -5478,18 +5027,18 @@ class NakshaApp(QMainWindow):
 
         def safe_close_event(event):
             """
-            âœ… FIXED: Proper VTK cleanup before closing to prevent handle errors
+            ✅ FIXED: Proper VTK cleanup before closing to prevent handle errors
             Shows confirmation dialog ONLY for Alt+F4, allows normal close otherwise
             """
             try:
                 # During app-wide shutdown, the main closeEvent owns all VTK cleanup.
                 # Avoid per-dock prompts/teardown here to prevent double-finalize races.
                 if getattr(self, "_shutdown_in_progress", False):
-                    print(f"ðŸšª App shutdown: accepting close for View {view_index + 1}")
+                    print(f"🚪 App shutdown: accepting close for View {view_index + 1}")
                     event.accept()
                     return
 
-                # âœ… NEW: Check if close was triggered by Alt+F4 (or window X button)
+                # ✅ NEW: Check if close was triggered by Alt+F4 (or window X button)
                 from PySide6.QtWidgets import QMessageBox
                
                 # Check if this is a spontaneous event (user-initiated like Alt+F4 or X button)
@@ -5499,20 +5048,20 @@ class NakshaApp(QMainWindow):
                         self,
                         "Close Cross-Section View?",
                         f"Are you sure you want to close Cross-Section View {view_index + 1}?\n\n"
-                        "The view can be reopened from Tools â†’ Cross Section.",
+                        "The view can be reopened from Tools → Cross Section.",
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.No
                     )
                    
                     if reply == QMessageBox.No:
-                        print(f"âŒ User cancelled closing View {view_index + 1}")
+                        print(f"❌ User cancelled closing View {view_index + 1}")
                         event.ignore()
                         return
                    
-                    print(f"ðŸšª User confirmed closing View {view_index + 1} - cleaning up...")
+                    print(f"🚪 User confirmed closing View {view_index + 1} - cleaning up...")
                 else:
                     # Programmatic close - no confirmation needed
-                    print(f"ðŸšª Programmatically closing View {view_index + 1} - cleaning up...")
+                    print(f"🚪 Programmatically closing View {view_index + 1} - cleaning up...")
 
                 # Detach per-view identify/point-sync hooks before VTK teardown.
                 try:
@@ -5520,23 +5069,23 @@ class NakshaApp(QMainWindow):
                     if identify_tool is not None and hasattr(identify_tool, "deactivate_for_section"):
                         identify_tool.deactivate_for_section(view_index)
                 except Exception as e:
-                    print(f"   âš ï¸ Identify section observer cleanup warning: {e}")
+                    print(f"   ⚠️ Identify section observer cleanup warning: {e}")
 
                 try:
                     point_sync_tool = getattr(self, "point_sync_tool", None)
                     if point_sync_tool is not None and hasattr(point_sync_tool, "deactivate_for_section"):
                         point_sync_tool.deactivate_for_section(view_index)
                 except Exception as e:
-                    print(f"   âš ï¸ Point sync section observer cleanup warning: {e}")
+                    print(f"   ⚠️ Point sync section observer cleanup warning: {e}")
 
                 try:
                     cs_measure = getattr(self, "cross_section_measurement_tool", None)
                     if cs_measure is not None and hasattr(cs_measure, "deactivate_for_section"):
                         cs_measure.deactivate_for_section(view_index)
                 except Exception as e:
-                    print(f"   âš ï¸ Cross-section measurement observer cleanup warning: {e}")
+                    print(f"   ⚠️ Cross-section measurement observer cleanup warning: {e}")
 
-                # âœ… CRITICAL: Stop all VTK rendering FIRST
+                # ✅ CRITICAL: Stop all VTK rendering FIRST
                 try:
                     # 1. Clear the VTK widget completely
                     if view_index in self.section_vtks:
@@ -5568,46 +5117,46 @@ class NakshaApp(QMainWindow):
                                         pass
                                     render_window.Finalize()
                                     vtk_widget._naksha_view_finalized = True
-                                    print(f"   âœ… VTK render window finalized")
+                                    print(f"   ✅ VTK render window finalized")
                         except Exception as e:
-                            print(f"   âš ï¸ Render window finalize warning: {e}")
+                            print(f"   ⚠️ Render window finalize warning: {e}")
                        
                         # Clear the renderer
                         try:
                             if hasattr(vtk_widget, 'renderer'):
                                 vtk_widget.renderer.RemoveAllViewProps()
-                                print(f"   âœ… Renderer cleared")
+                                print(f"   ✅ Renderer cleared")
                         except Exception as e:
-                            print(f"   âš ï¸ Renderer clear warning: {e}")
+                            print(f"   ⚠️ Renderer clear warning: {e}")
                        
                         # Set render window to None (breaks the connection)
                         try:
                             vtk_widget.SetRenderWindow(None)
-                            print(f"   âœ… VTK widget disconnected from render window")
+                            print(f"   ✅ VTK widget disconnected from render window")
                         except Exception as e:
-                            print(f"   âš ï¸ SetRenderWindow warning: {e}")
+                            print(f"   ⚠️ SetRenderWindow warning: {e}")
                
                 except Exception as e:
-                    print(f"   âš ï¸ VTK cleanup error: {e}")
+                    print(f"   ⚠️ VTK cleanup error: {e}")
                
-                # âœ… Save geometry BEFORE hiding
+                # ✅ Save geometry BEFORE hiding
                 from PySide6.QtCore import QSettings
-                settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+                settings = QSettings("NakshaAI", "LidarApp")
                
                 try:
                     settings.setValue(f"CrossSectionDock_{view_index}_geometry", dock.saveGeometry())
-                    print(f"   ðŸ’¾ Dock {view_index + 1} geometry saved")
+                    print(f"   💾 Dock {view_index + 1} geometry saved")
                 except Exception as e:
-                    print(f"   âš ï¸ Geometry save failed: {e}")
+                    print(f"   ⚠️ Geometry save failed: {e}")
                
-                # âœ… NOW safe to hide and close
+                # ✅ NOW safe to hide and close
                 dock.hide()
                
                 # Remove camera sync observer BEFORE removing vtk reference so the
                 # stale entry doesn't block reinstall when the dialog is reopened.
                 self._remove_camera_sync_observer(view_index)
 
-                # âœ… Clean up resize refit timer and event filter
+                # ✅ Clean up resize refit timer and event filter
                 try:
                     timers = getattr(self, '_section_resize_timers', {})
                     if view_index in timers:
@@ -5629,13 +5178,13 @@ class NakshaApp(QMainWindow):
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(100, lambda: dock.deleteLater())
                
-                print(f"   âœ… View {view_index + 1} cleanup complete")
+                print(f"   ✅ View {view_index + 1} cleanup complete")
                
                 # Accept the close event
                 event.accept()
                
             except Exception as e:
-                print(f"âš ï¸ Close event error: {e}")
+                print(f"⚠️ Close event error: {e}")
                 event.accept()  # Still allow close on error
  
         dock.closeEvent = safe_close_event
@@ -5655,9 +5204,9 @@ class NakshaApp(QMainWindow):
                 wrapper = ClassificationInteractor(self, vtk_widget.interactor)
                 vtk_widget.interactor.SetInteractorStyle(wrapper.style)
                 self.classify_interactors[view_index] = wrapper
-                print(f"âœ… Classification interactor attached to NEW View {view_index + 1}")
+                print(f"✅ Classification interactor attached to NEW View {view_index + 1}")
             except Exception as e:
-                print(f"âš ï¸ Failed to attach classification on new view {view_index + 1}: {e}")
+                print(f"⚠️ Failed to attach classification on new view {view_index + 1}: {e}")
         else:
             # No active tool - install right-click reactivation observer on plain style
             try:
@@ -5672,7 +5221,7 @@ class NakshaApp(QMainWindow):
                         cs_measure = getattr(app, "cross_section_measurement_tool", None)
                         if cs_measure is not None and getattr(cs_measure, "active", False):
                             return
-                        print(f"ðŸ–±ï¸ Right-click detected in cross-section view")
+                        print(f"🖱️ Right-click detected in cross-section view")
                         active_tool = getattr(app, "active_classify_tool", None)
                         section_has_classifier = bool(getattr(app, "classify_interactors", None))
                         if active_tool is None or not section_has_classifier:
@@ -5687,7 +5236,7 @@ class NakshaApp(QMainWindow):
                                     finally:
                                         app._right_click_reactivating = False
                                 except Exception as e:
-                                    print(f"   âš ï¸ Right-click reactivate failed: {e}")
+                                    print(f"   ⚠️ Right-click reactivate failed: {e}")
                     return _handler
                 # Remove old observer if any
                 old_tag = self._section_right_click_observers.get(view_index)
@@ -5699,7 +5248,7 @@ class NakshaApp(QMainWindow):
                 tag = interactor.AddObserver("RightButtonPressEvent", _make_handler(app_ref), 1.0)
                 self._section_right_click_observers[view_index] = tag
 
-                # Left-click observer: Nakshatech locate when cross-section tool active
+                # Left-click observer: MicroStation locate when cross-section tool active
                 def _make_left_handler(app, vidx):
                     def _left_handler(obj, event):
                         if not getattr(app, 'cross_section_active', False):
@@ -5732,21 +5281,21 @@ class NakshaApp(QMainWindow):
                     return _move_handler
                 interactor.AddObserver("MouseMoveEvent", _make_move_handler(app_ref, view_index), 1.0)
 
-                print(f"âœ… Right-click observer added to NEW View {view_index + 1}")
+                print(f"✅ Right-click observer added to NEW View {view_index + 1}")
             except Exception as e:
-                print(f"âš ï¸ Failed to add right-click observer on new view {view_index + 1}: {e}")
+                print(f"⚠️ Failed to add right-click observer on new view {view_index + 1}: {e}")
         
         # Store in controller for global access
         if not hasattr(self.section_controller, 'view_vtks'):
             self.section_controller.view_vtks = {}
         self.section_controller.view_vtks[view_index] = vtk_widget
         
-        print(f"âœ… Registered View {view_index + 1}: dock={dock}, vtk={vtk_widget}")
+        print(f"✅ Registered View {view_index + 1}: dock={dock}, vtk={vtk_widget}")
         print(f"   Active view set to: {self.section_controller.active_view}")
         
         def on_dock_activated():
             self.section_controller.active_view = view_index
-            print(f"âœ… Dock {view_index + 1} activated -> Active view set")
+            print(f"✅ Dock {view_index + 1} activated -> Active view set")
         
         dock.visibilityChanged.connect(
             lambda visible: on_dock_activated() if visible else None
@@ -5756,11 +5305,11 @@ class NakshaApp(QMainWindow):
             """Reinstall right-click observers when dock state changes (floating <-> tabified)."""
             self._update_cross_section_dock_title_style(dock, is_floating)
             if not is_floating:
-                print(f"ðŸ“Ž View {view_index + 1} docked/tabified - reinstalling right-click observers")
+                print(f"📎 View {view_index + 1} docked/tabified - reinstalling right-click observers")
                 try:
                     self._reinstall_section_right_click_observer(view_index)
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to reinstall observer: {e}")
+                    print(f"   ⚠️ Failed to reinstall observer: {e}")
 
                 # Wait until Qt completes the attach operation before applying
                 # the layout selected in Global Settings.
@@ -5774,7 +5323,7 @@ class NakshaApp(QMainWindow):
         self._register_canvas_cursor_widget(vtk_widget.interactor)
         self._install_section_wheel_zoom(vtk_widget)
 
-        # âœ… Auto-refit camera when section dock is resized
+        # ✅ Auto-refit camera when section dock is resized
         if not hasattr(self, '_section_resize_timers'):
             self._section_resize_timers = {}
         from PySide6.QtCore import QTimer, QEvent
@@ -5825,22 +5374,22 @@ class NakshaApp(QMainWindow):
 
         if hasattr(self, 'identification_tool') and self.identification_tool.active:
             self.identification_tool.activate_for_section(vtk_widget, view_index)
-            print(f"ðŸ” Auto-activated identification for view {view_index + 1}")
+            print(f"🔍 Auto-activated identification for view {view_index + 1}")
 
         if hasattr(self, 'cross_section_measurement_tool') and self.cross_section_measurement_tool.active:
             self.cross_section_measurement_tool.activate_for_section(vtk_widget, view_index)
-            print(f"ðŸ“ Auto-activated cross-section measurement for view {view_index + 1}")
+            print(f"📏 Auto-activated cross-section measurement for view {view_index + 1}")
 
         if hasattr(self, 'point_sync_tool') and self.point_sync_tool.active:
             self.point_sync_tool.activate_for_section(vtk_widget, view_index)
-            print(f"ðŸŽ¯ Auto-activated point sync for view {view_index + 1}")
+            print(f"🎯 Auto-activated point sync for view {view_index + 1}")
 
         # --------------------------------------------------------
         # 3. Attach Main Interactor (For new docks)
         # --------------------------------------------------------
         self._attach_cross_section_interactor()
 
-        # âœ… FIX: Restore section data if this view was previously computed
+        # ✅ FIX: Restore section data if this view was previously computed
         # When the dialog is closed and reopened, a new VTK widget is created but
         # the stored section data (section_{view_index}_core_points, etc.) still
         # exists on self. Re-render it so the dialog doesn't appear empty.
@@ -5854,22 +5403,22 @@ class NakshaApp(QMainWindow):
                     view=getattr(self, 'cross_view_mode', 'side')
                 )
                 vtk_widget.render()
-                print(f"âœ… Restored section data for View {view_index + 1}")
+                print(f"✅ Restored section data for View {view_index + 1}")
                 self.statusBar().showMessage(
-                    f"âœ… Cross Section View {view_index + 1} restored", 5000
+                    f"✅ Cross Section View {view_index + 1} restored", 5000
                 )
             except Exception as e:
-                print(f"âš ï¸ Failed to restore section data for View {view_index + 1}: {e}")
+                print(f"⚠️ Failed to restore section data for View {view_index + 1}: {e}")
                 self.statusBar().showMessage(
-                    "âœï¸ Draw a line on the Plan View to create cross-section", 5000
+                    "✏️ Draw a line on the Plan View to create cross-section", 5000
                 )
         else:
             self.statusBar().showMessage(
-                "âœï¸ Draw a line on the Plan View to create cross-section",
+                "✏️ Draw a line on the Plan View to create cross-section",
                 5000
             )
 
-        print(f"âœ… Cross Section View {view_index + 1} ready")
+        print(f"✅ Cross Section View {view_index + 1} ready")
 
                 # Install camera sync observer for ANY sync relationship (target OR source)
         if hasattr(self, 'view_sync_map'):
@@ -5889,7 +5438,7 @@ class NakshaApp(QMainWindow):
 
     def _attach_cross_section_interactor(self):
         """
-        âœ… HELPER: Attaches CrossSectionInteractor to main view
+        ✅ HELPER: Attaches CrossSectionInteractor to main view
         Shared by both new and existing view activation
         """
         from .cross_section.interactor_slice import CrossSectionInteractor
@@ -5900,7 +5449,7 @@ class NakshaApp(QMainWindow):
             # Save the old interactor to restore later
             if not hasattr(self, 'previous_interactor_style'):
                 self.previous_interactor_style = main_interactor.GetInteractorStyle()
-                print(f"ðŸ’¾ Saved previous interactor style: {self.previous_interactor_style}")
+                print(f"💾 Saved previous interactor style: {self.previous_interactor_style}")
             
             # Create and attach the cross-section interactor
             self.cross_interactor = CrossSectionInteractor(self, main_interactor)
@@ -5910,7 +5459,7 @@ class NakshaApp(QMainWindow):
             # Mark tool as active
             self.cross_section_active = True
             
-            # âœ… Create mock cross_action for compatibility
+            # ✅ Create mock cross_action for compatibility
             class MockAction:
                 def __init__(self):
                     self._checked = True
@@ -5922,29 +5471,29 @@ class NakshaApp(QMainWindow):
                     self._checked = checked
             
             self.cross_action = MockAction()
-            print("âœ… Created mock cross_action for interactor compatibility")
+            print("✅ Created mock cross_action for interactor compatibility")
             
             # Restore interactor after cross-section is drawn
             def restore_interactor_after_draw():
                 if hasattr(self, 'previous_interactor_style') and self.previous_interactor_style:
                     try:
                         main_interactor.SetInteractorStyle(self.previous_interactor_style)
-                        print(f"ðŸ”„ Restored previous interactor style")
+                        print(f"🔄 Restored previous interactor style")
                     except Exception as e:
-                        print(f"âš ï¸ Failed to restore interactor: {e}")
+                        print(f"⚠️ Failed to restore interactor: {e}")
                         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
                         main_interactor.SetInteractorStyle(vtkInteractorStyleImage())
                 
                 self.cross_section_active = False
                 self.cross_interactor = None
-                print("ðŸ›‘ Cross-section tool finished (auto-restore)")
+                print("🛑 Cross-section tool finished (auto-restore)")
             
             self.cross_interactor.on_section_complete = restore_interactor_after_draw
             
-            print("ðŸ§­ CrossSectionInteractor attached to MAIN viewer (with auto-restore)")
+            print("🧭 CrossSectionInteractor attached to MAIN viewer (with auto-restore)")
             
         except Exception as e:
-            print(f"âš ï¸ Failed to attach CrossSectionInteractor: {e}")
+            print(f"⚠️ Failed to attach CrossSectionInteractor: {e}")
             import traceback
             traceback.print_exc()
         
@@ -5955,7 +5504,7 @@ class NakshaApp(QMainWindow):
     def toggle_cross_section_mode(self, checked):
         """
         Toggle cross-section drawing mode.
-        âœ… FIXED: Automatically activates an existing open view if none is selected.
+        ✅ FIXED: Automatically activates an existing open view if none is selected.
         """
         if checked:
             # 1. Check if a view is already active
@@ -5970,7 +5519,7 @@ class NakshaApp(QMainWindow):
                 self.section_controller.active_view = first_view_idx
                 self.section_controller.current_vtk = self.section_vtks[first_view_idx]
                 
-                print(f"âš ï¸ No active view selected. Auto-activating View {first_view_idx}")
+                print(f"⚠️ No active view selected. Auto-activating View {first_view_idx}")
                 
                 # Optional: Bring that dock to front so user knows which one it is
                 self.section_docks[first_view_idx].raise_()
@@ -5982,9 +5531,9 @@ class NakshaApp(QMainWindow):
         else:
             self.deactivate_cross_section_tool()
         
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ════════════════════════════════════════════════════════════════════════════════
     # COMPLETE BIDIRECTIONAL SYNC - CAMERA + SECTION DATA
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ════════════════════════════════════════════════════════════════════════════════
 
     def _on_section_updated(self, view_idx: int):
         """
@@ -6006,7 +5555,7 @@ class NakshaApp(QMainWindow):
             buf = getattr(self, "section_buffer_points", None)
         
         if core is None:
-            print("âš ï¸ _on_section_updated: no section data available")
+            print("⚠️ _on_section_updated: no section data available")
             return
 
         # Sync section data to matched views
@@ -6047,8 +5596,8 @@ class NakshaApp(QMainWindow):
     def _sync_section_from(self, source_idx: int):
         """
         Copy section data from source view to ALL targets that match it.
-        âœ… BIDIRECTIONAL: Works with bidirectional sync
-        âœ… SYNCS: Points, masks, indices, and source camera/zoom
+        ✅ BIDIRECTIONAL: Works with bidirectional sync
+        ✅ SYNCS: Points, masks, indices, and source camera/zoom
         """
         import numpy as np
         
@@ -6074,7 +5623,7 @@ class NakshaApp(QMainWindow):
                     setattr(self, f"section_{source_idx}_buffer_points", buf)
             
             if core is None:
-                print(f"âš ï¸ _sync_section_from: no source data for View {source_idx + 1}")
+                print(f"⚠️ _sync_section_from: no source data for View {source_idx + 1}")
                 return
             
             # All attributes to sync
@@ -6135,7 +5684,7 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
                 
-                print(f"   ðŸ”— Syncing section: View {target_idx + 1} from View {source_idx + 1} (mode={view_mode})")
+                print(f"   🔗 Syncing section: View {target_idx + 1} from View {source_idx + 1} (mode={view_mode})")
                 
                 # Save current active view
                 prev_active = getattr(self.section_controller, "active_view", None)
@@ -6196,7 +5745,7 @@ class NakshaApp(QMainWindow):
                             gpu_slot=target_idx + 1,
                         )
                     except Exception as e:
-                        print(f"   âš ï¸ Palette apply failed: {e}")
+                        print(f"   ⚠️ Palette apply failed: {e}")
 
                     # Mirror the SOURCE camera/zoom after the target view finishes
                     # rebuilding and applying its own palette.
@@ -6210,9 +5759,9 @@ class NakshaApp(QMainWindow):
                                 vtk_widget, target_idx
                             )
                     except Exception as e:
-                        print(f"   âš ï¸ Post-sync source camera apply failed: {e}")
+                        print(f"   ⚠️ Post-sync source camera apply failed: {e}")
                     
-                    print(f"   âœ… Section synced to View {target_idx + 1}")
+                    print(f"   ✅ Section synced to View {target_idx + 1}")
                     
                 finally:
                     # Restore active view
@@ -6228,7 +5777,7 @@ class NakshaApp(QMainWindow):
                 self._remember_section_camera_state(target_idx)
         
         except Exception as e:
-            print(f"âš ï¸ Section sync error: {e}")
+            print(f"⚠️ Section sync error: {e}")
             import traceback
             traceback.print_exc()
         
@@ -6245,9 +5794,9 @@ class NakshaApp(QMainWindow):
     def set_view_sync(self, target_view_num: int, source_view_num):
         """
         Configure sync between views.
-        âœ… BIDIRECTIONAL: Both views can drive sync
-        âœ… REAL-TIME: Immediate synchronization
-        âœ… SYNCS: Both camera AND section data
+        ✅ BIDIRECTIONAL: Both views can drive sync
+        ✅ REAL-TIME: Immediate synchronization
+        ✅ SYNCS: Both camera AND section data
         """
         target_idx = target_view_num - 1
 
@@ -6266,24 +5815,24 @@ class NakshaApp(QMainWindow):
             if not has_any_sync:
                 self._remove_camera_sync_observer(target_idx)
             
-            print(f"ðŸ”• Sync cleared: View {target_view_num}")
+            print(f"🔕 Sync cleared: View {target_view_num}")
             return
 
         source_idx = source_view_num - 1
 
         if source_idx == target_idx:
-            print(f"âš ï¸ Ignoring self-sync for View {target_view_num}")
+            print(f"⚠️ Ignoring self-sync for View {target_view_num}")
             if target_idx in self.view_sync_map:
                 del self.view_sync_map[target_idx]
             return
 
         # Set the sync relationship (ALLOW BIDIRECTIONAL)
         self.view_sync_map[target_idx] = source_idx
-        print(f"ðŸ”— Sync set: View {target_view_num} = Match View {source_view_num}")
+        print(f"🔗 Sync set: View {target_view_num} = Match View {source_view_num}")
 
         # Check if bidirectional
         if source_idx in self.view_sync_map and self.view_sync_map[source_idx] == target_idx:
-            print(f"ðŸ”„ Bidirectional sync enabled: View {target_view_num} â†” View {source_view_num}")
+            print(f"🔄 Bidirectional sync enabled: View {target_view_num} ↔ View {source_view_num}")
 
         # Initial sync copies section geometry, then each view keeps its own
         # palette but mirrors the source camera/zoom. Real-time camera sync
@@ -6328,8 +5877,8 @@ class NakshaApp(QMainWindow):
     def _install_realtime_camera_observer(self, view_idx: int, vtk_widget):
         """
         Install REAL-TIME camera observer.
-        âœ… BIDIRECTIONAL: Works for both views
-        âœ… ZERO DELAY: Immediate sync
+        ✅ BIDIRECTIONAL: Works for both views
+        ✅ ZERO DELAY: Immediate sync
         """
         try:
             self._init_camera_sync_state()
@@ -6344,17 +5893,17 @@ class NakshaApp(QMainWindow):
             vtk_widget._sync_view_idx = view_idx
             
             def realtime_sync(obj, event):
-                """Real-time bidirectional sync â€” throttled to 30fps."""
+                """Real-time bidirectional sync — throttled to 30fps."""
                 import time as _time
                 if getattr(self, '_sync_count', 0) > 0:
                     return
                 if getattr(self, '_syncing_camera', False):
                     return
                 
-                # âœ… THROTTLE: 30fps max (33ms between syncs)
+                # ✅ THROTTLE: 30fps max (33ms between syncs)
                 now = _time.time()
                 
-                # ðŸš€ OPTIMIZATION: Disable real-time sync during classification dragging
+                # 🚀 OPTIMIZATION: Disable real-time sync during classification dragging
                 # the user is brushing in a section view causes extreme lag.
                 if getattr(self, 'is_dragging', False):
                     return
@@ -6393,10 +5942,10 @@ class NakshaApp(QMainWindow):
                 'vtk_widget': vtk_widget
             }
             
-            print(f"âœ… Real-time camera observer installed for View {view_idx + 1}")
+            print(f"✅ Real-time camera observer installed for View {view_idx + 1}")
             
         except Exception as e:
-            print(f"âš ï¸ Failed to install observer: {e}")
+            print(f"⚠️ Failed to install observer: {e}")
             import traceback
             traceback.print_exc()
 
@@ -6423,7 +5972,7 @@ class NakshaApp(QMainWindow):
                 self._apply_camera_immediate(target_vtk, source_state)
         
         except Exception as e:
-            print(f"âš ï¸ Bidirectional sync error: {e}")
+            print(f"⚠️ Bidirectional sync error: {e}")
         
         finally:
             self._sync_count = max(0, self._sync_count - 1)
@@ -6450,10 +5999,10 @@ class NakshaApp(QMainWindow):
                     pass
             
             del self._camera_observers[view_idx]
-            print(f"ðŸ”“ Observer removed from View {view_idx + 1}")
+            print(f"🔓 Observer removed from View {view_idx + 1}")
             
         except Exception as e:
-            print(f"âš ï¸ Observer removal error: {e}")
+            print(f"⚠️ Observer removal error: {e}")
 
 
     def _sync_camera_immediate(self, source_idx: int):
@@ -6504,7 +6053,7 @@ class NakshaApp(QMainWindow):
             camera.SetParallelScale(camera_state["parallel_scale"])
             camera.SetClippingRange(camera_state["clipping_range"])
             
-# âœ… FIX: Cross-section views must ALWAYS be parallel/2D
+# ✅ FIX: Cross-section views must ALWAYS be parallel/2D
             is_section_view = False
             if hasattr(self, 'section_vtks'):
                 for _idx, _vtk in self.section_vtks.items():
@@ -6595,15 +6144,15 @@ class NakshaApp(QMainWindow):
         if hasattr(self, 'view_sync_map'):
             self.view_sync_map.clear()
         
-        print("âœ… All camera sync disabled")
+        print("✅ All camera sync disabled")
                   
     def cleanup_closed_section_views(self):
         """
         AGGRESSIVE cleanup of ALL section view references when cross-section closes.
-        âœ… FIXED: Now properly removes widget references to stop false "cross-section active" detection
+        ✅ FIXED: Now properly removes widget references to stop false "cross-section active" detection
         """
         print("\n" + "="*60)
-        print("ðŸ§¹ CLEANUP: Starting section view cleanup...")
+        print("🧹 CLEANUP: Starting section view cleanup...")
         print("="*60)
         
         view_indices = set()
@@ -6636,18 +6185,18 @@ class NakshaApp(QMainWindow):
                     break  # Move to next attr
         
         if not view_indices:
-            print("   âœ… No section views found - already clean")
+            print("   ✅ No section views found - already clean")
             print("="*60 + "\n")
             return
         
-        print(f"   ðŸ“‹ Will clean views: {sorted(view_indices)}")
+        print(f"   📋 Will clean views: {sorted(view_indices)}")
         
-        # âœ… CRITICAL FIX: Clean each view COMPLETELY
+        # ✅ CRITICAL FIX: Clean each view COMPLETELY
         for view_idx in sorted(view_indices):
             try:
-                print(f"\n   ðŸ”§ Cleaning section view {view_idx}...")
+                print(f"\n   🔧 Cleaning section view {view_idx}...")
                 
-                # 1. âœ… CRITICAL: Remove from section_vtks FIRST (this stops "Cross-section active" detection)
+                # 1. ✅ CRITICAL: Remove from section_vtks FIRST (this stops "Cross-section active" detection)
                 if hasattr(self, 'section_vtks') and view_idx in self.section_vtks:
                     try:
                         # Clear the VTK widget
@@ -6658,7 +6207,7 @@ class NakshaApp(QMainWindow):
                         pass
                     
                     del self.section_vtks[view_idx]
-                    print(f"      âœ… Removed section_vtks[{view_idx}]")
+                    print(f"      ✅ Removed section_vtks[{view_idx}]")
                 
                 # 2. Remove from section_docks
                 if hasattr(self, 'section_docks') and view_idx in self.section_docks:
@@ -6669,55 +6218,97 @@ class NakshaApp(QMainWindow):
                         pass
                     
                     del self.section_docks[view_idx]
-                    print(f"      âœ… Removed section_docks[{view_idx}]")
+                    print(f"      ✅ Removed section_docks[{view_idx}]")
                 
                 # 3. Remove from classify_interactors
                 if hasattr(self, 'classify_interactors') and view_idx in self.classify_interactors:
                     del self.classify_interactors[view_idx]
-                    print(f"      âœ… Removed classify_interactors[{view_idx}]")
+                    print(f"      ✅ Removed classify_interactors[{view_idx}]")
                 
                 # 4. Delete ALL stored section data
                 for attr in data_attrs:
                     key = f"section_{view_idx}_{attr}"
                     if hasattr(self, key):
                         delattr(self, key)
-                        print(f"      âœ… Deleted {key}")
+                        print(f"      ✅ Deleted {key}")
                 
-                print(f"   âœ… Cross-section view {view_idx} cleanup complete")
+                print(f"   ✅ Cross-section view {view_idx} cleanup complete")
                 
             except Exception as e:
-                print(f"   âš ï¸ Cleanup error for view {view_idx}: {e}")
+                print(f"   ⚠️ Cleanup error for view {view_idx}: {e}")
                 import traceback
                 traceback.print_exc()
         
-        # 5. âœ… CRITICAL: Verify section_vtks is now empty
+        # 5. ✅ CRITICAL: Verify section_vtks is now empty
         if hasattr(self, 'section_vtks'):
             if self.section_vtks:
-                print(f"\n   âš ï¸ WARNING: section_vtks not empty: {list(self.section_vtks.keys())}")
+                print(f"\n   ⚠️ WARNING: section_vtks not empty: {list(self.section_vtks.keys())}")
                 # Force clear
                 self.section_vtks.clear()
-                print(f"   ðŸ”¨ FORCED CLEAR: section_vtks")
+                print(f"   🔨 FORCED CLEAR: section_vtks")
             else:
-                print(f"\n   âœ… VERIFIED: section_vtks is empty")
+                print(f"\n   ✅ VERIFIED: section_vtks is empty")
         
         # 6. Reset classify_interactor if all cross-sections closed
         if not getattr(self, 'section_vtks', {}):
             if hasattr(self, 'classify_interactor'):
                 self.classify_interactor = None
-                print("   ðŸ”„ All cross-sections closed - reset classify_interactor")
+                print("   🔄 All cross-sections closed - reset classify_interactor")
         
         print("\n" + "="*60)
-        print("âœ… CLEANUP COMPLETE")
+        print("✅ CLEANUP COMPLETE")
         print("="*60 + "\n")
+
+    def _stand_down_cross_section_measurement_tool(self, reason="cross-section drawing activated"):
+        """Turn OFF the Measure ▸ Cross Section (XS) cross-section measuring tool.
+
+        The XS tool is mutually exclusive with the normal cross-section line
+        tool (Tools ▸ Sections ▸ Cross): the line tool owns the main-view
+        locator, XS owns clicks inside the section views, and leaving both
+        armed lets one silently swallow the other's input. Whichever tool the
+        user activates last now disarms the other — here, starting a new
+        cross-section disarms XS.
+
+        Finished measurements stay on screen, exactly like Escape or
+        un-checking the XS button: only the click observers, any half-drawn
+        chain and the ribbon toggle are cleared.
+        """
+        tool = getattr(self, "cross_section_measurement_tool", None)
+        if tool is None:
+            return
+
+        if getattr(tool, "active", False):
+            try:
+                tool.deactivate()
+            except Exception as e:
+                print(f"⚠️ Cross-section measurement stand-down failed ({reason}): {e}")
+                try:
+                    tool.active = False
+                except Exception:
+                    pass
+
+        # Keep the Measure-ribbon XS button honest: deactivating the tool
+        # directly would otherwise leave it checked, so the user's next click
+        # on it would look like a no-op.
+        try:
+            ribbon = getattr(self, "ribbon_manager", None)
+            measure_ribbon = getattr(ribbon, "ribbons", {}).get("measure") if ribbon else None
+            btn = getattr(measure_ribbon, "cross_section_measure_btn", None)
+            if btn is not None and btn.isChecked():
+                btn.setChecked(False)  # cascades into its own idempotent sync
+        except Exception as e:
+            print(f"⚠️ Cross-section measurement ribbon sync failed: {e}")
+
+        print(f"📏 Cross-section measurement tool stood down ({reason})")
 
     def deactivate_cross_section_tool(self):
         """Deactivate cross-section tool only (do not close cross-section windows)."""
         try:
             self._cancel_cross_section_tool_only()
             self.set_cross_cursor_active(False, "cross_section")  
-            print("ðŸ›‘ Cross-section tool deactivated")
+            print("🛑 Cross-section tool deactivated")
         except Exception as e:
-            print(f"âš ï¸ deactivate_cross_section_tool failed: {e}")
+            print(f"⚠️ deactivate_cross_section_tool failed: {e}")
 
     # --------------------------------------------------------------
     def enable_section_point_picking(self):
@@ -6740,7 +6331,7 @@ class NakshaApp(QMainWindow):
         pid = picker.GetPointId()
         if pid >= 0 and pid < len(self.app.section_points):
             picked_point = self.app.section_points[pid]
-            print(f"âœ… Selected section point: {picked_point}")
+            print(f"✅ Selected section point: {picked_point}")
             self._highlight_section_point(pid)
 
     # --------------------------------------------------------------
@@ -6785,17 +6376,17 @@ class NakshaApp(QMainWindow):
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
             return
 
-        # âœ… MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
+        # ✅ MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
         # pick) collide with Cut Section on the same views, so disable them
         # automatically when Cut Section is activated (it just yields).
         self._deactivate_point_pick_tools()
 
-        # âœ… Do NOT touch the main interactor - cut section works on cross-section window!
+        # ✅ Do NOT touch the main interactor - cut section works on cross-section window!
         # Just activate the cut section controller
         self.cut_section_controller.activate()
         self.cut_section_mode_on = True
         self.set_cross_cursor_active(True, "cut_section")
-        print("âœ… Cut Section Mode enabled on cross-section window.")
+        print("✅ Cut Section Mode enabled on cross-section window.")
 
     def toggle_cut_section_mode(self, checked):
         """Toggle cut section mode (for UI Actions)."""
@@ -6807,7 +6398,7 @@ class NakshaApp(QMainWindow):
             self.cut_section_mode_on = False
             self.app.set_cross_cursor_active(False)
             self.set_cross_cursor_active(False, "cut_section") 
-            print("ðŸ›‘ Cut Section Mode disabled.")
+            print("🛑 Cut Section Mode disabled.")
 
     # ------------------ Hook into classification tools ------------------
     def on_classification_tool_start(self):
@@ -6832,7 +6423,7 @@ class NakshaApp(QMainWindow):
     def toggle_view_mode(self, mode: str, preserve_camera: bool = False):
         """
         Switch between 2D plan view (locked top view) and full 3D orbit view.
-        âœ… SIMPLE FIX: Backs up and restores section view actors
+        ✅ SIMPLE FIX: Backs up and restores section view actors
 
         preserve_camera:
             When True for 2D mode, keep the current camera orientation/position
@@ -6844,7 +6435,7 @@ class NakshaApp(QMainWindow):
             vtkInteractorStyleTrackballCamera,
         )
        
-        # âœ… STEP 1: Backup all section view actors BEFORE any changes
+        # ✅ STEP 1: Backup all section view actors BEFORE any changes
         section_actors_backup = {}
         if hasattr(self, 'section_vtks') and self.section_vtks:
             for view_idx, vtk_widget in self.section_vtks.items():
@@ -6858,11 +6449,11 @@ class NakshaApp(QMainWindow):
                             if actor:
                                 actor_list.append(actor)
                         section_actors_backup[view_idx] = actor_list
-                        print(f"ðŸ’¾ Backed up {len(actor_list)} actors from View {view_idx + 1}")
+                        print(f"💾 Backed up {len(actor_list)} actors from View {view_idx + 1}")
                 except Exception as e:
-                    print(f"âš ï¸ Backup failed for View {view_idx + 1}: {e}")
+                    print(f"⚠️ Backup failed for View {view_idx + 1}: {e}")
  
-        # âœ… STEP 2: Do the view mode switch
+        # ✅ STEP 2: Do the view mode switch
         if mode == "3d":
             if not (
                 getattr(self, "_main_view_3d_user_enabled", False)
@@ -6885,7 +6476,7 @@ class NakshaApp(QMainWindow):
             self.is_3d_mode = True
             self._main_view_2d_locked = False
             self.current_view = "3d"
-            print("ðŸŒ€ Switching to 3D view (tools disabled)")
+            print("🌀 Switching to 3D view (tools disabled)")
  
             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
             cam = self.vtk_widget.renderer.GetActiveCamera()
@@ -6907,7 +6498,7 @@ class NakshaApp(QMainWindow):
             if not preserve_camera or getattr(self, "current_view", None) == "3d":
                 self.current_view = "top"
             view_label = "2D orthographic view" if preserve_camera else "2D Plan View"
-            print(f"ðŸ“ Switching to {view_label} (tools enabled)")
+            print(f"📐 Switching to {view_label} (tools enabled)")
  
             cam = self.vtk_widget.renderer.GetActiveCamera()
             cam.ParallelProjectionOn()
@@ -6940,10 +6531,10 @@ class NakshaApp(QMainWindow):
                 4000,
             )
         else:
-            print(f"âš ï¸ Unknown view mode: {mode}")
+            print(f"⚠️ Unknown view mode: {mode}")
             return
  
-        # âœ… STEP 3: Restore section view actors if they were lost
+        # ✅ STEP 3: Restore section view actors if they were lost
         from PySide6.QtCore import QTimer
        
         def restore_actors():
@@ -6966,19 +6557,19 @@ class NakshaApp(QMainWindow):
                     current_count = current_actors.GetNumberOfItems() if current_actors else 0
                    
                     if current_count == 0 and len(actor_list) > 0:
-                        print(f"ðŸ”„ Restoring {len(actor_list)} actors to View {view_idx + 1}")
+                        print(f"🔄 Restoring {len(actor_list)} actors to View {view_idx + 1}")
                         for actor in actor_list:
                             try:
                                 renderer.AddActor(actor)
                             except Exception:
                                 pass
                         vtk_widget.render()
-                        print(f"âœ… View {view_idx + 1} restored")
+                        print(f"✅ View {view_idx + 1} restored")
                     else:
-                        print(f"âœ… View {view_idx + 1} OK ({current_count} actors)")
+                        print(f"✅ View {view_idx + 1} OK ({current_count} actors)")
                        
                 except Exception as e:
-                    print(f"âš ï¸ Restore failed for View {view_idx + 1}: {e}")
+                    print(f"⚠️ Restore failed for View {view_idx + 1}: {e}")
        
         # Restore after a short delay to let any pending operations complete
         QTimer.singleShot(100, restore_actors)
@@ -7008,7 +6599,7 @@ class NakshaApp(QMainWindow):
                 shortcut_filter, "rebuild_ctrl_alt_shortcuts"
             ):
                 shortcut_filter.rebuild_ctrl_alt_shortcuts()
-            print("âœ… Shortcuts updated:", self.shortcuts)
+            print("✅ Shortcuts updated:", self.shortcuts)
 
     # def keyPressEvent(self, event):
     #     # Block Alt+F4 at the key press level
@@ -7028,31 +6619,26 @@ class NakshaApp(QMainWindow):
         # Let GlobalShortcutFilter handle all global shortcuts
         super().keyPressEvent(event)
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     # FILE LOADING  (main entry + worker slots)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
 
-    def open_file(self, filenames=None, import_options=None, prompt_import=True):
+    def open_file(self):
         """
         Load LiDAR file(s).
 
-        Programmatic entry (smoke tests / automation): pass `filenames` to
-        skip the QFileDialog, and `import_options=<dict>` together with
-        `prompt_import=False` to skip the LoadPointCloudDialog. The threaded
-        worker pipeline is identical either way.
-
         Main-thread responsibilities:
-          â€¢ auto-save, file dialog, memory check, import-option prompt
-          â€¢ clear current project (VTK actors, state)
-          â€¢ start background FileLoaderWorker
+          • auto-save, file dialog, memory check, import-option prompt
+          • clear current project (VTK actors, state)
+          • start background FileLoaderWorker
 
         Worker-thread responsibilities (FileLoaderWorker):
-          â€¢ Phase 1 â€“ read each file with load_lidar_file()
-          â€¢ Phase 2 â€“ pre-allocate merged numpy arrays
-          â€¢ Phase 3 â€“ fill / merge arrays (zero-copy)
+          • Phase 1 – read each file with load_lidar_file()
+          • Phase 2 – pre-allocate merged numpy arrays
+          • Phase 3 – fill / merge arrays (zero-copy)
 
         Back on main thread (_on_load_finished):
-          â€¢ Phase 4+ â€“ DEM, spatial index, palette, VTK render, title â€¦
+          • Phase 4+ – DEM, spatial index, palette, VTK render, title …
         """
         from PySide6.QtCore import QCoreApplication
         from PySide6.QtWidgets import QMessageBox, QFileDialog
@@ -7060,11 +6646,11 @@ class NakshaApp(QMainWindow):
         import os
 
         print(f"\n{'='*70}")
-        print(f"ðŸ“‚ OPEN FILE - THREADED MODE")
+        print(f"📂 OPEN FILE - THREADED MODE")
         print(f"{'='*70}")
 
-        # â”€â”€ STEP 1: Auto-save current file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if hasattr(self, "data") and self.data is not None:
+        # ── STEP 1: Auto-save current file ────────────────────────────
+        if hasattr(self, "data") and self.data is not None and getattr(self, "_lnt_main_view", None) is None:
             save_path = (
                 getattr(self, "last_save_path", None)
                 or getattr(self, "loaded_file", None)
@@ -7074,7 +6660,7 @@ class NakshaApp(QMainWindow):
             _class_filtered = getattr(self, '_loaded_with_class_filter', False)
             if save_path and not _class_filtered:
                 try:
-                    print(f"\nðŸ’¾ AUTO-SAVING CURRENT FILE")
+                    print(f"\n💾 AUTO-SAVING CURRENT FILE")
                     print(f"   Path: {os.path.basename(save_path)}")
                     print(f"   Points: {len(self.data.get('xyz', [])):,}")
 
@@ -7082,14 +6668,14 @@ class NakshaApp(QMainWindow):
                     result = save_pointcloud_quick(self, save_path)
 
                     if result:
-                        print("âœ… Saved successfully")
+                        print("✅ Saved successfully")
                         if hasattr(self, "statusBar"):
                             self.statusBar().showMessage(
-                                f"ðŸ’¾ Saved: {os.path.basename(save_path)}", 2000
+                                f"💾 Saved: {os.path.basename(save_path)}", 2000
                             )
                             QCoreApplication.processEvents()
                     else:
-                        print("âš ï¸ Save returned False")
+                        print("⚠️ Save returned False")
 
                 except Exception as e:
                     import traceback
@@ -7103,118 +6689,27 @@ class NakshaApp(QMainWindow):
                     if reply == QMessageBox.No:
                         return
 
-        # â”€â”€ STEP 2: File picker (skipped when filenames passed in) â”€â”€â”€â”€â”€
-        if filenames is None:
-            filenames, _ = QFileDialog.getOpenFileNames(
-                self,
-                "Select File(s)",
-                "",
-                "LiDAR Files (*.las *.laz *.naksha);;All Files (*.las *.laz *.naksha *.ply *.ptc *.prj)",
-            )
-            if not filenames:
-                print("   User cancelled")
-                return
-        # A bare string is a SINGLE filename, not a sequence of characters.
-        # Iterating it directly produced one "file" per character (t, e, s, t,
-        # ...), which then failed as 33 bogus paths. QFileDialog always returns
-        # a list, so this only ever normalizes programmatic callers.
-        if isinstance(filenames, (str, os.PathLike)):
-            filenames = [str(filenames)]
-        else:
-            filenames = [str(p) for p in filenames]
+        # ── STEP 2: File picker ────────────────────────────────────────
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select File(s)",
+            "",
+            "LiDAR Files (*.las *.laz *.lnt);;All Files (*.las *.laz *.lnt *.ply *.ptc *.prj)",
+        )
+        if not filenames:
+            print("   User cancelled")
+            return
 
-        print(f"\nâœ… USER SELECTED {len(filenames)} FILE(S)")
+        print(f"\n✅ USER SELECTED {len(filenames)} FILE(S)")
         for i, f in enumerate(filenames):
             print(f"   {i+1}. {os.path.basename(f)}")
 
-        # â”€â”€ STEP 2.75: Cache-first fast path (Stage 3C) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # For a committed .nakshaidx + .nakshapc the source .laz point BODY is
-        # never decoded: StreamManager serves tiles from the cache on demand.
-        # RETURN BEFORE full LAZ point decode / app.data materialization.
-        #
-        # If the cache is MISSING / STALE / CORRUPT it is now BUILT
-        # AUTOMATICALLY (Part 6) instead of falling through to a full source
-        # decode. The user never runs a script and never moves cache files.
-        from pathlib import Path
-        project_request = filenames[0] if len(filenames) == 1 else filenames
-        if filenames and all(Path(p).suffix.lower() in (".las", ".laz", ".naksha") for p in filenames) and not getattr(
-                self, "_force_legacy_load", False):
-            from gui.naksha_cache.app_streaming import install_streaming
-            from gui.naksha_cache.auto_cache import (
-                classify_cache, STATE_HIT)
-            _state = classify_cache(project_request)
-            _valid = _state.validity
+        if len(filenames) == 1 and os.path.splitext(filenames[0])[1].lower() in (".las", ".laz", ".lnt"):
+            from gui.lnt_open import open_with_lnt
+            open_with_lnt(self, filenames[0])
+            return
 
-            if _state.state != STATE_HIT:
-                print(f"\nðŸ”§ CACHE {_state.state}: {_state.reason}")
-                print("   Building Naksha runtime cache automatically...")
-                if not self._build_cache_with_ui(project_request):
-                    print("   âš ï¸ Cache build did not complete; "
-                          "continuing without streaming.")
-                    _valid = None
-                else:
-                    from gui.naksha_cache.dataset_mode import cache_first_open
-                    _valid = cache_first_open(project_request)
-
-            if _valid is not None and _valid.ok:
-                print(f"\nðŸ“‚ CACHE-FIRST (Stage 3C): streaming from committed "
-                      f"NAKSHA cache ({_valid.total_points:,} pts, "
-                      f"{_valid.pc_bytes / 1024 ** 3:.2f} GiB NKPC)")
-                install_streaming(self, _valid.source_path, _valid)
-                self.loaded_sources = filenames
-                self._set_loading_state("POINTS_READY")
-                self._set_loading_state("READY")
-                return
-
-    def _build_cache_with_ui(self, source_path: str) -> bool:
-        """Build the Naksha cache automatically, off the GUI thread (PART 6/7).
-
-        Shows the OPTIMIZING POINT CLOUD dialog with stage, percent, points,
-        bytes and elapsed time, plus a Cancel button (PART 8). Returns True only
-        when a finalized, validated cache exists afterwards.
-        """
-        try:
-            from gui.naksha_cache.auto_cache_qt import (
-                CacheBuildController, build_progress_dialog)
-        except Exception as exc:
-            print(f"   âš ï¸ Qt cache controller unavailable: {exc}")
-            return False
-
-        ctrl = CacheBuildController(source_path, parent=self)
-        dlg, set_progress = build_progress_dialog(self, source_path)
-
-        # PART 7: queued connections marshal worker signals onto the GUI thread.
-        ctrl.progress.connect(
-            lambda p: set_progress(
-                p.percent, f"{p.stage}  -  {p.percent:.0f}%  -  "
-                           f"{p.processed_points:,} pts  -  "
-                           f"{p.bytes_written / 1048576:.1f} MB written  -  "
-                           f"{p.elapsed_s:.1f}s"))
-        outcome = {}
-
-        def on_finished(report):
-            outcome.update(report or {})
-            if report and report.get("committed"):
-                set_progress(100.0,
-                             f"Done in {report.get('elapsed_s', '?')}s - "
-                             f"cache saved beside the source file.")
-            else:
-                set_progress(0.0, "Cache build did not complete.")
-            dlg.accept()
-
-        ctrl.finished.connect(on_finished)
-        dlg.rejected.connect(ctrl.cancel)
-
-        ctrl.start()
-        dlg.exec()
-        if outcome.get("committed"):
-            print(f"   âœ… Cache ready in {outcome.get('elapsed_s')}s "
-                  f"workers={outcome.get('workers')}")
-            return True
-        print("   âš ï¸ Cache build cancelled or incomplete.")
-        return False
-
-        # â”€â”€ STEP 2.5: Memory safety check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── STEP 2.5: Memory safety check ─────────────────────────────
         try:
             import psutil
             total_mb     = sum(
@@ -7223,64 +6718,59 @@ class NakshaApp(QMainWindow):
             estimated_mb = total_mb * 4
             available_mb = psutil.virtual_memory().available / (1024 * 1024)
 
-            print(f"\nðŸ§® MEMORY CHECK:")
+            print(f"\n🧮 MEMORY CHECK:")
             print(f"   File size: {total_mb:.0f} MB")
             print(f"   Estimated memory needed: {estimated_mb:.0f} MB")
             print(f"   Available memory: {available_mb:.0f} MB")
 
             if estimated_mb > available_mb * 0.7:
                 reply = QMessageBox.warning(
-                    self, "âš ï¸ Memory Warning",
+                    self, "⚠️ Memory Warning",
                     f"Loading these files may require ~{estimated_mb:.0f} MB.\n"
                     f"You have {available_mb:.0f} MB available.\n\n"
                     f"This may cause slowdowns or crashes.\n\n"
                     f"Recommendations:\n"
-                    f"â€¢ Load files in smaller batches\n"
-                    f"â€¢ Close other applications\n"
-                    f"â€¢ Upgrade RAM for large datasets\n\n"
+                    f"• Load files in smaller batches\n"
+                    f"• Close other applications\n"
+                    f"• Upgrade RAM for large datasets\n\n"
                     f"Continue anyway?",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
                 )
                 if reply == QMessageBox.No:
-                    print("   âš ï¸ User cancelled due to memory warning")
+                    print("   ⚠️ User cancelled due to memory warning")
                     return
-                print("   âš ï¸ User chose to continue despite warning")
+                print("   ⚠️ User chose to continue despite warning")
             else:
-                print("   âœ… Sufficient memory available")
+                print("   ✅ Sufficient memory available")
 
         except ImportError:
-            print("\nâš ï¸ psutil not installed â€” skipping memory check")
+            print("\n⚠️ psutil not installed — skipping memory check")
         except Exception as e:
-            print(f"\nâš ï¸ Memory check failed: {e}")
+            print(f"\n⚠️ Memory check failed: {e}")
 
-        # â”€â”€ STEP 2.75: Import options (prompt BEFORE clearing) â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if not prompt_import and import_options is not None:
-            # Programmatic load (smoke tests / automation): the caller
-            # supplies the options dict - no LoadPointCloudDialog is shown.
-            batch_import_options = dict(import_options)
-        else:
-            batch_import_options = self._prompt_lidar_import_options_for_files(filenames)
-            if batch_import_options is None:
-                print("   User cancelled import setup")
-                return
+        # ── STEP 2.75: Import options (prompt BEFORE clearing) ─────────
+        batch_import_options = self._prompt_lidar_import_options_for_files(filenames)
+        if batch_import_options is None:
+            print("   User cancelled import setup")
+            return
 
-        # â”€â”€ STEP 3: Handle special single-file types early â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── STEP 3: Handle special single-file types early ────────────
         #   (PTC / PRJ don't need the threaded loader)
         if len(filenames) == 1:
             fname = filenames[0]
             if fname.lower().endswith(".ptc"):
-                print("ðŸ“‹ Loading PTC paletteâ€¦")
+                print("📋 Loading PTC palette…")
                 self._load_single_ptc(fname)
                 return
             if fname.lower().endswith(".prj"):
-                print("ðŸ“‹ Loading Nakshatech PRJâ€¦")
-                self._load_nakshatech_prj(fname)
+                print("📋 Loading TerraScan PRJ…")
+                self._load_terrascan_prj(fname)
                 return
 
-        # â”€â”€ STEP 4: Clear current project â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── STEP 4: Clear current project ─────────────────────────────
         print(f"\n{'='*60}")
-        print("ðŸ§¹ CLEARING CURRENT PROJECT")
+        print("🧹 CLEARING CURRENT PROJECT")
         print(f"{'='*60}")
 
         # Persist current file-specific display/PTC state before data clear.
@@ -7289,10 +6779,12 @@ class NakshaApp(QMainWindow):
             _save_display_settings_before_clear(self)
             print("[RUNTIME-CHECK] pre-clear-save caller=open_file step=main-load")
         except Exception as e:
-            print(f"âš ï¸ Display settings pre-save skipped: {e}")
+            print(f"⚠️ Display settings pre-save skipped: {e}")
 
         from gui.shading_display import clear_shading_cache
         clear_shading_cache(reason="new file")
+        from gui.shading_large_cloud import clear_large_shading_preset_cache
+        clear_large_shading_preset_cache(self)
 
         # Backup overlay actors (DXF + SNT) so they survive the data-layer clear.
         # Rasters live in their own renderer and are never touched here.
@@ -7307,7 +6799,7 @@ class NakshaApp(QMainWindow):
             for actor in dxf_backup:
                 renderer.RemoveActor(actor)
             if dxf_backup:
-                print(f"   ðŸ’¾ Backed up {len(dxf_backup)} DXF actors")
+                print(f"   💾 Backed up {len(dxf_backup)} DXF actors")
 
         if hasattr(self, "snt_actors") and self.snt_actors:
             for snt_data in self.snt_actors:
@@ -7318,7 +6810,7 @@ class NakshaApp(QMainWindow):
                     except Exception:
                         pass
             if snt_backup:
-                print(f"   ðŸ’¾ Backed up {len(snt_backup)} SNT actors")
+                print(f"   💾 Backed up {len(snt_backup)} SNT actors")
 
         # Clear VTK main view
         renderer.RemoveAllViewProps()
@@ -7327,7 +6819,7 @@ class NakshaApp(QMainWindow):
             if isinstance(d, dict):
                 d.clear()
         self.vtk_widget.render()
-        print("   âœ… VTK cleared")
+        print("   ✅ VTK cleared")
 
         # Clear cross-section views
         for vw in (getattr(self, "section_vtks", None) or {}).values():
@@ -7338,21 +6830,21 @@ class NakshaApp(QMainWindow):
                 vw.render()
             except Exception:
                 pass
-        print("   âœ… Cross-sections cleared")
+        print("   ✅ Cross-sections cleared")
 
         # Clear cut section state/view to prevent stale cut index map on next file load.
         if hasattr(self, "cut_section_controller") and self.cut_section_controller:
             try:
                 self.cut_section_controller.clear()
-                print("   âœ… Cut section cleared")
+                print("   ✅ Cut section cleared")
             except Exception as e:
-                print(f"   âš ï¸ Cut section clear failed: {e}")
+                print(f"   ⚠️ Cut section clear failed: {e}")
                 try:
                     ctrl = self.cut_section_controller
                     ctrl.cut_points = None
                     ctrl._cut_index_map = None
                     ctrl.is_cut_view_active = False
-                    print("   âœ… Applied fallback cut-state reset")
+                    print("   ✅ Applied fallback cut-state reset")
                 except Exception:
                     pass
 
@@ -7365,7 +6857,7 @@ class NakshaApp(QMainWindow):
             if mg is not None:
                 mg.force_gc()
         except Exception as e:
-            print(f"âš ï¸ Memory manager clear hook skipped: {e}")
+            print(f"⚠️ Memory manager clear hook skipped: {e}")
 
         # Reset internal state
         self.data                       = None
@@ -7373,7 +6865,7 @@ class NakshaApp(QMainWindow):
         self.last_save_path             = None
         self.class_palette              = {}
         self._loaded_with_class_filter  = False
-        # âœ… FIX: Clear stale Z-bounds cache so SNT actors are positioned correctly
+        # ✅ FIX: Clear stale Z-bounds cache so SNT actors are positioned correctly
         # relative to the next LAZ file. _get_snt_z_offset reads this cache first;
         # if it holds the previous file's z_max the SNT grid appears at the wrong height.
         self.data_bounds    = None
@@ -7421,9 +6913,9 @@ class NakshaApp(QMainWindow):
                     except Exception:
                         pass
 
-            print(f"   âœ… Cleared {len(stale_section_attrs)} stale section cache attrs")
+            print(f"   ✅ Cleared {len(stale_section_attrs)} stale section cache attrs")
         except Exception as e:
-            print(f"   âš ï¸ Section cache clear skipped: {e}")
+            print(f"   ⚠️ Section cache clear skipped: {e}")
 
         for stack in (
             getattr(self, "undo_stack", None),
@@ -7435,13 +6927,13 @@ class NakshaApp(QMainWindow):
         if hasattr(self, "spatial_index"):
             self.spatial_index = None
 
-        print("   âœ… All data cleared")
+        print("   ✅ All data cleared")
         QCoreApplication.processEvents()
 
         # Restore overlay actors immediately
         for actor in dxf_backup:
             renderer.AddActor(actor)
-        # âœ… FIX: Reset _snt_z_offset on preserved SNT actors so the delta math in
+        # ✅ FIX: Reset _snt_z_offset on preserved SNT actors so the delta math in
         # _apply_z_offset_to_actor starts from zero for the incoming LAZ file.
         for actor in snt_backup:
             actor._snt_z_offset = 0.0
@@ -7449,9 +6941,9 @@ class NakshaApp(QMainWindow):
         if dxf_backup or snt_backup:
             self.vtk_widget.render()
             QCoreApplication.processEvents()
-            print(f"   âœ… Restored {len(dxf_backup)} DXF + {len(snt_backup)} SNT actors")
+            print(f"   ✅ Restored {len(dxf_backup)} DXF + {len(snt_backup)} SNT actors")
 
-        # âœ… FIX: Reinstall digitizer observers + ensure renderers after inline clear.
+        # ✅ FIX: Reinstall digitizer observers + ensure renderers after inline clear.
         # open_file() does its own clear instead of calling clear_project.py,
         # so ObserverRegistry.release_all() wipes all VTK interactor observers
         # but nothing reinstalls them. Without observers, digitize tools cannot
@@ -7460,15 +6952,15 @@ class NakshaApp(QMainWindow):
             try:
                 self.digitizer._reinstall_all_observers()
                 self.digitizer._check_and_update_renderers()
-                print("   âœ… Digitizer observers + renderers restored (post-inline-clear)")
+                print("   ✅ Digitizer observers + renderers restored (post-inline-clear)")
             except Exception as _dig_err:
-                print(f"   âš ï¸ Digitizer observer restore failed: {_dig_err}")
+                print(f"   ⚠️ Digitizer observer restore failed: {_dig_err}")
 
         print(f"{'='*60}")
-        print("âœ… CLEAR COMPLETE")
+        print("✅ CLEAR COMPLETE")
         print(f"{'='*60}\n")
 
-        # â”€â”€ STEP 5: Show progress dialog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── STEP 5: Show progress dialog ───────────────────────────────
         label = (
             f"{len(filenames)} file(s)"
             if len(filenames) > 1
@@ -7476,12 +6968,12 @@ class NakshaApp(QMainWindow):
         )
         self._load_progress = LoadingProgressDialog(self, show_cancel=False)
         self._load_progress.set_filename(label)
-        self.setWindowTitle("Loading LiDAR Fileâ€¦")   # show status in main window title bar
+        self.setWindowTitle("Loading LiDAR File…")   # show status in main window title bar
         self._load_progress.show()
         QCoreApplication.processEvents()
 
-        # â”€â”€ STEP 6: Start background worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        #   Main thread is now FREE â€” the event loop keeps running.
+        # ── STEP 6: Start background worker ───────────────────────────
+        #   Main thread is now FREE — the event loop keeps running.
         from gui.file_loader_worker import FileLoaderWorker
 
         _target_project_crs_wkt = None
@@ -7508,7 +7000,7 @@ class NakshaApp(QMainWindow):
 
         worker.start()
 
-    # â”€â”€ Worker â†’ Main-thread slots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Worker → Main-thread slots ─────────────────────────────────────
 
     def _on_load_progress(self, percent: int, status: str):
         """Forward worker progress to the progress dialog (main thread)."""
@@ -7524,7 +7016,7 @@ class NakshaApp(QMainWindow):
             dlg.set_points_count(total)
 
     def _on_load_error(self, message: str):
-        """Handle worker error â€” always on main thread."""
+        """Handle worker error — always on main thread."""
         from PySide6.QtWidgets import QMessageBox
         dlg = getattr(self, "_load_progress", None)
         if dlg:
@@ -7550,7 +7042,7 @@ class NakshaApp(QMainWindow):
     def _on_load_finished(self, result: dict):
         """
         Called on the MAIN THREAD after the worker finishes Phases 1-3.
-        All VTK / Qt rendering lives here â€” identical logic to the original
+        All VTK / Qt rendering lives here — identical logic to the original
         Phase 4+ block, preserving every detail.
         """
         import os
@@ -7568,20 +7060,13 @@ class NakshaApp(QMainWindow):
             QCoreApplication.processEvents()
 
         print(f"\n{'='*60}")
-        print("ðŸ“¥ Phase 4+: Main-thread finalisationâ€¦")
+        print("📥 Phase 4+: Main-thread finalisation…")
         print(f"{'='*60}")
 
-        # â”€â”€ Phase 4: Store merged data (references â€” zero copy) â”€â”€â”€â”€â”€â”€â”€â”€
-        _prog(87, "Finalizing dataâ€¦")
+        # ── Phase 4: Store merged data (references — zero copy) ────────
+        _prog(87, "Finalizing data…")
 
-        classification = result.get("classification")
-        if classification is not None:
-            classification = np.asarray(classification)
-            if classification.ndim == 2 and classification.shape[1] == 1:
-                classification = classification[:, 0]
-            else:
-                classification = np.ravel(classification)
-        self.data = {"xyz": result["xyz"], "classification": classification}
+        self.data = {"xyz": result["xyz"], "classification": result["classification"]}
         if "rgb"       in result: self.data["rgb"]       = result["rgb"]
         if "intensity" in result: self.data["intensity"] = result["intensity"]
         # Source coordinates are preserved logically through this metadata even
@@ -7593,48 +7078,6 @@ class NakshaApp(QMainWindow):
         self.data["_source_crs_consistent"] = bool(result.get("source_crs_consistent", True))
         self.data["_projection_report"] = result.get("projection_report")
         self.data["_layer_crs_info"] = list(result.get("layer_info_list") or [])
-
-        # Native Vulkan backend (opt-in, no-op unless NAKSHA_RENDER_BACKEND=
-        # vulkan activated successfully): one-time point-cloud upload per
-        # load. Never repeated on camera/display-mode changes. Failure here
-        # must never affect the existing VTK load/display path below.
-        #
-        # ORDER MATTERS: the class palette is applied BEFORE the upload so the
-        # very first presented frame already has the PTC colours. Uploading
-        # first presented the default/rainbow palette and only re-tinted on the
-        # frames after the user loaded a .ptc - the reported colour flash.
-        self._set_loading_state("POINT CLOUD LOADING",
-                                f"{len(self.data['xyz']):,} points")
-        self._set_loading_state("PTC APPLYING")
-        _startup_ptc = self._apply_startup_ptc(result.get("first_file"))
-        rec_ptc = _startup_ptc
-        self._set_loading_state("VULKAN INITIALIZING")
-        try:
-            rb = getattr(self, "render_backend", None)
-            from gui.naksha_cache.dataset_mode import is_streaming_dataset
-            if rb is not None and getattr(rb, "active", False):
-                if is_streaming_dataset(self):
-                    # STREAMING mode: a monolithic upload_point_cloud() is
-                    # FORBIDDEN. Tile uploads are performed by the
-                    # StreamManager only. Gate the call site (Part 48).
-                    from gui.naksha_cache.app_streaming import (
-                        assert_not_monolithic_upload)
-                    assert_not_monolithic_upload(self)
-                else:
-                    rb.upload_point_cloud()
-        except Exception as _vk_upload_err:
-            print(f"âš ï¸ Vulkan point-cloud upload skipped (VTK unaffected): {_vk_upload_err}")
-        # FIRST FRAME RULE: the popup is a LOADING indicator, so it must not be
-        # dismissed until the user can actually SEE something. The upload call
-        # above only enqueues GPU work; the frame is presented later. Transition
-        # to POINTS_READY here, and let the first successfully presented frame
-        # (see _note_first_presented_frame) drive the final READY teardown.
-        self._set_loading_state("POINTS_READY")
-        if not bool(getattr(rb, "active", False) if rb is not None else False):
-            # No Vulkan surface to present through (headless/tests): nothing can
-            # ever deliver a first frame, so settle now rather than hang.
-            self._set_loading_state("READY")
-        self._last_startup_ptc = rec_ptc
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
         # Track whether this load was class-filtered so auto-save skips the file.
@@ -7649,13 +7092,13 @@ class NakshaApp(QMainWindow):
         num_files    = result["num_files"]
 
         import numpy as np
-        print(f"\nâœ… Final dataset ready: {total_points:,} points")
+        print(f"\n✅ Final dataset ready: {total_points:,} points")
         xyz_mb = result["xyz"].nbytes / (1024**2)
         cls_mb = result["classification"].nbytes / (1024**2)
         rgb_mb = result.get("rgb",       np.array([])).nbytes / (1024**2)
         print(f"   Memory used: {xyz_mb + cls_mb + rgb_mb:.1f} MB")
 
-        # â”€â”€ CRS / unified project coordinates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── CRS / unified project coordinates ──────────────────────────
         try:
             from pyproj import CRS as _CRS
             from gui.crs_manager import (
@@ -7714,21 +7157,21 @@ class NakshaApp(QMainWindow):
                 if source_crs is not None:
                     try:
                         if source_crs.equals(runtime_crs):
-                            print(f"   ðŸ“ LiDAR CRS: {source_crs.name} ({source_label})")
+                            print(f"   📐 LiDAR CRS: {source_crs.name} ({source_label})")
                         else:
-                            print(f"   ðŸŒ LiDAR source CRS: {source_crs.name}")
-                            print(f"   ðŸŒ Project CRS:      {runtime_crs.name}")
-                            print("   âœ… XYZ is stored in project coordinates for this session; source CRS is preserved for save/export")
+                            print(f"   🌐 LiDAR source CRS: {source_crs.name}")
+                            print(f"   🌐 Project CRS:      {runtime_crs.name}")
+                            print("   ✅ XYZ is stored in project coordinates for this session; source CRS is preserved for save/export")
                     except Exception:
                         pass
             else:
                 if existing is None:
                     clear_canvas_crs(self)
-                print("   âš ï¸ CRS unresolved: coordinates are kept unchanged; no CRS is guessed")
+                print("   ⚠️ CRS unresolved: coordinates are kept unchanged; no CRS is guessed")
         except Exception as _crs_err:
-            print(f"   âš ï¸ CRS registration failed: {_crs_err}")
+            print(f"   ⚠️ CRS registration failed: {_crs_err}")
 
-        # â”€â”€ Layers panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Layers panel ───────────────────────────────────────────────
         for fi in result["layer_info_list"]:
             layer = {
                 "type"      : "laz_tile",
@@ -7750,15 +7193,15 @@ class NakshaApp(QMainWindow):
             if hasattr(self, "layers_dock") and self.layers_dock:
                 self.layers_dock.add_layer(layer)
 
-        # â”€â”€ DEM for shading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        _prog(88, "Building DEMâ€¦")
+        # ── DEM for shading ────────────────────────────────────────────
+        _prog(88, "Building DEM…")
         try:
             from gui.shading_display import build_base_dem_mesh
             build_base_dem_mesh(self, percentile_filter=99.9, downsample=2)
         except Exception:
             pass
 
-        # â”€â”€ File paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── File paths ─────────────────────────────────────────────────
         self.loaded_file    = first_file
         self.last_save_path = first_file
         input_format_version = result.get("input_format_version")
@@ -7770,19 +7213,20 @@ class NakshaApp(QMainWindow):
             self.data["input_format_version"] = input_format_version
             self.data["las_version"] = self.last_save_version
 
-        # â”€â”€ Spatial index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Spatial index ──────────────────────────────────────────────
         if total_points > 50_000:
-            _prog(90, "Building spatial indexâ€¦")
+            _prog(90, "Scheduling shared spatial index…")
             try:
-                from gui.performance_optimizations import SpatialIndex
-                self.spatial_index = SpatialIndex(self.data["xyz"])
-                print("   âœ… Spatial index built")
+                from gui.spatial_index import schedule_shared_index_build
+                self.spatial_index = None
+                schedule_shared_index_build(self, self.data["xyz"])
+                print("PHASE2_SPATIAL_INDEX status=scheduled source=multi_load")
             except Exception as e:
-                print(f"   âš ï¸ Spatial index failed: {e}")
+                print(f"PHASE2_SPATIAL_INDEX status=schedule_failed error={e}")
                 self.spatial_index = None
 
-        # â”€â”€ Restore display settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        _prog(92, "Restoring settingsâ€¦")
+        # ── Restore display settings ───────────────────────────────────
+        _prog(92, "Restoring settings…")
         try:
             from gui.display_mode import restore_display_settings_for_file
             restore_display_settings_for_file(self, first_file, refresh=False)
@@ -7803,8 +7247,8 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
 
-        # â”€â”€ Palette â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        _prog(94, "Loading paletteâ€¦")
+        # ── Palette ────────────────────────────────────────────────────
+        _prog(94, "Loading palette…")
         palette_to_apply = self._get_palette_for_file(first_file)
 
         if palette_to_apply:
@@ -7817,11 +7261,11 @@ class NakshaApp(QMainWindow):
                 palette_to_apply = clone_palette(palette_to_apply)
                 for _code, _entry in palette_to_apply.items():
                     _entry["show"] = (_code in _sel)
-                print(f"   ðŸ‘ Initial visibility: showing classes {sorted(_sel)}")
+                print(f"   👁 Initial visibility: showing classes {sorted(_sel)}")
 
             visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
-            _prog(96, f"Rendering {visible_count} classesâ€¦")
-            print(f"ðŸŽ¨ Applying palette with {visible_count} visible classesâ€¦")
+            _prog(96, f"Rendering {visible_count} classes…")
+            print(f"🎨 Applying palette with {visible_count} visible classes…")
             self.apply_class_map({
                 "classes"     : palette_to_apply,
                 "slot"        : 0,
@@ -7831,16 +7275,16 @@ class NakshaApp(QMainWindow):
             if isinstance(_batch_opts, dict) and _batch_opts.get("only_class"):
                 self._sync_display_dialog_visibility(palette_to_apply)
 
-        # â”€â”€ Drawings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Drawings ───────────────────────────────────────────────────
         try:
             from gui.save_pointcloud import finalize_drawing_render
             finalize_drawing_render(self)
-            print("âœ… Drawings finalized after point cloud render")
+            print("✅ Drawings finalized after point cloud render")
         except Exception:
             pass
 
-        # â”€â”€ Finalise interactor + view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        _prog(98, "Finalizingâ€¦")
+        # ── Finalise interactor + view ─────────────────────────────────
+        _prog(98, "Finalizing…")
         try:
             from gui.pointcloud_display import force_interactor_ready
             force_interactor_ready(self, delay_ms=300)
@@ -7849,7 +7293,7 @@ class NakshaApp(QMainWindow):
 
         self.toggle_view_mode("2d")
 
-        # â”€â”€ Window title â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Window title ───────────────────────────────────────────────
         if num_files == 1:
             self._update_window_title(first_file, self.project_crs_epsg)
         else:
@@ -7858,21 +7302,21 @@ class NakshaApp(QMainWindow):
                 self.project_crs_epsg,
             )
 
-        # â”€â”€ Auto-load drawings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Auto-load drawings ─────────────────────────────────────────
         if hasattr(self, "digitizer") and self.digitizer:
             try:
                 self.digitizer.auto_load_drawings(first_file)
             except Exception:
                 pass
 
-        # â”€â”€ Statistics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Statistics ─────────────────────────────────────────────────
         if hasattr(self, "point_count_widget") and self.point_count_widget:
             try:
                 refresh_point_statistics(self)
             except Exception:
                 pass
 
-        # â”€â”€ Re-apply loaded PRJ dialog state (if present) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Re-apply loaded PRJ dialog state (if present) ─────────────
         # Keep block-identifier context sticky across point-cloud reloads.
         if hasattr(self, "block_identifier_dialog") and self.block_identifier_dialog:
             try:
@@ -7881,14 +7325,14 @@ class NakshaApp(QMainWindow):
                 prj_data = getattr(prj_dlg, "prj_data", None)
                 if (not prj_data) and prj_path and os.path.exists(prj_path):
                     if hasattr(prj_dlg, "parse_prj_file"):
-                        print(f"ðŸ” Restoring PRJ dialog data: {os.path.basename(prj_path)}")
+                        print(f"🔁 Restoring PRJ dialog data: {os.path.basename(prj_path)}")
                         prj_dlg.parse_prj_file(prj_path)
                 if hasattr(prj_dlg, "reapply_hide_state"):
                     prj_dlg.reapply_hide_state()
             except Exception as _prj_restore_err:
-                print(f"âš ï¸ PRJ dialog state restore skipped: {_prj_restore_err}")
+                print(f"⚠️ PRJ dialog state restore skipped: {_prj_restore_err}")
 
-        # âœ… FIX: Final digitizer health check after all load operations.
+        # ✅ FIX: Final digitizer health check after all load operations.
         # Must run AFTER toggle_view_mode, auto_load_drawings, and the
         # force_interactor_ready callback. Mirrors clear_project.py's
         # final restoration: _check_and_update_renderers() first (ensures
@@ -7898,13 +7342,13 @@ class NakshaApp(QMainWindow):
             try:
                 self.digitizer._check_and_update_renderers()
                 self.digitizer._reinstall_all_observers()
-                print("âœ… Digitizer fully restored (post-load)")
+                print("✅ Digitizer fully restored (post-load)")
             except Exception as _dig_err:
-                print(f"âš ï¸ Digitizer restore failed: {_dig_err}")
+                print(f"⚠️ Digitizer restore failed: {_dig_err}")
 
-        # âœ… FIX: Call fit_view() to properly position camera at data bounds.
+        # ✅ FIX: Call fit_view() to properly position camera at data bounds.
         # toggle_view_mode("2d") resets camera to origin (0,0,0) then calls
-        # ResetCamera(), but this doesn't match what fit_view() does â€” fit_view()
+        # ResetCamera(), but this doesn't match what fit_view() does — fit_view()
         # manually computes bounds from point cloud + DXF + SNT data and sets
         # the camera position, focal point, and parallel scale correctly.
         # Without this, digitize tool actors (3D vtkActor) are invisible because
@@ -7912,15 +7356,15 @@ class NakshaApp(QMainWindow):
         # (~256000, 4779000). This is exactly what Shift+F does to fix the issue.
         try:
             self.fit_view()
-            print("âœ… Camera fitted to data bounds (post-load)")
+            print("✅ Camera fitted to data bounds (post-load)")
         except Exception as _fit_err:
-            print(f"âš ï¸ Post-load fit_view failed: {_fit_err}")
+            print(f"⚠️ Post-load fit_view failed: {_fit_err}")
 
-        # â”€â”€ Done â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Done ───────────────────────────────────────────────────────
         total_time = time.time() - t0
 
         print(f"\n{'='*60}")
-        print("âœ… LOAD COMPLETE - THREADED MODE")
+        print("✅ LOAD COMPLETE - THREADED MODE")
 
         print(f"   Files:       {num_files}")
         print(f"   Points:      {total_points:,}")
@@ -7936,144 +7380,8 @@ class NakshaApp(QMainWindow):
                 )
             except Exception:
                 pass
-        # DATA STATE MACHINE: tear the overlay down NOW, deterministically.
-        #
-        # finish_success() only schedules the teardown on a 500 ms timer, and
-        # on a large file that timer can still be pending when the user clicks
-        # away and back - which is how the "Reading Block Data" overlay came
-        # back after a focus change. Hiding synchronously here (and dropping
-        # our reference so nothing can raise it) removes that window entirely.
-        self._teardown_loading_overlay()
 
         self._file_loader_worker = None
-
-    def print_naksha_data_state(self, reason: str = "") -> None:
-        """[NAKSHA DATA STATE] - diagnostic only.
-
-        Reports the current data-state-machine value, whether a loading widget
-        is still alive AND on screen, and why that is. Pure read: it never
-        hides, shows, or mutates the overlay. The point is that after READY a
-        focus/activation/swapchain event can be shown to be a no-op for the
-        loading UI, rather than asserted to be one.
-        """
-        try:
-            state = str(getattr(self, "_data_state", "UNKNOWN") or "UNKNOWN")
-            dlg = getattr(self, "_load_progress", None)
-            if dlg is None:
-                widget = "HIDDEN (no widget exists)"
-            else:
-                try:
-                    visible = bool(dlg.isVisible())
-                except Exception:
-                    visible = False
-                widget = ("VISIBLE" if visible
-                          else "HIDDEN (detached, cannot be re-raised)")
-            print(
-                "[NAKSHA DATA STATE]\n"
-                f"  Current state:    {state}\n"
-                f"  Loading widget:    {widget}\n"
-                f"  Reason shown:      {reason or 'n/a'}\n",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[NAKSHA DATA STATE] diagnostic unavailable: {exc}", flush=True)
-
-    def print_load_ui_state(self, file_name: str = "", points=None) -> None:
-        """[LOAD UI STATE] - diagnostic only. Never mutates UI state.
-
-        Prints the load timings and, crucially, WHY the overlay is currently
-        visible (or why it is not). "Reason popup visible" is the field that
-        makes a regression obvious: anything other than "state == LOADING" or
-        "upload done, awaiting first frame" is a bug.
-        """
-        try:
-            tl = getattr(self, "_load_timeline", None) or {}
-            t0 = tl.get("__start__")
-            state = str(getattr(self, "_data_state", "UNKNOWN") or "UNKNOWN")
-            dlg = getattr(self, "_load_progress", None)
-            if dlg is None:
-                visible, reason = False, "no widget (already detached/released)"
-            else:
-                try:
-                    visible = bool(dlg.isVisible())
-                except Exception:
-                    visible = False
-                if state == "LOADING":
-                    reason = "state == LOADING (legitimate)"
-                elif state == "POINTS_READY":
-                    reason = "upload complete, awaiting first presented frame"
-                else:
-                    reason = f"UNEXPECTED: state == {state}"
-            first = tl.get("FIRST_VISIBLE_FRAME")
-            vis_ms = ((first - t0) * 1000.0) if (t0 and first) else None
-            up_ms = None
-            if t0 and tl.get("VULKAN INITIALIZING"):
-                up_ms = (tl["VULKAN INITIALIZING"] - t0) * 1000.0
-
-            def _ms(v):
-                return "n/a" if v is None else f"{v:,.1f} ms"
-
-            print(
-                "[LOAD UI STATE]\n"
-                f"  File:                     {file_name or 'n/a'}\n"
-                f"  Points:                   {('n/a' if points is None else f'{int(points):,}')}\n"
-                f"  Start:                    {_ms(0.0 if t0 else None)}\n"
-                f"  Point upload complete:    {_ms(up_ms)}\n"
-                f"  First visible frame:      {_ms(vis_ms)}\n"
-                f"  Popup hidden:             "
-                f"{'n/a (not yet hidden)' if visible else 'YES'}\n"
-                f"  Reason popup visible:     {reason}\n"
-                f"  Data state:               {state}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[LOAD UI STATE] diagnostic unavailable: {exc}", flush=True)
-
-    def _note_first_presented_frame(self) -> None:
-        """Called after a frame is actually presented. Drives the READY teardown.
-
-        This is the FIRST FRAME RULE in one place: the loading overlay is only
-        released once the engine reports a frame reached vkQueuePresentKHR.
-        Everything expensive after the upload (surface, shading, LOD, spatial
-        index, backups) runs independently and does not gate this.
-        """
-        try:
-            if str(getattr(self, "_data_state", "")) != "POINTS_READY":
-                return  # already READY, or still genuinely loading
-            tl = getattr(self, "_load_timeline", None)
-            if tl is not None:
-                tl["FIRST_VISIBLE_FRAME"] = time.perf_counter()
-            self._set_loading_state("READY")
-        except Exception as exc:
-            print(f"âš ï¸ first-frame handler failed: {exc}")
-
-    def _teardown_loading_overlay(self) -> None:
-        """Hide the loading overlay and release it. Safe to call repeatedly.
-
-        Idempotent by design: every call ends with the overlay hidden and the
-        app's reference dropped, so a later focus/activation event has nothing
-        left to raise.
-        """
-        dlg = getattr(self, "_load_progress", None)
-        if dlg is None:
-            return
-        try:
-            dlg.mark_loading_done()      # sets _loading_done -> show() refuses
-        except Exception:
-            pass
-        for _m in ("_remove_blocker", "hide", "setParent"):
-            try:
-                if _m == "setParent":
-                    dlg.setParent(None)  # detach: no parent => never re-raised
-                else:
-                    getattr(dlg, _m)()
-            except Exception:
-                pass
-        self._load_progress = None
-        try:
-            self.setWindowTitle("NAKSHA")   # undo "Loading LiDAR Fileâ€¦"
-        except Exception:
-            pass
 
     def attach_classification_to_main(self):
         """
@@ -8088,12 +7396,12 @@ class NakshaApp(QMainWindow):
             try:
                 from .cross_section.interactor_classify import ClassificationInteractor
             except ImportError as e:
-                print(f"âš ï¸ Cannot import ClassificationInteractor: {e}")
+                print(f"⚠️ Cannot import ClassificationInteractor: {e}")
                 return
 
         # Ensure main PyVista widget exists
         if not hasattr(self, 'vtk_widget') or self.vtk_widget is None:
-            print("âš ï¸ No main VTK widget (vtk_widget) - cannot attach ClassificationInteractor to main view")
+            print("⚠️ No main VTK widget (vtk_widget) - cannot attach ClassificationInteractor to main view")
             return
 
         iren = self.vtk_widget.interactor
@@ -8112,217 +7420,9 @@ class NakshaApp(QMainWindow):
         # Keep a reference so we can deactivate later if needed
         self.classify_interactor = wrapper
 
-        print("âœ… ClassificationInteractor attached to MAIN view")
+        print("✅ ClassificationInteractor attached to MAIN view")
  
  
-    def load_pipeline_report(self) -> str:
-        """[LOAD PIPELINE] - how long each load stage actually took.
-
-        Read from the timestamps captured in _set_loading_state, so these are
-        measurements rather than estimates. The headline number is the time to
-        the first PRESENTED frame with the point cloud resident, which is what
-        the user actually waits for.
-
-        NOTE on honesty: any Delaunay / shaded-mesh / surface work runs on a
-        worker QThread and is deliberately NOT part of this timeline. If those
-        stages appear here as blocking, that is a bug worth reporting.
-        """
-        tl = dict(getattr(self, "_load_timeline", {}) or {})
-        start = tl.pop("__start__", None)
-        lines = ["[LOAD PIPELINE]", ""]
-        if start is None:
-            lines.append("  no load has been recorded in this session")
-            return "\n".join(lines)
-        order = sorted(tl.items(), key=lambda kv: kv[1])
-        prev = start
-        total_ready = None
-        for name, t in order:
-            ms = (t - prev) * 1000.0
-            if total_ready is None and name == "READY":
-                total_ready = (t - start) * 1000.0
-            lines.append(f"  {name:<28} +{ms/1000.0:8.2f} s")
-            prev = t
-        rb = getattr(self, "render_backend", None)
-        try:
-            t = rb.vulkan_backend.get_frame_timing() if rb is not None else {}
-        except Exception:
-            t = {}
-        if total_ready is not None:
-            lines.append("")
-            lines.append(f"  Point cloud ready: {total_ready/1000.0:,.2f} s")
-        gpu = t.get("gpuRenderMs", -1.0)
-        lines.append(f"  First visible frame GPU: "
-                     f"{gpu:,.2f} ms" if gpu and gpu > 0
-                     else "  First visible frame GPU: not available yet")
-        lines.append("")
-        lines.append("  Background tasks: not on this path "
-                     "(Delaunay / shaded mesh / surface run on worker threads)")
-        return "\n".join(lines)
-
-    def _set_loading_state(self, state: str, detail: str = "") -> None:
-        """Explicit load-state marker shown while a dataset is being brought up.
-
-        States: POINT CLOUD LOADING -> PTC APPLYING -> VULKAN INITIALIZING ->
-        POINTS_READY -> READY. Surfaced both on the progress dialog and in the
-        log so a slow load is visibly progressing instead of looking frozen.
-
-        The loading overlay is permitted ONLY while the data state is LOADING.
-        POINTS_READY means the upload is done but no frame has been presented
-        yet, so the popup is still correct; READY tears it down for good.
-        """
-        self._vulkan_loading_state = state
-        # Advance the data state machine off the stage labels.
-        if state in ("POINT CLOUD LOADING", "PTC APPLYING", "VULKAN INITIALIZING"):
-            self._data_state = "LOADING"
-        elif state == "POINTS_READY":
-            # Upload complete, first frame not yet presented. The popup stays
-            # up: the user must not be shown a dismissed loader before there
-            # is anything to look at.
-            self._data_state = "POINTS_READY"
-        elif state == "READY":
-            if self._data_state == "EMPTY":
-                self._data_state = "FIRST_FRAME_READY"
-            self._data_state = "READY"
-            # Deterministic teardown, not a 500 ms timer: after READY the
-            # overlay can never come back on a focus/activation event.
-            self._teardown_loading_overlay()
-        # [LOAD PIPELINE] timestamp every stage transition. The first frame
-        # the point cloud is actually visible is what the user waits for, so
-        # the gap between "POINT CLOUD LOADING" and "READY" is the number that
-        # matters - and it tells us whether any of it is Delaunay/shading
-        # (which must never gate the point cloud).
-        _now = time.perf_counter()
-        _tl = getattr(self, "_load_timeline", None)
-        if _tl is None:
-            _tl = {}
-            self._load_timeline = _tl
-            _tl["__start__"] = _now
-        _tl[state] = _now
-        print(f"[LOAD] {state}" + (f" - {detail}" if detail else ""), flush=True)
-        dlg = getattr(self, "_load_progress", None)
-        if dlg is not None:
-            try:
-                dlg.set_status(state + (f": {detail}" if detail else ""))
-            except Exception:
-                pass
-
-    def _apply_startup_ptc(self, dataset=None) -> str:
-        """Apply the .ptc palette BOUND TO THIS DATASET before the first frame.
-
-        Applied before upload_point_cloud() so the very first presented frame
-        already carries the PTC class colours (rather than the default palette
-        flashing and the PTC landing afterwards).
-
-        Phase 6B.5: the old implementation read one global `last_ptc_path` and
-        applied it to whatever dataset was opened - so project A's palette
-        repainted project B. A palette is now applied only when it was bound to
-        the dataset being opened (see DisplayModeDialog._remember_project_ptc);
-        otherwise this returns '' and the built-in Naksha default is used.
-        """
-        try:
-            import os
-            from PySide6.QtCore import QSettings
-            from gui.ptc_table import PTC_BINDING_SETTING, resolve_project_ptc
-            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
-            if dataset is None:
-                dataset = getattr(self, "loaded_file", None)
-            path = resolve_project_ptc(settings.value(PTC_BINDING_SETTING),
-                                       dataset)
-            if not path:
-                print("   [PTC] no project-bound palette for this dataset - "
-                      "using the Naksha default", flush=True)
-                return ""
-            palette = self._load_ptc_file(path)
-            if not palette:
-                return ""
-            self.class_palette = {int(k): dict(v) for k, v in palette.items()}
-            if hasattr(self, "view_palettes") and isinstance(self.view_palettes, dict):
-                self.view_palettes[0] = {int(k): dict(v) for k, v in palette.items()}
-            self.display_mode = "class"
-            dlg = getattr(self, "display_mode_dialog", None)
-            if dlg is not None and hasattr(dlg, "sync_with_app_state"):
-                try:
-                    dlg.sync_with_app_state()
-                except Exception:
-                    pass
-            print(f"   Startup PTC applied before first frame: "
-                  f"{os.path.basename(path)} ({len(palette)} classes)", flush=True)
-            return path
-        except Exception as _e:
-            print(f"   Startup PTC skipped (VTK/Vulkan unaffected): {_e!r}")
-            return ""
-
-    def _push_palette_to_stream_manager(self, reason: str = "ptc") -> dict:
-        """Bridge the application's parsed PTC state onto the streaming renderer.
-
-        THE PTC WIRING GAP THIS CLOSES. `_load_single_ptc` used to:
-            parse via `_load_ptc_file`   -> works
-            `apply_class_map`            -> updates app state
-            `sync_palette_to_gpu(...)`   -> DEAD (the function body is entirely
-                                             commented out, so it is a no-op)
-            never touch `naksha_stream`  -> the Vulkan renderer never saw it
-
-        So a PTC load parsed correctly, updated the UI, reported success, and
-        changed nothing on screen. This routes the SAME existing state
-        (`app.class_palette` plus the existing visibility builder) into
-        `NakshaStreamManager.apply_palette`, which pushes a 768-byte class LUT and
-        a 256-byte visibility table and requests a redraw.
-
-        No new parser, no second palette system, no geometry work: the manager
-        records xyz_uploads and geometry_rebuilds and both must stay 0.
-        """
-        mgr = getattr(self, "naksha_stream", None)
-        if mgr is None:
-            return {"ok": False, "reason": "no stream manager"}
-        apply_palette = getattr(mgr, "apply_palette", None)
-        if not callable(apply_palette):
-            return {"ok": False, "reason": "manager has no apply_palette"}
-        try:
-            report = apply_palette(palette=getattr(self, "class_palette", None),
-                                   reason=reason)
-        except Exception as exc:                                    # noqa: BLE001
-            print(f"[PTC PUSH] failed: {exc!r}", flush=True)
-            return {"ok": False, "reason": repr(exc)}
-        report = report if isinstance(report, dict) else {"ok": bool(report)}
-        perf = report.get("performance", {})
-        print(f"[PTC PUSH] reason={reason} "
-              f"pushed_to_renderer={report.get('pushed_to_renderer')} "
-              f"visibility={report.get('visibility_pushed')} "
-              f"xyz_uploads={perf.get('xyz_uploads', '?')} "
-              f"geometry_rebuilds={perf.get('geometry_rebuilds', '?')}", flush=True)
-        return report
-
-    def _route_streaming_display_mode(self, mode: str) -> bool:
-        """Tell the streaming manager the mode, through the canonical setter.
-
-        Assigning `self.display_mode = mode` only changes an app attribute. The
-        manager is the authority on what is actually rendered, so a path that
-        sets the attribute without this call leaves the renderer on the previous
-        mode while the UI claims the new one - the impossible
-        `ui_mode=rgb / stream_mode=shaded` pairing.
-        """
-        try:
-            from gui.naksha_cache.dataset_mode import is_streaming_dataset
-        except Exception:
-            is_streaming_dataset = None
-        if is_streaming_dataset is None or not is_streaming_dataset(self):
-            return False
-        try:
-            from gui.naksha_cache.app_streaming import streaming_display_mode
-            smode = streaming_display_mode(mode)
-            mgr = getattr(self, "naksha_stream", None)
-            if mgr is None or not callable(getattr(mgr, "set_display_mode", None)):
-                return False
-            ok = bool(mgr.set_display_mode(smode))
-            setter = getattr(self, "_set_streaming_display_mode", None)
-            if callable(setter):
-                setter(mode, smode, ok)
-            print(f"  [STREAMING MODE] mode={mode} stream_mode={smode} ok={ok}")
-            return ok
-        except Exception as exc:                                    # noqa: BLE001
-            print(f"  [STREAMING MODE] routing failed: {exc!r}")
-            return False
-
     def _load_single_ptc(self, filename):
         """Load PTC palette file"""
         from gui.progress_dialog import LoadingProgressDialog
@@ -8356,15 +7456,6 @@ class NakshaApp(QMainWindow):
                 "slot": 0,
                 "color_mode": 0
             })
-
-            # PHASE 1B / PART 6+7: reach the VULKAN renderer.
-            # The legacy `sync_palette_to_gpu` call below is kept for the VTK/actor
-            # path, but its body is entirely commented out - it is a no-op - so on
-            # its own a PTC load never reached the GPU. These two calls are what
-            # actually make a PTC load visible, and both are LUT/state only:
-            # xyz_uploads and geometry_rebuilds must stay 0.
-            self._push_palette_to_stream_manager(reason=f"ptc:{filename}")
-            self._route_streaming_display_mode("class")
            
             try:
                 from gui.unified_actor_manager import sync_palette_to_gpu
@@ -8375,22 +7466,13 @@ class NakshaApp(QMainWindow):
                     border=float(getattr(self, 'point_border_percent', 0) or 0.0),
                     render=True,
                 )
-                print("   âœ… Slot 0 GPU explicitly re-pushed after PTC load")
+                print("   ✅ Slot 0 GPU explicitly re-pushed after PTC load")
             except Exception as _ptc_push_err:
-                print(f"   âš ï¸ Slot 0 GPU push failed after PTC load: {_ptc_push_err}")
+                print(f"   ⚠️ Slot 0 GPU push failed after PTC load: {_ptc_push_err}")
 
             from PySide6.QtCore import QSettings
-            from gui.ptc_table import PTC_BINDING_SETTING, bind_project_ptc
-            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
-            # 6B.5: bound to the dataset it was chosen for; `last_ptc_path` is
-            # kept only as the file picker's recent location.
-            settings.setValue(
-                PTC_BINDING_SETTING,
-                bind_project_ptc(settings.value(PTC_BINDING_SETTING),
-                                 getattr(self, "loaded_file", None), filename))
+            settings = QSettings("NakshaAI", "LidarApp")
             settings.setValue("last_ptc_path", filename)
-            settings.remove("global_last_ptc_path")
-            settings.sync()
            
             if hasattr(self, 'point_count_widget') and self.point_count_widget:
                 refresh_point_statistics(self)
@@ -8415,13 +7497,13 @@ class NakshaApp(QMainWindow):
         return prompt_lidar_import_options(first_lidar, parent=self)
  
  
-    def _load_nakshatech_prj(self, filename):
-        """Load Nakshatech PRJ project"""
+    def _load_terrascan_prj(self, filename):
+        """Load TerraScan PRJ project"""
         from gui.progress_dialog import LoadingProgressDialog
         from PySide6.QtCore import QCoreApplication
 
-        from .data_loader import _parse_nakshatech_prj
-        laz_files = _parse_nakshatech_prj(filename)
+        from .data_loader import _parse_terrascan_prj
+        laz_files = _parse_terrascan_prj(filename)
 
         import_options = self._prompt_lidar_import_options_for_files(laz_files)
         if import_options is None:
@@ -8431,7 +7513,7 @@ class NakshaApp(QMainWindow):
         progress.set_filename(filename)
         progress.show()
 
-        progress.set_progress(20, "Parsing Nakshatech project...")
+        progress.set_progress(20, "Parsing TerraScan project...")
         QCoreApplication.processEvents()
 
         total_files = len(laz_files)
@@ -8472,16 +7554,16 @@ class NakshaApp(QMainWindow):
 
                     _dst_crs = get_canvas_crs(self)
                     if _dst_crs is None and _src_crs is not None:
-                        set_canvas_crs(self, _src_crs, source="Nakshatech tile CRS", dataset=laz, force=True)
+                        set_canvas_crs(self, _src_crs, source="TerraScan tile CRS", dataset=laz, force=True)
                         _dst_crs = get_canvas_crs(self) or _src_crs
                     if _src_crs is not None and _dst_crs is not None and not _src_crs.equals(_dst_crs):
                         laz_data["xyz"], _rep = transform_points(
                             laz_data["xyz"], _src_crs, _dst_crs,
                             copy=False, chunk_size=1_000_000,
                         )
-                        print(f"Nakshatech tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
+                        print(f"TerraScan tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
                 except Exception as _crs_exc:
-                    print(f"Nakshatech tile CRS warning ({laz}): {_crs_exc}")
+                    print(f"TerraScan tile CRS warning ({laz}): {_crs_exc}")
 
                 layer = {
                     "type": "laz_tile",
@@ -8520,7 +7602,7 @@ class NakshaApp(QMainWindow):
                 self.crs = _pc
                 print(f"Project CRS: {_pc.name}")
         except Exception as e:
-            print(f"Could not report Nakshatech project CRS: {e}")
+            print(f"Could not report TerraScan project CRS: {e}")
        
         from .display_mode import restore_display_settings_for_file
         restore_display_settings_for_file(self, filename)
@@ -8553,7 +7635,7 @@ class NakshaApp(QMainWindow):
             QCoreApplication.processEvents()
        
         print(f"\n{'='*60}")
-        print(f"ðŸ“‚ Loading file: {os.path.basename(filename)}")
+        print(f"📂 Loading file: {os.path.basename(filename)}")
         print(f"{'='*60}")
        
         load_start = time.time()
@@ -8567,13 +7649,13 @@ class NakshaApp(QMainWindow):
             prompt_user=False,
         )
         if not lidar_data:
-            print("âŒ Failed to load LiDAR file")
+            print("❌ Failed to load LiDAR file")
             progress.finish_error("Failed to read file")
             return
        
         n_points = len(lidar_data.get('xyz', []))
         progress.set_points_count(n_points)
-        print(f"ðŸ“Š Data loaded: {n_points:,} points")
+        print(f"📊 Data loaded: {n_points:,} points")
        
         update_progress(35, f"Processing {n_points:,} points...")
        
@@ -8668,15 +7750,16 @@ class NakshaApp(QMainWindow):
             _io.get("only_class") and _io.get("class_codes")
         )
  
-        # Build spatial index
+        # Build one shared Phase-2 spatial index in the background.
         if n_points > 50_000:
             try:
-                update_progress(50, "Building spatial index...")
-                from gui.performance_optimizations import SpatialIndex
-                self.spatial_index = SpatialIndex(self.data["xyz"])
-                print(f"âœ… Spatial index ready")
+                update_progress(50, "Scheduling shared spatial index...")
+                from gui.spatial_index import schedule_shared_index_build
+                self.spatial_index = None
+                schedule_shared_index_build(self, self.data["xyz"])
+                print("PHASE2_SPATIAL_INDEX status=scheduled source=file_load")
             except Exception as e:
-                print(f"âš ï¸ Spatial index failed: {e}")
+                print(f"PHASE2_SPATIAL_INDEX status=schedule_failed error={e}")
                 self.spatial_index = None
        
         # Project CRS was already established above before spatial indexing.
@@ -8720,7 +7803,7 @@ class NakshaApp(QMainWindow):
         # Apply palette
         if palette_to_apply:
             # If user selected specific classes on load, hide all others in the
-            # palette. All points remain in memory â€” user can re-enable classes
+            # palette. All points remain in memory — user can re-enable classes
             # via Display Mode at any time without reloading.
             if isinstance(import_options, dict) and import_options.get("only_class"):
                 from gui.display_mode import clone_palette
@@ -8728,7 +7811,7 @@ class NakshaApp(QMainWindow):
                 palette_to_apply = clone_palette(palette_to_apply)
                 for _code, _entry in palette_to_apply.items():
                     _entry["show"] = (_code in _sel)
-                print(f"   ðŸ‘ Initial visibility: showing classes {sorted(_sel)}")
+                print(f"   👁 Initial visibility: showing classes {sorted(_sel)}")
         
             visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
             update_progress(85, f"Rendering {visible_count} visible classes...")
@@ -8756,7 +7839,7 @@ class NakshaApp(QMainWindow):
             try:
                 self.digitizer.auto_load_drawings(filename)
             except Exception as e:
-                print(f"âš ï¸ Failed to auto-load drawings: {e}")
+                print(f"⚠️ Failed to auto-load drawings: {e}")
        
         # Update statistics
         if hasattr(self, 'point_count_widget') and self.point_count_widget:
@@ -8764,8 +7847,8 @@ class NakshaApp(QMainWindow):
        
         total_time = time.time() - load_start
         print(f"{'='*60}")
-        print(f"âœ… LOAD COMPLETE: {os.path.basename(filename)}")
-        print(f"   â±ï¸ Time: {total_time:.1f}s")
+        print(f"✅ LOAD COMPLETE: {os.path.basename(filename)}")
+        print(f"   ⏱️ Time: {total_time:.1f}s")
         print(f"{'='*60}\n")
        
         progress.finish_success(f"Loaded {n_points:,} points in {total_time:.1f}s")
@@ -8833,7 +7916,7 @@ class NakshaApp(QMainWindow):
             from gui.unified_actor_manager import invalidate_palette_cache
             invalidate_palette_cache()
         except Exception as e:
-            print(f"âš ï¸ Import class block restore skipped: {e}")
+            print(f"⚠️ Import class block restore skipped: {e}")
 
     def _sync_display_dialog_visibility(self, palette):
         """After an only-selected-classes load hides classes, keep the Display
@@ -8858,7 +7941,7 @@ class NakshaApp(QMainWindow):
             if dlg is not None and hasattr(dlg, "sync_slot_visibility_from_palette"):
                 dlg.sync_slot_visibility_from_palette(0, palette)
         except Exception as e:
-            print(f"âš ï¸ Display dialog visibility sync skipped: {e}")
+            print(f"⚠️ Display dialog visibility sync skipped: {e}")
 
     def _get_palette_for_file(self, filename):
         """Helper to get appropriate palette for file"""
@@ -8882,7 +7965,7 @@ class NakshaApp(QMainWindow):
             source_palette = self.class_palette
 
         if source_palette:
-            print("ðŸ”„ Reusing existing/restored palette")
+            print("🔄 Reusing existing/restored palette")
             palette = self._normalize_palette_weights(clone_palette(source_palette))
 
             # Ensure at least one class is visible
@@ -8894,20 +7977,20 @@ class NakshaApp(QMainWindow):
 
         # PTC must not be auto-loaded here. It is global state managed
         # exclusively by the Display Mode dialog. If no palette is in memory
-        # the renderer falls back to Nakshatech defaults until the user loads
+        # the renderer falls back to TerraScan defaults until the user loads
         # a PTC manually.
-        print("ðŸ“‹ No active PTC in memory â€” using Nakshatech defaults")
+        print("📋 No active PTC in memory — using TerraScan defaults")
         from gui.class_display import build_class_palette
         data = getattr(self, 'data', None)
         classification = data.get('classification') if isinstance(data, dict) else None
         return build_class_palette(classification) if classification is not None else {}
 
         # # Try to load from last PTC
-        # settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        # settings = QSettings("NakshaAI", "LidarApp")
         # last_ptc = settings.value("global_last_ptc_path", "") or settings.value("last_ptc_path", "")
         
         # if last_ptc and os.path.exists(last_ptc):
-        #     print(f"ðŸ“ Loading PTC: {os.path.basename(last_ptc)}")
+        #     print(f"📁 Loading PTC: {os.path.basename(last_ptc)}")
         #     from .display_mode import DisplayModeDialog
         #     dlg = DisplayModeDialog(self)
         #     dlg.load_classes_from_path(last_ptc)
@@ -8938,7 +8021,7 @@ class NakshaApp(QMainWindow):
            
         #     return class_map
        
-        # print("ðŸ“‹ Using Nakshatech defaults")
+        # print("📋 Using TerraScan defaults")
         # return None
     # ============================================================
     # SIMPLER VERSION - Just add progress to existing code
@@ -8953,7 +8036,7 @@ class NakshaApp(QMainWindow):
         try:
             from gui.progress_dialog import LoadingProgressDialog
         except Exception as e:
-            print(f"âš ï¸ Could not import LoadingProgressDialog: {e}")
+            print(f"⚠️ Could not import LoadingProgressDialog: {e}")
             # Fallback minimal progress object to avoid crashes when the dialog class is missing
             class LoadingProgressDialog:
                 def __init__(self, parent, show_cancel=False):
@@ -9026,7 +8109,7 @@ class NakshaApp(QMainWindow):
             return
 
         if key == "Escape":
-            print("ðŸ”‘ ESC pressed â€” checking active tools...")
+            print("🔑 ESC pressed — checking active tools...")
             # VTK windows do not always pass Escape through Qt's global event
             # filter, so persistent nested-cut placement is handled here too.
             handled = False
@@ -9040,34 +8123,34 @@ class NakshaApp(QMainWindow):
             if not handled:
                 handled = self._deactivate_active_identification_tools_for_escape()
 
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             # PRIORITY 1: Cancel active curve drawing
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             if hasattr(self, 'curve_tool') and self.curve_tool:
                 ct = self.curve_tool
                 
                 if ct.active:
                     if hasattr(ct, "suspend"):
                         ct.suspend()
-                        print("   âœ… Curve drawing paused")
+                        print("   ✅ Curve drawing paused")
                     else:
                         ct._cancel_curve()
-                        print("   âœ… Curve drawing cancelled")
+                        print("   ✅ Curve drawing cancelled")
                     handled = True
                 
                 elif getattr(ct, '_select_mode', False):
                     ct.deactivate_select_mode()
-                    print("   âœ… Curve select mode deactivated")
+                    print("   ✅ Curve select mode deactivated")
                     handled = True
 
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             # PRIORITY 2: Cancel cross-section mode (YOUR EXISTING LOGIC)
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             if not handled:
                 current_style = self.vtk_widget.interactor.GetInteractorStyle()
 
                 if isinstance(current_style, CrossSectionInteractor):
-                    print("ðŸ›‘ ESC - deactivating cross-section")
+                    print("🛑 ESC - deactivating cross-section")
                     self._cancel_cross_section_tool_only()
                     self.set_cross_cursor_active(False, "cross_section")
                     try:
@@ -9080,12 +8163,12 @@ class NakshaApp(QMainWindow):
                 # Also check the cancel helper
                 if getattr(self, "cross_interactor", None):
                     self._cancel_cross_section_tool_only()
-                    print("ðŸ›‘ Cross-section tool canceled (ESC) - views preserved")
+                    print("🛑 Cross-section tool canceled (ESC) - views preserved")
                     handled = True
 
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             # PRIORITY 3: Deactivate digitizer tools
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             if not handled:
                 if hasattr(self, 'digitizer') and self.digitizer:
                     try:
@@ -9093,33 +8176,33 @@ class NakshaApp(QMainWindow):
                             self.digitizer.deactivate_all()
                         elif hasattr(self.digitizer, 'current_tool') and self.digitizer.current_tool:
                             self.digitizer.set_tool(None)
-                        print("   âœ… Digitizer tools deactivated")
+                        print("   ✅ Digitizer tools deactivated")
                         handled = True
                     except Exception as e:
-                        print(f"   âš ï¸ Digitizer deactivate failed: {e}")
+                        print(f"   ⚠️ Digitizer deactivate failed: {e}")
 
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             # PRIORITY 4: Deactivate measurement / zoom tools
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             if not handled:
                 for tool_name in ('measurement_tool', 'select_rectangle_tool', 'zoom_rectangle_tool'):
                     tool = getattr(self, tool_name, None)
                     if tool and hasattr(tool, 'deactivate'):
                         try:
                             tool.deactivate()
-                            print(f"   âœ… {tool_name} deactivated")
+                            print(f"   ✅ {tool_name} deactivated")
                             handled = True
                         except Exception:
                             pass
 
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             # FINAL: Restore cursor and show status
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════
             self.vtk_widget.setCursor(Qt.ArrowCursor)
 
             if handled:
                 self.statusBar().showMessage(
-                    "âœ… Tools off â€” Right-click grid labels to load LAZ data", 3000
+                    "✅ Tools off — Right-click grid labels to load LAZ data", 3000
                 )
             else:
                 self.statusBar().showMessage("Ready", 2000)    
@@ -9169,7 +8252,7 @@ class NakshaApp(QMainWindow):
     #             self.vtk_widget.render()
                
                    
-    #             # âœ… CRITICAL: Aggressive cleanup of all section views
+    #             # ✅ CRITICAL: Aggressive cleanup of all section views
     #                     self._cancel_cross_section_tool_only()
                
     #             self.statusBar().showMessage("Cross-section mode canceled", 2000)
@@ -9187,32 +8270,42 @@ class NakshaApp(QMainWindow):
         return palette
 
     def _load_ptc_file(self, path):
-        """Parse a Nakshatech-style .ptc file into a class_map dict, or None.
+            """Parse TerraScan-style .ptc file and return a class_map dict."""
+            try:
+                with open(path, "r") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+            except Exception as e:
+                self._show_display_mode_front_message(
+                    QMessageBox.Critical,
+                    "Error",
+                    f"Failed to open .ptc file:\n{e}",
+                )
+                return None
 
-        This used to be a SECOND inline copy of the record loop. Two parsers
-        meant two behaviours: this one silently `continue`d past malformed
-        records (a partly-loadable palette, without telling anyone), while
-        DisplayModeDialog's copy had already mutated live state by then. Both
-        now call gui/ptc_table, which returns a COMPLETE palette or raises with
-        file/line/reason - and the caller keeps its previous palette on failure.
-        """
-        try:
-            from gui.ptc_table import parse_ptc_file
-        except Exception as exc:                                    # noqa: BLE001
-            print(f"[PTC LOAD FAILED] parser unavailable: {exc!r}", flush=True)
-            return None
-        try:
-            palette, warnings = parse_ptc_file(path)
-        except Exception as exc:                                    # noqa: BLE001
-            message = (exc.as_dialog_text() if hasattr(exc, "as_dialog_text")
-                       else f"File:\n{path}\n\nReason:\n{exc}")
-            print(f"[PTC LOAD FAILED] {message}", flush=True)
-            self._show_display_mode_front_message(
-                QMessageBox.Critical, "PTC LOAD FAILED", message)
-            return None
-        for warning in warnings:
-            print(f"[PTC WARNING] {warning}", flush=True)
-        return {int(code): dict(info) for code, info in palette.items()}
+            class_map = {}
+            for i in range(0, len(lines), 2):
+                try:
+                    header = lines[i].split("\t")
+                    detail = lines[i + 1].split("\t")
+                    if len(header) < 2 or len(detail) < 5:
+                        continue
+                    code = int(header[0])
+                    desc = header[1]
+                    lvl = header[2] if len(header) > 2 else "0"
+                    draw = detail[1]
+                    rgb = [int(c) for c in detail[3].split(",")]
+                    show = detail[4] == "1"
+                    class_map[code] = {
+                        "show": show,
+                        "description": desc,
+                        "draw": draw,
+                        "lvl": lvl,
+                        "color": tuple(rgb),
+                    }
+                except Exception as e:
+                    print(f"⚠️ Skipping malformed entry at line {i}: {e}")
+                    continue
+            return class_map
 
     def _ensure_shading_controls_dock(self):
         dock = getattr(self, "shading_dock", None)
@@ -9260,6 +8353,9 @@ class NakshaApp(QMainWindow):
         return panel
 
     def _can_show_shading_controls(self):
+        native_view = getattr(self, "_lnt_main_view", None)
+        if native_view is not None:
+            return native_view.shading_name in ("shaded", "shaded_class", "surface")
         try:
             data = getattr(self, "data", None)
             mode = str(getattr(self, "display_mode", "") or "").lower()
@@ -9365,7 +8461,7 @@ class NakshaApp(QMainWindow):
                 return
             if hasattr(ct, 'resume'):
                 ct.resume()
-                print(f"   ðŸ”® Curve tool auto-resumed after {reason}")
+                print(f"   🔮 Curve tool auto-resumed after {reason}")
 
         QTimer.singleShot(0, _do_resume)
 
@@ -9377,7 +8473,7 @@ class NakshaApp(QMainWindow):
     ):
         """
         Pause (not cancel) an in-progress curve drawing so app.curve_tool.points
-        survives a display-mode switch â€” matching how SmartLine/Polyline already
+        survives a display-mode switch — matching how SmartLine/Polyline already
         behave (their temp_points live on the persistent Digitizer and nobody
         clears them on mode switch).
 
@@ -9385,7 +8481,7 @@ class NakshaApp(QMainWindow):
         change: set_display_mode() is called from ~7 different places (keyboard
         shortcuts via execute_tool.py, the ribbon Elevation/Intensity/Depth
         buttons, and the 3 "Apply" settings dialogs) and only the keyboard-
-        shortcut path had a suspend() guard before this fix â€” every other
+        shortcut path had a suspend() guard before this fix — every other
         caller went straight into set_display_mode() with zero curve-tool
         awareness, which is what let ct._cancel_curve() wipe self.points
         depending on which UI element the user clicked.
@@ -9410,7 +8506,7 @@ class NakshaApp(QMainWindow):
         if not is_active and not is_select_mode:
             return
 
-        print(f"   ðŸŽ¨ Suspending curve tool ({reason})")
+        print(f"   🎨 Suspending curve tool ({reason})")
 
         if is_active:
             if hasattr(ct, "suspend"):
@@ -9421,7 +8517,7 @@ class NakshaApp(QMainWindow):
                     # suspended until the user selects Curve again.
                     self._schedule_curve_tool_resume(reason)
             else:
-                # Defensive fallback only â€” should be unreachable once
+                # Defensive fallback only — should be unreachable once
                 # CurveTool.suspend() exists, kept so an older/partial
                 # CurveTool build degrades to the old cancel behavior
                 # instead of hard-crashing.
@@ -9430,40 +8526,17 @@ class NakshaApp(QMainWindow):
         if is_select_mode:
             ct.deactivate_select_mode()
 
-    def _set_streaming_display_mode(self, ui_mode, stream_mode, ok=True):
-        """ONE canonical display-mode state for STREAMING.
-
-        app.display_mode used to be assigned only on the LEGACY path, which the
-        streaming branch returns before reaching. So after a streaming mode
-        switch the UI still reported the previous mode while the manager had
-        already moved - the ui_mode=rgb / stream_mode=shaded desync.
-
-        This records the UI name, keeps the manager authoritative, and asserts
-        the two agree. A mismatch is reported loudly rather than tolerated.
-        """
-        mgr = getattr(self, "naksha_stream", None)
-        from gui.naksha_cache.app_streaming import streaming_ui_mode
-        from gui.naksha_cache.display_modes import canonical_mode
-        self._requested_display_mode = str(ui_mode)
-        mgr_mode = str(getattr(mgr, "display_mode", "")) if mgr is not None else ""
-        self.display_mode = streaming_ui_mode(mgr_mode) if mgr_mode else str(ui_mode)
-        print(f"[MODE STATE] ui_mode={ui_mode} translated_mode={stream_mode} "
-              f"manager_mode={mgr_mode} "
-              f"adapter_mode={getattr(mgr, 'display_mode', '?')} "
-              f"ok={ok}")
-        if (mgr is not None and mgr_mode
-                and not getattr(mgr, "_pending_display_mode", None)
-                and canonical_mode(mgr_mode) != canonical_mode(stream_mode)):
-            print(f"[MODE DESYNC] ui={ui_mode} translated={stream_mode} "
-                  f"manager={mgr_mode} - canonical modes disagree")
-        return True
-
     def set_display_mode(self, mode):
         """
-        Nakshatech-style display mode switch.
+        MicroStation-style display mode switch.
         ALL modes write directly into the unified actor's RGB buffer.
         Zero actor rebuild. DXF/SNT grids always preserved.
         """
+        native_view = getattr(self, "_lnt_main_view", None)
+        if native_view is not None:
+            self._suspend_curve_tool_safely(f"switching to {mode} display mode")
+            native_view.set_app_display_mode(mode)
+            return
         if self.data is None:
             self._show_display_mode_front_message(
                 QMessageBox.Warning,
@@ -9472,41 +8545,7 @@ class NakshaApp(QMainWindow):
             )
             return
 
-        # ---- STREAMING (Vulkan) FAST PATH --------------------------------
-        # In DatasetMode.STREAMING app.data is deliberately EMPTY: the points
-        # live in the resident GPU buffer uploaded by NakshaStreamManager.
-        # Everything below this point is the LEGACY VTK unified-actor path,
-        # which cannot work here - it needs app.data to build an actor, so it
-        # printed "Could not create unified actor" on every display-mode click
-        # and then restored the camera. Route the mode to the streaming
-        # manager instead and return before any actor work.
-        try:
-            from gui.naksha_cache.dataset_mode import is_streaming_dataset
-        except Exception:
-            is_streaming_dataset = None
-        if is_streaming_dataset is not None and is_streaming_dataset(self):
-            mgr = getattr(self, "naksha_stream", None)
-            if mgr is not None:
-                from gui.naksha_cache.app_streaming import (
-                    streaming_display_mode)
-                smode = streaming_display_mode(mode)
-                if str(getattr(mgr, "display_mode", "rgb")) == smode:
-                    return True
-                ok = bool(mgr.set_display_mode(smode))
-                # CANONICAL MODE STATE. app.display_mode was previously left
-                # STALE in streaming: this branch returns before the later
-                # `self.display_mode = mode` assignment, so the UI kept an old
-                # value while the manager moved on - producing the impossible
-                # ui_mode=rgb / stream_mode=shaded pair. One setter, one source
-                # of truth, updated on EVERY path below.
-                self._set_streaming_display_mode(mode, smode, ok)
-                print(f"  [STREAMING DISPLAY] ui_mode={mode} "
-                      f"stream_mode={smode} manager=0x{id(mgr):x} ok={ok}")
-                # Footer must not fall back to app.data, which is empty.
-                self.update_total_points_label()
-                return ok
-
-        # âœ… FIX: suspend (never cancel) any in-progress curve drawing before
+        # ✅ FIX: suspend (never cancel) any in-progress curve drawing before
         # the mode switch actually happens. Covers every caller of this
         # method, not just the keyboard-shortcut path.
         # Every display mode owns only data-layer actors. Repair the shared
@@ -9519,7 +8558,7 @@ class NakshaApp(QMainWindow):
         import time as _time
         mode = str(mode or "").lower().strip()
         t0 = _time.perf_counter()
-        print(f"\nðŸŽ¨ Display mode â†’ {mode}")
+        print(f"\n🎨 Display mode → {mode}")
 
         # Surface is a heavy mesh build. Skip duplicate Surface calls only when
         # the Display Mode class visibility has not changed.
@@ -9574,13 +8613,13 @@ class NakshaApp(QMainWindow):
                         or previous_quality != current_quality
                     ):
                         force_surface_rebuild = True
-                        print("ðŸ” Surface Display Mode signature changed â€” switching/rebuilding Surface mesh")
+                        print("🔁 Surface Display Mode signature changed — switching/rebuilding Surface mesh")
                         print(f"   classes old={previous_sig}")
                         print(f"   classes new={current_sig}")
                         print(f"   quality old={previous_quality} new={current_quality}")
 
                 except Exception as _surface_sig_err:
-                    print(f"âš ï¸ Surface signature check failed: {_surface_sig_err}")
+                    print(f"⚠️ Surface signature check failed: {_surface_sig_err}")
                     force_surface_rebuild = False
 
                 if not force_surface_rebuild:
@@ -9594,7 +8633,7 @@ class NakshaApp(QMainWindow):
                     except Exception:
                         pass
 
-                    print("â­ï¸ Surface already active â€” skipped duplicate rebuild")
+                    print("⏭️ Surface already active — skipped duplicate rebuild")
                     return
 
         self.display_mode = mode
@@ -9635,17 +8674,11 @@ class NakshaApp(QMainWindow):
                 if dock_name == 'shading_dock':
                     self.shading_panel = None
 
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # SHADED CLASS â€” separate mesh pipeline (triangulated surface)
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ═══════════════════════════════════════════════════════════════
+        # SHADED CLASS — separate mesh pipeline (triangulated surface)
+        # ═══════════════════════════════════════════════════════════════
         if mode == "shaded_class":
-            # A cache-backed (DatasetMode.STREAMING) dataset keeps app.data
-            # EMPTY by design - the class ids are resident in the GPU point
-            # buffer. Refusing here would block the one renderer that works
-            # without app.data (the instant splat + depth-normal lighting pass)
-            # while the legacy Delaunay TIN, which does need it, stays gated.
-            _streaming = getattr(self, 'naksha_stream', None) is not None
-            if self.data.get("classification") is None and not _streaming:
+            if self.data.get("classification") is None:
                 QMessageBox.warning(self, "No Classification",
                     "Shaded Classification requires class data.")
                 mode = "class"
@@ -9683,9 +8716,9 @@ class NakshaApp(QMainWindow):
                 self._restore_camera_safe(saved_camera)
                 return
 
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        # SURFACE MODE â€” separate mesh pipeline, no class-color overlay
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ═══════════════════════════════════════════════════════════════
+        # SURFACE MODE — separate mesh pipeline, no class-color overlay
+        # ═══════════════════════════════════════════════════════════════
         if mode == "surface":
             try:
                 from .pointcloud_display import update_pointcloud
@@ -9703,14 +8736,14 @@ class NakshaApp(QMainWindow):
                 self._restore_camera_safe(saved_camera)
                 return
             except Exception as _surface_err:
-                print(f"âš ï¸ Surface display failed: {_surface_err}")
+                print(f"⚠️ Surface display failed: {_surface_err}")
                 mode = "elevation"
                 self.display_mode = "elevation"
 
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ═══════════════════════════════════════════════════════════════
         # ALL OTHER MODES: Write colors into unified actor RGB buffer
-        # Zero rebuild. Nakshatech instant switch.
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Zero rebuild. MicroStation instant switch.
+        # ═══════════════════════════════════════════════════════════════
 
         # Remove Surface mesh if switching away from Surface mode.
         if mode != "surface":
@@ -9718,7 +8751,7 @@ class NakshaApp(QMainWindow):
                 from gui.surface_mode import detach_surface_before_non_surface_mode
                 detach_surface_before_non_surface_mode(self, requested_mode=mode)
             except Exception as _surface_cleanup_err:
-                print(f"  âš ï¸ Surface cleanup before {mode} skipped: {_surface_cleanup_err}")
+                print(f"  ⚠️ Surface cleanup before {mode} skipped: {_surface_cleanup_err}")
 
         # Remove every shading-owned actor (base, edges, and fast-add patches)
         # while preserving cached geometry for a later fast shading restore.
@@ -9726,7 +8759,7 @@ class NakshaApp(QMainWindow):
             from .shading_display import detach_shading_before_non_shading_mode
             detach_shading_before_non_shading_mode(self)
         except Exception as _shading_detach_err:
-            print(f"  âš ï¸ Shading detach skipped: {_shading_detach_err}")
+            print(f"  ⚠️ Shading detach skipped: {_shading_detach_err}")
 
         # Ensure unified actor exists
         from gui.unified_actor_manager import (
@@ -9745,9 +8778,43 @@ class NakshaApp(QMainWindow):
             actor = _get_unified_actor(self)
 
         if actor is None:
-            print("  âš ï¸ Could not create unified actor")
+            print("  ⚠️ Could not create unified actor")
             self._restore_camera_safe(saved_camera)
             return
+
+        # PHASE2B resident-tile display path.  Do not let legacy single-actor
+        # RGB code address the first tile as if it represented the whole cloud.
+        try:
+            from gui.unified_actor_manager import _is_main_tiled, apply_main_tiled_color_mode
+            if _is_main_tiled(self):
+                if apply_main_tiled_color_mode(self, mode, render=True):
+                    _MODE_TO_IDX_TILED = {
+                        "class": 0, "shaded_class": 1, "depth": 2,
+                        "intensity": 3, "rgb": 4, "elevation": 5,
+                        "surface": 6, "line": 7,
+                    }
+                    try:
+                        if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+                            dlg = self.display_mode_dialog
+                            if dlg.current_slot != 0:
+                                dlg.slot_box.blockSignals(True)
+                                dlg.slot_box.setCurrentIndex(0)
+                                dlg.slot_box.blockSignals(False)
+                                dlg.on_slot_changed(0)
+                            _target_idx = _MODE_TO_IDX_TILED.get(mode, -1)
+                            if _target_idx >= 0 and dlg.color_mode.currentIndex() != _target_idx:
+                                dlg.color_mode.blockSignals(True)
+                                dlg.color_mode.setCurrentIndex(_target_idx)
+                                dlg.color_mode.blockSignals(False)
+                    except Exception:
+                        pass
+                    self._restore_camera_safe(saved_camera)
+                    self._ensure_overlay_actors()
+                    elapsed = (_time.perf_counter() - t0) * 1000
+                    print(f"  ⚡ Tiled display switch complete: {elapsed:.0f}ms\n")
+                    return
+        except Exception as _tile_mode_err:
+            print(f"  ⚠️ PHASE2B tiled display path failed, using compatibility path: {_tile_mode_err}")
 
         # Make unified actor visible (it may have been hidden by shading mode)
         actor.SetVisibility(True)
@@ -9757,7 +8824,7 @@ class NakshaApp(QMainWindow):
         gi = getattr(self, '_main_global_indices', None)
 
         if rgb_ptr is None or vtk_ca is None:
-            print("  âš ï¸ RGB buffer not available â€” falling back to full rebuild")
+            print("  ⚠️ RGB buffer not available — falling back to full rebuild")
             from .pointcloud_display import update_pointcloud
             update_pointcloud(self, mode)
             self._restore_camera_safe(saved_camera)
@@ -9769,7 +8836,7 @@ class NakshaApp(QMainWindow):
         vis_xyz = xyz[gi] if gi is not None else xyz
         vis_class = classification[gi] if (classification is not None and gi is not None) else classification
 
-        # â”€â”€ COMPUTE COLORS BASED ON MODE â”€â”€
+        # ── COMPUTE COLORS BASED ON MODE ──
         if mode == "class":
             # Classification colors from palette
             palette = getattr(self, 'class_palette', {})
@@ -9781,7 +8848,7 @@ class NakshaApp(QMainWindow):
                 self.point_border_percent = float(saved_border)
 
             fast_palette_refresh(self, palette=palette, border_percent=border)
-            print(f"  âœ… Class mode: palette applied ({len(palette)} classes)")
+            print(f"  ✅ Class mode: palette applied ({len(palette)} classes)")
 
         elif mode == "rgb":
             rgb_data = self.data.get("rgb")
@@ -9789,21 +8856,21 @@ class NakshaApp(QMainWindow):
                 vis_rgb = rgb_data[gi] if gi is not None else rgb_data
                 np.copyto(rgb_ptr, vis_rgb[:len(rgb_ptr)])
             else:
-                # No RGB data â€” show white
+                # No RGB data — show white
                 rgb_ptr[:] = 200
             vtk_ca.Modified()
             _mark_actor_dirty(actor)
             self.vtk_widget.render()
-            print(f"  âœ… RGB mode: direct color copy")
+            print(f"  ✅ RGB mode: direct color copy")
 
         elif mode == "intensity":
-            from gui.pointcloud_display import _nakshatech_intensity_rgb
+            from gui.pointcloud_display import _microstation_intensity_rgb
 
             intensity = self.data.get("intensity")
             if intensity is not None:
                 vis_int = intensity[gi] if gi is not None else intensity
 
-                colors_u8, clip_lo, clip_hi = _nakshatech_intensity_rgb(
+                colors_u8, clip_lo, clip_hi = _microstation_intensity_rgb(
                     vis_int,
                     low_pct=getattr(self, "intensity_clip_low", 0.5),
                     high_pct=getattr(self, "intensity_clip_high", 99.8),
@@ -9816,20 +8883,20 @@ class NakshaApp(QMainWindow):
                 rgb_ptr[:, 2] = colors_u8[:len(rgb_ptr), 2]
 
                 print(
-                    f"  âœ… Intensity mode: raw [{float(vis_int.min()):.1f}, {float(vis_int.max()):.1f}] "
+                    f"  ✅ Intensity mode: raw [{float(vis_int.min()):.1f}, {float(vis_int.max()):.1f}] "
                     f"clip [{clip_lo:.1f}, {clip_hi:.1f}] "
                     f"gamma={getattr(self, 'intensity_gamma', 1.35):.2f}"
                 )
             else:
                 rgb_ptr[:] = 128
-                print("  âš ï¸ No intensity data â€” showing gray")
+                print("  ⚠️ No intensity data — showing gray")
 
             vtk_ca.Modified()
             _mark_actor_dirty(actor)
             self.vtk_widget.render()
 
         elif mode == "elevation":
-            from gui.pointcloud_display import _nakshatech_elevation_rgb
+            from gui.pointcloud_display import _microstation_elevation_rgb
             import time as _time
 
             t_elev0 = _time.perf_counter()
@@ -9871,9 +8938,9 @@ class NakshaApp(QMainWindow):
                 and len(self._elevation_cache_colors) == len(rgb_ptr)
             ):
                 colors_u8 = self._elevation_cache_colors
-                print("  âš¡ Elevation cache hit")
+                print("  ⚡ Elevation cache hit")
             else:
-                colors_u8, clip_lo, clip_hi = _nakshatech_elevation_rgb(
+                colors_u8, clip_lo, clip_hi = _microstation_elevation_rgb(
                     vis_z,
                     color_ramp=getattr(self, "elevation_color_ramp", None),
                     low_pct=getattr(self, "elevation_clip_low", 1.0),
@@ -9883,7 +8950,7 @@ class NakshaApp(QMainWindow):
                 self._elevation_cache_key = cache_key
                 self._elevation_cache_colors = colors_u8
                 print(
-                    f"  âœ… Elevation computed: raw Z [{z_min:.1f}, {z_max:.1f}] "
+                    f"  ✅ Elevation computed: raw Z [{z_min:.1f}, {z_max:.1f}] "
                     f"clip [{clip_lo:.1f}, {clip_hi:.1f}]"
                 )
 
@@ -9895,16 +8962,16 @@ class NakshaApp(QMainWindow):
             self.vtk_widget.render()
 
             t_elev_ms = (_time.perf_counter() - t_elev0) * 1000.0
-            print(f"  âš¡ Elevation mode apply: {t_elev_ms:.1f}ms")
+            print(f"  ⚡ Elevation mode apply: {t_elev_ms:.1f}ms")
 
         elif mode == "depth":
-            # âœ… FIX: Read custom depth settings from app attributes
-            from gui.pointcloud_display import _nakshatech_depth_rgb_from_camera
+            # ✅ FIX: Read custom depth settings from app attributes
+            from gui.pointcloud_display import _microstation_depth_rgb_from_camera
             
             # Use camera-based depth (true depth from camera perspective)
             camera = self.vtk_widget.renderer.GetActiveCamera()
             
-            colors_u8 = _nakshatech_depth_rgb_from_camera(
+            colors_u8 = _microstation_depth_rgb_from_camera(
                 vis_xyz,
                 camera,
                 low_pct=getattr(self, "depth_clip_low", 1.0),
@@ -9925,7 +8992,7 @@ class NakshaApp(QMainWindow):
             clip_hi = getattr(self, "depth_clip_high", 99.0)
             scheme = getattr(self, "depth_color_scheme", "grayscale")
             gamma_val = getattr(self, "depth_gamma", 1.0)
-            print(f"  âœ… Depth mode applied: clip={clip_lo:.1f}-{clip_hi:.1f}%, scheme={scheme}, gamma={gamma_val:.2f}")
+            print(f"  ✅ Depth mode applied: clip={clip_lo:.1f}-{clip_hi:.1f}%, scheme={scheme}, gamma={gamma_val:.2f}")
 
         elif mode == "line":
             # Line is only a color presentation of the SAME point geometry.
@@ -10005,17 +9072,17 @@ class NakshaApp(QMainWindow):
                     len(dict(getattr(self, "flight_line_visibility", {}) or {})),
                 )
                 print(
-                    f"  âš¡ Line mode: existing unified actor recolored via LUT "
+                    f"  ⚡ Line mode: existing unified actor recolored via LUT "
                     f"({configured_lines} configured flight lines)"
                 )
 
         else:
-            # Unknown mode â€” fallback to pointcloud_display
+            # Unknown mode — fallback to pointcloud_display
             try:
                 from .pointcloud_display import update_pointcloud
                 update_pointcloud(self, mode)
             except Exception as e:
-                print(f"  âš ï¸ Fallback display failed: {e}")
+                print(f"  ⚠️ Fallback display failed: {e}")
 
         if mode not in ("class", "shaded_class"):
             try:
@@ -10031,9 +9098,9 @@ class NakshaApp(QMainWindow):
                         _ctx = getattr(_actor, "_naksha_shader_ctx", None)
                         if _ctx is not None:
                             _push_uniforms_direct(_actor, _ctx)
-                        print(f"  ðŸ”³ Border {_border_val}% preserved in {mode} mode")
+                        print(f"  🔳 Border {_border_val}% preserved in {mode} mode")
             except Exception as _be:
-                print(f"  âš ï¸ Border preservation failed: {_be}")
+                print(f"  ⚠️ Border preservation failed: {_be}")
 
         _MODE_TO_IDX = {
             "class":        0,
@@ -10060,16 +9127,16 @@ class NakshaApp(QMainWindow):
                     dlg.color_mode.setCurrentIndex(target_idx)
                     dlg.color_mode.blockSignals(False)
         except Exception as _ce:
-            pass  # dialog may not be open yet â€” not critical
+            pass  # dialog may not be open yet — not critical
 
         # Restore camera
         self._restore_camera_safe(saved_camera)
 
-        # âœ… BULLETPROOF: Ensure overlays survive any mode switch
+        # ✅ BULLETPROOF: Ensure overlays survive any mode switch
         self._ensure_overlay_actors()
 
         elapsed = (_time.perf_counter() - t0) * 1000
-        print(f"  âš¡ Display switch complete: {elapsed:.0f}ms\n")
+        print(f"  ⚡ Display switch complete: {elapsed:.0f}ms\n")
 
 
     def _handle_display_mode_change(self, mode):
@@ -10083,40 +9150,40 @@ class NakshaApp(QMainWindow):
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import Qt
         
-        # âœ… Special handling for Elevation mode
+        # ✅ Special handling for Elevation mode
         if mode == 'elevation':
             modifiers = QApplication.keyboardModifiers()
             
             if modifiers & Qt.ShiftModifier:
-                # Shift+Click â†’ Open customization dialog
+                # Shift+Click → Open customization dialog
                 self._open_elevation_settings()
                 return  # Don't call set_display_mode
             else:
-                # Normal click â†’ keep the last applied ramp active
+                # Normal click → keep the last applied ramp active
                 # until the user changes it again.
                 pass
         
-        # âœ… NEW: Special handling for Intensity mode
+        # ✅ NEW: Special handling for Intensity mode
         elif mode == 'intensity':
             modifiers = QApplication.keyboardModifiers()
             
             if modifiers & Qt.ShiftModifier:
-                # Shift+Click â†’ Open intensity settings dialog
+                # Shift+Click → Open intensity settings dialog
                 self._open_intensity_settings()
                 return  # Don't call set_display_mode
-            # Normal click â†’ Just apply default intensity settings
+            # Normal click → Just apply default intensity settings
 
-        # âœ… NEW: Special handling for Depth mode
+        # ✅ NEW: Special handling for Depth mode
         elif mode == 'depth':
             modifiers = QApplication.keyboardModifiers()
             
             if modifiers & Qt.ShiftModifier:
-                # Shift+Click â†’ Open depth settings dialog
+                # Shift+Click → Open depth settings dialog
                 self._open_depth_settings()
                 return  # Don't call set_display_mode
-            # Normal click â†’ Just apply default depth settings
+            # Normal click → Just apply default depth settings
         
-        # âœ… For all modes (including elevation/intensity after settings)
+        # ✅ For all modes (including elevation/intensity after settings)
         self.set_display_mode(mode)
 
 
@@ -10143,7 +9210,7 @@ class NakshaApp(QMainWindow):
             
     #         # User feedback
     #             self.statusBar().showMessage(
-    #                 f"âœ¨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
+    #                 f"✨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
     #                 3000
     #             )
 
@@ -10160,10 +9227,10 @@ class NakshaApp(QMainWindow):
         modifiers = QApplication.keyboardModifiers()
         
         if modifiers & Qt.ShiftModifier:
-            # Shift+Click â†’ Open customization dialog
+            # Shift+Click → Open customization dialog
             self._open_elevation_settings()
         else:
-            # Normal click â†’ Reapply the currently saved ramp if present.
+            # Normal click → Reapply the currently saved ramp if present.
             # Do not clear user edits here; the last applied elevation ramp
             # should remain active until the user changes it.
             self.set_display_mode('elevation')
@@ -10171,7 +9238,7 @@ class NakshaApp(QMainWindow):
     def _open_elevation_settings(self):
         """
         Open elevation color ramp customization dialog (Shift+Click on Elevation button).
-        âœ… FIXED: Now passes app reference so settings persist across sessions.
+        ✅ FIXED: Now passes app reference so settings persist across sessions.
         """
         if self.data is None:
             from PySide6.QtWidgets import QMessageBox
@@ -10180,7 +9247,7 @@ class NakshaApp(QMainWindow):
         
         from gui.elevation_settings_dialog import ElevationSettingsDialog
         
-        # âœ… Pass self (app) as second parameter
+        # ✅ Pass self (app) as second parameter
         dialog = ElevationSettingsDialog(self, app=self)
         
         # Settings are already loaded in __init__ via app parameter
@@ -10190,34 +9257,34 @@ class NakshaApp(QMainWindow):
             # User clicked Apply - save custom ramp
             self.elevation_color_ramp = dialog.get_color_ramp()
             
-            # âœ… OPTIONAL: Save to QSettings for persistence across app restarts
+            # ✅ OPTIONAL: Save to QSettings for persistence across app restarts
             try:
                 from PySide6.QtCore import QSettings
-                settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+                settings = QSettings("NakshaAI", "LidarApp")
                 # Convert to serializable format
                 ramp_data = [(float(pos), list(color)) for pos, color in self.elevation_color_ramp]
                 settings.setValue("elevation_color_ramp", ramp_data)
                 settings.sync()
-                print(f"ðŸ’¾ Saved elevation ramp to settings")
+                print(f"💾 Saved elevation ramp to settings")
             except Exception as e:
-                print(f"âš ï¸ Failed to save elevation ramp: {e}")
+                print(f"⚠️ Failed to save elevation ramp: {e}")
             
             # Apply immediately
             self.set_display_mode('elevation')
             
-            print(f"âœ… Custom elevation ramp applied: {len(self.elevation_color_ramp)} color stops")
+            print(f"✅ Custom elevation ramp applied: {len(self.elevation_color_ramp)} color stops")
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(
-                    f"âœ¨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
+                    f"✨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
                     3000
                 )
         else:
-            print("â­ï¸ Elevation settings canceled")
+            print("⏭️ Elevation settings canceled")
 
     def _open_intensity_settings(self):
         """
         Open intensity display customization dialog (Shift+Click on Intensity button).
-        âœ… NEW: Allows users to adjust brightness/darkness of intensity display.
+        ✅ NEW: Allows users to adjust brightness/darkness of intensity display.
         """
         if self.data is None or self.data.get("intensity") is None:
             from PySide6.QtWidgets import QMessageBox
@@ -10242,35 +9309,35 @@ class NakshaApp(QMainWindow):
             self.intensity_clip_low = settings['clip_low']
             self.intensity_clip_high = settings['clip_high']
             
-            # âœ… Save to QSettings for persistence across app restarts
+            # ✅ Save to QSettings for persistence across app restarts
             try:
                 from PySide6.QtCore import QSettings
-                qsettings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+                qsettings = QSettings("NakshaAI", "LidarApp")
                 qsettings.setValue("intensity_gamma", self.intensity_gamma)
                 qsettings.setValue("intensity_clip_low", self.intensity_clip_low)
                 qsettings.setValue("intensity_clip_high", self.intensity_clip_high)
                 qsettings.sync()
-                print(f"ðŸ’¾ Saved intensity settings: gamma={self.intensity_gamma:.2f}")
+                print(f"💾 Saved intensity settings: gamma={self.intensity_gamma:.2f}")
             except Exception as e:
-                print(f"âš ï¸ Failed to save intensity settings: {e}")
+                print(f"⚠️ Failed to save intensity settings: {e}")
             
             # Apply immediately
             self.set_display_mode('intensity')
             
-            print(f"âœ… Custom intensity settings applied: gamma={self.intensity_gamma:.2f}")
+            print(f"✅ Custom intensity settings applied: gamma={self.intensity_gamma:.2f}")
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(
-                    f"âš¡ Intensity display updated (gamma={self.intensity_gamma:.2f})",
+                    f"⚡ Intensity display updated (gamma={self.intensity_gamma:.2f})",
                     3000
                 )
         else:
-            print("â­ï¸ Intensity settings canceled")
+            print("⏭️ Intensity settings canceled")
 
 
     def _open_depth_settings(self):
         """
         Open depth display customization dialog (Shift+Click on Depth button).
-        âœ… NEW: Allows users to adjust depth visualization settings.
+        ✅ NEW: Allows users to adjust depth visualization settings.
         """
         if self.data is None:
             from PySide6.QtWidgets import QMessageBox
@@ -10295,30 +9362,30 @@ class NakshaApp(QMainWindow):
             self.depth_color_scheme = settings['depth_color_scheme']
             self.depth_gamma = settings['depth_gamma']
             
-            # âœ… Save to QSettings for persistence across app restarts
+            # ✅ Save to QSettings for persistence across app restarts
             try:
                 from PySide6.QtCore import QSettings
-                qsettings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+                qsettings = QSettings("NakshaAI", "LidarApp")
                 qsettings.setValue("depth_clip_low", self.depth_clip_low)
                 qsettings.setValue("depth_clip_high", self.depth_clip_high)
                 qsettings.setValue("depth_color_scheme", self.depth_color_scheme)
                 qsettings.setValue("depth_gamma", self.depth_gamma)
                 qsettings.sync()
-                print(f"ðŸ’¾ Saved depth settings: scheme={self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
+                print(f"💾 Saved depth settings: scheme={self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
             except Exception as e:
-                print(f"âš ï¸ Failed to save depth settings: {e}")
+                print(f"⚠️ Failed to save depth settings: {e}")
             
             # Apply immediately
             self.set_display_mode('depth')
             
-            print(f"âœ… Custom depth settings applied: {self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
+            print(f"✅ Custom depth settings applied: {self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(
-                    f"ðŸ“ Depth display updated ({self.depth_color_scheme}, gamma={self.depth_gamma:.2f})",
+                    f"📏 Depth display updated ({self.depth_color_scheme}, gamma={self.depth_gamma:.2f})",
                     3000
                 )
         else:
-            print("â­ï¸ Depth settings canceled")
+            print("⏭️ Depth settings canceled")
 
 
     def _restore_camera_safe(self, saved_camera):
@@ -10372,16 +9439,16 @@ class NakshaApp(QMainWindow):
                                 restored += 1
 
             if restored > 0:
-                # âœ… FIX: Reset clipping range after re-adding actors so SNT actors
+                # ✅ FIX: Reset clipping range after re-adding actors so SNT actors
                 # at their Z-offset positions are not outside the view frustum.
                 try:
                     renderer.ResetCameraClippingRange()
                 except Exception:
                     pass
                 self.vtk_widget.render()
-                print(f"   âœ… _ensure_overlay_actors: restored {restored} missing actors")
+                print(f"   ✅ _ensure_overlay_actors: restored {restored} missing actors")
         except Exception as e:
-            print(f"   âš ï¸ _ensure_overlay_actors failed: {e}")
+            print(f"   ⚠️ _ensure_overlay_actors failed: {e}")
 
     
     def open_display_mode(self):
@@ -10400,7 +9467,7 @@ class NakshaApp(QMainWindow):
             from gui.display_mode import DisplayModeDialog
         
             print(f"\n{'='*60}")
-            print(f"ðŸ“‚ CREATING DISPLAY MODE DIALOG")
+            print(f"📂 CREATING DISPLAY MODE DIALOG")
             print(f"{'='*60}")
         
             # Create dialog (connection happens inside __init__)
@@ -10422,14 +9489,14 @@ class NakshaApp(QMainWindow):
         
             print(f"{'='*60}\n")
         else:
-            # âœ… CRITICAL: Dialog already exists - just refresh table from app's palette
+            # ✅ CRITICAL: Dialog already exists - just refresh table from app's palette
             print(f"\n{'='*60}")
-            print(f"ðŸ”„ REOPENING EXISTING DISPLAY MODE DIALOG")
+            print(f"🔄 REOPENING EXISTING DISPLAY MODE DIALOG")
             print(f"{'='*60}")
             
             # Sync table with current app state (preserves weights)
             if hasattr(self, 'class_palette') and self.class_palette:
-                print(f"   ðŸ”„ Syncing table with app.class_palette...")
+                print(f"   🔄 Syncing table with app.class_palette...")
                 
                 for row in range(self.display_mode_dialog.table.rowCount()):
                     code = int(self.display_mode_dialog.table.item(row, 1).text())
@@ -10447,7 +9514,7 @@ class NakshaApp(QMainWindow):
                         if chk:
                             chk.setChecked(show)
                 
-                print(f"   âœ… Table synced with existing weights")
+                print(f"   ✅ Table synced with existing weights")
             
             print(f"{'='*60}\n")
     
@@ -10465,10 +9532,10 @@ class NakshaApp(QMainWindow):
 
     def apply_class_map(self, payload):
         """
-        âš¡ ULTRA-OPTIMIZED: Instant apply button response for any file size.
-        âœ… UNIFIED ACTOR PATH: GPU weight_lut + visibility_lut push (<1ms)
-        âœ… Legacy fast path: GPU color buffer update (when unified actor absent)
-        âœ… Async path: Non-blocking rebuilds for large files
+        ⚡ ULTRA-OPTIMIZED: Instant apply button response for any file size.
+        ✅ UNIFIED ACTOR PATH: GPU weight_lut + visibility_lut push (<1ms)
+        ✅ Legacy fast path: GPU color buffer update (when unified actor absent)
+        ✅ Async path: Non-blocking rebuilds for large files
         """
 
         if getattr(self, "_is_applying_class_map", False):
@@ -10525,13 +9592,18 @@ class NakshaApp(QMainWindow):
                 from gui.display_mode import clone_palette
                 self.class_palette = clone_palette(self.view_palettes[0])
                 self.point_border_percent = border_value
+                native_view = getattr(self, "_lnt_main_view", None)
+                if native_view is not None:
+                    native_view._push_applied_palette()
+                    native_view.set_app_display_mode("class" if color_mode == 0 else "shaded_class")
+                    return
             # ADD AFTER:
-                # â”€â”€ Keep dialog.view_palettes[0] in sync so DisplayMode preset shortcuts
+                # ── Keep dialog.view_palettes[0] in sync so DisplayMode preset shortcuts
                 # don't reseed slot 0 GPU with stale ptc.ptc colours.
                 dlg = getattr(self, 'display_mode_dialog', None)
                 if dlg is not None and hasattr(dlg, 'view_palettes'):
                     dlg.view_palettes[0] = clone_palette(self.view_palettes[0])
-                    print("   âœ… PRE-STEP: dialog.view_palettes[0] synced from app (slot 0 apply)")
+                    print("   ✅ PRE-STEP: dialog.view_palettes[0] synced from app (slot 0 apply)")
 
                 # Quick border-only path
                 if border_only and not force_refresh:
@@ -10541,7 +9613,7 @@ class NakshaApp(QMainWindow):
 
                 is_class_mode = (color_mode == 0)
 
-                # âœ… UNIFIED ACTOR FAST PATH (highest priority)
+                # ✅ UNIFIED ACTOR FAST PATH (highest priority)
                 # sync_palette_to_gpu pushes BOTH the RGB color buffer AND
                 # weight_lut / visibility_lut to the GPU shader in < 1 ms.
                 # This is the ONLY path that correctly updates point weights.
@@ -10562,9 +9634,9 @@ class NakshaApp(QMainWindow):
                             self._is_applying_class_map = False
                             return
                     except Exception as _unified_err:
-                        print(f"âš ï¸ unified actor fast-path error, falling back: {_unified_err}")
+                        print(f"⚠️ unified actor fast-path error, falling back: {_unified_err}")
 
-                # âœ… LEGACY GPU COLOR BUFFER PATH (fallback when no unified actor)
+                # ✅ LEGACY GPU COLOR BUFFER PATH (fallback when no unified actor)
                 use_fast_path = (
                     is_class_mode and
                     not force_refresh and
@@ -10602,7 +9674,7 @@ class NakshaApp(QMainWindow):
                                         if name.startswith('class_'):
                                             apply_border_shader_ring(actor, border_value)
                                 except Exception as e:
-                                    print(f"âš ï¸ Border application failed in fast path: {e}")
+                                    print(f"⚠️ Border application failed in fast path: {e}")
 
                             def deferred_render():
                                 try:
@@ -10616,7 +9688,7 @@ class NakshaApp(QMainWindow):
                     except Exception as e:
                         pass  # Fall through to rebuild
 
-                # ðŸ”„ REBUILD PATH
+                # 🔄 REBUILD PATH
                 point_count = len(self.data["xyz"]) if hasattr(self, 'data') and self.data and "xyz" in self.data else 0
 
                 def deferred_rebuild():
@@ -10624,7 +9696,7 @@ class NakshaApp(QMainWindow):
                         from gui.class_display import update_class_mode
                         update_class_mode(self, force_refresh=True)
                     except Exception as e:
-                        print(f"âš ï¸ Rebuild error: {e}")
+                        print(f"⚠️ Rebuild error: {e}")
 
                 if point_count > 500_000:
                     QTimer.singleShot(0, deferred_rebuild)
@@ -10647,7 +9719,7 @@ class NakshaApp(QMainWindow):
                     self._is_applying_class_map = False
                     return
             
-                # â† REMOVED: self.class_palette = self.view_palettes[target_view]
+                # ← REMOVED: self.class_palette = self.view_palettes[target_view]
                 # app.class_palette must always be the MAIN view palette.
                 # Section palettes live in app.view_palettes[slot_idx] only.
             
@@ -10657,7 +9729,7 @@ class NakshaApp(QMainWindow):
                         if hasattr(self, 'section_interactors') and section_idx in self.section_interactors:
                             self.section_interactors[section_idx].setup_picker()
                     except Exception as e:
-                        print(f"âš ï¸ Section update error: {e}")
+                        print(f"⚠️ Section update error: {e}")
             
                 QTimer.singleShot(0, deferred_section_update)
                 self._is_applying_class_map = False
@@ -10679,14 +9751,14 @@ class NakshaApp(QMainWindow):
                             if hasattr(ctrl, '_refresh_cut_colors_fast'):
                                 ctrl._refresh_cut_colors_fast()
                         except Exception as e:
-                            print(f"âš ï¸ Cut section update error: {e}")
+                            print(f"⚠️ Cut section update error: {e}")
 
                     QTimer.singleShot(0, deferred_cut_update)
                     self._is_applying_class_map = False
                     return
 
         except Exception as e:
-            print(f"âŒ apply_class_map failed: {e}")
+            print(f"❌ apply_class_map failed: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -10722,7 +9794,7 @@ class NakshaApp(QMainWindow):
             self.vtk_widget.render()
             
         except Exception as e:
-            print(f"âš ï¸ Border update failed: {e}")
+            print(f"⚠️ Border update failed: {e}")
 
 
     def _update_section_border_only(self, section_idx, border_value):
@@ -10754,13 +9826,13 @@ class NakshaApp(QMainWindow):
             vtk_widget.render()
             
         except Exception as e:
-            print(f"âš ï¸ Section border update failed: {e}")
+            print(f"⚠️ Section border update failed: {e}")
             
     def _refresh_active_cross_section_only(self):
         """
         Refresh ONLY the active cross-section view after classification.
         Uses the ACTIVE VIEW's palette (not global or other views).
-        âœ… FIXED: Proper palette isolation per view
+        ✅ FIXED: Proper palette isolation per view
         """
         try:
             app = self.app if hasattr(self, 'app') else self
@@ -10769,24 +9841,24 @@ class NakshaApp(QMainWindow):
             active_view = getattr(app.section_controller, 'active_view', None)
             
             if active_view is None:
-                print("âš ï¸ No active view set")
+                print("⚠️ No active view set")
                 return
             
             # Convert to Display Mode slot (1-based: 1, 2, 3, 4)
             target_slot = active_view + 1
             
             print(f"\n{'='*60}")
-            print(f"ðŸ”„ ISOLATED REFRESH: Cross-Section View {active_view} (Display Mode Slot {target_slot})")
+            print(f"🔄 ISOLATED REFRESH: Cross-Section View {active_view} (Display Mode Slot {target_slot})")
             
             # Get the VTK widget for this view
             if not hasattr(app, 'section_vtks') or active_view not in app.section_vtks:
-                print(f"   âš ï¸ View {active_view} not found in section_vtks")
+                print(f"   ⚠️ View {active_view} not found in section_vtks")
                 print(f"{'='*60}\n")
                 return
             
             vtk_widget = app.section_vtks[active_view]
             
-            # âœ… CRITICAL: Get THIS VIEW's palette from Display Mode dialog
+            # ✅ CRITICAL: Get THIS VIEW's palette from Display Mode dialog
             view_palette = None
             
             if hasattr(app, 'display_mode_dialog'):
@@ -10795,10 +9867,10 @@ class NakshaApp(QMainWindow):
                 # Check if this view has a stored palette in view_palettes
                 if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
                     view_palette = dialog.view_palettes[target_slot]
-                    print(f"   âœ… Using stored view_palettes[{target_slot}]")
+                    print(f"   ✅ Using stored view_palettes[{target_slot}]")
                 else:
                     # Build palette from Display Mode table for this slot
-                    print(f"   ðŸ”„ Building palette from Display Mode slot {target_slot}")
+                    print(f"   🔄 Building palette from Display Mode slot {target_slot}")
                     
                     # Save current slot
                     original_slot = dialog.current_slot
@@ -10834,18 +9906,18 @@ class NakshaApp(QMainWindow):
                         dialog.current_slot = original_slot
                         dialog._load_slot_checkboxes(original_slot)
                     
-                    print(f"   âœ… Built palette with {len(view_palette)} visible classes")
+                    print(f"   ✅ Built palette with {len(view_palette)} visible classes")
             
             # Fallback: keep slot isolation if no Display Mode palette exists
             if not view_palette:
-                print(f"   âš ï¸ No Display Mode palette for slot {target_slot} - seeding isolated slot defaults")
+                print(f"   ⚠️ No Display Mode palette for slot {target_slot} - seeding isolated slot defaults")
                 view_palette = self._get_cross_section_palette(
                     target_slot,
                     allow_default_seed=True,
                     persist_seed=False,
                 )
                 if not view_palette:
-                    print("   âŒ No palette available - cannot refresh")
+                    print("   ❌ No palette available - cannot refresh")
                     print(f"{'='*60}\n")
                     return
             
@@ -10855,13 +9927,13 @@ class NakshaApp(QMainWindow):
             visible = [c for c, v in view_palette.items() if v.get("show", False)]
             
             if not visible:
-                print(f"   âš ï¸ No visible classes in view {active_view}'s palette")
+                print(f"   ⚠️ No visible classes in view {active_view}'s palette")
                 vtk_widget.clear()
                 vtk_widget.render()
                 print(f"{'='*60}\n")
                 return
             
-            print(f"   ðŸ“‹ Visible classes: {visible}")
+            print(f"   📋 Visible classes: {visible}")
             
             # Get stored section data for this specific view
             pts = getattr(app, f"section_{active_view}_core_points", None)
@@ -10870,7 +9942,7 @@ class NakshaApp(QMainWindow):
             buffer_mask = getattr(app, f"section_{active_view}_buffer_mask", None)
             
             if pts is None or core_mask is None:
-                print(f"   âš ï¸ No section data for view {active_view}")
+                print(f"   ⚠️ No section data for view {active_view}")
                 print(f"{'='*60}\n")
                 return
             
@@ -10881,7 +9953,7 @@ class NakshaApp(QMainWindow):
                 current_classes = app.data["classification"]
             
             if current_classes is None:
-                print("   âš ï¸ No classification data")
+                print("   ⚠️ No classification data")
                 print(f"{'='*60}\n")
                 return
             
@@ -10897,22 +9969,22 @@ class NakshaApp(QMainWindow):
                 all_pts = pts
                 all_cls = current_classes[core_mask]
             
-            # âœ… CRITICAL: Filter by THIS VIEW's visible classes ONLY
+            # ✅ CRITICAL: Filter by THIS VIEW's visible classes ONLY
             mask = np.isin(all_cls, visible)
             filtered_pts = all_pts[mask]
             filtered_cls = all_cls[mask]
             
-            print(f"   ðŸ“Š Total points: {len(all_pts)}")
-            print(f"   ðŸ“Š Filtered points: {len(filtered_pts)} (visible classes only)")
+            print(f"   📊 Total points: {len(all_pts)}")
+            print(f"   📊 Filtered points: {len(filtered_pts)} (visible classes only)")
             
             if len(filtered_pts) == 0:
-                print("   âš ï¸ No points after filtering")
+                print("   ⚠️ No points after filtering")
                 vtk_widget.clear()
                 vtk_widget.render()
                 print(f"{'='*60}\n")
                 return
             
-            # âœ… Build color array using THIS VIEW's palette ONLY
+            # ✅ Build color array using THIS VIEW's palette ONLY
             colors = np.zeros((len(filtered_pts), 3), dtype=np.uint8)
             for i, cls in enumerate(filtered_cls):
                 entry = view_palette.get(int(cls), {"color": (128, 128, 128)})
@@ -10920,7 +9992,7 @@ class NakshaApp(QMainWindow):
             
             # Debug: Show unique classes being rendered
             unique_classes = np.unique(filtered_cls)
-            print(f"   ðŸŽ¨ Rendering classes: {unique_classes}")
+            print(f"   🎨 Rendering classes: {unique_classes}")
             for cls in unique_classes:
                 count = np.sum(filtered_cls == cls)
                 color = view_palette.get(int(cls), {}).get("color", (128, 128, 128))
@@ -10948,11 +10020,11 @@ class NakshaApp(QMainWindow):
             vtk_widget.camera_position = cam_pos
             vtk_widget.render()
             
-            print(f"   âœ… View {active_view} refreshed with {len(filtered_pts)} points")
+            print(f"   ✅ View {active_view} refreshed with {len(filtered_pts)} points")
             print(f"{'='*60}\n")
             
         except Exception as e:
-            print(f"   âŒ Isolated refresh failed: {e}")
+            print(f"   ❌ Isolated refresh failed: {e}")
             import traceback
             traceback.print_exc()
             print(f"{'='*60}\n")
@@ -10962,19 +10034,19 @@ class NakshaApp(QMainWindow):
             """
             Activate a classification tool.
             Works for: cut/cross sections and main view (fallback).
-            âœ… UPDATED: ClassPicker never steals focus
+            ✅ UPDATED: ClassPicker never steals focus
             """
             if tool_name != "cut_section":
                 self._deactivate_pending_cut_section_tool("switching to classification")
 
-            # âœ… NEW: If cross-section was active (shortcut switch), deactivate it properly
+            # ✅ NEW: If cross-section was active (shortcut switch), deactivate it properly
             if getattr(self, "cross_section_active", False):
-                print("ðŸ›‘ Deactivating cross-section (switching to classification)")
+                print("🛑 Deactivating cross-section (switching to classification)")
                 if hasattr(self, "_cancel_cross_section_tool_only"):
                     self._cancel_cross_section_tool_only()
                    
             if tool_name is None:
-                # âœ… Temp Fence tool lifecycle: returning to "no tool" (pan/idle)
+                # ✅ Temp Fence tool lifecycle: returning to "no tool" (pan/idle)
                 # must stand down vertex capture too, or its left-click observer
                 # keeps consuming every click and blocks panning. Same stand-down
                 # already done below for switching to a different named tool.
@@ -10983,7 +10055,7 @@ class NakshaApp(QMainWindow):
                     if _tft is not None:
                         _tft.deactivate()
                 except Exception as _e:
-                    print(f"âš ï¸ Temp fence stand-down failed: {_e}")
+                    print(f"⚠️ Temp fence stand-down failed: {_e}")
 
                 self.active_classify_tool = None
                 if hasattr(self, 'skip_main_view_refresh'):
@@ -10993,10 +10065,10 @@ class NakshaApp(QMainWindow):
 
                 if hasattr(self, 'digitizer'):
                     self.digitizer.enabled = True
-                    print("âœ… Digitizer re-enabled")
+                    print("✅ Digitizer re-enabled")
                 return
 
-            # âœ… Temp Fence tool lifecycle: switching to any other tool stands
+            # ✅ Temp Fence tool lifecycle: switching to any other tool stands
             # down the vertex capture. A finalized fence + popup intentionally
             # stay alive until replaced / used / Esc'd (handled inside the tool).
             if tool_name != "temp_fence":
@@ -11005,9 +10077,9 @@ class NakshaApp(QMainWindow):
                     if _tft is not None:
                         _tft.deactivate()
                 except Exception as _e:
-                    print(f"âš ï¸ Temp fence stand-down failed: {_e}")
+                    print(f"⚠️ Temp fence stand-down failed: {_e}")
    
-            # Brush size dialog â€” skip during right-click reactivation to avoid blocking
+            # Brush size dialog — skip during right-click reactivation to avoid blocking
             if tool_name == "brush" and not getattr(self, "_right_click_reactivating", False):
                 from gui.brush_size_dialog import activate_brush_tool_with_dialog
                 show_settings = bool(getattr(self, "_brush_settings_requested_from_ui", False))
@@ -11026,7 +10098,7 @@ class NakshaApp(QMainWindow):
                 ):
                     return
                
-              # âœ… LiDAR algorithm dialogs â€” By Class ribbon buttons
+              # ✅ LiDAR algorithm dialogs — By Class ribbon buttons
             if tool_name.startswith("algo_") or tool_name.startswith("byclass_"):
                 try:
                     from gui.lidar_classification_tools import (
@@ -11047,10 +10119,10 @@ class NakshaApp(QMainWindow):
                         "byclass_below_surface":  open_classify_below_surface,
                     }.get(tool_name, lambda a: None)(self)
                 except Exception as e:
-                    print(f"âš ï¸ Algorithm dialog failed ({tool_name}): {e}")
+                    print(f"⚠️ Algorithm dialog failed ({tool_name}): {e}")
                 return  ###
 
-            # âœ… NEW: Temporary Fence tool â€” draw a throwaway polygon fence on
+            # ✅ NEW: Temporary Fence tool — draw a throwaway polygon fence on
             # the main view, then pick a By Class tool from the popup that
             # appears (the fence is pre-applied in that dialog). Fully
             # standalone: never touches the digitizer or classification
@@ -11065,7 +10137,7 @@ class NakshaApp(QMainWindow):
                     if getattr(self, "active_classify_tool", None):
                         self.set_classify_tool(None)
                 except Exception as _e:
-                    print(f"âš ï¸ Temp Fence: failed to stand down classify tool: {_e}")
+                    print(f"⚠️ Temp Fence: failed to stand down classify tool: {_e}")
                 try:
                     if hasattr(self, 'digitizer'):
                         self.digitizer.enabled = False
@@ -11077,19 +10149,19 @@ class NakshaApp(QMainWindow):
                     tft.activate()
                     self.active_classify_tool = "temp_fence"
                 except Exception as e:
-                    print(f"âš ï¸ Temp Fence activation failed: {e}")
+                    print(f"⚠️ Temp Fence activation failed: {e}")
                     import traceback; traceback.print_exc()
                 return
            
             # Stand down conflicting tools so their VTK observers don't fight the
-            # classification interactor â€” same direction the element-select tool
+            # classification interactor — same direction the element-select tool
             # uses to stand down classification on activation. Each call is
             # wrapped so one failure can't abort classification setup.
             try:
                 if hasattr(self, 'digitizer'):
                     self.digitizer.deactivate_element_select_tool()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate element select before classification: {e}")
+                print(f"⚠️ Failed to deactivate element select before classification: {e}")
 
             # Defensive: ribbon_manager.ribbons may be missing during startup/teardown.
             identify_tool = getattr(self, "identification_tool", None)
@@ -11102,9 +10174,9 @@ class NakshaApp(QMainWindow):
                         identify_ribbon.deactivate_all_tools()
                     else:
                         identify_tool.deactivate()
-                    print("ðŸ›‘ Identification tool deactivated for classification")
+                    print("🛑 Identification tool deactivated for classification")
                 except Exception as e:
-                    print(f"âš ï¸ Failed to deactivate identification before classification: {e}")
+                    print(f"⚠️ Failed to deactivate identification before classification: {e}")
 
             measurement_tool = getattr(self, "measurement_tool", None)
             if measurement_tool is not None and getattr(measurement_tool, "active", False):
@@ -11113,13 +10185,13 @@ class NakshaApp(QMainWindow):
                         measurement_tool.deactivate_completely()
                     else:
                         measurement_tool.deactivate()
-                    print("ðŸ›‘ Measurement tool deactivated for classification")
+                    print("🛑 Measurement tool deactivated for classification")
                 except Exception as e:
-                    print(f"âš ï¸ Failed to deactivate measurement before classification: {e}")
+                    print(f"⚠️ Failed to deactivate measurement before classification: {e}")
 
             if hasattr(self, 'digitizer'):
                 self.digitizer.enabled = False
-                print("ðŸš« Digitizer disabled (classification active)")
+                print("🚫 Digitizer disabled (classification active)")
 
             has_cross_section = (hasattr(self, "section_vtks") and len(self.section_vtks) > 0)
             has_cut_section = (
@@ -11164,40 +10236,40 @@ class NakshaApp(QMainWindow):
             self.from_classes = getattr(self, "from_classes", None)
             self.to_class = getattr(self, "to_class", None)
    
-            # âœ… FIXED: Ensure class picker is ALWAYS visible (even if minimized)
+            # ✅ FIXED: Ensure class picker is ALWAYS visible (even if minimized)
             from gui.class_picker import ClassPicker
             class_picker = self._get_live_class_picker()
             if class_picker is None:
                 # Create new ClassPicker
-                print("ðŸ“‹ Creating new ClassPicker...")
+                print("📋 Creating new ClassPicker...")
                 self.class_picker = ClassPicker(self, parent=self)
                 class_picker = self.class_picker
             
-                # âœ… Configure for non-focus mode
+                # ✅ Configure for non-focus mode
                 class_picker.configure_for_background_mode()
             
                 class_picker.show()
-                print("âœ… ClassPicker created and shown")
+                print("✅ ClassPicker created and shown")
             else:
-                # âœ… CRITICAL FIX: Restore from minimized state
-                print("ðŸ“‹ ClassPicker exists - ensuring visibility...")
+                # ✅ CRITICAL FIX: Restore from minimized state
+                print("📋 ClassPicker exists - ensuring visibility...")
             
                 # First sync the data
                 class_picker.sync_with_app()
             
-                # âœ… NEW: This line fixes the minimized window issue!
+                # ✅ NEW: This line fixes the minimized window issue!
                 class_picker.ensure_visible()
             
-                print("âœ… ClassPicker is now visible and active")
+                print("✅ ClassPicker is now visible and active")
    
-            # âœ… CRITICAL: Keep focus on main view
+            # ✅ CRITICAL: Keep focus on main view
             if hasattr(self, 'vtk_widget'):
                 self.vtk_widget.setFocus()
             # Attach interactors
             try:
                 if do_cut:
                     self.cut_section_controller.activate_classification_mode()
-                    # don't return â€” fall through to also attach sections + main
+                    # don't return — fall through to also attach sections + main
  
                 if do_sections:
                     self.attach_classification_to_all_section_views()
@@ -11214,7 +10286,7 @@ class NakshaApp(QMainWindow):
                             try:
                                 ci._build_spatial_index_for_brush()
                             except Exception as _e:
-                                print(f"âš ï¸ Brush index pre-warm failed: {_e}")
+                                print(f"⚠️ Brush index pre-warm failed: {_e}")
                         t = threading.Thread(
                             target=_safe_prebuild,
                             daemon=True,
@@ -11223,27 +10295,27 @@ class NakshaApp(QMainWindow):
                         t.start()
                         ci._prebuild_thread = t
  
-                # âœ… Always re-attach to cut section if cut data exists
+                # ✅ Always re-attach to cut section if cut data exists
                 if has_cut_section:
                     self.attach_classification_to_cut_section()
    
             except Exception as e:
-                print(f"âš ï¸ Failed to attach classification interactor: {e}")
+                print(f"⚠️ Failed to attach classification interactor: {e}")
                 import traceback; traceback.print_exc()
             
     def enable_digitizer_mode(self):
         """Enable digitizer (for drawing tools)."""
         if hasattr(self, 'digitizer'):
             self.digitizer.enabled = True
-            print("âœ… Digitizer enabled - Ctrl+Z/Y will affect drawings")
-            self.statusBar().showMessage("âœï¸ Drawing mode - Undo/Redo affects drawings", 2000)
+            print("✅ Digitizer enabled - Ctrl+Z/Y will affect drawings")
+            self.statusBar().showMessage("✏️ Drawing mode - Undo/Redo affects drawings", 2000)
 
     def disable_digitizer_mode(self):
         """Disable digitizer (for classification tools)."""
         if hasattr(self, 'digitizer'):
             self.digitizer.enabled = False
-            print("ðŸš« Digitizer disabled - Ctrl+Z/Y will affect classification")
-            self.statusBar().showMessage("ðŸŽ¨ Classification mode - Undo/Redo affects classification", 2000)
+            print("🚫 Digitizer disabled - Ctrl+Z/Y will affect classification")
+            self.statusBar().showMessage("🎨 Classification mode - Undo/Redo affects classification", 2000)
                 
             
     def attach_classification_to_all_section_views(self):
@@ -11251,16 +10323,16 @@ class NakshaApp(QMainWindow):
         Attach a ClassificationInteractor to every open cross-section view (1..4).
         Replaces the view's interactor style so classification works from any dock.
         
-        âœ… ISSUE 1 FIX: Attachment ONLY installs event observers â€” never touches RGB buffer.
+        ✅ ISSUE 1 FIX: Attachment ONLY installs event observers — never touches RGB buffer.
         """
         try:
             from gui.cross_section.interactor_classify import ClassificationInteractor
         except Exception as e:
-            print(f"âš ï¸ Cannot import ClassificationInteractor: {e}")
+            print(f"⚠️ Cannot import ClassificationInteractor: {e}")
             return
 
         if not hasattr(self, "section_vtks") or not self.section_vtks:
-            print("â„¹ï¸ No cross-section views are open")
+            print("ℹ️ No cross-section views are open")
             return
 
         if not hasattr(self, "classify_interactors"):
@@ -11277,10 +10349,10 @@ class NakshaApp(QMainWindow):
                 self.classify_interactors[view_idx] = wrapper
                 attached += 1
             except Exception as e:
-                print(f"âš ï¸ Attach classify interactor failed for View {view_idx + 1}: {e}")
+                print(f"⚠️ Attach classify interactor failed for View {view_idx + 1}: {e}")
 
-        print(f"âœ… Classification interactor attached to {attached} cross-section view(s)")
-        # âœ… ISSUE 1 FIX: No fast_cross_section_update / _refresh_single_view / sync_palette_to_gpu calls here
+        print(f"✅ Classification interactor attached to {attached} cross-section view(s)")
+        # ✅ ISSUE 1 FIX: No fast_cross_section_update / _refresh_single_view / sync_palette_to_gpu calls here
 
     
     def attach_classification_to_cut_section(self):
@@ -11288,7 +10360,7 @@ class NakshaApp(QMainWindow):
         try:
             from gui.cross_section.interactor_classify import ClassificationInteractor
         except Exception as e:
-            print(f"âš ï¸ Cannot import ClassificationInteractor: {e}")
+            print(f"⚠️ Cannot import ClassificationInteractor: {e}")
             return
  
         cut_ctrl = getattr(self, 'cut_section_controller', None)
@@ -11310,10 +10382,10 @@ class NakshaApp(QMainWindow):
         wrapper.is_cut_section = True
         cut_vtk.interactor.SetInteractorStyle(wrapper.style)
  
-        # Store in SEPARATE attribute â€” not classify_interactor (which is for main view)
+        # Store in SEPARATE attribute — not classify_interactor (which is for main view)
         self.cut_classify_interactor = wrapper
  
-        print("âœ… ClassificationInteractor re-attached to Cut Section")    
+        print("✅ ClassificationInteractor re-attached to Cut Section")    
  
     def preserve_dxf_actors(self):
         """Forces DXF/SNT actors to stay visible and ON TOP during all zooms."""
@@ -11325,7 +10397,7 @@ class NakshaApp(QMainWindow):
                     if renderer.HasViewProp(actor): renderer.RemoveActor(actor)
                     renderer.AddActor(actor)
                    
-                    # ðŸ›¡ï¸ THE LOD SHIELD: Force 100% render time allocation
+                    # 🛡️ THE LOD SHIELD: Force 100% render time allocation
                     # This prevents the LOD manager from hiding the lines at zoom-out
                     actor.SetAllocatedRenderTime(1000.0, renderer)
                    
@@ -11342,8 +10414,8 @@ class NakshaApp(QMainWindow):
            
             renderer.ResetCameraClippingRange()
             self.vtk_widget.render()
-            print("âœ… SNT/DXF Shielded and Prioritized.")
-        except Exception as e: print(f"âš ï¸ Sync failed: {e}")
+            print("✅ SNT/DXF Shielded and Prioritized.")
+        except Exception as e: print(f"⚠️ Sync failed: {e}")
  
     def deactivate_classification_tool(self, preserve_cross_section=False,
                                        cancel_pending_brush=False):
@@ -11353,7 +10425,7 @@ class NakshaApp(QMainWindow):
         Call this when user closes class picker or cancels classification.
         """
         print(f"\n{'='*60}")
-        print(f"ðŸ›‘ DEACTIVATING CLASSIFICATION TOOL")
+        print(f"🛑 DEACTIVATING CLASSIFICATION TOOL")
         print(f"{'='*60}")
 
         # Escape means cancel, not commit. Brush painting updates the canonical
@@ -11375,7 +10447,9 @@ class NakshaApp(QMainWindow):
                     try:
                         cancel()
                     except Exception as exc:
-                        print(f"âš ï¸ Pending brush rollback failed: {exc}")
+                        print(f"⚠️ Pending brush rollback failed: {exc}")
+        elif self.active_classify_tool == "brush":
+            self._finalize_pending_classification_stroke_for_history()
 
         try:
             from . import session_manager
@@ -11387,27 +10461,27 @@ class NakshaApp(QMainWindow):
         # Clear tool
         self.active_classify_tool = None
        
-        # âœ… CRITICAL: Unlock main view
+        # ✅ CRITICAL: Unlock main view
         self.skip_main_view_refresh = False
-        print("   ðŸ”“ Main view refresh UNLOCKED")
+        print("   🔓 Main view refresh UNLOCKED")
        
         # Close class picker
         if self._get_live_class_picker() is not None:
             self._hide_class_picker_safely()
-            print("   âœ… Class picker closed")
+            print("   ✅ Class picker closed")
        
         # Restore section view interactors
         if hasattr(self, "section_controller"):
             try:
                 self.section_controller.unlock_after_classification()
-                print("   âœ… Section controller unlocked")
+                print("   ✅ Section controller unlocked")
             except Exception:
                 pass
        
         if hasattr(self, "cut_section_controller"):
             try:
                 self.cut_section_controller.unlock_after_classification()
-                print("   âœ… Cut section controller unlocked")
+                print("   ✅ Cut section controller unlocked")
             except Exception:
                 pass
  
@@ -11420,7 +10494,7 @@ class NakshaApp(QMainWindow):
                     except Exception: pass
                 self.classify_interactors.clear()
         except Exception as e:
-            print(f"âš ï¸ Failed to clear classification interactors: {e}")
+            print(f"⚠️ Failed to clear classification interactors: {e}")
 
         # Restore the main view interactor and clear any main/cut classification wrappers.
         try:
@@ -11433,7 +10507,7 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
                 self.classify_interactor = None
-                print("   âœ… Main classification interactor cleared")
+                print("   ✅ Main classification interactor cleared")
 
             if hasattr(self, "cut_classify_interactor") and self.cut_classify_interactor:
                 try:
@@ -11442,18 +10516,18 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
                 self.cut_classify_interactor = None
-                print("   âœ… Cut classification interactor cleared")
+                print("   ✅ Cut classification interactor cleared")
 
             if hasattr(self, "vtk_widget") and self.vtk_widget and hasattr(self.vtk_widget, "interactor"):
                 self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
-                print("   âœ… Main view interactor restored")
+                print("   ✅ Main view interactor restored")
         except Exception as e:
-            print(f"âš ï¸ Failed to restore main interactor after classification: {e}")
+            print(f"⚠️ Failed to restore main interactor after classification: {e}")
        
       
-        # âœ… BETTER: Check if cross-section button is checked, not if interactor exists
+        # ✅ BETTER: Check if cross-section button is checked, not if interactor exists
         if (not preserve_cross_section) and hasattr(self, 'cross_action') and self.cross_action is not None and self.cross_action.isChecked():
-            print("   ðŸ›‘ Also deactivating cross-section mode")
+            print("   🛑 Also deactivating cross-section mode")
            
             try:
                 # Clean up cross-section visuals
@@ -11474,15 +10548,15 @@ class NakshaApp(QMainWindow):
                 self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
                
                 self.vtk_widget.render()
-                print("   âœ… Cross-section mode deactivated")
+                print("   ✅ Cross-section mode deactivated")
             except Exception as e:
-                print(f"   âš ï¸ Error deactivating cross-section: {e}")
+                print(f"   ⚠️ Error deactivating cross-section: {e}")
  
         elif preserve_cross_section and hasattr(self, 'cross_action') and self.cross_action is not None and self.cross_action.isChecked():
-            print("   â„¹ï¸ Preserving cross-section mode while deactivating classification")
+            print("   ℹ️ Preserving cross-section mode while deactivating classification")
        
         print(f"{'='*60}")
-        print(f"âœ… Classification tool fully deactivated - all views unlocked")
+        print(f"✅ Classification tool fully deactivated - all views unlocked")
         print(f"{'='*60}\n")
 
         # Make sure no stale refresh-suppression state survives tool teardown.
@@ -11503,11 +10577,11 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass
        
-        self.statusBar().showMessage("âœ… Classification tool deactivated", 2000)
+        self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
                     
     def _refresh_view(self, include_overlays=False, fast_color_only=False):
         """
-        ðŸš€ SENIOR REFACTOR: Smart Redraw.
+        🚀 SENIOR REFACTOR: Smart Redraw.
         If fast_color_only is True, we skip the 'clear()' and 'add_mesh' pipeline entirely.
         """
         # --- NEW FAST PATH ---
@@ -11519,7 +10593,7 @@ class NakshaApp(QMainWindow):
             return
 
         # --- SLOW PATH (Only for initial load or toggle overlays) ---
-        print("âš ï¸ Performing full view refresh (Slow Path)")
+        print("⚠️ Performing full view refresh (Slow Path)")
         self.vtk_widget.clear()
 
         # main dataset
@@ -11558,15 +10632,21 @@ class NakshaApp(QMainWindow):
         self._classified_point_count()
         undo_stack = getattr(self, "undo_stack", None) or []
         step = undo_stack[-1] if undo_stack else {}
-        changed_indices = step.get("indices")
         changed = np.asarray(changed_mask)
-        if changed_indices is not None:
-            changed_indices = np.asarray(changed_indices, dtype=np.int64).ravel()
-            new_classes = np.asarray(classification)[changed_indices]
-        elif changed.dtype == bool:
-            new_classes = np.asarray(classification)[changed]
+        # Phase 1: the explicit transaction payload is authoritative.  Do not
+        # substitute the newest undo-stack entry because undo/redo may already
+        # have moved that entry to the opposite history stack.
+        if changed.dtype == bool:
+            changed_indices = np.flatnonzero(changed).astype(np.int64, copy=False)
         else:
-            new_classes = np.asarray(classification)[changed.astype(np.int64, copy=False).ravel()]
+            changed_indices = changed.astype(np.int64, copy=False).ravel()
+        if changed_indices.size == 0:
+            return False
+        valid = (changed_indices >= 0) & (changed_indices < len(classification))
+        changed_indices = changed_indices[valid]
+        if changed_indices.size == 0:
+            return False
+        new_classes = np.asarray(classification)[changed_indices]
         if new_classes.size == 0:
             return False
         if old_classes is None:
@@ -11651,13 +10731,13 @@ class NakshaApp(QMainWindow):
             )
     def _force_main_view_refresh_after_undo(self, changed_mask):
         """
-        âœ… NEW METHOD: Guaranteed main view refresh after undo/redo
+        ✅ NEW METHOD: Guaranteed main view refresh after undo/redo
         
         This method ensures the main view ALWAYS updates, regardless of 
         cross-section state or other factors.
         """
         print(f"\n{'='*60}")
-        print(f"ðŸ”„ FORCING MAIN VIEW REFRESH AFTER UNDO/REDO")
+        print(f"🔄 FORCING MAIN VIEW REFRESH AFTER UNDO/REDO")
         print(f"{'='*60}")
         
         try:
@@ -11676,9 +10756,9 @@ class NakshaApp(QMainWindow):
                             'parallel_scale': camera.GetParallelScale(),
                             'parallel_projection': camera.GetParallelProjection(),
                         }
-                        print(f"   ðŸ“· Camera saved")
+                        print(f"   📷 Camera saved")
                 except Exception as e:
-                    print(f"   âš ï¸ Camera save failed: {e}")
+                    print(f"   ⚠️ Camera save failed: {e}")
             
             # Get affected classes
             affected_classes = set()
@@ -11695,31 +10775,31 @@ class NakshaApp(QMainWindow):
                 if 'new_classes' in last_undo:
                     affected_classes.update(np.unique(last_undo['new_classes']).tolist())
             
-            print(f"   ðŸ“Š Affected classes: {sorted(affected_classes)}")
+            print(f"   📊 Affected classes: {sorted(affected_classes)}")
             
             if len(affected_classes) == 0:
-                print(f"   âš ï¸ No affected classes detected")
+                print(f"   ⚠️ No affected classes detected")
                 print(f"{'='*60}\n")
                 return
             
-            # âœ… STRATEGY: Remove and re-add ONLY affected class actors
+            # ✅ STRATEGY: Remove and re-add ONLY affected class actors
             if self.display_mode == "class":
-                print(f"   ðŸŽ¨ Class mode - updating {len(affected_classes)} classes")
+                print(f"   🎨 Class mode - updating {len(affected_classes)} classes")
                 
                 try:
                     from gui.class_display import update_class_mode
                     
                     # Simple approach: Full refresh (most reliable)
                     update_class_mode(self)
-                    print(f"   âœ… Full refresh complete")
+                    print(f"   ✅ Full refresh complete")
                     
                 except Exception as e:
-                    print(f"   âŒ Refresh failed: {e}")
+                    print(f"   ❌ Refresh failed: {e}")
                     import traceback
                     traceback.print_exc()
             
             elif self.display_mode == "shaded_class":
-                print(f"   ðŸŒ— Shaded mode - full rebuild required")
+                print(f"   🌗 Shaded mode - full rebuild required")
                 
                 try:
                     from gui.shading_display import update_shaded_class
@@ -11729,21 +10809,21 @@ class NakshaApp(QMainWindow):
                     ambient = getattr(self, "shade_ambient", 0.2)
                     
                     update_shaded_class(self, azimuth, angle, ambient)
-                    print(f"   âœ… Shaded mode refreshed")
+                    print(f"   ✅ Shaded mode refreshed")
                     
                 except Exception as e:
-                    print(f"   âŒ Shaded refresh failed: {e}")
+                    print(f"   ❌ Shaded refresh failed: {e}")
             
             else:
-                print(f"   ðŸ“Š {self.display_mode} mode - standard refresh")
+                print(f"   📊 {self.display_mode} mode - standard refresh")
                 
                 try:
                     from gui.pointcloud_display import update_pointcloud
                     update_pointcloud(self, self.display_mode)
-                    print(f"   âœ… Refreshed")
+                    print(f"   ✅ Refreshed")
                     
                 except Exception as e:
-                    print(f"   âŒ Refresh failed: {e}")
+                    print(f"   ❌ Refresh failed: {e}")
             
             # Restore camera
             if saved_camera and hasattr(self, 'vtk_widget') and self.vtk_widget.renderer:
@@ -11760,21 +10840,21 @@ class NakshaApp(QMainWindow):
                     self.vtk_widget.renderer.ResetCameraClippingRange()
                     self.vtk_widget.render()
                     
-                    print(f"   ðŸ“· Camera restored")
+                    print(f"   📷 Camera restored")
                 except Exception as e:
-                    print(f"   âš ï¸ Camera restore failed: {e}")
+                    print(f"   ⚠️ Camera restore failed: {e}")
             
             # Force immediate render
             try:
                 if hasattr(self, 'vtk_widget'):
                     self.vtk_widget.GetRenderWindow().Render()
-                    print(f"   ðŸŽ¨ Forced render complete")
+                    print(f"   🎨 Forced render complete")
             except Exception as e:
-                print(f"   âš ï¸ Render warning: {e}")
+                print(f"   ⚠️ Render warning: {e}")
             
             # Also refresh cross-sections if they exist
             if hasattr(self, 'section_vtks') and self.section_vtks:
-                print(f"\n   ðŸ”„ Refreshing cross-sections...")
+                print(f"\n   🔄 Refreshing cross-sections...")
                 for view_idx in sorted(self.section_vtks.keys()):
                     try:
                         # Get section data
@@ -11787,24 +10867,24 @@ class NakshaApp(QMainWindow):
                                 vtk_widget = self.section_vtks[view_idx]
                                 if vtk_widget:
                                     vtk_widget.render()
-                            print(f"      âœ… View {view_idx + 1} refreshed")
+                            print(f"      ✅ View {view_idx + 1} refreshed")
                     except Exception as e:
-                        print(f"      âš ï¸ View {view_idx + 1} error: {e}")
+                        print(f"      ⚠️ View {view_idx + 1} error: {e}")
             
             print(f"\n{'='*60}")
-            print(f"âœ… MAIN VIEW REFRESH COMPLETE")
+            print(f"✅ MAIN VIEW REFRESH COMPLETE")
             print(f"{'='*60}\n")
             
         except Exception as e:
-            print(f"\nâŒ CRITICAL ERROR IN MAIN VIEW REFRESH: {e}")
+            print(f"\n❌ CRITICAL ERROR IN MAIN VIEW REFRESH: {e}")
             import traceback
             traceback.print_exc()
             print(f"{'='*60}\n")
             
     def _smart_refresh_after_undo_redo(self, changed_mask, target_classes, operation="Update", num_points=0):
                 """
-                âœ… SMART REFRESH: Update ONLY affected classes without blinking
-                âœ… FIXED: Border shader preserved - only classification data reverted
+                ✅ SMART REFRESH: Update ONLY affected classes without blinking
+                ✅ FIXED: Border shader preserved - only classification data reverted
                 
                 Strategy:
                 1. Identify which classes were affected (old + new)
@@ -11844,10 +10924,10 @@ class NakshaApp(QMainWindow):
                     affected_classes.update(np.unique(current_classes).tolist())
                     
                     affected_classes = sorted(list(affected_classes))
-                    print(f"   ðŸ“Š Affected classes: {affected_classes}")
+                    print(f"   📊 Affected classes: {affected_classes}")
                     
                     if len(affected_classes) == 0:
-                        print(f"   âš ï¸ No affected classes detected")
+                        print(f"   ⚠️ No affected classes detected")
                         return
                     
                     # ========================================================================
@@ -11870,10 +10950,10 @@ class NakshaApp(QMainWindow):
                                     'view_angle': camera.GetViewAngle(),
                                     'clipping_range': camera.GetClippingRange()
                                 }
-                                print(f"   ðŸ“· Camera saved")
-                                print(f"   ðŸ”³ Border state: {'ENABLED' if border_enabled else 'DISABLED'} ({border_percent}%)")
+                                print(f"   📷 Camera saved")
+                                print(f"   🔳 Border state: {'ENABLED' if border_enabled else 'DISABLED'} ({border_percent}%)")
                         except Exception as e:
-                            print(f"   âš ï¸ Camera save failed: {e}")
+                            print(f"   ⚠️ Camera save failed: {e}")
                     
                     # ========================================================================
                     # STEP 3: Remove ONLY class actors (preserve border shader state)
@@ -11897,7 +10977,7 @@ class NakshaApp(QMainWindow):
                                 except Exception:
                                     pass
 
-                    print(f"   ðŸ—‘ï¸ Removed {actors_removed} class actors (preserved border shaders and DXF)")
+                    print(f"   🗑️ Removed {actors_removed} class actors (preserved border shaders and DXF)")
                 
                     # ========================================================================
                     # STEP 4: Re-add ALL visible classes with border shader if enabled
@@ -11951,7 +11031,7 @@ class NakshaApp(QMainWindow):
                             )
                             actor.Modified()
                         except Exception as e:
-                            print(f"   âš ï¸ Border shader attach failed: {e}")
+                            print(f"   ⚠️ Border shader attach failed: {e}")
 
                     for class_code in visible_classes:
                         try:
@@ -11995,13 +11075,13 @@ class NakshaApp(QMainWindow):
                             
                             # Only print affected classes
                             if class_code in affected_classes:
-                                print(f"   âœ… Class {class_code}: {len(class_pts):,} points (weight={weight:.2f})")
+                                print(f"   ✅ Class {class_code}: {len(class_pts):,} points (weight={weight:.2f})")
                             
                         except Exception as e:
-                            print(f"   âŒ Class {class_code} failed: {e}")
+                            print(f"   ❌ Class {class_code} failed: {e}")
                             continue
 
-                    print(f"   ðŸŽ¯ Added {actors_added} class actors for {len(visible_classes)} visible classes")
+                    print(f"   🎯 Added {actors_added} class actors for {len(visible_classes)} visible classes")
                 
                     # ========================================================================
                     # STEP 5: Restore camera and render ONCE
@@ -12022,19 +11102,19 @@ class NakshaApp(QMainWindow):
                                 camera.ParallelProjectionOff()
                             
                             self.vtk_widget.renderer.ResetCameraClippingRange()
-                            print(f"   ðŸ“· Camera restored")
+                            print(f"   📷 Camera restored")
                         except Exception as e:
-                            print(f"   âš ï¸ Camera restore warning: {e}")
+                            print(f"   ⚠️ Camera restore warning: {e}")
                     
                     # Single render call (no flicker!)
                     self.vtk_widget.render()
-                    print(f"   ðŸŽ¨ Single render complete (NO BLINK)")
+                    print(f"   🎨 Single render complete (NO BLINK)")
                     
                     # ========================================================================
                     # STEP 6: Update cross-sections if active
                     # ========================================================================
                     if hasattr(self, 'section_vtks') and self.section_vtks:
-                        print(f"\n   ðŸ”„ Refreshing {len(self.section_vtks)} cross-section view(s)...")
+                        print(f"\n   🔄 Refreshing {len(self.section_vtks)} cross-section view(s)...")
                         
                         # Check if we have the classification interactor
                         if hasattr(self, 'classify_interactors'):
@@ -12047,15 +11127,15 @@ class NakshaApp(QMainWindow):
                                         # Use the interactor's refresh method
                                         if hasattr(interactor, '_refresh_single_view'):
                                             interactor._refresh_single_view(view_idx)
-                                            print(f"      âœ… View {view_idx + 1}: Refreshed")
+                                            print(f"      ✅ View {view_idx + 1}: Refreshed")
                                         else:
-                                            print(f"      âš ï¸ View {view_idx + 1}: No refresh method")
+                                            print(f"      ⚠️ View {view_idx + 1}: No refresh method")
                                     else:
-                                        print(f"      â­ï¸ View {view_idx + 1}: No interactor")
+                                        print(f"      ⏭️ View {view_idx + 1}: No interactor")
                                 except Exception as e:
-                                    print(f"      âš ï¸ View {view_idx + 1} refresh failed: {e}")
+                                    print(f"      ⚠️ View {view_idx + 1} refresh failed: {e}")
                         else:
-                            print(f"      âš ï¸ No classify_interactors found")
+                            print(f"      ⚠️ No classify_interactors found")
                     
                     # ========================================================================
                     # STEP 7: Update statistics
@@ -12069,11 +11149,11 @@ class NakshaApp(QMainWindow):
                         self.statusBar().showMessage(f"{operation}: {num_points:,} points", 2000)
                     
                     print(f"{'='*60}")
-                    print(f"âœ… {operation} COMPLETE - NO BLINK")
+                    print(f"✅ {operation} COMPLETE - NO BLINK")
                     print(f"{'='*60}\n")
                     
                 except Exception as e:
-                    print(f"\nâŒ SMART REFRESH ERROR: {e}")
+                    print(f"\n❌ SMART REFRESH ERROR: {e}")
                     import traceback
                     traceback.print_exc()
                     print(f"{'='*60}\n")
@@ -12114,7 +11194,7 @@ class NakshaApp(QMainWindow):
             pts = self.data['xyz'][mask]
             
             if len(pts) == 0:
-                continue  # Class now empty â€” actor removed, done
+                continue  # Class now empty — actor removed, done
 
             info = palette.get(cls_id, {})
             color = info.get('color', (128, 128, 128))
@@ -12201,6 +11281,15 @@ class NakshaApp(QMainWindow):
 
 
     def undo_classification(self):
+        """Undo classification using sparse canonical indices (Phase 1)."""
+        import numpy as np
+        from gui.classification_delta import (
+            make_delta,
+            materialize_changed_mask,
+            publish_delta,
+            resolve_changed_indices,
+        )
+
         self._finalize_pending_classification_stroke_for_history()
         if not self.undo_stack:
             print("CLASSIFICATION_UNDO status=no_history")
@@ -12210,49 +11299,75 @@ class NakshaApp(QMainWindow):
                 pass
             return False
 
-        # Validate before removing the entry. Previously a missing/empty mask
-        # silently consumed the step, making subsequent Ctrl+Z presses appear
-        # broken until the classify tool was deactivated.
         step = self.undo_stack[-1]
-        mask = step.get('mask')
-        if mask is None:
-            indices = step.get('indices')
-            if indices is not None and hasattr(self, "data") and "classification" in self.data:
-                import numpy as np
-                mask = np.zeros(len(self.data["classification"]), dtype=bool)
-                idx = np.asarray(indices, dtype=np.int64).ravel()
-                if idx.size > 0:
-                    idx = idx[(idx >= 0) & (idx < mask.shape[0])]
-                    if idx.size > 0:
-                        mask[idx] = True
-        if mask is None or not mask.any():
-            print("CLASSIFICATION_UNDO status=invalid_history reason=empty_mask")
+        classes = self.data.get("classification") if hasattr(self, "data") else None
+        if classes is None:
+            print("CLASSIFICATION_UNDO status=invalid_history reason=no_classification_array")
+            return False
+
+        indices = resolve_changed_indices(
+            step.get("indices", step.get("mask")),
+            app=self,
+            n_points=len(classes),
+        )
+        if indices.size == 0:
+            print("CLASSIFICATION_UNDO status=invalid_history reason=empty_indices")
             return False
 
         old_cls = step.get('old_classes')
         if old_cls is None:
             print("CLASSIFICATION_UNDO status=invalid_history reason=missing_old_classes")
             return False
-        import numpy as np
-        old_cls = np.asarray(old_cls)
-        changed_count = int(np.count_nonzero(mask))
-        if old_cls.size not in (1, changed_count):
+        old_cls = np.asarray(old_cls, dtype=classes.dtype).ravel()
+        if old_cls.size == 1 and indices.size > 1:
+            old_cls = np.full(indices.size, old_cls[0], dtype=classes.dtype)
+        if old_cls.size != indices.size:
             print(
                 "CLASSIFICATION_UNDO status=invalid_history "
-                f"reason=class_count_mismatch changed={changed_count} "
+                f"reason=class_count_mismatch changed={indices.size} "
                 f"old_classes={old_cls.size}"
             )
             return False
 
-        self.undo_stack.pop()
+        # Build/validate the sparse history transaction BEFORE consuming the
+        # stack or mutating canonical classes.  Phase 1 popped first; a delta
+        # construction error therefore destroyed Undo history even though the
+        # visual refresh never completed.
+        classes_before_undo = classes[indices].copy()
+        try:
+            delta = make_delta(
+                indices,
+                old_classes=classes_before_undo,
+                new_classes=old_cls,
+                dataset_size=len(classes),
+                operation="undo",
+                origin_view="history",
+                tx_id=int(getattr(self, "_classification_tx_id", 0) or 0),
+            )
+        except Exception as exc:
+            print(f"CLASSIFICATION_UNDO status=prepare_failed error={exc}")
+            return False
 
-        # 1. Revert CPU RAM
-        classes_before_undo = self.data["classification"][mask].copy()
-        self.data["classification"][mask] = old_cls
-        if self._apply_classified_point_count_delta(mask, classes_before_undo):
+        self.undo_stack.pop()
+        classes[indices] = old_cls
+        self.classification_revision = int(
+            getattr(self, "classification_revision", 0) or 0
+        ) + 1
+        publish_delta(self, delta)
+
+        try:
+            from gui.shading_display import record_shading_classification_delta
+            record_shading_classification_delta(
+                self, indices, classes_before_undo, old_cls,
+                operation='undo', origin_view='history',
+            )
+        except Exception as _shading_delta_err:
+            print(f'SHADING_DELTA_JOURNAL status=undo_record_failed reason={_shading_delta_err}')
+
+        if self._apply_classified_point_count_delta(indices, classes_before_undo):
             self._refresh_window_title_classification_count()
         self.redo_stack.append(step)
-        
+
         try:
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
@@ -12262,63 +11377,65 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.redo_stack.pop(0))
 
-        # 2. Main View refresh
         current_display_mode = str(getattr(self, "display_mode", "") or "").lower()
-
+        history_mask = None
         if current_display_mode == "surface":
             try:
-                self.classification_revision = int(getattr(self, "classification_revision", 0) or 0) + 1
-                self.refresh_surface_after_classification(reason="undo", changed_mask=mask)
+                history_mask = materialize_changed_mask(
+                    self, delta, reason="surface_undo"
+                )
+                self.refresh_surface_after_classification(
+                    reason="undo", changed_mask=history_mask
+                )
             except Exception as _surface_undo_err:
                 print(f"Surface undo refresh failed: {_surface_undo_err}")
         else:
             from gui.unified_actor_manager import fast_undo_update
             try:
-                fast_undo_update(self, changed_mask=mask)
+                fast_undo_update(
+                    self,
+                    changed_indices=indices,
+                    delta=delta,
+                )
             except Exception as _undo_refresh_err:
-                # CPU classification is already reverted and the redo entry is
-                # installed. A stale/L0D view buffer must not invalidate undo.
-                print(f"âš ï¸ Undo main-view refresh skipped: {_undo_refresh_err}")
+                print(f"⚠️ Undo main-view refresh skipped: {_undo_refresh_err}")
 
-        # 3. âš¡ CRITICAL FIX: Invalidate ALL section view mirrors
-        #    so they are rebuilt from fresh self.data["classification"]
-        #    instead of stale pre-undo GPU cache
+        # Refresh section mirrors from canonical truth and patch only section
+        # points that correspond to these global indices.
         if hasattr(self, 'section_vtks') and self.section_vtks:
             for view_idx, vtk_widget in self.section_vtks.items():
                 try:
-                    # Wipe the stale mirror so fast_cross_section_update
-                    # is forced to rebuild from self.data["classification"]
                     actor = getattr(vtk_widget, '_naksha_unified_actor', None)
                     if actor is not None:
-                        mirror = getattr(actor, '_naksha_section_class', None)
-                        if mirror is not None:
-                            # Re-read from ground truth classification for THIS view's points
-                            section_indices = getattr(self, f'_section_{view_idx}_global_indices', None)
-                            if section_indices is not None and len(section_indices) > 0:
-                                import numpy as np
-                                actor._naksha_section_class = (
-                                    self.data["classification"][section_indices].copy()
-                                )
-                            else:
-                                # No index map yet â†’ mark mirror as invalid
-                                actor._naksha_section_class = None
+                        section_indices = getattr(
+                            self, f'_section_{view_idx}_global_indices', None
+                        )
+                        if section_indices is not None and len(section_indices) > 0:
+                            actor._naksha_section_class = classes[section_indices].copy()
+                        else:
+                            actor._naksha_section_class = None
                 except Exception as e:
-                    print(f"âš ï¸ Mirror invalidation for view {view_idx}: {e}")
+                    print(f"⚠️ Mirror invalidation for view {view_idx}: {e}")
 
-            # Now do the fast GPU poke with clean mirrors
-            from gui.unified_actor_manager import fast_cross_section_update, build_section_unified_actor
+            from gui.unified_actor_manager import (
+                build_section_unified_actor,
+                fast_cross_section_update,
+            )
             for view_idx in self.section_vtks.keys():
                 slot_idx = view_idx + 1
                 palette = self._get_cross_section_palette(slot_idx)
                 ok = fast_cross_section_update(
                     self,
                     view_idx,
-                    mask,
+                    changed_indices=indices,
+                    delta=delta,
                     palette=palette,
                     force_visibility_refresh=False,
                 )
                 if not ok:
-                    border = float(getattr(self, "view_borders", {}).get(slot_idx, 0) or 0.0)
+                    border = float(
+                        getattr(self, "view_borders", {}).get(slot_idx, 0) or 0.0
+                    )
                     view_mode = getattr(self, "cross_view_mode", "front")
                     rebuilt = build_section_unified_actor(
                         self,
@@ -12331,28 +11448,31 @@ class NakshaApp(QMainWindow):
                         fast_cross_section_update(
                             self,
                             view_idx,
-                            mask,
+                            changed_indices=indices,
+                            delta=delta,
                             palette=palette,
                             force_visibility_refresh=False,
                         )
 
-        # 4. âš¡ CRITICAL FIX: Refresh Cut Section (Slot 5) if active
         if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
             ctrl = self.cut_section_controller
             if getattr(ctrl, 'is_cut_view_active', False):
                 try:
-                    print("   ðŸ”ª Refreshing Cut Section (Slot 5) after Undo")
+                    print("   🔪 Refreshing Cut Section (Slot 5) after Undo")
                     ctrl._refresh_cut_colors_fast()
                 except Exception as e:
-                    print(f"   âš ï¸ Cut section refresh failed: {e}")
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
 
-        # 5. Refresh shaded mesh if in shaded mode
-        if getattr(self, "display_mode", None) == "shaded_class":
+        if current_display_mode == "shaded_class":
+            if history_mask is None:
+                history_mask = materialize_changed_mask(
+                    self, delta, reason="shading_history_undo"
+                )
             try:
                 from gui.shading_display import refresh_shaded_after_history_fast
                 refreshed = refresh_shaded_after_history_fast(
                     self,
-                    mask,
+                    history_mask,
                     classes_before_undo,
                     old_cls,
                     "undo",
@@ -12363,109 +11483,121 @@ class NakshaApp(QMainWindow):
                 print(f"SHADING_HISTORY_FAST status=failed operation=undo error={_se}")
                 try:
                     from gui.shading_display import refresh_shaded_after_undo_fast
-                    if not refresh_shaded_after_undo_fast(self, mask):
+                    if not refresh_shaded_after_undo_fast(self, history_mask):
                         raise RuntimeError("legacy undo shading path declined")
                 except Exception:
                     from gui.shading_display import update_shaded_class, clear_shading_cache
                     clear_shading_cache("undo topology fallback")
                     update_shaded_class(self, force_rebuild=True)
 
-        # 6. Section Shaded/Surface meshes: undo never emits
-        #    classification_finished (unlike redo/classify commits), so the
-        #    section_mesh_display dispatcher never runs for it -- refresh
-        #    directly here instead.
         try:
             from gui.cross_section.section_shaded_surface import (
                 refresh_all_shaded_surface_sections_after_classify,
             )
             refresh_all_shaded_surface_sections_after_classify(self)
         except Exception as _section_mesh_undo_err:
-            print(f"   âš ï¸ Section Shaded/Surface refresh-after-undo failed: {_section_mesh_undo_err}")
+            print(
+                "   ⚠️ Section Shaded/Surface refresh-after-undo failed: "
+                f"{_section_mesh_undo_err}"
+            )
+
+        print(
+            "CLASSIFY_PHASE1_HISTORY operation=undo "
+            f"changed={indices.size} dataset={len(classes)} "
+            f"legacy_mask={int(history_mask is not None)}"
+        )
 
         self._last_changed_mask = None
         self._last_changed_indices = None
+        self._last_classification_delta = None
         self._gpu_sync_done = False
-        # Surface refresh owns its own presentation.  A metadata-only Surface
-        # undo needs no 12M/50M-face redraw, while a true rebuild already rendered.
-        if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            # gui/gpu_render_manager.py wraps vtk_widget.render() with TWO
-            # separate throttles: a classify-streak coalescer (gated on
-            # _last_classify_ts, cleared below just in case) AND a general
-            # "too soon since last render" debounce that schedules a delayed
-            # timer instead of rendering now -- a classify commit renders
-            # Main View milliseconds before undo's own render call, so undo
-            # almost always lands in that debounce window and gets deferred.
-            # Section widgets aren't wrapped by either throttle, which is why
-            # they always looked correct immediately while Main View lagged.
-            #
-            # unified_actor_manager._safe_direct_render was tried here first
-            # but is broken: it looks for the render manager on
-            # vtk_widget._naksha_gpu_render_manager, an attribute that is
-            # never actually set anywhere (the manager lives at
-            # app.gpu_render_manager instead) -- so its lookup always failed
-            # and it silently fell back to calling the raw VTK render
-            # window's Render() directly, which skips whatever pyvistaqt's
-            # own bound render() does for the Qt-embedded widget (buffer
-            # swap / widget update), leaving the screen not actually
-            # repainted even though "a render" nominally happened.
-            #
-            # force_render() is the correct, already-built "bypass the
-            # throttle" helper: it cancels the pending timer and calls
-            # _execute_render(), which uses the TRUE original bound render
-            # method captured at wrap time.
+
+        if current_display_mode != "surface":
             self._last_classify_ts = 0.0
             mgr = getattr(self, "gpu_render_manager", None)
             if mgr is not None:
                 mgr.force_render()
             else:
                 self.vtk_widget.render()
-            # Root cause found by the user: pressing Ctrl+Z while Main View
-            # itself still holds keyboard focus after a Shaded-mode classify
-            # left the screen un-repainted even though force_render() above
-            # completed internally -- but clicking into a cross-section
-            # widget first (giving IT focus) made the SAME undo work. VTK's
-            # render can finish writing its buffer while Qt still defers
-            # actually compositing it to screen until something pumps the
-            # event loop; a focus/mouse event on another widget does that
-            # as a side effect. Force that flush directly instead of
-            # depending on incidental focus changes.
             try:
                 self.vtk_widget.update()
                 from PySide6.QtCore import QEventLoop
                 from PySide6.QtWidgets import QApplication
-                # ExcludeUserInputEvents: flush the pending paint without
-                # reentrantly processing new mouse/keyboard events while
-                # still inside this keypress handler (undo_classification
-                # runs synchronously from Ctrl+Z) -- a bare processEvents()
-                # here could recursively dispatch another queued key/click,
-                # double-triggering something mid-undo.
                 QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
             except Exception:
                 pass
+        return True
 
     def redo_classification(self):
-        """ðŸš€ NAKSHATECH REDO: Instant GPU Forward-Patch"""
-        if not self.redo_stack: return
-        step = self.redo_stack.pop()
-        mask = step.get('mask')
-        if mask is None:
-            indices = step.get('indices')
-            if indices is not None and hasattr(self, "data") and "classification" in self.data:
-                import numpy as np
-                mask = np.zeros(len(self.data["classification"]), dtype=bool)
-                idx = np.asarray(indices, dtype=np.int64).ravel()
-                if idx.size > 0:
-                    idx = idx[(idx >= 0) & (idx < mask.shape[0])]
-                    if idx.size > 0:
-                        mask[idx] = True
-        if mask is None or not mask.any(): return
+        """Redo classification using sparse canonical indices (Phase 1)."""
+        import numpy as np
+        from gui.classification_delta import (
+            make_delta,
+            materialize_changed_mask,
+            publish_delta,
+            resolve_changed_indices,
+        )
+
+        if not self.redo_stack:
+            return False
+        step = self.redo_stack[-1]
+        classes = self.data.get("classification") if hasattr(self, "data") else None
+        if classes is None:
+            return False
+
+        indices = resolve_changed_indices(
+            step.get("indices", step.get("mask")),
+            app=self,
+            n_points=len(classes),
+        )
+        if indices.size == 0:
+            return False
 
         new_cls = step.get('new_classes')
-        if new_cls is None: return
+        if new_cls is None:
+            return False
+        new_cls = np.asarray(new_cls, dtype=classes.dtype).ravel()
+        if new_cls.size == 1 and indices.size > 1:
+            new_cls = np.full(indices.size, new_cls[0], dtype=classes.dtype)
+        if new_cls.size != indices.size:
+            print(
+                "CLASSIFICATION_REDO status=invalid_history "
+                f"reason=class_count_mismatch changed={indices.size} "
+                f"new_classes={new_cls.size}"
+            )
+            return False
 
-        # 1. Update RAM
-        classes_before_redo = self.data["classification"][mask].copy()
-        self.data["classification"][mask] = new_cls
+        classes_before_redo = classes[indices].copy()
+        try:
+            delta = make_delta(
+                indices,
+                old_classes=classes_before_redo,
+                new_classes=new_cls,
+                dataset_size=len(classes),
+                operation="redo",
+                origin_view="history",
+                tx_id=int(getattr(self, "_classification_tx_id", 0) or 0),
+            )
+        except Exception as exc:
+            print(f"CLASSIFICATION_REDO status=prepare_failed error={exc}")
+            return False
+
+        self.redo_stack.pop()
+        classes[indices] = new_cls
+        self.classification_revision = int(
+            getattr(self, "classification_revision", 0) or 0
+        ) + 1
+        publish_delta(self, delta)
+
+        try:
+            from gui.shading_display import record_shading_classification_delta
+            record_shading_classification_delta(
+                self, indices, classes_before_redo, new_cls,
+                operation='redo', origin_view='history',
+            )
+        except Exception as _shading_delta_err:
+            print(f'SHADING_DELTA_JOURNAL status=redo_record_failed reason={_shading_delta_err}')
+
         self.undo_stack.append(step)
         try:
             from gui.memory_manager import current_recommended_undo_steps
@@ -12476,41 +11608,49 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.undo_stack.pop(0))
 
-        # 2. Main View refresh
         current_display_mode = str(getattr(self, "display_mode", "") or "").lower()
-
+        history_mask = None
         if current_display_mode == "surface":
             try:
-                self.classification_revision = int(getattr(self, "classification_revision", 0) or 0) + 1
-                self.refresh_surface_after_classification(reason="redo", changed_mask=mask)
+                history_mask = materialize_changed_mask(
+                    self, delta, reason="surface_redo"
+                )
+                self.refresh_surface_after_classification(
+                    reason="redo", changed_mask=history_mask
+                )
             except Exception as _surface_redo_err:
                 print(f"Surface redo refresh failed: {_surface_redo_err}")
         else:
             from gui.unified_actor_manager import fast_undo_update
-            fast_undo_update(self, changed_mask=mask)
+            fast_undo_update(
+                self,
+                changed_indices=indices,
+                delta=delta,
+            )
 
-        # 3. CRITICAL FIX: Invalidate section mirrors before cross-section update
         if hasattr(self, 'section_vtks') and self.section_vtks:
             for view_idx in self.section_vtks.keys():
                 self._sync_section_mirror_from_data(view_idx)
 
-        # 4. âš¡ CRITICAL FIX: Refresh Cut Section (Slot 5) if active
         if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
             ctrl = self.cut_section_controller
             if getattr(ctrl, 'is_cut_view_active', False):
                 try:
-                    print("   ðŸ”ª Refreshing Cut Section (Slot 5) after Redo")
+                    print("   🔪 Refreshing Cut Section (Slot 5) after Redo")
                     ctrl._refresh_cut_colors_fast()
                 except Exception as e:
-                    print(f"   âš ï¸ Cut section refresh failed: {e}")
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
 
-        # 5. Refresh shaded mesh if needed
-        if getattr(self, "display_mode", None) == "shaded_class":
+        if current_display_mode == "shaded_class":
+            if history_mask is None:
+                history_mask = materialize_changed_mask(
+                    self, delta, reason="shading_history_redo"
+                )
             try:
                 from gui.shading_display import refresh_shaded_after_history_fast
                 refreshed = refresh_shaded_after_history_fast(
                     self,
-                    mask,
+                    history_mask,
                     classes_before_redo,
                     new_cls,
                     "redo",
@@ -12521,52 +11661,52 @@ class NakshaApp(QMainWindow):
                 print(f"SHADING_HISTORY_FAST status=failed operation=redo error={_se}")
                 try:
                     from gui.shading_display import refresh_shaded_after_undo_fast
-                    if not refresh_shaded_after_undo_fast(self, mask):
+                    if not refresh_shaded_after_undo_fast(self, history_mask):
                         raise RuntimeError("legacy redo shading path declined")
                 except Exception:
                     from gui.shading_display import update_shaded_class, clear_shading_cache
                     clear_shading_cache("redo topology fallback")
                     update_shaded_class(self, force_rebuild=True)
 
-        # 5. Emit signal (now mirrors are clean before _on_classification_finished runs)
-        self.classification_finished.emit(mask)
+        # Existing signal bus remains active, but mark the Main View as already
+        # owned by this history commit so the subscriber only handles sections/
+        # statistics and cannot perform a second 47M-point presentation pass.
+        self._cross_section_interactor_owns_main_refresh = True
+        try:
+            self.classification_finished.emit(delta)
+        finally:
+            self._cross_section_interactor_owns_main_refresh = False
+
+        print(
+            "CLASSIFY_PHASE1_HISTORY operation=redo "
+            f"changed={indices.size} dataset={len(classes)} "
+            f"legacy_mask={int(history_mask is not None)}"
+        )
+
         self._last_changed_mask = None
         self._last_changed_indices = None
+        self._last_classification_delta = None
         self._gpu_sync_done = False
 
-        # Surface refresh owns presentation for both no-op and exact topology paths.
-        if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            # See matching comment in undo_classification: force_render()
-            # bypasses BOTH GPURenderManager throttles (classify-streak +
-            # general debounce) and uses the TRUE original bound render
-            # method, unlike the broken _safe_direct_render lookup that was
-            # here before.
+        if current_display_mode != "surface":
             self._last_classify_ts = 0.0
             mgr = getattr(self, "gpu_render_manager", None)
             if mgr is not None:
                 mgr.force_render()
             else:
                 self.vtk_widget.render()
-            # Force a Qt paint flush explicitly instead of depending on
-            # incidental focus changes to another widget to make it happen.
             try:
                 self.vtk_widget.update()
                 from PySide6.QtCore import QEventLoop
                 from PySide6.QtWidgets import QApplication
-                # ExcludeUserInputEvents: flush the pending paint without
-                # reentrantly processing new mouse/keyboard events while
-                # still inside this keypress handler (undo_classification
-                # runs synchronously from Ctrl+Z) -- a bare processEvents()
-                # here could recursively dispatch another queued key/click,
-                # double-triggering something mid-undo.
                 QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
             except Exception:
                 pass
-
+        return True
 
     def _refresh_main_view_after_undo(self, affected_classes, changed_mask):
         """
-        âœ… CRITICAL FIX: Rebuild main view actors for affected classes.
+        ✅ CRITICAL FIX: Rebuild main view actors for affected classes.
         
         This prevents void points by ensuring:
         1. Classes that LOST points have their actors removed if empty
@@ -12577,7 +11717,7 @@ class NakshaApp(QMainWindow):
         
         plotter = getattr(self, 'vtk_widget', None)
         if plotter is None:
-            print(f"      âš ï¸ No VTK widget found")
+            print(f"      ⚠️ No VTK widget found")
             return
         
         xyz = self.data["xyz"]
@@ -12586,7 +11726,7 @@ class NakshaApp(QMainWindow):
         # Get Main View palette (Slot 0)
         palette = self._get_main_view_palette()
         
-        print(f"      ðŸ”§ Rebuilding {len(affected_classes)} class actors...")
+        print(f"      🔧 Rebuilding {len(affected_classes)} class actors...")
         
         # Save camera position
         saved_camera = None
@@ -12596,9 +11736,9 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass
         
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ════════════════════════════════════════════════════════════════════
         # Rebuild each affected class
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ════════════════════════════════════════════════════════════════════
         for class_code in affected_classes:
             class_code = int(class_code)
             actor_name = f"class_{class_code}"
@@ -12609,7 +11749,7 @@ class NakshaApp(QMainWindow):
                 # Hidden class - remove actor if exists
                 if actor_name in plotter.actors:
                     plotter.remove_actor(actor_name, render=False)
-                    print(f"         ðŸš« Removed hidden class {class_code}")
+                    print(f"         🚫 Removed hidden class {class_code}")
                 continue
             
             # Get all points for this class
@@ -12621,7 +11761,7 @@ class NakshaApp(QMainWindow):
                 plotter.remove_actor(actor_name, render=False)
             
             if len(class_pts) == 0:
-                print(f"         âœ‚ï¸ Class {class_code}: No points (removed)")
+                print(f"         ✂️ Class {class_code}: No points (removed)")
                 continue
             
             # Get styling
@@ -12654,7 +11794,7 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
             
-            print(f"         âœ… Rebuilt class {class_code}: {len(class_pts):,} points")
+            print(f"         ✅ Rebuilt class {class_code}: {len(class_pts):,} points")
         
         # Restore camera
         if saved_camera is not None:
@@ -12665,18 +11805,18 @@ class NakshaApp(QMainWindow):
         
         # Single render at the end
         plotter.render()
-        print(f"      âœ… Main view refreshed")
+        print(f"      ✅ Main view refreshed")
 
 
     def _manual_refresh_cross_section(self, view_idx, affected_classes):
         """
-        âœ… Manual fallback refresh for cross-section after undo.
+        ✅ Manual fallback refresh for cross-section after undo.
         """
         import pyvista as pv
         import numpy as np
         
         if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
-            print(f"      âš ï¸ View {view_idx}: VTK widget not found")
+            print(f"      ⚠️ View {view_idx}: VTK widget not found")
             return
         
         vtk_widget = self.section_vtks[view_idx]
@@ -12689,29 +11829,29 @@ class NakshaApp(QMainWindow):
         buffer_mask = getattr(self, f'section_{view_idx}_buffer_mask', None)
         
         if core_pts is None or core_mask is None:
-            print(f"      â­ï¸ View {view_idx}: No section data stored")
+            print(f"      ⏭️ View {view_idx}: No section data stored")
             return
         
         # Get palette for this view
         palette = self._get_cross_section_palette(slot_idx)
         visible = [c for c, v in palette.items() if v.get("show", False)]
         
-        # âœ… CRITICAL: Get FRESH classification data from main array
+        # ✅ CRITICAL: Get FRESH classification data from main array
         current_classes = self.data["classification"]
         
         # Verify we got the updated data
         if not isinstance(current_classes, np.ndarray):
-            print(f"      âŒ View {view_idx}: Invalid classification data type")
+            print(f"      ❌ View {view_idx}: Invalid classification data type")
             return
         
         # Extract section classifications using the stored mask
         try:
             section_classes = current_classes[core_mask]
         except Exception as e:
-            print(f"      âŒ View {view_idx}: Failed to extract section classes: {e}")
+            print(f"      ❌ View {view_idx}: Failed to extract section classes: {e}")
             return
         
-        print(f"      ðŸ”„ Manual refresh View {slot_idx}...")
+        print(f"      🔄 Manual refresh View {slot_idx}...")
         print(f"         Core points: {len(core_pts):,}")
         print(f"         Affected classes: {sorted(affected_classes)}")
         print(f"         Visible classes: {sorted(visible)}")
@@ -12731,9 +11871,9 @@ class NakshaApp(QMainWindow):
             pass
         
         try:
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ════════════════════════════════════════════════════════════════
             # Rebuild CORE points for affected classes
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ════════════════════════════════════════════════════════════════
             for cls_val in affected_classes:
                 cls_val = int(cls_val)
                 actor_name = f"class_{cls_val}"
@@ -12742,7 +11882,7 @@ class NakshaApp(QMainWindow):
                 if cls_val not in visible:
                     if actor_name in vtk_widget.actors:
                         vtk_widget.remove_actor(actor_name, render=False)
-                        print(f"         ðŸš« Removed hidden class {cls_val}")
+                        print(f"         🚫 Removed hidden class {cls_val}")
                     continue
                 
                 # Get points for this class
@@ -12754,7 +11894,7 @@ class NakshaApp(QMainWindow):
                     vtk_widget.remove_actor(actor_name, render=False)
                 
                 if len(cls_pts) == 0:
-                    print(f"         âœ‚ï¸ Class {cls_val}: 0 points (removed)")
+                    print(f"         ✂️ Class {cls_val}: 0 points (removed)")
                     continue
                 
                 # Get styling
@@ -12779,11 +11919,11 @@ class NakshaApp(QMainWindow):
                     render=False
                 )
                 
-                print(f"         âœ… Class {cls_val}: {len(cls_pts):,} points rebuilt")
+                print(f"         ✅ Class {cls_val}: {len(cls_pts):,} points rebuilt")
             
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ════════════════════════════════════════════════════════════════
             # Rebuild BUFFER points for affected classes
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ════════════════════════════════════════════════════════════════
             if buffer_pts is not None and buffer_mask is not None and len(buffer_pts) > 0:
                 try:
                     buffer_classes = current_classes[buffer_mask]
@@ -12830,9 +11970,9 @@ class NakshaApp(QMainWindow):
                             render=False
                         )
                         
-                        print(f"         ðŸ”¹ Buffer {cls_val}: {len(cls_pts):,} points")
+                        print(f"         🔹 Buffer {cls_val}: {len(cls_pts):,} points")
                 except Exception as e:
-                    print(f"         âš ï¸ Buffer refresh failed: {e}")
+                    print(f"         ⚠️ Buffer refresh failed: {e}")
             
         finally:
             # Re-enable interactor
@@ -12850,7 +11990,7 @@ class NakshaApp(QMainWindow):
         
         # Render the view
         vtk_widget.render()
-        print(f"      âœ… View {slot_idx} refreshed and rendered")
+        print(f"      ✅ View {slot_idx} refreshed and rendered")
 
 
     def _get_main_view_palette(self):
@@ -12903,7 +12043,7 @@ class NakshaApp(QMainWindow):
 
         if seeded:
             print(
-                f"   â„¹ï¸ Seeded slot {slot_i} default palette from Main colors/weights "
+                f"   ℹ️ Seeded slot {slot_i} default palette from Main colors/weights "
                 f"({len(seeded)} classes, visibility independent)"
             )
         return seeded
@@ -12960,7 +12100,7 @@ class NakshaApp(QMainWindow):
                     dlg.view_palettes = {}
                 dlg.view_palettes[slot_i] = {int(c): dict(v) for c, v in seeded.items()}
 
-            print(f"   âœ… Persisted seeded slot palette for slot {slot_i}")
+            print(f"   ✅ Persisted seeded slot palette for slot {slot_i}")
 
         return seeded
 
@@ -13143,7 +12283,7 @@ class NakshaApp(QMainWindow):
             if gpu_slot is not None:
                 print(f"  gpu.slot={int(gpu_slot)}")
         except Exception as e:
-            print(f"   âš ï¸ palette audit log failed: {e}")
+            print(f"   ⚠️ palette audit log failed: {e}")
 
     def _sync_palette_between_section_views(self, source_idx: int, target_idx: int):
         """
@@ -13269,7 +12409,7 @@ class NakshaApp(QMainWindow):
     
     def refresh_after_classification(self, to_class, changed_mask=None): ################
         """
-        âš¡ NAKSHATECH STYLE REFRESH
+        ⚡ MICROSTATION STYLE REFRESH
         This replaces the slow rebuild logic during active classification.
         """
         if changed_mask is None:
@@ -13308,11 +12448,11 @@ class NakshaApp(QMainWindow):
 
     def _refresh_all_views_after_change(self, num_points, operation="Update"):
         """
-        âœ… INTERNAL: Complete rebuild of main view + all cross-sections after classification change
+        ✅ INTERNAL: Complete rebuild of main view + all cross-sections after classification change
         
         Args:
             num_points: Number of points affected
-            operation: Operation name for logging (e.g., "âª Undo", "ðŸ”œ Redo")
+            operation: Operation name for logging (e.g., "⏪ Undo", "🔜 Redo")
         """
         print(f"\n{'='*60}")
         print(f"{operation} - Processing {num_points:,} points")
@@ -13352,7 +12492,7 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage(f"{operation}: {num_points:,} points", 3000)
         
         print(f"{'='*60}")
-        print(f"âœ… {operation} COMPLETE - All views updated")
+        print(f"✅ {operation} COMPLETE - All views updated")
         print(f"{'='*60}\n")
 
 
@@ -13373,7 +12513,7 @@ class NakshaApp(QMainWindow):
                     'parallel_projection': camera.GetParallelProjection()
                 }
         except Exception as e:
-            print(f"âš ï¸ Camera save failed: {e}")
+            print(f"⚠️ Camera save failed: {e}")
         return None
 
     def _restore_camera_state(self, saved_camera):
@@ -13392,11 +12532,11 @@ class NakshaApp(QMainWindow):
                 camera.ParallelProjectionOn()
             self.vtk_widget.renderer.ResetCameraClippingRange()
         except Exception as e:
-            print(f"âš ï¸ Camera restore failed: {e}")
+            print(f"⚠️ Camera restore failed: {e}")
 
     def _rebuild_main_view(self):
         """Complete rebuild of main VTK view"""
-        print("ðŸ”„ Rebuilding Main View...")
+        print("🔄 Rebuilding Main View...")
         self._preserve_view = True
         
         try:
@@ -13412,7 +12552,7 @@ class NakshaApp(QMainWindow):
             if self.display_mode == "class":
                 from gui.class_display import update_class_mode
                 update_class_mode(self)
-                print("âœ… Main view rebuilt (class)")
+                print("✅ Main view rebuilt (class)")
                 
             elif self.display_mode in ("shaded_class", "shadedclass"):
                 from gui.shading_display import update_shaded_class
@@ -13422,15 +12562,15 @@ class NakshaApp(QMainWindow):
                     getattr(self, "shading_sharpness_angle", 45.0),
                     getattr(self, "shade_ambient", 0.2),
                 )
-                print("âœ… Main view rebuilt (shaded)")
+                print("✅ Main view rebuilt (shaded)")
                 
             else:
                 from gui.pointcloud_display import updatepointcloud
                 updatepointcloud(self, self.display_mode)
-                print(f"âœ… Main view rebuilt ({self.display_mode})")
+                print(f"✅ Main view rebuilt ({self.display_mode})")
                 
         except Exception as e:
-            print(f"âŒ Main view rebuild failed: {e}")
+            print(f"❌ Main view rebuild failed: {e}")
             import traceback
             traceback.print_exc()
 
@@ -13440,11 +12580,11 @@ class NakshaApp(QMainWindow):
             try:
                 self.vtk_widget.GetRenderWindow().Render()
             except Exception as e:
-                print(f"âš ï¸ Main render failed: {e}")
+                print(f"⚠️ Main render failed: {e}")
                 
     def _refresh_cross_sections_async(self):
         """
-        âœ… Schedule cross-section refresh for next event loop iteration.
+        ✅ Schedule cross-section refresh for next event loop iteration.
         Prevents UI micro-stutters during classification.
         """
         try:
@@ -13452,19 +12592,19 @@ class NakshaApp(QMainWindow):
             # Reduced to 5ms for even faster response
             QTimer.singleShot(5, self._refresh_cross_sections)
         except Exception as e:
-            print(f"âš ï¸ Async scheduling failed: {e}")
+            print(f"⚠️ Async scheduling failed: {e}")
             self._refresh_cross_sections()
 
     def _refresh_cross_sections(self):
         """
-        ðŸš€ REFRESH ALL CROSS-SECTIONS
+        🚀 REFRESH ALL CROSS-SECTIONS
         Coordinates between the SectionController and the GPU.
         """
         if not (hasattr(self, 'section_vtks') and self.section_vtks):
             return
         
         if not (hasattr(self, 'section_controller') and self.section_controller):
-            print(" âŒ ERROR: section_controller not found!")
+            print(" ❌ ERROR: section_controller not found!")
             return
 
         # Use the stored view-specific palettes if they exist
@@ -13490,7 +12630,7 @@ class NakshaApp(QMainWindow):
                 # 3. TRIGGER REFRESH
                 # We prioritize the specialized view-specific refresh
                 if hasattr(self.section_controller, 'refresh_colors_for_view'):
-                    # âœ… The controller method should now handle the GPU Buffer Swap
+                    # ✅ The controller method should now handle the GPU Buffer Swap
                     self.section_controller.refresh_colors_for_view(view_idx, palette=view_palette)
                 elif hasattr(self.section_controller, 'refresh_colors'):
                     self.section_controller.refresh_colors()
@@ -13499,7 +12639,7 @@ class NakshaApp(QMainWindow):
                     self.section_controller.active_view = old_active
                     
             except Exception as e:
-                print(f" âŒ Cross-section View {view_idx + 1} failed: {e}")
+                print(f" ❌ Cross-section View {view_idx + 1} failed: {e}")
         
         # Process events so the screen actually updates
         try:
@@ -13523,13 +12663,13 @@ class NakshaApp(QMainWindow):
                 parent = parent.parent()
                 
         except Exception as e:
-            print(f"      âš ï¸ Could not find dock widget: {e}")
+            print(f"      ⚠️ Could not find dock widget: {e}")
         
         return None
 
     def _force_section_data_update(self, view_idx):
         """
-        âœ… Force complete data pipeline update for cross-section view
+        ✅ Force complete data pipeline update for cross-section view
         This is a fallback when section_controller methods aren't available
         """
         vtk_widget = self.section_vtks[view_idx]
@@ -13556,7 +12696,7 @@ class NakshaApp(QMainWindow):
             if not polydata:
                 continue
             
-            # âœ… CRITICAL: Update colors from current classification
+            # ✅ CRITICAL: Update colors from current classification
             if hasattr(polydata, 'GetPointData'):
                 point_data = polydata.GetPointData()
                 if point_data and point_data.GetScalars():
@@ -13571,7 +12711,7 @@ class NakshaApp(QMainWindow):
             
             updated_count += 1
         
-        print(f"      ðŸ”„ Updated {updated_count} actor pipeline(s)")
+        print(f"      🔄 Updated {updated_count} actor pipeline(s)")
         
         # 2. Force render
         if hasattr(vtk_widget, 'GetRenderWindow'):
@@ -13581,11 +12721,11 @@ class NakshaApp(QMainWindow):
 
     def _render_section_view(self, view_idx):
         """
-        âœ… FIXED: Render a single cross-section view with pipeline update
+        ✅ FIXED: Render a single cross-section view with pipeline update
         """
         vtk_widget = self.section_vtks[view_idx]
         
-        # 1. âœ… CRITICAL: Mark all data sources as modified
+        # 1. ✅ CRITICAL: Mark all data sources as modified
         if hasattr(vtk_widget, 'renderer') and vtk_widget.renderer:
             actors = vtk_widget.renderer.GetActors()
             actors.InitTraversal()
@@ -13615,7 +12755,7 @@ class NakshaApp(QMainWindow):
         try:
             from PySide6.QtCore import QCoreApplication
             QCoreApplication.processEvents()
-            print("âœ… Qt events processed")
+            print("✅ Qt events processed")
         except Exception as e:
             pass
 
@@ -13625,19 +12765,19 @@ class NakshaApp(QMainWindow):
             try:
                 from gui.point_count_widget import refreshpointstatistics
                 refreshpointstatistics(self)
-                print("âœ… Statistics updated")
+                print("✅ Statistics updated")
             except Exception as e:
                 pass
 
     def _refresh_changed_points_after_undo_redo(self, changed_mask):
         """
-        âœ… FIXED: Always refreshes main view, regardless of cross-section state
+        ✅ FIXED: Always refreshes main view, regardless of cross-section state
         
         Args:
             changed_mask: Boolean mask of points that were changed by undo/redo
         """
         print(f"\n{'='*60}")
-        print(f"ðŸ”„ PARTIAL REFRESH AFTER UNDO/REDO")
+        print(f"🔄 PARTIAL REFRESH AFTER UNDO/REDO")
         print(f"   Changed points: {changed_mask.sum():,}")
         print(f"   Display mode: {getattr(self, 'display_mode', 'unknown')}")
         print(f"{'='*60}")
@@ -13649,17 +12789,17 @@ class NakshaApp(QMainWindow):
             # STEP 1: ALWAYS Refresh Main View First (most important!)
             # ========================================================================
             current_mode = getattr(self, 'display_mode', 'class')
-            print(f"\nðŸ”„ Refreshing Main View...")
+            print(f"\n🔄 Refreshing Main View...")
             
             try:
                 if current_mode == "class":
-                    # âœ… CRITICAL: Always use partial refresh for undo/redo
-                    print(f"   âš¡ Using PARTIAL refresh (undo/redo)")
+                    # ✅ CRITICAL: Always use partial refresh for undo/redo
+                    print(f"   ⚡ Using PARTIAL refresh (undo/redo)")
                     self._refresh_main_view_partial_with_mask(changed_mask)
-                    print(f"   âœ… Main View PARTIAL refresh complete")
+                    print(f"   ✅ Main View PARTIAL refresh complete")
                     
                 elif current_mode == "shaded_class":
-                    print(f"   ðŸŒ— Shaded mode - FULL refresh required")
+                    print(f"   🌗 Shaded mode - FULL refresh required")
                     from gui.shading_display import update_shaded_class
                     update_shaded_class(
                         self,
@@ -13667,21 +12807,21 @@ class NakshaApp(QMainWindow):
                         getattr(self, "shading_sharpness_angle", 45.0),
                         getattr(self, "shade_ambient", 0.2)
                     )
-                    print(f"   âœ… Main View refreshed (shaded_class mode)")
+                    print(f"   ✅ Main View refreshed (shaded_class mode)")
                     
                 elif current_mode in ["rgb", "intensity", "elevation", "depth"]:
-                    print(f"   ðŸ“Š {current_mode} mode - FULL refresh")
+                    print(f"   📊 {current_mode} mode - FULL refresh")
                     from gui.pointcloud_display import update_pointcloud
                     update_pointcloud(self, current_mode)
-                    print(f"   âœ… Main View refreshed ({current_mode} mode)")
+                    print(f"   ✅ Main View refreshed ({current_mode} mode)")
                     
                 else:
-                    print(f"   âš ï¸ Unknown mode '{current_mode}' - using class mode")
+                    print(f"   ⚠️ Unknown mode '{current_mode}' - using class mode")
                     from gui.class_display import update_class_mode
                     update_class_mode(self)
                     
             except Exception as e:
-                print(f"   âŒ Main View refresh failed: {e}")
+                print(f"   ❌ Main View refresh failed: {e}")
                 import traceback
                 traceback.print_exc()
             
@@ -13693,40 +12833,40 @@ class NakshaApp(QMainWindow):
                     self.section_controller._last_changed_mask = changed_mask
                 
                 num_views = len(self.section_vtks)
-                print(f"\nðŸ”„ Refreshing {num_views} cross-section view(s)...")
+                print(f"\n🔄 Refreshing {num_views} cross-section view(s)...")
                 
                 for view_idx in sorted(self.section_vtks.keys()):
-                    print(f"   ðŸ“‹ View {view_idx + 1}:")
+                    print(f"   📋 View {view_idx + 1}:")
                     try:
                         # Use the single view refresh
                         self._refresh_single_view_partial(view_idx, changed_mask)
                     except Exception as e:
-                        print(f"      âš ï¸ View {view_idx + 1} refresh failed: {e}")
+                        print(f"      ⚠️ View {view_idx + 1} refresh failed: {e}")
             
             # ========================================================================
             # STEP 3: Refresh Cut Section (if active)
             # ========================================================================
             if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
                 if getattr(self.cut_section_controller, 'is_cut_view_active', False):
-                    print(f"\nðŸ”„ Refreshing Cut Section view...")
+                    print(f"\n🔄 Refreshing Cut Section view...")
                     try:
                         if hasattr(self.cut_section_controller, 'onclassificationchanged'):
                             self.cut_section_controller.onclassificationchanged()
-                            print(f"   âœ… Cut Section refreshed")
+                            print(f"   ✅ Cut Section refreshed")
                     except Exception as e:
-                        print(f"   âš ï¸ Cut Section refresh failed: {e}")
+                        print(f"   ⚠️ Cut Section refresh failed: {e}")
             
             # ========================================================================
             # STEP 4: Update Statistics
             # ========================================================================
             if hasattr(self, 'point_count_widget') and self.point_count_widget:
-                print(f"\nðŸ“Š Updating Point Statistics...")
+                print(f"\n📊 Updating Point Statistics...")
                 try:
                     from gui.point_count_widget import refresh_point_statistics
                     refresh_point_statistics(self)
-                    print(f"   âœ… Point Statistics updated")
+                    print(f"   ✅ Point Statistics updated")
                 except Exception as e:
-                    print(f"   âš ï¸ Statistics update failed: {e}")
+                    print(f"   ⚠️ Statistics update failed: {e}")
 
             # ========================================================================
             # STEP 5: Force Final Render
@@ -13740,17 +12880,17 @@ class NakshaApp(QMainWindow):
                 # Force immediate render
                 if hasattr(self, 'vtk_widget') and self.vtk_widget:
                     self.vtk_widget.GetRenderWindow().Render()
-                    print(f"âœ… Final render forced")
+                    print(f"✅ Final render forced")
                 
             except Exception as e:
-                print(f"âš ï¸ Final render warning: {e}")
+                print(f"⚠️ Final render warning: {e}")
 
             print(f"\n{'='*60}")
-            print(f"âœ… REFRESH COMPLETE")
+            print(f"✅ REFRESH COMPLETE")
             print(f"{'='*60}\n")
 
-        except Exception as e:  # â† This is the OUTER try/except from the function start
-                print(f"\nâš ï¸ PARTIAL REFRESH ERROR: {e}")
+        except Exception as e:  # ← This is the OUTER try/except from the function start
+                print(f"\n⚠️ PARTIAL REFRESH ERROR: {e}")
                 import traceback
                 traceback.print_exc()
                     
@@ -13784,15 +12924,15 @@ class NakshaApp(QMainWindow):
                 intersect = False
         
         if intersect:
-            print(f"      âš ï¸ Changed points detected in View {view_idx + 1} - Refreshing")
+            print(f"      ⚠️ Changed points detected in View {view_idx + 1} - Refreshing")
             # Call the standard single-view refresh
             self._refresh_single_view(view_idx)
         else:
-            print(f"      â­ï¸ View {view_idx + 1} unaffected - Skipping")
+            print(f"      ⏭️ View {view_idx + 1} unaffected - Skipping")
 
     def _refresh_single_view_partial(self, view_index, changed_mask):
         """
-        âœ… Refresh only changed points in a single cross-section view
+        ✅ Refresh only changed points in a single cross-section view
         
         Args:
             view_index: View index (0-3)
@@ -13807,7 +12947,7 @@ class NakshaApp(QMainWindow):
         
         # Check if view exists
         if not hasattr(self, 'section_vtks') or view_index not in self.section_vtks:
-            print(f"         â­ï¸ View not found")
+            print(f"         ⏭️ View not found")
             return
         
         vtk_widget = self.section_vtks[view_index]
@@ -13819,21 +12959,21 @@ class NakshaApp(QMainWindow):
         buffer_mask = getattr(self, f'section_{view_index}_buffer_mask', None)
         
         if pts is None or core_mask is None:
-            print(f"         â­ï¸ No section data")
+            print(f"         ⏭️ No section data")
             return
         
-        # âœ… Check if ANY changed points are in this view
+        # ✅ Check if ANY changed points are in this view
         view_has_changes = np.any(changed_mask & core_mask)
         if buf is not None and buffer_mask is not None:
             view_has_changes |= np.any(changed_mask & buffer_mask)
         
         if not view_has_changes:
-            print(f"         â­ï¸ No changed points in this view - skipping")
+            print(f"         ⏭️ No changed points in this view - skipping")
             return
         
-        print(f"         âœ… Changed points found - refreshing...")
+        print(f"         ✅ Changed points found - refreshing...")
         
-        # âœ… Get THIS VIEW's palette from Display Mode
+        # ✅ Get THIS VIEW's palette from Display Mode
         view_palette = None
         
         if hasattr(self, 'display_mode_dialog'):
@@ -13849,14 +12989,14 @@ class NakshaApp(QMainWindow):
             )
         
         if not view_palette:
-            print(f"         âŒ No palette available")
+            print(f"         ❌ No palette available")
             return
         
         # Get visible classes
         visible = [c for c, v in view_palette.items() if v.get("show", False)]
         
         if not visible:
-            print(f"         â­ï¸ No visible classes")
+            print(f"         ⏭️ No visible classes")
             vtk_widget.clear()
             vtk_widget.render()
             return
@@ -13912,11 +13052,11 @@ class NakshaApp(QMainWindow):
         vtk_widget.camera_position = cam_pos
         vtk_widget.render()
         
-        print(f"         âœ… Refreshed {len(filtered_pts):,} points")
+        print(f"         ✅ Refreshed {len(filtered_pts):,} points")
         
     def _refresh_main_view_partial_with_mask(self, changed_mask):
         """
-        âœ… FIXED: Proper weight-based rendering order & Filter Isolation.
+        ✅ FIXED: Proper weight-based rendering order & Filter Isolation.
         - Calculates correct point size (psize) even during targeted updates.
         - Synchronizes border settings with global app state.
         - Handles Undo/Redo class transitions without leaving 'ghost' points.
@@ -13925,7 +13065,7 @@ class NakshaApp(QMainWindow):
         import pyvista as pv
  
         self._doing_partial_refresh = True
-        print("\n   ðŸ”„ Main View Targeted Refresh (Syncing Weights & Borders)...")
+        print("\n   🔄 Main View Targeted Refresh (Syncing Weights & Borders)...")
  
         # --- Local Shader Helpers ---
         def _border_ring_fraction(border_percent: float) -> float:
@@ -14012,7 +13152,7 @@ class NakshaApp(QMainWindow):
             if palette0 is None:
                 palette0 = getattr(self, "class_palette", {}) or {}
  
-            # âœ… SYNC: Use global border settings to match the classification tools
+            # ✅ SYNC: Use global border settings to match the classification tools
             border_val = float(getattr(self, "point_border_percent", 0) or 0.0)
  
             xyz, classes = self.data["xyz"], self.data["classification"]
@@ -14035,7 +13175,7 @@ class NakshaApp(QMainWindow):
             # PATH B: Per-class actors (Handles Weights & Filters)
             # ===================================================================
             else:
-                # âœ… Path B1: Full Rebuild for Custom Weights (Prevents Z-fighting)
+                # ✅ Path B1: Full Rebuild for Custom Weights (Prevents Z-fighting)
                 if has_custom_weights:
                     recent_class = getattr(self, "_last_classified_to_class", None)
                     for name in list(plotter.actors.keys()):
@@ -14061,7 +13201,7 @@ class NakshaApp(QMainWindow):
                                                render_points_as_spheres=True, name=f"class_{code}", render=False)
                         _apply_black_ring_shader(act, border_val)
  
-                # âœ… Path B2: Targeted Update (Flicker-Free, Handles specific point size)
+                # ✅ Path B2: Targeted Update (Flicker-Free, Handles specific point size)
                 else:
                     changed_idx = np.flatnonzero(mask_bool)
                     affected = set(np.unique(classes[changed_idx]).tolist())
@@ -14075,7 +13215,7 @@ class NakshaApp(QMainWindow):
                             pts = xyz[classes == c]
                             if pts.size > 0:
                                 entry = palette0.get(int(c), {})
-                                # âœ… FIX: Calculate size from weight instead of hardcoding 2.5
+                                # ✅ FIX: Calculate size from weight instead of hardcoding 2.5
                                 w = max(0.1, min(float(entry.get("weight", 1.0)), 12.0))
                                 psize = max(1.5, min(2.5 * w, 30.0))
                                 cloud = pv.PolyData(pts)
@@ -14101,15 +13241,15 @@ class NakshaApp(QMainWindow):
 
  
         except Exception as e:
-            print(f"âŒ Partial Refresh Error: {e}")
+            print(f"❌ Partial Refresh Error: {e}")
         finally:
             self._doing_partial_refresh = False
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     #  REPLACE your existing _load_backup_settings method with this one.
     #  It's currently called at the end of __init__ and should also be
     #  called after a file is loaded to start the timer.
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     def _load_backup_settings(self):
         """Load backup interval from QSettings and start/stop the timer."""
         try:
@@ -14125,19 +13265,19 @@ class NakshaApp(QMainWindow):
                 # _auto_backup will silently return.
                 if not self.auto_backup_timer.isActive():
                     self.auto_backup_timer.start()
-                    print(f"â±ï¸ Auto-backup timer started: every {interval_minutes} min")
+                    print(f"⏱️ Auto-backup timer started: every {interval_minutes} min")
             else:
                 if self.auto_backup_timer.isActive():
                     self.auto_backup_timer.stop()
-                    print("â±ï¸ Auto-backup timer stopped (disabled)")
+                    print("⏱️ Auto-backup timer stopped (disabled)")
         except Exception as e:
-            print(f"âš ï¸ Failed to load backup settings: {e}")
+            print(f"⚠️ Failed to load backup settings: {e}")
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     #  REPLACE your existing _auto_backup method with this one.
     #  This is the critical fix: snapshot on main thread (<1ms),
     #  then write in background QThread.
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     def _auto_backup(self):
         """Trigger a background auto-backup without blocking the UI."""
         if getattr(self, "_dataset_load_in_progress", False):
@@ -14146,7 +13286,7 @@ class NakshaApp(QMainWindow):
 
         # Guard: prevent overlapping backups
         if self._backup_worker_running:
-            print("â­ï¸ Auto-backup skipped â€” previous still writing")
+            print("⏭️ Auto-backup skipped — previous still writing")
             return
 
         # Guard: no data
@@ -14163,7 +13303,7 @@ class NakshaApp(QMainWindow):
             from .save_pointcloud import _import_options_reduce_points
             if _import_options_reduce_points(data.get("import_options")):
                 print(
-                    "â­ï¸ Auto-backup skipped â€” current dataset is a filtered/sampled subset "
+                    "⏭️ Auto-backup skipped — current dataset is a filtered/sampled subset "
                     "and preserving the source file layout is not safe."
                 )
                 return
@@ -14229,7 +13369,7 @@ class NakshaApp(QMainWindow):
                 "intensity": intensity16,
             }
         except Exception as e:
-            print(f"âš ï¸ Backup snapshot failed: {e}")
+            print(f"⚠️ Backup snapshot failed: {e}")
             return
 
         # ---- Launch background worker ----
@@ -14255,9 +13395,9 @@ class NakshaApp(QMainWindow):
         self._active_backup_worker = worker
         worker.start()
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
     #  ADD these 5 new methods to NakshaApp (after _auto_backup)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
 
     def _compute_backup_path(self) -> str:
         """Compute the backup file path from saved settings."""
@@ -14295,16 +13435,16 @@ class NakshaApp(QMainWindow):
             return os.path.join(folder, filename)
 
         except Exception as e:
-            print(f"âš ï¸ Failed to compute backup path: {e}")
+            print(f"⚠️ Failed to compute backup path: {e}")
             return None
 
     def _on_backup_finished(self, path: str):
         """Signal handler: backup succeeded (runs on main thread)."""
-        print(f"ðŸ’¾ Auto-backup saved â†’ {path}")
+        print(f"💾 Auto-backup saved → {path}")
 
     def _on_backup_failed(self, error: str):
         """Signal handler: backup failed (runs on main thread)."""
-        print(f"âš ï¸ Auto-backup failed: {error}")
+        print(f"⚠️ Auto-backup failed: {error}")
 
     def _on_backup_worker_done(self):
         """Signal handler: worker thread finished (success or failure)."""
@@ -14353,11 +13493,11 @@ class NakshaApp(QMainWindow):
         Called during app initialization to restore user preferences.
         """
         try:
-            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+            settings = QSettings("NakshaAI", "LidarApp")
             
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════════
             # ELEVATION SETTINGS
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════════
             # Load custom color ramp if saved
             saved_ramp = settings.value("elevation_color_ramp", None)
             if saved_ramp:
@@ -14367,9 +13507,9 @@ class NakshaApp(QMainWindow):
                         (float(pos), tuple(color)) 
                         for pos, color in saved_ramp
                     ]
-                    print(f"âœ… Loaded saved elevation ramp: {len(self.elevation_color_ramp)} stops")
+                    print(f"✅ Loaded saved elevation ramp: {len(self.elevation_color_ramp)} stops")
                 except Exception as e:
-                    print(f"âš ï¸ Failed to load elevation ramp: {e}")
+                    print(f"⚠️ Failed to load elevation ramp: {e}")
                     self.elevation_color_ramp = None
             self.shading_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
             if self.shading_quality not in ("fast", "normal", "slow"):
@@ -14385,28 +13525,28 @@ class NakshaApp(QMainWindow):
                         (float(pos), tuple(color))
                         for pos, color in saved_surface_ramp
                     ]
-                    print(f"âœ… Loaded saved surface ramp: {len(self.surface_color_ramp)} stops")
+                    print(f"✅ Loaded saved surface ramp: {len(self.surface_color_ramp)} stops")
                 except Exception as e:
-                    print(f"âš ï¸ Failed to load surface ramp: {e}")
+                    print(f"⚠️ Failed to load surface ramp: {e}")
                     self.surface_color_ramp = None
             
             # Load clip percentiles
             self.elevation_clip_low = settings.value("elevation_clip_low", 1.0, type=float)
             self.elevation_clip_high = settings.value("elevation_clip_high", 99.0, type=float)
             
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════════
             # INTENSITY SETTINGS
-            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # ══════════════════════════════════════════════════════════
             self.intensity_gamma = settings.value("intensity_gamma", 1.65, type=float)
             self.intensity_clip_low = settings.value("intensity_clip_low", 0.5, type=float)
             self.intensity_clip_high = settings.value("intensity_clip_high", 99.8, type=float)
             
-            print(f"âœ… Display settings loaded:")
+            print(f"✅ Display settings loaded:")
             print(f"   Elevation: {self.elevation_clip_low}%-{self.elevation_clip_high}%")
             print(f"   Intensity: gamma={self.intensity_gamma:.2f}, {self.intensity_clip_low}%-{self.intensity_clip_high}%")
             
         except Exception as e:
-            print(f"âš ï¸ Failed to load display settings: {e}")
+            print(f"⚠️ Failed to load display settings: {e}")
             # Keep defaults if load fails
 
     def toggle_gis_layers_panel(self):
@@ -14417,7 +13557,7 @@ class NakshaApp(QMainWindow):
             self._sync_activity_bar()
             return result
         except Exception as exc:
-            print(f"âš ï¸ Overlay Control Center failed to open: {exc}")
+            print(f"⚠️ Overlay Control Center failed to open: {exc}")
             import traceback
             traceback.print_exc()
             return None
@@ -14428,12 +13568,12 @@ class NakshaApp(QMainWindow):
             from gui.gis.gdb import toggle_gdb_panel
             return toggle_gdb_panel(self)
         except Exception as exc:
-            print(f"âš ï¸ GDB panel failed to open: {exc}")
+            print(f"⚠️ GDB panel failed to open: {exc}")
             import traceback
             traceback.print_exc()
             return None
 
-    # â”€â”€ Drag-and-drop import of GIS overlays â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Drag-and-drop import of GIS overlays ────────────────────────────────
     # Supported extensions that we will accept on a drop. Anything else is
     # ignored so we don't interfere with other drop targets.
     _GIS_DROP_EXTS = (
@@ -14464,7 +13604,7 @@ class NakshaApp(QMainWindow):
                 event.acceptProposedAction()
                 return
         except Exception as exc:
-            print(f"âš ï¸ dragEnterEvent: {exc}")
+            print(f"⚠️ dragEnterEvent: {exc}")
         event.ignore()
 
     def dragMoveEvent(self, event):
@@ -14494,17 +13634,17 @@ class NakshaApp(QMainWindow):
                     if _import_one(self, p):
                         ok += 1
                     elif _import_batch_canceled(self):
-                        print(f"   â›” Drop import cancelled by user at {p}")
+                        print(f"   ⛔ Drop import cancelled by user at {p}")
                         break
                 except Exception as exc:
-                    print(f"   âŒ Drop import error for {p}: {exc}")
+                    print(f"   ❌ Drop import error for {p}: {exc}")
                     import traceback
                     traceback.print_exc()
             if ok:
                 show_gis_layers_panel(self)
-            print(f"ðŸ“¥ Drag-drop import: {ok}/{len(paths)} file(s) loaded")
+            print(f"📥 Drag-drop import: {ok}/{len(paths)} file(s) loaded")
         except Exception as exc:
-            print(f"âš ï¸ dropEvent: {exc}")
+            print(f"⚠️ dropEvent: {exc}")
             event.ignore()
 
     def open_backup_settings(self):
@@ -14523,10 +13663,10 @@ class NakshaApp(QMainWindow):
                 from gui.soak_telemetry import SoakTelemetryController
 
                 self._soak_telemetry = SoakTelemetryController(self)
-            print("âœ… Soak telemetry started automatically (5s sampling)")
+            print("✅ Soak telemetry started automatically (5s sampling)")
             return True
         except Exception as e:
-            print(f"âš ï¸ Failed to auto-start soak telemetry: {e}")
+            print(f"⚠️ Failed to auto-start soak telemetry: {e}")
             return False
 
     def open_soak_telemetry(self):
@@ -14542,7 +13682,7 @@ class NakshaApp(QMainWindow):
                 self.statusBar().showMessage("Soak telemetry panel opened (5s sampling running)", 3000)
             return self._soak_telemetry
         except Exception as e:
-            print(f"âš ï¸ Failed to open soak telemetry: {e}")
+            print(f"⚠️ Failed to open soak telemetry: {e}")
             if hasattr(self, "statusBar") and self.statusBar():
                 self.statusBar().showMessage(f"Soak telemetry failed to open: {e}", 5000)
             QMessageBox.warning(
@@ -14565,7 +13705,7 @@ class NakshaApp(QMainWindow):
         import os
         from datetime import datetime
         
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
         
         # Get folder
         use_custom = settings.value("backup_use_custom_path", False, type=bool)
@@ -14840,64 +13980,11 @@ class NakshaApp(QMainWindow):
 
         return super().nativeEvent(eventType, message)
 
-    def _join_background_workers(self, reason: str = "", timeout_ms: int = 15000):
-        """Stop and join every QThread the app owns. Safe to call repeatedly.
-
-        The failure this prevents is Qt aborting the process when a QThread
-        object is destroyed while its run() is still executing. So each worker
-        is asked to stop, then WAITED ON - dropping the reference is not enough.
-        A worker that will not stop within the timeout is reported and skipped
-        rather than allowed to block shutdown.
-        """
-        names = (
-            "_surface_async_worker", "_surface_preview_worker",
-            "_shaded_preview_worker", "_shading_worker",
-            "_file_loader_worker", "_backup_worker",
-        )
-        stopped, stubborn = [], []
-        for attr in names:
-            try:
-                w = getattr(self, attr, None)
-            except Exception:
-                continue
-            if w is None:
-                continue
-            for meth in ("abort", "stop", "requestInterruption"):
-                try:
-                    if hasattr(w, meth):
-                        getattr(w, meth)()
-                        break
-                except Exception:
-                    pass
-            try:
-                if not w.isRunning():
-                    setattr(self, attr, None)
-                    stopped.append(f"{attr}(already stopped)")
-                    continue
-            except Exception:
-                setattr(self, attr, None)
-                continue
-            try:
-                if w.wait(int(timeout_ms)):
-                    stopped.append(attr)
-                else:
-                    stubborn.append(attr)
-            except Exception as exc:
-                stubborn.append(f"{attr}({exc})")
-            try:
-                setattr(self, attr, None)
-            except Exception:
-                pass
-        if stopped or stubborn:
-            print(f"[THREAD SHUTDOWN] {reason or 'join'}: stopped={len(stopped)} "
-                  f"unresponsive={stubborn or 'none'}")
-        return stopped, stubborn
-
     def closeEvent(self, event):
         """
         Graceful, production-grade cleanup for a graphics app.
-        âœ… ENHANCED: Closes ALL dialogs and popups without leaving anything behind
-        âœ… FIX: Proper cut section cleanup BEFORE VTK widget destruction
+        ✅ ENHANCED: Closes ALL dialogs and popups without leaving anything behind
+        ✅ FIX: Proper cut section cleanup BEFORE VTK widget destruction
         """
         if getattr(self, "_shutdown_in_progress", False):
             event.accept()
@@ -14915,32 +14002,22 @@ class NakshaApp(QMainWindow):
             return
 
         self._shutdown_in_progress = True
-        print("ðŸ§¹ Main window closing - cleaning up child dialogs")
+        native_view = getattr(self, "_lnt_main_view", None)
+        if native_view is not None:
+            native_view.stop(restore=False)
+            self._lnt_main_view = None
+        renderer_owner = getattr(self, "render_backend", None)
+        if renderer_owner is not None:
+            renderer_owner.shutdown()
+        print("🧹 Main window closing - cleaning up child dialogs")
 
-        # [PART 3] Stop and JOIN every background compute worker BEFORE the
-        # renderer is torn down. A QThread that is garbage-collected while
-        # still running aborts the process with "QThread: Destroyed while
-        # thread is still running" - the crash this fixes. Workers that cannot
-        # be interrupted are waited on with a bounded timeout, and a failure to
-        # stop cleanly is reported rather than raised, so shutdown always
-        # completes.
-        self._join_background_workers("shutdown")
-
-        # Native Vulkan backend teardown (no-op if never activated).
-        try:
-            _rb = getattr(self, "render_backend", None)
-            if _rb is not None:
-                _rb.shutdown()
-        except Exception as _rb_shutdown_err:
-            print(f"âš ï¸ Vulkan backend shutdown failed (ignored): {_rb_shutdown_err}")
-
-        # âœ… Temp Fence tool: full teardown (actors + popup + timer)
+        # ✅ Temp Fence tool: full teardown (actors + popup + timer)
         try:
             _tft = getattr(self, "temp_fence_tool", None)
             if _tft is not None:
                 _tft.shutdown()
         except Exception as _e:
-            print(f"âš ï¸ Temp fence shutdown failed: {_e}")
+            print(f"⚠️ Temp fence shutdown failed: {_e}")
 
         # Classifiers cooperatively mutate the shared class array in QThreads.
         # Join them before deleting dialogs, point data, or VTK resources.
@@ -15013,7 +14090,7 @@ class NakshaApp(QMainWindow):
             'height_convert_dialog',
             'display_mode_dialog',
             'display_dialog',
-            # â”€â”€ attachment / tool dialogs stored directly on app â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── attachment / tool dialogs stored directly on app ──────────
             'snt_dialog',
             'dxf_dialog',
             'dwg_dialog',
@@ -15031,7 +14108,7 @@ class NakshaApp(QMainWindow):
                 if dialog:
                     try:
                         dialog.close()
-                        print(f"   âœ… Closed {attr}")
+                        print(f"   ✅ Closed {attr}")
                     except Exception:
                         pass
        
@@ -15048,7 +14125,7 @@ class NakshaApp(QMainWindow):
                             except Exception:
                                 pass
        
-        print("âœ… Main window cleanup complete")
+        print("✅ Main window cleanup complete")
 
         print("=" * 60)
         print("Main Window Closing - Graceful Cleanup")
@@ -15113,14 +14190,14 @@ class NakshaApp(QMainWindow):
                 self.settings.setValue("geometry", self.saveGeometry())
                 self.settings.setValue("windowState", self.saveState())
 
-                # âœ… NEW: Save each cross-section dock geometry individually
+                # ✅ NEW: Save each cross-section dock geometry individually
                 if hasattr(self, 'section_docks') and self.section_docks:
                     for view_index, dock in self.section_docks.items():
                         dock_geo_key = f"CrossSectionDock_{view_index}_geometry"
                         self.settings.setValue(dock_geo_key, dock.saveGeometry())
-                        print(f"   âœ… Saved dock {view_index + 1} geometry")
+                        print(f"   ✅ Saved dock {view_index + 1} geometry")
                 
-                # âœ… NEW: Save cut section dock geometry
+                # ✅ NEW: Save cut section dock geometry
                 if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
                     if hasattr(self.cut_section_controller, 'cut_dock') and self.cut_section_controller.cut_dock:
                         try:
@@ -15128,19 +14205,19 @@ class NakshaApp(QMainWindow):
                                 "CutSectionDock_geometry",
                                 self.cut_section_controller.cut_dock.saveGeometry()
                             )
-                            print(f"   âœ… Saved cut section dock geometry")
+                            print(f"   ✅ Saved cut section dock geometry")
                         except Exception as e:
-                            print(f"   âš ï¸ Cut dock geometry save failed: {e}")
+                            print(f"   ⚠️ Cut dock geometry save failed: {e}")
 
-                print("âœ“ Window state and dock positions saved")
+                print("✓ Window state and dock positions saved")
             except Exception as e:
                 print(f"Warning: Could not save window state: {e}")
 
             # ============================================================
-            # âœ… CRITICAL FIX: CLEAN CUT SECTION CONTROLLER FIRST
+            # ✅ CRITICAL FIX: CLEAN CUT SECTION CONTROLLER FIRST
             # Must happen BEFORE any VTK widget cleanup
             # ============================================================
-            print("\nðŸ”§ Cleaning cut section controller...")
+            print("\n🔧 Cleaning cut section controller...")
             # Suppress expected VTK teardown warnings while dock widgets are being finalized.
             try:
                 import vtk
@@ -15153,77 +14230,77 @@ class NakshaApp(QMainWindow):
                         self.cut_section_controller._force_close_requested = True
                         try:
                             dock = self.cut_section_controller.cut_dock
-                            dock.hide()                        # âœ… destroy HWND first
+                            dock.hide()                        # ✅ destroy HWND first
                             if hasattr(self, 'removeDockWidget'):
-                                self.removeDockWidget(dock)    # âœ… detach from main window
+                                self.removeDockWidget(dock)    # ✅ detach from main window
                             dock.close()
                         except Exception:
                             pass
 
                     self.cut_section_controller.clear()
                     self.cut_section_controller = None
-                    print("   âœ… Cut section controller cleaned")
+                    print("   ✅ Cut section controller cleaned")
                 except Exception as e:
-                    print(f"   âš ï¸ Cut section cleanup error: {e}")
+                    print(f"   ⚠️ Cut section cleanup error: {e}")
                     import traceback
                     traceback.print_exc()
 
             # ============================================================
             # CLOSE ALL DIALOGS AND POPUPS (COMPREHENSIVE)
             # ============================================================
-            print("\nðŸ”’ Closing all dialogs and popups...")
+            print("\n🔒 Closing all dialogs and popups...")
 
-            # âœ… 1. Close the "Select Cross-Section View" dialog
+            # ✅ 1. Close the "Select Cross-Section View" dialog
             if hasattr(self, '_view_selector_dialog') and self._view_selector_dialog:
                 try:
-                    print("   ðŸ”’ Closing 'Select Cross-Section View' dialog")
+                    print("   🔒 Closing 'Select Cross-Section View' dialog")
                     if self._view_selector_dialog.isVisible():
                         self._view_selector_dialog.close()
                     self._view_selector_dialog.deleteLater()
                     self._view_selector_dialog = None
-                    print("   âœ… 'Select Cross-Section View' dialog closed")
+                    print("   ✅ 'Select Cross-Section View' dialog closed")
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to close view selector dialog: {e}")
+                    print(f"   ⚠️ Failed to close view selector dialog: {e}")
 
-            # âœ… 2. Close Display Mode dialog
+            # ✅ 2. Close Display Mode dialog
             if hasattr(self, "display_dialog") and self.display_dialog:
                 try:
-                    print("   ðŸ”’ Closing Display Mode dialog")
+                    print("   🔒 Closing Display Mode dialog")
                     self.display_dialog.close()
                     self.display_dialog.deleteLater()
                     self.display_dialog = None
-                    print("   âœ… Display Mode dialog closed")
+                    print("   ✅ Display Mode dialog closed")
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to close display dialog: {e}")
+                    print(f"   ⚠️ Failed to close display dialog: {e}")
 
-            # âœ… 3. Close legacy displaymodedialog (if it exists separately)
+            # ✅ 3. Close legacy displaymodedialog (if it exists separately)
             if hasattr(self, "displaymodedialog") and self.displaymodedialog:
                 try:
-                    print("   ðŸ”’ Closing legacy Display Mode dialog")
+                    print("   🔒 Closing legacy Display Mode dialog")
                     self.displaymodedialog.close()
                     self.displaymodedialog.deleteLater()
                     self.displaymodedialog = None
-                    print("   âœ… Legacy Display Mode dialog closed")
+                    print("   ✅ Legacy Display Mode dialog closed")
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to close legacy display dialog: {e}")
+                    print(f"   ⚠️ Failed to close legacy display dialog: {e}")
 
-            # âœ… 4. Close Class Picker
+            # ✅ 4. Close Class Picker
             if hasattr(self, "class_picker") and self.class_picker:
                 try:
-                    print("   ðŸ”’ Closing Class Picker")
+                    print("   🔒 Closing Class Picker")
                     self.class_picker.close()
                     self.class_picker.deleteLater()
-                    print("   âœ… Class Picker closed")
+                    print("   ✅ Class Picker closed")
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to close class picker: {e}")
+                    print(f"   ⚠️ Failed to close class picker: {e}")
                 finally:
                     self.class_picker = None
 
-            # âœ… 5. Close ShortcutManager (Config Tools)
+            # ✅ 5. Close ShortcutManager (Config Tools)
             try:
                 from gui.shortcut_manager import ShortcutManager
                 if ShortcutManager.instance is not None:
-                    print("   ðŸ”’ Closing Shortcut Manager (Config Tools)")
+                    print("   🔒 Closing Shortcut Manager (Config Tools)")
                     inst = ShortcutManager.instance
                     ShortcutManager.instance = None
                     try:
@@ -15234,43 +14311,43 @@ class NakshaApp(QMainWindow):
                         inst.deleteLater()
                     except Exception:
                         pass
-                    print("   âœ… Shortcut Manager closed")
+                    print("   ✅ Shortcut Manager closed")
             except Exception as e:
-                print(f"   âš ï¸ Failed to close ShortcutManager: {e}")
+                print(f"   ⚠️ Failed to close ShortcutManager: {e}")
 
-            # âœ… 6. Close any active tool dialog
+            # ✅ 6. Close any active tool dialog
             if hasattr(self, "active_tool_dialog") and self.active_tool_dialog:
                 try:
                     if self.active_tool_dialog.isVisible():
-                        print("   ðŸ”’ Closing active tool dialog")
+                        print("   🔒 Closing active tool dialog")
                         self.active_tool_dialog.close()
                         self.active_tool_dialog.deleteLater()
                         self.active_tool_dialog = None
-                        print("   âœ… Active tool dialog closed")
+                        print("   ✅ Active tool dialog closed")
                 except Exception as e:
-                    print(f"   âš ï¸ Failed to close active tool dialog: {e}")
+                    print(f"   ⚠️ Failed to close active tool dialog: {e}")
 
-            # âœ… 7. Close ALL remaining QDialog instances (catch-all)
+            # ✅ 7. Close ALL remaining QDialog instances (catch-all)
             try:
                 from PySide6.QtWidgets import QDialog
                 all_dialogs = self.findChildren(QDialog)
                 if all_dialogs:
-                    print(f"   ðŸ” Found {len(all_dialogs)} additional dialog(s)")
+                    print(f"   🔍 Found {len(all_dialogs)} additional dialog(s)")
                     for dialog in all_dialogs:
                         try:
                             if dialog.isVisible():
                                 dialog_name = dialog.windowTitle() or type(dialog).__name__
-                                print(f"   ðŸ”’ Closing: {dialog_name}")
+                                print(f"   🔒 Closing: {dialog_name}")
                                 dialog.close()
                                 dialog.deleteLater()
                         except Exception as e:
-                            print(f"   âš ï¸ Failed to close dialog: {e}")
-                    print(f"   âœ… All {len(all_dialogs)} dialog(s) closed")
+                            print(f"   ⚠️ Failed to close dialog: {e}")
+                    print(f"   ✅ All {len(all_dialogs)} dialog(s) closed")
             except Exception as e:
-                print(f"   âš ï¸ Failed to close remaining dialogs: {e}")
+                print(f"   ⚠️ Failed to close remaining dialogs: {e}")
 
-# â”€â”€ INSERT BEFORE (new step 7b) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # âœ… 7b. Close lidar classification + block-creation dialogs
+# ── INSERT BEFORE (new step 7b) ───────────────────────────────────────────
+            # ✅ 7b. Close lidar classification + block-creation dialogs
             #         stored on ribbon panel objects (not on self).
             try:
                 ribbon_dialog_attrs = [
@@ -15294,42 +14371,42 @@ class NakshaApp(QMainWindow):
                                 dlg.close()
                                 dlg.deleteLater()
                                 setattr(ribbon_panel, attr, None)
-                                print(f"   âœ… Closed ribbon dialog: {dlg_name}")
+                                print(f"   ✅ Closed ribbon dialog: {dlg_name}")
                             except Exception as e:
-                                print(f"   âš ï¸ Could not close {attr}: {e}")
+                                print(f"   ⚠️ Could not close {attr}: {e}")
             except Exception as e:
-                print(f"   âš ï¸ Failed to close ribbon panel dialogs: {e}")
+                print(f"   ⚠️ Failed to close ribbon panel dialogs: {e}")
 
-            # âœ… 8. Close ALL QWidget-based popups (if any)
+            # ✅ 8. Close ALL QWidget-based popups (if any)
             try:
                 from PySide6.QtWidgets import QWidget
                 from PySide6.QtCore import Qt
                 all_widgets = self.findChildren(QWidget)
                 popup_widgets = [w for w in all_widgets if w.windowFlags() & Qt.Tool or w.windowFlags() & Qt.Popup]
                 if popup_widgets:
-                    print(f"   ðŸ” Found {len(popup_widgets)} popup widget(s)")
+                    print(f"   🔍 Found {len(popup_widgets)} popup widget(s)")
                     for widget in popup_widgets:
                         try:
                             if widget.isVisible() and widget != self:
                                 widget_name = widget.objectName() or type(widget).__name__
-                                print(f"   ðŸ”’ Closing popup: {widget_name}")
+                                print(f"   🔒 Closing popup: {widget_name}")
                                 widget.close()
                                 widget.deleteLater()
                         except Exception as e:
-                            print(f"   âš ï¸ Failed to close popup widget: {e}")
-                    print(f"   âœ… All {len(popup_widgets)} popup(s) closed")
+                            print(f"   ⚠️ Failed to close popup widget: {e}")
+                    print(f"   ✅ All {len(popup_widgets)} popup(s) closed")
             except Exception as e:
-                print(f"   âš ï¸ Failed to close popup widgets: {e}")
+                print(f"   ⚠️ Failed to close popup widgets: {e}")
 
-            # âœ… 9. Kill all floating minimize-chips (Qt.Tool windows â€“ NOT
+            # ✅ 9. Kill all floating minimize-chips (Qt.Tool windows – NOT
             #        children of self, so findChildren() cannot see them).
             try:
                 close_all_chips()
-                print("   âœ… All minimized chips removed from taskbar")
+                print("   ✅ All minimized chips removed from taskbar")
             except Exception as e:
-                print(f"   âš ï¸ Failed to close minimize chips: {e}")
+                print(f"   ⚠️ Failed to close minimize chips: {e}")
 
-            # âœ… 10. Force-close every OS-level top-level window that still
+            # ✅ 10. Force-close every OS-level top-level window that still
             #         belongs to this application (catches dialogs that called
             #         showMinimized() and are therefore top-level, plus any
             #         other parentless QWidget left over).
@@ -15343,17 +14420,17 @@ class NakshaApp(QMainWindow):
                                 continue
                             if tlw.isVisible() or tlw.windowState() & Qt.WindowMinimized:
                                 tlw_name = tlw.windowTitle() or type(tlw).__name__
-                                print(f"   ðŸ”’ Closing top-level window: {tlw_name}")
+                                print(f"   🔒 Closing top-level window: {tlw_name}")
                                 tlw.hide()
                                 tlw.close()
                                 tlw.deleteLater()
                         except Exception as e:
-                            print(f"   âš ï¸ Could not close top-level window: {e}")
-                    print("   âœ… All top-level windows closed")
+                            print(f"   ⚠️ Could not close top-level window: {e}")
+                    print("   ✅ All top-level windows closed")
             except Exception as e:
-                print(f"   âš ï¸ Failed to sweep top-level windows: {e}")
+                print(f"   ⚠️ Failed to sweep top-level windows: {e}")
 
-            print("âœ… All dialogs and popups closed\n")
+            print("✅ All dialogs and popups closed\n")
 
             # ============================================================
             # STOP BACKGROUND THREADS AND TIMERS
@@ -15376,7 +14453,7 @@ class NakshaApp(QMainWindow):
                         thread.quit()
                         waited = thread.wait(timeout_ms)
                         if not waited:
-                            print(f"âš ï¸ {label} thread still running after timeout; leaving it to finish safely")
+                            print(f"⚠️ {label} thread still running after timeout; leaving it to finish safely")
                             if thread not in _SHUTDOWN_THREAD_GUARD:
                                 _SHUTDOWN_THREAD_GUARD.append(thread)
                                 thread.finished.connect(
@@ -15387,7 +14464,7 @@ class NakshaApp(QMainWindow):
                     else:
                         thread.wait(100)
                 except Exception as exc:
-                    print(f"   âš ï¸ {label} thread shutdown error: {exc}")
+                    print(f"   ⚠️ {label} thread shutdown error: {exc}")
                     return False
                 return True
 
@@ -15403,7 +14480,7 @@ class NakshaApp(QMainWindow):
                     t.quit()
                     waited = t.wait(9000)
                     if not waited:
-                        print("âš ï¸ Backup thread still running after timeout; leaving it to finish safely")
+                        print("⚠️ Backup thread still running after timeout; leaving it to finish safely")
                         if t not in _SHUTDOWN_THREAD_GUARD:
                             _SHUTDOWN_THREAD_GUARD.append(t)
                             t.finished.connect(
@@ -15423,7 +14500,7 @@ class NakshaApp(QMainWindow):
                         elif hasattr(worker, "stop"):
                             worker.stop()
                     except Exception as exc:
-                        print(f"   âš ï¸ Color worker shutdown error: {exc}")
+                        print(f"   ⚠️ Color worker shutdown error: {exc}")
                 color_stopped = shutdown_thread(color_thread, "color")
                 if color_stopped:
                     try:
@@ -15514,18 +14591,18 @@ class NakshaApp(QMainWindow):
                         except Exception:
                             pass
                 
-                # âœ… FIX: Safe render window finalization (VTK version compatibility)
+                # ✅ FIX: Safe render window finalization (VTK version compatibility)
                 try:
                     if hasattr(vtkwidget, "GetRenderWindow"):
                         rw = vtkwidget.GetRenderWindow()
                         if rw:
-                            # âœ… Check if SetMapped exists before calling (not all VTK versions have it)
+                            # ✅ Check if SetMapped exists before calling (not all VTK versions have it)
                             if hasattr(rw, 'SetMapped'):
                                 rw.SetMapped(False)
                             rw.Finalize()
                             del rw
                 except Exception as e:
-                    print(f"   âš ï¸ RenderWindow finalize warning: {e}")
+                    print(f"   ⚠️ RenderWindow finalize warning: {e}")
                 
                 if hasattr(vtkwidget, "SetRenderWindow"):
                     vtkwidget.SetRenderWindow(None)
@@ -15556,7 +14633,7 @@ class NakshaApp(QMainWindow):
                 self.sectionvtks.clear()
                 self.sectionvtks = None
 
-            # âœ… FIX: Cut section VTK cleanup (already handled above, skip duplicate)
+            # ✅ FIX: Cut section VTK cleanup (already handled above, skip duplicate)
             # Cut section controller was already cleaned at the start
 
             # Clean main VTK widget
@@ -15623,12 +14700,12 @@ class NakshaApp(QMainWindow):
             iren.RemoveObservers("LeftButtonReleaseEvent")
             iren.SetInteractorStyle(None)
         self.active_tool = None
-        print("ðŸ”µ All tools deactivated.")
+        print("🔵 All tools deactivated.")
 
     def enable_2d_lock(self):
         """
         Lock the VTK interactor to 2D mode (no 3D rotation).
-        Allows only pan and zoom â€” ideal for Plan View.
+        Allows only pan and zoom — ideal for Plan View.
         """
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
         interactor = self.vtk_widget.interactor
@@ -15648,7 +14725,7 @@ class NakshaApp(QMainWindow):
 
         style = vtkInteractorStyleImage()  # pan/zoom only, no rotation
         interactor.SetInteractorStyle(style)
-        print("ðŸ”’ Plan View locked to 2D (rotation disabled).")
+        print("🔒 Plan View locked to 2D (rotation disabled).")
 
     def enable_3d_orbit(self):
         """
@@ -15666,7 +14743,7 @@ class NakshaApp(QMainWindow):
         cam = self.vtk_widget.renderer.GetActiveCamera()
         cam.ParallelProjectionOff()
         self.vtk_widget.render()
-        print("ðŸŒ€ 3D orbit mode re-enabled.")
+        print("🌀 3D orbit mode re-enabled.")
 
 
 
@@ -15731,7 +14808,7 @@ class NakshaApp(QMainWindow):
                 from .save_pointcloud import save_pointcloud
                 file_ribbon.save_file.connect(lambda: save_pointcloud(self, path=None, show_dialog=True))
             except Exception as e:
-                print(f"âš ï¸ Failed to connect Save As: {e}")
+                print(f"⚠️ Failed to connect Save As: {e}")
 
             if hasattr(file_ribbon, "save_quick"):
                 file_ribbon.save_quick.connect(self._save_quick_no_dialog)
@@ -15772,7 +14849,7 @@ class NakshaApp(QMainWindow):
         display_ribbon.display_mode_clicked.connect(self.open_display_mode)
         display_ribbon.fields_clicked.connect(self.open_fields_panel)
         display_ribbon.border_width_changed.connect(self.on_border_changed)
-        print("âœ… Border slider connected to on_border_changed")
+        print("✅ Border slider connected to on_border_changed")
 
         # =========================
         # Draw ribbon
@@ -15784,7 +14861,7 @@ class NakshaApp(QMainWindow):
                 self._draw_curve_context_active = False
                 self._deactivate_pending_cut_section_tool("switching to drawing")
 
-                # âœ… MUTUAL EXCLUSION: every draw tool (including the Ortho
+                # ✅ MUTUAL EXCLUSION: every draw tool (including the Ortho
                 # polygon tool and Hatch Area) reacts to left-click on the
                 # main view, which collides with Identify / Point Sync / SNT
                 # pick. Disable the point-pick tools whenever a draw tool is
@@ -15818,7 +14895,7 @@ class NakshaApp(QMainWindow):
 
                 if hasattr(self, "digitizer"):
                     self.digitizer.enabled = True
-                    print("âœ… Digitizer enabled for drawing")
+                    print("✅ Digitizer enabled for drawing")
 
                     # Default behavior: normal Move Vertex remains free 360 movement.
                     self.digitizer.vertex_move_constraint_mode = "free"
@@ -15861,11 +14938,11 @@ class NakshaApp(QMainWindow):
             curve_ribbon.clear_curves.connect(
                 lambda: self.curve_tool.clear_all_curves() if hasattr(self, "curve_tool") else None
             )
-            print("âœ… Curve ribbon connected")
+            print("✅ Curve ribbon connected")
 
         self._sidebar_actions_connected = True
 
-    # â”€â”€ Vertex Move Measure Popup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Vertex Move Measure Popup ────────────────────────────────
 
     def _show_vertex_move_measure_popup(self):
         """Show the floating vertex-move-measure popup near the cursor.
@@ -15923,24 +15000,24 @@ class NakshaApp(QMainWindow):
         """Handle saturation slider changes from View Ribbon."""
         # Convert percentage (0-200) to multiplier (0.0-2.0)
         self.current_saturation = value / 100.0
-        print(f"ðŸŽ¨ Saturation set to {value}% (multiplier: {self.current_saturation:.2f}x)")
+        print(f"🎨 Saturation set to {value}% (multiplier: {self.current_saturation:.2f}x)")
         
         # Refresh display if in depth or intensity mode
         if self.display_mode in ["depth", "intensity"]:
             from gui.pointcloud_display import update_pointcloud
             update_pointcloud(self, self.display_mode)
-            self.statusBar().showMessage(f"ðŸŽ¨ Saturation: {value}%", 2000)
+            self.statusBar().showMessage(f"🎨 Saturation: {value}%", 2000)
 
     def on_sharpness_changed(self, value):
         """
-        Amplifier removed â€” this handler is intentionally a no-op.
+        Amplifier removed — this handler is intentionally a no-op.
         current_sharpness is permanently 1.0 to prevent depth/intensity values
         from corrupting the class color buffer when switching display modes.
         The signal is also disconnected at ribbon setup, so this should not fire.
         """
         # DO NOT update self.current_sharpness here.
         # DO NOT call update_pointcloud here.
-        print(f"âš ï¸ on_sharpness_changed called (amplifier disabled) â€” ignoring value={value}")
+        print(f"⚠️ on_sharpness_changed called (amplifier disabled) — ignoring value={value}")
 
             # In app_window.py - add to Tools ribbon
     def debug_class_0(self):
@@ -15953,9 +15030,9 @@ class NakshaApp(QMainWindow):
         class_0_count = np.sum(self.data["classification"] == 0)
         
         info = f"""
-        â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        ═══════════════════════════════════
         CLASS 0 DIAGNOSTIC
-        â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        ═══════════════════════════════════
         Total points: {len(self.data['classification']):,}
         Class 0 points: {class_0_count:,} ({100*class_0_count/len(self.data['classification']):.1f}%)
         Unique classes: {unique_classes}
@@ -15963,7 +15040,7 @@ class NakshaApp(QMainWindow):
         Class 0 in palette: {0 in self.class_palette}
         Class 0 visible: {self.class_palette.get(0, {}).get('show', False)}
         Class 0 color: {self.class_palette.get(0, {}).get('color', 'NOT SET')}
-        â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        ═══════════════════════════════════
         """
         
         print(info)
@@ -15987,7 +15064,7 @@ class NakshaApp(QMainWindow):
         # for that action and revoke it for every orthographic view.
         self._main_view_3d_user_enabled = mode == '3d'
 
-        # âœ… NEW: Store DXF visibility state
+        # ✅ NEW: Store DXF visibility state
         dxf_visibility = {}
         if hasattr(self, 'dxf_actors'):
             for i, dxf_data in enumerate(self.dxf_actors):
@@ -15995,7 +15072,7 @@ class NakshaApp(QMainWindow):
                 for actor in dxf_data['actors']:
                     dxf_visibility[i].append(actor.GetVisibility())
         
-        # âœ… CRITICAL: Temporarily disable cross-section interactor BEFORE view change
+        # ✅ CRITICAL: Temporarily disable cross-section interactor BEFORE view change
         interactor_was_active = False
         if hasattr(self, 'cross_interactor') and self.cross_interactor:
             interactor_was_active = True
@@ -16019,7 +15096,7 @@ class NakshaApp(QMainWindow):
         finally:
             self._allow_3d_switch = previous_allow_3d
         
-        # âœ… NEW: Restore DXF visibility after view change
+        # ✅ NEW: Restore DXF visibility after view change
         if hasattr(self, 'dxf_actors') and dxf_visibility:
             for i, dxf_data in enumerate(self.dxf_actors):
                 if i in dxf_visibility:
@@ -16027,20 +15104,20 @@ class NakshaApp(QMainWindow):
                         if j < len(dxf_visibility[i]):
                             actor.SetVisibility(dxf_visibility[i][j])
         
-        # âœ… CRITICAL: Re-attach interactor AFTER view change with fresh state
+        # ✅ CRITICAL: Re-attach interactor AFTER view change with fresh state
         if interactor_was_active:
             cross_interactor_ref.P1 = None
             cross_interactor_ref.P2 = None
             cross_interactor_ref.slice_state = 0
             
             self.vtk_widget.interactor.SetInteractorStyle(cross_interactor_ref)
-            print(f"âœ… Cross-section interactor reattached for {mode} view")
+            print(f"✅ Cross-section interactor reattached for {mode} view")
             
             if hasattr(self, 'section_controller') and self.section_controller:
                 try:
                     self.section_controller.clear()
                 except Exception as e:
-                    print(f"âš ï¸ Clear failed: {e}")
+                    print(f"⚠️ Clear failed: {e}")
         
         # Keep existing cross-section windows visible
         if hasattr(self, 'section_vtks') and self.section_vtks:
@@ -16049,9 +15126,9 @@ class NakshaApp(QMainWindow):
                     try:
                         vtk_widget.render()
                     except Exception as e:
-                        print(f"âš ï¸ View {view_idx + 1} render failed: {e}")
+                        print(f"⚠️ View {view_idx + 1} render failed: {e}")
         
-        # âœ… NEW: Final render to show DXF
+        # ✅ NEW: Final render to show DXF
         self.vtk_widget.GetRenderWindow().Render()
 
         if hasattr(self, "_schedule_main_view_history_commit"):
@@ -16066,26 +15143,26 @@ class NakshaApp(QMainWindow):
                 if getattr(dialog, "_is_minimized_to_chip", False):
                     dialog.restore_from_chip()
                 if dialog.isVisible():
-                    print(f"ðŸ›‘ Closing element selection dialog ({reason})")
+                    print(f"🛑 Closing element selection dialog ({reason})")
                     dialog.close()
             except Exception as e:
-                print(f"âš ï¸ Failed to close element selection dialog: {e}")
+                print(f"⚠️ Failed to close element selection dialog: {e}")
 
         digitizer = getattr(self, "digitizer", None)
         if digitizer is not None:
             try:
                 digitizer.deactivate_element_select_tool()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate element selection tool: {e}")
+                print(f"⚠️ Failed to deactivate element selection tool: {e}")
 
         select_rect = getattr(self, "select_rectangle_tool", None)
         if select_rect is not None:
             try:
                 if getattr(select_rect, "active", False):
-                    print(f"ðŸ›‘ Deactivating rectangle selection tool ({reason})")
+                    print(f"🛑 Deactivating rectangle selection tool ({reason})")
                     select_rect.deactivate()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate rectangle selection tool: {e}")
+                print(f"⚠️ Failed to deactivate rectangle selection tool: {e}")
 
     def _deactivate_digitize_tool(self):
         """Deactivate any active digitize/selection tool (for mutual exclusion with section tools)."""
@@ -16103,7 +15180,7 @@ class NakshaApp(QMainWindow):
         accudraw_tool = getattr(digitizer, "accudraw_tool", None) if digitizer is not None else None
         if accudraw_tool is not None and getattr(accudraw_tool, "active", False):
             try:
-                print("ðŸ›‘ Deactivating AccuDraw before section tool activation")
+                print("🛑 Deactivating AccuDraw before section tool activation")
                 if hasattr(accudraw_tool, "finish_for_tool_switch"):
                     accudraw_tool.finish_for_tool_switch("section tool activation")
                 else:
@@ -16114,11 +15191,11 @@ class NakshaApp(QMainWindow):
                     )
                     accudraw_tool.deactivate(cancel=has_unfinished)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate AccuDraw: {e}")
+                print(f"⚠️ Failed to deactivate AccuDraw: {e}")
 
         if hasattr(self, 'digitizer') and self.digitizer and getattr(self.digitizer, 'active_tool', None):
             try:
-                print("ðŸ›‘ Deactivating digitize tool before section tool activation")
+                print("🛑 Deactivating digitize tool before section tool activation")
                 # Preserve in-progress draw state so the user can resume the
                 # exact unfinished shape after leaving cross-section mode.
                 resumable_tools = {
@@ -16136,7 +15213,7 @@ class NakshaApp(QMainWindow):
                 else:
                     self.digitizer.set_tool(None)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate digitize tool: {e}")
+                print(f"⚠️ Failed to deactivate digitize tool: {e}")
 
     def _deactivate_pending_cut_section_tool(self, reason="switching tools"):
         """
@@ -16163,7 +15240,7 @@ class NakshaApp(QMainWindow):
             pending = state not in (0, 3) or has_preview or has_observers
 
             if pending:
-                print(f"ðŸ›‘ Deactivating pending cut-section tool ({reason})")
+                print(f"🛑 Deactivating pending cut-section tool ({reason})")
 
             force_cleanup = getattr(ctrl, "_force_deactivate_pending_state", None)
             if pending and force_cleanup:
@@ -16178,12 +15255,22 @@ class NakshaApp(QMainWindow):
                 except TypeError:
                     self.set_cross_cursor_active(False)
         except Exception as e:
-            print(f"âš ï¸ Failed to deactivate pending cut-section tool: {e}")
+            print(f"⚠️ Failed to deactivate pending cut-section tool: {e}")
 
     def handle_tool_activation(self, tool_name):
         """Handle tool activation from sidebar"""
         if tool_name != "cut_section":
             self._deactivate_pending_cut_section_tool(f"switching to {tool_name}")
+
+        # ✅ MUTUAL EXCLUSION: deactivate any active classification tool so its
+        # VTK interactor doesn't fight the newly activated tool's observers.
+        # Mirrors what execute_tool() does on the shortcut path.
+        if getattr(self, "active_classify_tool", None) is not None:
+            try:
+                print(f"🛑 Deactivating classification tool before {tool_name} (sidebar)")
+                self.deactivate_classification_tool(preserve_cross_section=True)
+            except Exception as _e:
+                print(f"⚠️ Failed to deactivate classification before {tool_name}: {_e}")
 
         if tool_name == "cross_section":
             self.toggle_cross_section_mode(True)
@@ -16199,11 +15286,11 @@ class NakshaApp(QMainWindow):
             # self.set_cross_cursor_active(True)
         elif tool_name == "configure_shortcuts":
             self.open_shortcut_manager()
-        elif tool_name == "backup_settings":  # â† ADD THIS
+        elif tool_name == "backup_settings":  # ← ADD THIS
             self.open_backup_settings()
         elif tool_name == "soak_telemetry":
             self.open_soak_telemetry()
-        elif tool_name == "prj_block_identifier":  # â† ADD THIS
+        elif tool_name == "prj_block_identifier":  # ← ADD THIS
             from gui.prj_block_identifier import show_block_identifier_dialog
             self.block_identifier_dialog = show_block_identifier_dialog(self)
         elif tool_name == "sync_views":
@@ -16223,7 +15310,7 @@ class NakshaApp(QMainWindow):
             else:
                 QMessageBox.information(self, "Load by Fence", "No fenced load is active.")
         else:
-            print(f"âš ï¸ Unknown tool_name from ToolsRibbon: {tool_name}")
+            print(f"⚠️ Unknown tool_name from ToolsRibbon: {tool_name}")
 
 
 
@@ -16259,7 +15346,7 @@ class NakshaApp(QMainWindow):
         from PySide6.QtCore import QSettings
         from PySide6.QtGui import QColor
        
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
        
         # Load color
         color_name = settings.value("cross_line_color", "#FF00FF")  # Magenta hex
@@ -16272,7 +15359,7 @@ class NakshaApp(QMainWindow):
         # Load style
         self.cross_line_style = settings.value("cross_line_style", "solid", type=str)
        
-        print(f"âœ… Loaded cross-section settings: {color_name}, {self.cross_line_width}px, {self.cross_line_style}")
+        print(f"✅ Loaded cross-section settings: {color_name}, {self.cross_line_width}px, {self.cross_line_style}")
            
 
 
@@ -16283,19 +15370,24 @@ class NakshaApp(QMainWindow):
         elif action == "redo":
             self.redo_classification()
         elif action == "cut":
-            print("âœ‚ï¸ Cut action â€” not implemented yet")
+            print("✂️ Cut action — not implemented yet")
         elif action == "copy":
-            print("ðŸ“‹ Copy action â€” not implemented yet")
+            tool = getattr(getattr(self, "digitizer", None), "_element_select_tool", None)
+            if (tool is not None and tool.is_active() and
+                    getattr(tool, "_method", None) == "snt_text"):
+                tool.copy_selected_snt_text_to_clipboard()
+            else:
+                print("📋 Copy action — not implemented yet")
         elif action == "paste":
-            print("ðŸ“Ž Paste action â€” not implemented yet")
+            print("📎 Paste action — not implemented yet")
         elif action == "delete":
-            print("ðŸ—‘ï¸ Delete action â€” not implemented yet")
+            print("🗑️ Delete action — not implemented yet")
         elif action == "select_all":
-            print("ðŸ”˜ Select All â€” not implemented yet")
+            print("🔘 Select All — not implemented yet")
         elif action == "deselect":
-            print("â­• Deselect All â€” not implemented yet")
+            print("⭕ Deselect All — not implemented yet")
         else:
-            print(f"âš ï¸ Unknown edit action: {action}")
+            print(f"⚠️ Unknown edit action: {action}")
 
 
 
@@ -16305,7 +15397,7 @@ class NakshaApp(QMainWindow):
         if not hasattr(self, "data") or self.data is None:
             return
         self.shadow_enabled = enabled
-        print(f"ðŸŒ— Shadow {'enabled' if enabled else 'disabled'}")
+        print(f"🌗 Shadow {'enabled' if enabled else 'disabled'}")
 
         # Adjust ambient term: less ambient = stronger shadow
         ambient = 0.1 if enabled else 0.4
@@ -16315,7 +15407,7 @@ class NakshaApp(QMainWindow):
         
         from .shading_display import update_shaded_class
         
-        # âœ… Pass all parameters including quality and speed
+        # ✅ Pass all parameters including quality and speed
         update_shaded_class(
             self,
             azimuth=getattr(self, "last_shade_azimuth", 45.0),
@@ -16332,19 +15424,19 @@ class NakshaApp(QMainWindow):
             return
         
         self.depth_enabled = enabled
-        print(f"ðŸ§± Depth shading {'enabled' if enabled else 'disabled'}")
+        print(f"🧱 Depth shading {'enabled' if enabled else 'disabled'}")
 
         if self.display_mode != "shaded_class":
-            print("âš ï¸ Depth shading only applies to shaded_class mode.")
+            print("⚠️ Depth shading only applies to shaded_class mode.")
             return
 
-        # âœ… Store depth state
+        # ✅ Store depth state
         if enabled:
-            print("âœ… Depth shading will be applied during triangulation")
+            print("✅ Depth shading will be applied during triangulation")
         else:
-            print("âœ… Depth shading disabled")
+            print("✅ Depth shading disabled")
         
-        # âœ… Rebuild with depth consideration
+        # ✅ Rebuild with depth consideration
         from .shading_display import update_shaded_class
         update_shaded_class(
             self,
@@ -16371,55 +15463,63 @@ class NakshaApp(QMainWindow):
                 preserve_camera=True,
                 reason="restore_main_interactor",
             ):
-                print("ðŸ”„ Main interactor restored to 2D mode")
+                print("🔄 Main interactor restored to 2D mode")
 
         except Exception as e:
-            print(f"âš ï¸ Failed to restore interactor: {e}")
+            print(f"⚠️ Failed to restore interactor: {e}")
         self.set_cross_cursor_active(False)
 
 
     #     """Instant update without rebuilding the point cloud."""
     #     self.point_border_percent = border_percent
         
-    #     # ðŸš€ PRODUCTION FIX: Poke GPU directly, no rebuild.
+    #     # 🚀 PRODUCTION FIX: Poke GPU directly, no rebuild.
         
     #     # Update Main View (Slot 0)
         
     #     # Update any active Cross-Sections (Slots 1-4)
 
-    #     self.statusBar().showMessage(f"ðŸ”³ Border: {border_percent}% (GPU Updated)", 1000)
+    #     self.statusBar().showMessage(f"🔳 Border: {border_percent}% (GPU Updated)", 1000)
 
     def on_border_changed(self, border_percent):
         """Instant update without rebuilding the point cloud."""
         self.point_border_percent = border_percent
         if not hasattr(self, 'view_borders'):
             self.view_borders = {i: 0 for i in range(6)}
-        self.view_borders[0] = border_percent          # â† keep view_borders in sync
+        self.view_borders[0] = border_percent          # ← keep view_borders in sync
 
         CLASS_MODES = {"class", "shaded_class"}
         current_mode = getattr(self, "display_mode", "class")
 
         if current_mode not in CLASS_MODES:
-            # âœ… In non-class modes: push the border uniform directly without
-            # calling sync_palette_to_gpu (which would overwrite the color buffer
+            # ✅ In non-class modes: push border uniforms without rewriting the
+            # resident RGB presentation.  Phase-2B must update every render tile.
             try:
                 from gui.unified_actor_manager import (
-                    _get_unified_actor, _apply_border_once, _push_uniforms_direct
+                    _get_unified_actor, _apply_border_once, _push_uniforms_direct,
+                    _is_main_tiled, sync_palette_to_gpu
                 )
-                _actor = _get_unified_actor(self)
-                if _actor is not None:
-                    _apply_border_once(_actor, border_percent)
-                    _ctx = getattr(_actor, "_naksha_shader_ctx", None)
-                    if _ctx is not None:
-                        _push_uniforms_direct(_actor, _ctx)
-                    try:
-                        self.vtk_widget.render()
-                    except Exception:
-                        pass
-                    print(f"ðŸ”³ Border {border_percent}% pushed in {current_mode} mode (uniform only)")
+                if _is_main_tiled(self):
+                    sync_palette_to_gpu(
+                        self, slot_idx=0, palette=getattr(self, 'class_palette', None),
+                        border=float(border_percent), render=True, rewrite_rgb=False
+                    )
+                    print(f"🔳 Border {border_percent}% pushed to tiled Main View in {current_mode} mode")
+                else:
+                    _actor = _get_unified_actor(self)
+                    if _actor is not None:
+                        _apply_border_once(_actor, border_percent)
+                        _ctx = getattr(_actor, "_naksha_shader_ctx", None)
+                        if _ctx is not None:
+                            _push_uniforms_direct(_actor, _ctx)
+                        try:
+                            self.vtk_widget.render()
+                        except Exception:
+                            pass
+                        print(f"🔳 Border {border_percent}% pushed in {current_mode} mode (uniform only)")
             except Exception as _be:
-                print(f"âš ï¸ Border uniform push failed: {_be}")
-            self.statusBar().showMessage(f"ðŸ”³ Border: {border_percent}%", 1000)
+                print(f"⚠️ Border uniform push failed: {_be}")
+            self.statusBar().showMessage(f"🔳 Border: {border_percent}%", 1000)
             return
 
         from gui.unified_actor_manager import sync_palette_to_gpu
@@ -16431,65 +15531,122 @@ class NakshaApp(QMainWindow):
                 b = float(self.view_borders.get(view_idx + 1, 0))
                 sync_palette_to_gpu(self, slot_idx=view_idx + 1, border=b)
 
-        self.statusBar().showMessage(f"ðŸ”³ Border: {border_percent}% (GPU Updated)", 1000)
+        self.statusBar().showMessage(f"🔳 Border: {border_percent}% (GPU Updated)", 1000)
 
 
     def apply_classification_signal(self, changed_mask, to_class):
-        """ðŸš€ ZERO-LAG SYNC: Main View + All Sub-views"""
+        """Compatibility signal entry point using Phase-1 sparse transactions.
+
+        Historical callers may still provide bool[N].  It is consumed once to
+        obtain canonical indices; Class mode stays sparse afterwards.
+        """
         import numpy as np
+        from gui.classification_delta import (
+            SparseClassificationDelta,
+            make_delta,
+            materialize_changed_mask,
+            publish_delta,
+            resolve_changed_indices,
+        )
 
-        # 1. Update Core CPU Memory
-        # Preserve the exact transition for Surface before mutating ground truth.
-        # This is O(K) and lets Surface decide whether geometry actually changed.
-        try:
-            _surface_changed_idx = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
-            _surface_old = self.data["classification"][_surface_changed_idx].copy()
-            _surface_new = np.full(
-                _surface_changed_idx.size, to_class, dtype=self.data["classification"].dtype
+        classes = self.data["classification"]
+        incoming_delta = changed_mask if isinstance(changed_mask, SparseClassificationDelta) else None
+        changed_idx = resolve_changed_indices(changed_mask, app=self, n_points=len(classes))
+        if changed_idx.size == 0:
+            return False
+
+        old_classes = classes[changed_idx].copy()
+        new_classes = np.full(changed_idx.size, to_class, dtype=classes.dtype)
+        effective = old_classes != new_classes
+        if not np.all(effective):
+            changed_idx = changed_idx[effective]
+            old_classes = old_classes[effective]
+            new_classes = new_classes[effective]
+        if changed_idx.size == 0:
+            return False
+
+        self._pending_surface_delta = {
+            "indices": changed_idx.copy(),
+            "old_classes": old_classes.copy(),
+            "new_classes": new_classes.copy(),
+        }
+
+        classes[changed_idx] = new_classes
+        self.classification_revision = int(
+            getattr(self, "classification_revision", 0) or 0
+        ) + 1
+
+        delta = incoming_delta
+        if delta is None or not np.array_equal(delta.indices, changed_idx):
+            delta = make_delta(
+                changed_idx,
+                old_classes=old_classes,
+                new_classes=new_classes,
+                dataset_size=len(classes),
+                operation="classification",
+                origin_view="apply_classification_signal",
+                tx_id=int(getattr(self, "_classification_tx_id", 0) or 0),
             )
-            self._pending_surface_delta = {
-                "indices": _surface_changed_idx.copy(),
-                "old_classes": _surface_old,
-                "new_classes": _surface_new,
-            }
-        except Exception:
-            self._pending_surface_delta = None
+        publish_delta(self, delta)
 
-        self.data["classification"][changed_mask] = to_class
-        self.classification_revision = int(getattr(self, "classification_revision", 0) or 0) + 1
+        try:
+            from gui.shading_display import record_shading_classification_delta
+            record_shading_classification_delta(
+                self,
+                changed_idx,
+                old_classes,
+                new_classes,
+                operation='classification',
+                origin_view='apply_classification_signal',
+            )
+        except Exception as _shading_delta_err:
+            print(f'SHADING_DELTA_JOURNAL status=record_failed reason={_shading_delta_err}')
 
-        # *** CRITICAL FIX: Clear redo stack â€” new classification invalidates redo history ***
         self.redo_stack.clear()
 
-        # 2. âš¡ POKE MAIN VIEW GPU / SURFACE MESH
-        if str(getattr(self, "display_mode", "class") or "class").lower() == "surface":
+        display_mode = str(getattr(self, "display_mode", "class") or "class").lower()
+        if display_mode == "surface":
             try:
-                self.refresh_surface_after_classification(reason="classification", changed_mask=changed_mask)
+                surface_mask = materialize_changed_mask(
+                    self, delta, reason="surface_apply_classification_signal"
+                )
+                self.refresh_surface_after_classification(
+                    reason="classification", changed_mask=surface_mask
+                )
             except Exception as _surface_err:
-                print(f"âš ï¸ Surface refresh after classification failed: {_surface_err}")
+                print(f"⚠️ Surface refresh after classification failed: {_surface_err}")
         else:
             from gui.unified_actor_manager import fast_classify_update
-            fast_classify_update(self, changed_mask, to_class)
-        # 3. Invalidate section mirrors before signal fires
+            fast_classify_update(
+                self,
+                changed_indices=changed_idx,
+                delta=delta,
+                to_class=to_class,
+            )
+
         if hasattr(self, 'section_vtks'):
             for view_idx in self.section_vtks.keys():
                 self._sync_section_mirror_from_data(view_idx)
 
-        # 4. POKE ALL OTHER VIEWPORTS (Signal Bus)
-        self.classification_finished.emit(changed_mask)
+        self.classification_finished.emit(delta)
 
-        # 5. Final Render
-        if str(getattr(self, "display_mode", "class") or "class").lower() != "surface":
+        if display_mode != "surface":
             self.vtk_widget.render()
+
+        print(
+            "CLASSIFY_PHASE1_SIGNAL_COMMIT "
+            f"changed={changed_idx.size} dataset={len(classes)} mask_materialized=0"
+        )
+        return True
 
     def activate_dock_by_view(self, view_index):
         """
         Activate the corresponding dock based on Display Mode view selection.
-        âœ… FIXED: Proper error handling and view activation
+        ✅ FIXED: Proper error handling and view activation
         """
         try:
             print(f"\n{'='*60}")
-            print(f"ðŸŽ¯ ACTIVATING VIEW {view_index}")
+            print(f"🎯 ACTIVATING VIEW {view_index}")
             print(f"{'='*60}")
             
             if view_index == 0:
@@ -16498,7 +15655,7 @@ class NakshaApp(QMainWindow):
                     try:
                         self.vtk_widget.interactor.GetRenderWindow().GetInteractor().GetRenderWindow().Render()
                         self.vtk_widget.setFocus()
-                        # âœ… BUG FIX: Prevent stuck panning. When returning to the main view, 
+                        # ✅ BUG FIX: Prevent stuck panning. When returning to the main view, 
                         # force reset the mouse interaction state to clear any missed release events.
                         style = self.vtk_widget.interactor.GetInteractorStyle()
                         if style:
@@ -16511,11 +15668,11 @@ class NakshaApp(QMainWindow):
                                     style.OnRightButtonUp()
                             except Exception:
                                 pass
-                        print(f"âœ… Activated Main View")
+                        print(f"✅ Activated Main View")
                     except Exception as e:
-                        print(f"âš ï¸ Error activating main view: {e}")
+                        print(f"⚠️ Error activating main view: {e}")
                 else:
-                    print(f"âš ï¸ vtk_widget not found")
+                    print(f"⚠️ vtk_widget not found")
                     
             elif view_index >= 1 and view_index <= 4:
                 # Cross Section Views 1-4
@@ -16553,9 +15710,9 @@ class NakshaApp(QMainWindow):
                         self.section_controller.active_view = section_index
                         print(f"   Set section_controller.active_view = {section_index}")
                     
-                    print(f"âœ… Activated Cross Section View {view_index}")
+                    print(f"✅ Activated Cross Section View {view_index}")
                 else:
-                    print(f"âš ï¸ Cross Section View {view_index} not found")
+                    print(f"⚠️ Cross Section View {view_index} not found")
                     print(f"   section_docks exists: {hasattr(self, 'section_docks')}")
                     if hasattr(self, 'section_docks'):
                         print(f"   Available views: {[i+1 for i in self.section_docks.keys()]}")
@@ -16564,15 +15721,15 @@ class NakshaApp(QMainWindow):
                     #     self,
                     #     "View Not Open",
                     #     f"Cross Section View {view_index} is not open.\n"
-                    #     f"Please create it first using Tools â†’ Cross Section."
+                    #     f"Please create it first using Tools → Cross Section."
                     # )
             else:
-                print(f"âš ï¸ Invalid view index: {view_index}")
+                print(f"⚠️ Invalid view index: {view_index}")
             
             print(f"{'='*60}\n")
                 
         except Exception as e:
-            print(f"âš ï¸ Error activating dock for view {view_index}: {e}")
+            print(f"⚠️ Error activating dock for view {view_index}: {e}")
             import traceback
             traceback.print_exc()
             print(f"{'='*60}\n")
@@ -16580,17 +15737,17 @@ class NakshaApp(QMainWindow):
     def refresh_all_views(self):
         """
         Master refresh function - Context Aware
-        âœ… Fixes Issue 1: Preserves Main View filters/weights by preventing state overwrite.
-        âœ… Fixes Issue 2: Prevents Cross-View settings from leaking into the Main View.
-        âœ… OPTIMIZED: Synchronizes Cut-Section using the high-speed GPU buffer path (No 3-4s lag).
+        ✅ Fixes Issue 1: Preserves Main View filters/weights by preventing state overwrite.
+        ✅ Fixes Issue 2: Prevents Cross-View settings from leaking into the Main View.
+        ✅ OPTIMIZED: Synchronizes Cut-Section using the high-speed GPU buffer path (No 3-4s lag).
         """
         try:
             print("\n" + "="*60)
-            print("ðŸ”„ GLOBAL REFRESH - PRESERVING VIEW CONTEXTS")
+            print("🔄 GLOBAL REFRESH - PRESERVING VIEW CONTEXTS")
             print("="*60)
             
-            # âœ… 1. Refresh Main View with context protection
-            print(f"ðŸ“º Refreshing Main View (mode: {self.display_mode})")
+            # ✅ 1. Refresh Main View with context protection
+            print(f"📺 Refreshing Main View (mode: {self.display_mode})")
             
             if self.display_mode == "class":
                 from gui.class_display import update_class_mode
@@ -16609,9 +15766,9 @@ class NakshaApp(QMainWindow):
                 from .pointcloud_display import update_pointcloud
                 update_pointcloud(self, self.display_mode)
             
-            print("âœ… Main View updated (Filters preserved)")
+            print("✅ Main View updated (Filters preserved)")
             
-            # âœ… 2. Refresh ALL cross-section views independently
+            # ✅ 2. Refresh ALL cross-section views independently
             if hasattr(self, 'section_vtks') and hasattr(self, 'section_controller'):
                 if hasattr(self.section_controller, 'refresh_colors'):
                     self.section_controller.refresh_colors()
@@ -16620,14 +15777,14 @@ class NakshaApp(QMainWindow):
                     for view_idx, vtk_widget in self.section_vtks.items():
                         if vtk_widget and hasattr(vtk_widget, 'render'):
                             vtk_widget.render()
-                    print("âœ… Cross-section views updated (Local filters maintained)")
+                    print("✅ Cross-section views updated (Local filters maintained)")
             
-            # âœ… 3. OPTIMIZED: Refresh cut-section view using fast GPU path
+            # ✅ 3. OPTIMIZED: Refresh cut-section view using fast GPU path
             if hasattr(self, 'cut_section_controller'):
                 ctrl = self.cut_section_controller
                 # Check if the cut view is active and has data
                 if getattr(ctrl, 'is_cut_view_active', False) and ctrl.cut_points is not None:
-                    print("âœ‚ï¸ [FAST-SYNC] Refreshing Cut Section...")
+                    print("✂️ [FAST-SYNC] Refreshing Cut Section...")
                     
                     # Direct call to the optimized millisecond-refresh method
                     if hasattr(ctrl, '_refresh_cut_colors_fast'):
@@ -16636,54 +15793,54 @@ class NakshaApp(QMainWindow):
                         # Fallback to standard refresh if fast method is missing
                         ctrl.refresh_colors()
                         
-                    print("âœ… Cut Section updated (Sync Complete)")
+                    print("✅ Cut Section updated (Sync Complete)")
             
-            # âœ… 4. Sync Display Mode dialog WITHOUT triggering a re-apply
+            # ✅ 4. Sync Display Mode dialog WITHOUT triggering a re-apply
             if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
                 if hasattr(self.display_mode_dialog, 'sync_with_app_state'):
                     self.display_mode_dialog.sync_with_app_state()
-                print("âœ… Display Mode dialog synced")
+                print("✅ Display Mode dialog synced")
             
-            # âœ… 5. UPDATE STATISTICS
+            # ✅ 5. UPDATE STATISTICS
             if hasattr(self, 'point_count_widget') and self.point_count_widget:
                 refresh_point_statistics(self)
-                print("ðŸ“Š Statistics updated")
+                print("📊 Statistics updated")
             
             # Final Render of Main View
             if hasattr(self, 'vtk_widget'):
                 self.vtk_widget.render()
 
             print("="*60)
-            print("âœ… GLOBAL REFRESH COMPLETE - NO LEAKAGE")
+            print("✅ GLOBAL REFRESH COMPLETE - NO LEAKAGE")
             print("="*60 + "\n")
             
             if hasattr(self, 'statusBar') and self.statusBar():
-                self.statusBar().showMessage("âœ… All views synchronized", 2000)
+                self.statusBar().showMessage("✅ All views synchronized", 2000)
             
         except Exception as e:
-            print(f"âš ï¸ refresh_all_views failed: {e}")
+            print(f"⚠️ refresh_all_views failed: {e}")
             import traceback
             traceback.print_exc()
 
 # New 
     def refresh_all_classification_views(self):
         """
-        âœ… OPTIMIZED: Update ALL views after classification changes.
+        ✅ OPTIMIZED: Update ALL views after classification changes.
         Uses debouncing and vectorized operations for speed.
         """
         from gui.display_mode import clone_palette
         print(f"\n{'='*60}")
-        print(f"ðŸ”„ REFRESHING ALL CLASSIFICATION VIEWS (optimized)")
+        print(f"🔄 REFRESHING ALL CLASSIFICATION VIEWS (optimized)")
         print(f"{'='*60}")
         
-        # âœ… CRITICAL FIX: Initialize view_palettes if missing
+        # ✅ CRITICAL FIX: Initialize view_palettes if missing
         if not hasattr(self, 'view_palettes'):
             self.view_palettes = {}
-            print("âš ï¸ view_palettes was missing - created it")
+            print("⚠️ view_palettes was missing - created it")
         
-        # âœ… EMERGENCY FALLBACK: If view_palettes is empty, seed slot defaults.
+        # ✅ EMERGENCY FALLBACK: If view_palettes is empty, seed slot defaults.
         if not self.view_palettes or all(not v for v in self.view_palettes.values()):
-            print("âš ï¸ view_palettes is empty - seeding slot palettes")
+            print("⚠️ view_palettes is empty - seeding slot palettes")
             if hasattr(self, 'class_palette') and self.class_palette:
                 # Slot 0 remains canonical main view behavior.
                 self.view_palettes[0] = clone_palette(self.class_palette)
@@ -16692,9 +15849,9 @@ class NakshaApp(QMainWindow):
                     seeded = self._build_slot_palette_from_main_defaults(i)
                     if seeded:
                         self.view_palettes[i] = seeded
-                print(f"   âœ… Initialized slot palettes from main defaults ({len(self.class_palette)} classes)")
+                print(f"   ✅ Initialized slot palettes from main defaults ({len(self.class_palette)} classes)")
         
-        # âœ… Track which views need updating
+        # ✅ Track which views need updating
         views_to_update = set()
         
         if self.display_mode == "class":
@@ -16705,25 +15862,25 @@ class NakshaApp(QMainWindow):
                 views_to_update.add(view_idx + 1)  # Cross-section views
         
         if not views_to_update:
-            print("â­ï¸ No views need updating")
+            print("⏭️ No views need updating")
             print(f"{'='*60}\n")
             return
         
-        print(f"ðŸ“Š Updating {len(views_to_update)} views: {sorted(views_to_update)}")
+        print(f"📊 Updating {len(views_to_update)} views: {sorted(views_to_update)}")
         
         try:
             # --------------------------------------------------------
             # 1. Refresh MAIN VIEW (View 0) - if needed
             # --------------------------------------------------------
             if 0 in views_to_update:
-                print("   ðŸŽ¨ Refreshing Main View (0)...")
+                print("   🎨 Refreshing Main View (0)...")
                 
                 # Use Main View's palette if it exists
                 if 0 in self.view_palettes and self.view_palettes[0]:
                     old_palette = clone_palette(self.class_palette) if hasattr(self, 'class_palette') else {}
                     self.class_palette = clone_palette(self.view_palettes[0])
                     
-                    # âœ… Use fast color update if possible
+                    # ✅ Use fast color update if possible
                     if hasattr(self, '_last_changed_mask') and self._last_changed_mask is not None:
                         from gui.pointcloud_display import fast_update_colors
                         fast_update_colors(self, self._last_changed_mask)
@@ -16735,9 +15892,9 @@ class NakshaApp(QMainWindow):
                         self.class_palette = clone_palette(old_palette)
                     
                     visible = [c for c, v in self.view_palettes[0].items() if v.get("show")]
-                    print(f"   âœ… Main View updated ({len(visible)} visible classes)")
+                    print(f"   ✅ Main View updated ({len(visible)} visible classes)")
                 else:
-                    print("   â­ï¸ Main View using global palette")
+                    print("   ⏭️ Main View using global palette")
                     from gui.class_display import update_class_mode
                     update_class_mode(self)
             
@@ -16763,18 +15920,18 @@ class NakshaApp(QMainWindow):
             # 3. Refresh CUT SECTION if active
             # --------------------------------------------------------
             if hasattr(self, 'cut_section_controller') and self.cut_section_controller.cut_points is not None:
-                print("   ðŸ”„ Refreshing Cut Section...")
+                print("   🔄 Refreshing Cut Section...")
                 self.cut_section_controller.refresh_colors()
-                print("   âœ… Cut Section updated")
+                print("   ✅ Cut Section updated")
             
             print(f"{'='*60}")
-            print(f"âœ… ALL VIEWS REFRESHED SUCCESSFULLY")
+            print(f"✅ ALL VIEWS REFRESHED SUCCESSFULLY")
             print(f"{'='*60}\n")
             
-            self.statusBar().showMessage("âœ… All views updated", 2000)
+            self.statusBar().showMessage("✅ All views updated", 2000)
             
         except Exception as e:
-            print(f"âš ï¸ Multi-view refresh error: {e}")
+            print(f"⚠️ Multi-view refresh error: {e}")
             import traceback
             traceback.print_exc()
 
@@ -16848,7 +16005,7 @@ class NakshaApp(QMainWindow):
             from gui.cross_section.interactor_classify import install_camera_2d_lock
             install_camera_2d_lock(vtk_widget, self)
         except Exception as e:
-            print(f"âš ï¸ Lock install in _apply_plain_section_2d_style failed: {e}")
+            print(f"⚠️ Lock install in _apply_plain_section_2d_style failed: {e}")
 
         # The Qt-level filter survives interactor-style swaps and consumes a
         # wheel event only after applying a valid camera update.  The observers
@@ -16872,7 +16029,7 @@ class NakshaApp(QMainWindow):
                     cs_measure = getattr(app, "cross_section_measurement_tool", None)
                     if cs_measure is not None and getattr(cs_measure, "active", False):
                         return
-                    print(f"ðŸ–±ï¸ Right-click detected in cross-section view (fallback)")
+                    print(f"🖱️ Right-click detected in cross-section view (fallback)")
                     active_tool = getattr(app, "active_classify_tool", None)
                     section_has_classifier = bool(getattr(app, "classify_interactors", None))
                     if active_tool is None or not section_has_classifier:
@@ -16887,7 +16044,7 @@ class NakshaApp(QMainWindow):
                                 finally:
                                     app._right_click_reactivating = False
                             except Exception as e:
-                                print(f"   âš ï¸ Right-click reactivate failed: {e}")
+                                print(f"   ⚠️ Right-click reactivate failed: {e}")
                 return _handler
 
             if hasattr(self, 'section_vtks') and self.section_vtks:
@@ -16907,14 +16064,14 @@ class NakshaApp(QMainWindow):
                                 "RightButtonPressEvent", _make_right_click_handler(self), 1.0
                             )
                             self._section_right_click_observers[view_idx] = tag
-                            print(f"   âœ… View {view_idx + 1}: Interactor restored (fallback)")
+                            print(f"   ✅ View {view_idx + 1}: Interactor restored (fallback)")
                     except Exception as e:
-                        print(f"   âš ï¸ View {view_idx + 1}: Fallback restore failed - {e}")
+                        print(f"   ⚠️ View {view_idx + 1}: Fallback restore failed - {e}")
 
-            print("   âœ… Section interactors restored (fallback method)")
+            print("   ✅ Section interactors restored (fallback method)")
 
         except Exception as e:
-            print(f"   âš ï¸ Fallback restore failed: {e}")
+            print(f"   ⚠️ Fallback restore failed: {e}")
 
     def _reinstall_section_right_click_observer(self, view_idx):
         """
@@ -16944,7 +16101,7 @@ class NakshaApp(QMainWindow):
 
         # Only install observer if no classification tool is currently active
         if getattr(self, "active_classify_tool", None) is not None:
-            print(f"   â„¹ï¸ View {view_idx + 1}: Classification active, skipping observer reinstall")
+            print(f"   ℹ️ View {view_idx + 1}: Classification active, skipping observer reinstall")
             return
 
         def _make_handler(app):
@@ -16952,7 +16109,7 @@ class NakshaApp(QMainWindow):
                 cs_measure = getattr(app, "cross_section_measurement_tool", None)
                 if cs_measure is not None and getattr(cs_measure, "active", False):
                     return
-                print(f"ðŸ–±ï¸ Right-click detected in cross-section view (tabified)")
+                print(f"🖱️ Right-click detected in cross-section view (tabified)")
                 active_tool = getattr(app, "active_classify_tool", None)
                 section_has_classifier = bool(getattr(app, "classify_interactors", None))
                 if active_tool is None or not section_has_classifier:
@@ -16967,7 +16124,7 @@ class NakshaApp(QMainWindow):
                             finally:
                                 app._right_click_reactivating = False
                         except Exception as e:
-                            print(f"   âš ï¸ Right-click reactivate failed: {e}")
+                            print(f"   ⚠️ Right-click reactivate failed: {e}")
             return _handler
 
         # Ensure plain 2D style is set
@@ -16975,7 +16132,7 @@ class NakshaApp(QMainWindow):
 
         tag = interactor.AddObserver("RightButtonPressEvent", _make_handler(self), 1.0)
         self._section_right_click_observers[view_idx] = tag
-        print(f"   âœ… View {view_idx + 1}: Right-click observer reinstalled (tabified)")
+        print(f"   ✅ View {view_idx + 1}: Right-click observer reinstalled (tabified)")
 
 # In class_picker.py    
     def deactivate_classification(self):
@@ -16983,33 +16140,36 @@ class NakshaApp(QMainWindow):
         Deactivate classification mode and restore normal interaction.
         """
         print(f"\n{'='*60}")
-        print(f"ðŸ›‘ DEACTIVATING CLASSIFICATION TOOL (deactivate_classification)")
+        print(f"🛑 DEACTIVATING CLASSIFICATION TOOL (deactivate_classification)")
         print(f"{'='*60}")
+
+        if self.active_classify_tool == "brush":
+            self._finalize_pending_classification_stroke_for_history()
         
         # Clear tool
         self.active_classify_tool = None
         
-        # âœ… CRITICAL: Unlock main view
+        # ✅ CRITICAL: Unlock main view
         self.skip_main_view_refresh = False
-        print("   ðŸ”“ Main view refresh UNLOCKED")
+        print("   🔓 Main view refresh UNLOCKED")
         
         # Close class picker
         if self._get_live_class_picker() is not None:
             self._hide_class_picker_safely()
-            print("   âœ… Class picker closed")
+            print("   ✅ Class picker closed")
         
         # Restore section view interactors (with safety check)
         if hasattr(self, "section_controller"):
             try:
                 if hasattr(self.section_controller, 'unlock_after_classification'):
                     self.section_controller.unlock_after_classification()
-                    print("   âœ… Section controller unlocked")
+                    print("   ✅ Section controller unlocked")
                 else:
-                    print("   âš ï¸ section_controller missing unlock_after_classification method")
+                    print("   ⚠️ section_controller missing unlock_after_classification method")
                     # Fallback: manually restore interactors
                     self._restore_section_interactors()
             except Exception as e:
-                print(f"   âš ï¸ Section controller unlock failed: {e}")
+                print(f"   ⚠️ Section controller unlock failed: {e}")
                 # Fallback: manually restore interactors
                 self._restore_section_interactors()
         
@@ -17018,11 +16178,11 @@ class NakshaApp(QMainWindow):
             try:
                 if hasattr(self.cut_section_controller, 'unlock_after_classification'):
                     self.cut_section_controller.unlock_after_classification()
-                    print("   âœ… Cut section controller unlocked")
+                    print("   ✅ Cut section controller unlocked")
                 else:
-                    print("   âš ï¸ cut_section_controller missing unlock_after_classification method")
+                    print("   ⚠️ cut_section_controller missing unlock_after_classification method")
             except Exception as e:
-                print(f"   âš ï¸ Cut section controller unlock failed: {e}")
+                print(f"   ⚠️ Cut section controller unlock failed: {e}")
 
         # Restore default 2D interactor on all cross-section views
         try:
@@ -17030,15 +16190,15 @@ class NakshaApp(QMainWindow):
             # interactors AND added right-click observers - just clear wrappers
             if hasattr(self, "classify_interactors"):
                 self.classify_interactors.clear()
-                print("   âœ… Classification interactors cleared")
+                print("   ✅ Classification interactors cleared")
         except Exception as e:
-            print(f"âš ï¸ Failed to clear classification interactors: {e}")
+            print(f"⚠️ Failed to clear classification interactors: {e}")
         
         print(f"{'='*60}")
-        print(f"âœ… Classification tool fully deactivated - all views unlocked")
+        print(f"✅ Classification tool fully deactivated - all views unlocked")
         print(f"{'='*60}\n")
         
-        self.statusBar().showMessage("âœ… Classification tool deactivated", 2000)
+        self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
     #     """
     #     Deactivate classification mode and restore normal interaction.
     #     """
@@ -17054,7 +16214,7 @@ class NakshaApp(QMainWindow):
         
     #         self.cut_section_controller.unlock_after_classification()
         
-    #     self.statusBar().showMessage("âœ… Classification tool deactivated", 2000)
+    #     self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
 
 
     def refresh_all_section_views(self):
@@ -17066,7 +16226,7 @@ class NakshaApp(QMainWindow):
                 return
             
             print(f"\n{'='*60}")
-            print(f"ðŸ”„ REFRESHING ALL CROSS-SECTION VIEWS")
+            print(f"🔄 REFRESHING ALL CROSS-SECTION VIEWS")
             print(f"{'='*60}")
             
             import numpy as np
@@ -17081,7 +16241,7 @@ class NakshaApp(QMainWindow):
                     buffer_mask = getattr(self, f"section_{view_idx}_buffer_mask", None)
                     
                     if pts is None or core_mask is None:
-                        print(f"   â­ï¸ View {view_idx + 1}: No data")
+                        print(f"   ⏭️ View {view_idx + 1}: No data")
                         continue
                     
                     # Combine core + buffer
@@ -17098,7 +16258,7 @@ class NakshaApp(QMainWindow):
                     # Filter by visible classes
                     visible = [c for c, v in self.class_palette.items() if v.get("show")]
                     if not visible:
-                        print(f"   â­ï¸ View {view_idx + 1}: No visible classes")
+                        print(f"   ⏭️ View {view_idx + 1}: No visible classes")
                         continue
                     
                     mask = np.isin(all_cls, visible)
@@ -17135,10 +16295,10 @@ class NakshaApp(QMainWindow):
                     vtk_widget.camera_position = cam_pos
                     vtk_widget.render()
                     
-                    print(f"   âœ… View {view_idx + 1} refreshed ({len(filtered_pts)} points)")
+                    print(f"   ✅ View {view_idx + 1} refreshed ({len(filtered_pts)} points)")
                     
                 except Exception as e:
-                    print(f"   âš ï¸ View {view_idx + 1} refresh failed: {e}")
+                    print(f"   ⚠️ View {view_idx + 1} refresh failed: {e}")
             
             print(f"{'='*60}\n") 
 
@@ -17158,7 +16318,7 @@ class NakshaApp(QMainWindow):
         self._update_debounce_timer.start(50)
 
         if getattr(self, "_debug_perf", False):
-            print(f"ðŸ“… Scheduled update for views: {view_indices}")
+            print(f"📅 Scheduled update for views: {view_indices}")
     
     def _execute_pending_updates(self):
         """Execute batched updates (called after debounce delay)."""
@@ -17166,7 +16326,7 @@ class NakshaApp(QMainWindow):
             return
         
         if getattr(self, "_debug_perf", False):
-            print(f"ðŸ”„ Batch updating views: {self._pending_view_updates}")
+            print(f"🔄 Batch updating views: {self._pending_view_updates}")
         
         for view_idx in sorted(self._pending_view_updates):
             if view_idx == 0:
@@ -17179,21 +16339,21 @@ class NakshaApp(QMainWindow):
         
         self._pending_view_updates.clear()
         if getattr(self, "_debug_perf", False):
-            print("âœ… Batch update complete")
+            print("✅ Batch update complete")
 
     def _refresh_single_section_view(self, view_idx, border_percent=0):
         """
         Optimized single cross-section view refresh.
-        âœ… UNIFIED ACTOR PATH: Builds a single _section_X_unified actor per view.
+        ✅ UNIFIED ACTOR PATH: Builds a single _section_X_unified actor per view.
         This enables sync_palette_to_gpu, undo/redo, and per-view weights to work
         through the same GPU uniform system as the Main View.
         """
         if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
-            print(f"â­ï¸ View {view_idx} not found")
+            print(f"⏭️ View {view_idx} not found")
             return
 
         target_view = view_idx + 1  # Convert to 1-based slot (1-4)
-        print(f"   ðŸ”„ Refreshing Cross Section View {target_view} (unified actor)...")
+        print(f"   🔄 Refreshing Cross Section View {target_view} (unified actor)...")
 
         # Guard against stale section masks from a previously loaded file.
         # If mask length does not match current classification length, clear the
@@ -17209,7 +16369,7 @@ class NakshaApp(QMainWindow):
                         core_mask_arr = _np.asarray(core_mask, dtype=bool).ravel()
                         if core_mask_arr.size != n_class:
                             print(
-                                f"   âš ï¸ View {target_view}: stale section cache "
+                                f"   ⚠️ View {target_view}: stale section cache "
                                 f"(mask={core_mask_arr.size}, data={n_class}) - clearing"
                             )
                             for _name in (
@@ -17230,11 +16390,11 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass
 
-        # â”€â”€ Read border value if not provided â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Read border value if not provided ─────────────────────────────
         if border_percent == 0 and hasattr(self, 'view_borders'):
             border_percent = self.view_borders.get(target_view, 0)
 
-        # â”€â”€ Get view-specific palette â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Get view-specific palette ─────────────────────────────────────
         if not hasattr(self, 'view_palettes'):
             self.view_palettes = {}
 
@@ -17248,7 +16408,7 @@ class NakshaApp(QMainWindow):
                 persist_seed=True,
             )
             if not palette:
-                print(f"   â­ï¸ No palette available for View {target_view}")
+                print(f"   ⏭️ No palette available for View {target_view}")
                 return
             if not hasattr(self, 'view_palettes') or not isinstance(self.view_palettes, dict):
                 self.view_palettes = {}
@@ -17259,7 +16419,7 @@ class NakshaApp(QMainWindow):
 
         point_size = float(getattr(self, 'point_size', 3.0))
 
-        # â”€â”€ Build unified actor (same pattern as Main View) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Build unified actor (same pattern as Main View) ───────────────
         try:
             from gui.unified_actor_manager import (
                 build_section_legacy_border_actors,
@@ -17296,11 +16456,11 @@ class NakshaApp(QMainWindow):
                 point_size=point_size,
             )
             if actor is not None:
-                print(f"   âœ… View {target_view} unified actor ready")
+                print(f"   ✅ View {target_view} unified actor ready")
             else:
-                print(f"   âš ï¸ View {target_view}: build_section_unified_actor returned None")
+                print(f"   ⚠️ View {target_view}: build_section_unified_actor returned None")
         except Exception as e:
-            print(f"   âš ï¸ Unified actor build failed for View {target_view}: {e}")
+            print(f"   ⚠️ Unified actor build failed for View {target_view}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -17314,7 +16474,7 @@ class NakshaApp(QMainWindow):
         from PySide6.QtCore import QSettings
         
         print(f"\n{'='*60}")
-        print(f"ðŸ”„ RESETTING ALL CLASS WEIGHTS TO 1.0")
+        print(f"🔄 RESETTING ALL CLASS WEIGHTS TO 1.0")
         
         # 1. Reset in-memory palette
         if hasattr(self, 'class_palette') and self.class_palette:
@@ -17322,7 +16482,7 @@ class NakshaApp(QMainWindow):
                 old_weight = self.class_palette[code].get('weight', 1.0)
                 self.class_palette[code]['weight'] = 1.0
                 if old_weight != 1.0:
-                    print(f"   âœ… Class {code}: {old_weight:.1f}x â†’ 1.0x")
+                    print(f"   ✅ Class {code}: {old_weight:.1f}x → 1.0x")
         
         # 2. Reset in view_palettes
         if hasattr(self, 'view_palettes') and self.view_palettes:
@@ -17332,27 +16492,27 @@ class NakshaApp(QMainWindow):
                         palette[code]['weight'] = 1.0
         
         # 3. Clear saved weights in QSettings
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
         settings.remove("class_weight_states")
         settings.sync()
-        print(f"   âœ… Cleared saved weights from settings")
+        print(f"   ✅ Cleared saved weights from settings")
         
         # 4. Re-render if data is loaded
         if hasattr(self, 'data') and self.data is not None:
             if self.display_mode == "class":
                 from gui.class_display import update_class_mode
                 update_class_mode(self)
-                print(f"   âœ… Re-rendered with normal weights")
+                print(f"   ✅ Re-rendered with normal weights")
         
         print(f"{'='*60}\n")
         
         if hasattr(self, 'statusBar'):
-            self.statusBar().showMessage("âœ… All class weights reset to 1.0x (normal)", 3000)
+            self.statusBar().showMessage("✅ All class weights reset to 1.0x (normal)", 3000)
 
 
     def sanitize_class_weights(self):
         """
-        âœ… AUTO-FIX: Clamp any extreme weights to reasonable range (0.5-3.0).
+        ✅ AUTO-FIX: Clamp any extreme weights to reasonable range (0.5-3.0).
         Call this right after loading class palette.
         """
         fixed_count = 0
@@ -17368,7 +16528,7 @@ class NakshaApp(QMainWindow):
                 if weight != clamped:
                     info['weight'] = clamped
                     fixed_count += 1
-                    print(f"âš ï¸ Fixed Class {code}: {weight:.1f}x â†’ {clamped:.1f}x")
+                    print(f"⚠️ Fixed Class {code}: {weight:.1f}x → {clamped:.1f}x")
         
         # Fix view_palettes
         if hasattr(self, 'view_palettes') and self.view_palettes:
@@ -17381,11 +16541,11 @@ class NakshaApp(QMainWindow):
                             info['weight'] = clamped
         
         if fixed_count > 0:
-            print(f"âœ… Auto-fixed {fixed_count} extreme weights")
+            print(f"✅ Auto-fixed {fixed_count} extreme weights")
             
             # Update QSettings to prevent this on next load
             from PySide6.QtCore import QSettings
-            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+            settings = QSettings("NakshaAI", "LidarApp")
             weight_states = settings.value("class_weight_states", {})
             if isinstance(weight_states, dict):
                 for code_str, weight in weight_states.items():
@@ -17393,40 +16553,40 @@ class NakshaApp(QMainWindow):
                         weight_states[code_str] = max(0.5, min(float(weight), 3.0))
                 settings.setValue("class_weight_states", weight_states)
                 settings.sync()
-                print(f"âœ… Updated saved weights in settings")
+                print(f"✅ Updated saved weights in settings")
 
 
     def test_display_mode_setup(self):
         '''Quick test to verify Display Mode signal exists'''
         if hasattr(self, 'display_dialog') and self.display_dialog:
             print("="*60)
-            print("ðŸ§ª TESTING DISPLAY MODE SETUP")
+            print("🧪 TESTING DISPLAY MODE SETUP")
             
             # Test 1: Signal exists
             has_signal = hasattr(self.display_dialog, 'classes_loaded')
-            print(f"   Signal exists: {'âœ… YES' if has_signal else 'âŒ NO'}")
+            print(f"   Signal exists: {'✅ YES' if has_signal else '❌ NO'}")
             
             # Test 2: Signal is correct type
             if has_signal:
                 from PySide6.QtCore import Signal
                 is_signal = isinstance(type(self.display_dialog).classes_loaded, type(Signal()))
-                print(f"   Is valid Signal: {'âœ… YES' if is_signal else 'âŒ NO'}")
+                print(f"   Is valid Signal: {'✅ YES' if is_signal else '❌ NO'}")
             
             # Test 3: Can connect to it
             if has_signal:
                 try:
-                    test_slot = lambda: print("   ðŸŽ‰ Test signal received!")
+                    test_slot = lambda: print("   🎉 Test signal received!")
                     self.display_dialog.classes_loaded.connect(test_slot)
-                    print(f"   Can connect: âœ… YES")
+                    print(f"   Can connect: ✅ YES")
                     
                     # Clean up test connection
                     self.display_dialog.classes_loaded.disconnect(test_slot)
                 except Exception as e:
-                    print(f"   Can connect: âŒ NO - {e}")
+                    print(f"   Can connect: ❌ NO - {e}")
             
             print("="*60)
         else:
-            print("âš ï¸ Display Mode dialog not created yet")
+            print("⚠️ Display Mode dialog not created yet")
 
 
     def normalize_all_class_weights(self):
@@ -17435,7 +16595,7 @@ class NakshaApp(QMainWindow):
         Prevents saved/corrupted weight values from causing size issues.
         """
         print("\n" + "="*60)
-        print("ðŸ”§ NORMALIZING CLASS WEIGHTS ON LOAD")
+        print("🔧 NORMALIZING CLASS WEIGHTS ON LOAD")
         print("="*60)
         
         reset_count = 0
@@ -17447,7 +16607,7 @@ class NakshaApp(QMainWindow):
                 if old_weight != 1.0:
                     self.class_palette[code]["weight"] = 1.0
                     reset_count += 1
-                    print(f"   âœ… Class {code}: {old_weight:.2f}x â†’ 1.0x")
+                    print(f"   ✅ Class {code}: {old_weight:.2f}x → 1.0x")
         
         # Fix view_palettes
         if hasattr(self, 'view_palettes') and self.view_palettes:
@@ -17460,64 +16620,76 @@ class NakshaApp(QMainWindow):
         
         # Clear saved weights from QSettings
         from PySide6.QtCore import QSettings
-        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings = QSettings("NakshaAI", "LidarApp")
         if settings.contains("class_weight_states"):
             settings.remove("class_weight_states")
             settings.sync()
-            print("   âœ… Cleared saved weights from settings")
+            print("   ✅ Cleared saved weights from settings")
         
         if reset_count > 0:
-            print(f"\n   âœ… Reset {reset_count} classes to normal weight")
+            print(f"\n   ✅ Reset {reset_count} classes to normal weight")
         else:
-            print("   â„¹ï¸  All weights already normal")        
+            print("   ℹ️  All weights already normal")        
         print("="*60 + "\n")
         
     def activate_measurement_tool(self, tool_name):
         """
         Activate measurement tool with proper coordination.
-        âœ… FIXED: Proper cleanup and priority handling
+        ✅ FIXED: Proper cleanup and priority handling
         """
         self._deactivate_pending_cut_section_tool("switching to measurement")
+
+        # ✅ MUTUAL EXCLUSION: deactivate any active classification tool so its
+        # VTK interactor doesn't fight the measurement tool observers.
+        # This mirrors what execute_tool() does on the shortcut path, making
+        # manual button clicks behave identically to keyboard shortcuts.
+        if getattr(self, "active_classify_tool", None) is not None:
+            try:
+                print(f"🛑 Deactivating classification tool before measurement ({tool_name})")
+                self.deactivate_classification_tool(preserve_cross_section=True)
+            except Exception as _e:
+                print(f"⚠️ Failed to deactivate classification before measurement: {_e}")
+
         if not hasattr(self, 'measurement_tool'):
             from gui.measurement_tools import MeasurementTool
             self.measurement_tool = MeasurementTool(self.digitizer)
 
-        # âœ… Deactivate element selection tool â€” it has its own VTK observers at
+        # ✅ Deactivate element selection tool — it has its own VTK observers at
         # priority 2.0 that will compete with measurement tool observers.
         try:
             if hasattr(self, "digitizer") and self.digitizer:
                 self.digitizer.deactivate_element_select_tool()
         except Exception as e:
-            print(f"âš ï¸ Failed to deactivate element select for measurement: {e}")
+            print(f"⚠️ Failed to deactivate element select for measurement: {e}")
         
-        # âœ… CRITICAL: Deactivate cross-section COMPLETELY
+        # ✅ CRITICAL: Deactivate cross-section COMPLETELY
         # Cancel cross-section and restore original interactor style before activating measurement
         if getattr(self, 'cross_section_active', False) or (hasattr(self, 'cross_interactor') and self.cross_interactor):
-            print("ðŸ”„ Deactivating cross-section for measurement")
+            print("🔄 Deactivating cross-section for measurement")
             self._cancel_cross_section_tool_only()
 
         
-        # âœ… Deactivate section controller
+        # ✅ Deactivate section controller
         if hasattr(self, 'section_controller'):
             self.section_controller.deactivate_for_measurement()
         
-        # âœ… Deactivate digitizer
+        # ✅ Deactivate digitizer
         if hasattr(self, 'digitizer'):
             self.digitizer.active_tool = None
         
-        # âœ… Now activate measurement (it will add its own observers)
+        # ✅ Now activate measurement (it will add its own observers)
         self.measurement_tool.activate(mode=tool_name)
         
         # Show instructions
         if tool_name == "measure_line":
-            self.statusBar().showMessage("ðŸ“ Click 2 points to measure", 5000)
+            self.statusBar().showMessage("📏 Click 2 points to measure", 5000)
         elif tool_name == "measure_path":
-            self.statusBar().showMessage("ðŸ“ Click points, right-click to finish", 5000)
+            self.statusBar().showMessage("📏 Click points, right-click to finish", 5000)
         elif tool_name == "measure_polygon":
-            self.statusBar().showMessage("ðŸ“ Click points, right-click to close", 5000)
+            self.statusBar().showMessage("📏 Click points, right-click to close", 5000)
             
         elif tool_name == "measure_block_area":
-            self.statusBar().showMessage("ðŸ“ Click inside a block to measure its area", 5000)
+            self.statusBar().showMessage("📏 Click inside a block to measure its area", 5000)
 
         status_message = {
             "measure_line": "Click 2 points to measure",
@@ -17530,7 +16702,7 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage(status_message, 5000)
 
     def clear_all_measurements(self):
-        """Clear all measurement lines and labels â€” main view AND cross-section."""
+        """Clear all measurement lines and labels — main view AND cross-section."""
         if hasattr(self, 'measurement_tool'):
             self.measurement_tool.clear_all_measurements()
         cs_measure = getattr(self, 'cross_section_measurement_tool', None)
@@ -17538,8 +16710,8 @@ class NakshaApp(QMainWindow):
             try:
                 cs_measure.clear_all()
             except Exception as e:
-                print(f"âš ï¸ Failed to clear cross-section measurements: {e}")
-        self.statusBar().showMessage("ðŸ—‘ï¸ Measurements cleared", 2000)
+                print(f"⚠️ Failed to clear cross-section measurements: {e}")
+        self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
     def export_measurements(self):
         """Export measurement report to file."""
         if not hasattr(self, 'measurement_tool'):
@@ -17560,10 +16732,10 @@ class NakshaApp(QMainWindow):
                 try:
                     with open(filepath, 'w') as f:
                         f.write(report)
-                    print(f"âœ… Measurements exported to: {filepath}")
-                    self.statusBar().showMessage(f"âœ… Exported to {filepath}", 3000)
+                    print(f"✅ Measurements exported to: {filepath}")
+                    self.statusBar().showMessage(f"✅ Exported to {filepath}", 3000)
                 except Exception as e:
-                    print(f"âš ï¸ Export failed: {e}")
+                    print(f"⚠️ Export failed: {e}")
 
 
     def ensure_display_mode_dialog(self):
@@ -17587,7 +16759,7 @@ class NakshaApp(QMainWindow):
                 self.display_mode_dialog.applied.connect(self.apply_class_map)
                 self.display_mode_dialog.view_switched.connect(self.activate_dock_by_view)
                 
-                # Phase 3: Connect palette_changed â†’ GPU uniform sync
+                # Phase 3: Connect palette_changed → GPU uniform sync
                 self.display_mode_dialog.palette_changed.connect(self._on_palette_changed)
                 
                 # Connect to other systems
@@ -17602,10 +16774,10 @@ class NakshaApp(QMainWindow):
                     lambda *_: setattr(self, 'display_mode_dialog', None)
                 )
                 
-                print("âœ… Display Mode dialog created")
+                print("✅ Display Mode dialog created")
                 return True
             except Exception as e:
-                print(f"âš ï¸ Failed to create display mode dialog: {e}")
+                print(f"⚠️ Failed to create display mode dialog: {e}")
                 return False
         
         return True
@@ -17698,7 +16870,7 @@ class NakshaApp(QMainWindow):
                 try:
                     dialog.sync_with_app_state()
                 except Exception as e:
-                    print(f"âš ï¸ Dialog sync failed on open: {e}")
+                    print(f"⚠️ Dialog sync failed on open: {e}")
             # Display Mode is intentionally NOT globally always-on-top.
             # show_safely() raises it only for this explicit user request;
             # afterwards native Windows z-order is respected.
@@ -17727,7 +16899,7 @@ class NakshaApp(QMainWindow):
                 self.display_mode_dialog.applied.connect(self.apply_class_map)
                 self.display_mode_dialog.view_switched.connect(self.activate_dock_by_view)
             
-                # Phase 3: Connect palette_changed â†’ GPU uniform sync
+                # Phase 3: Connect palette_changed → GPU uniform sync
                 self.display_mode_dialog.palette_changed.connect(self._on_palette_changed)
             
                 class_picker = self._get_live_class_picker()
@@ -17737,7 +16909,7 @@ class NakshaApp(QMainWindow):
                 if hasattr(self, 'point_count_widget') and self.point_count_widget:
                     self.point_count_widget.connect_to_display_mode(self.display_mode_dialog)
         
-            # âœ… NUCLEAR OPTION: Force visibility no matter what state
+            # ✅ NUCLEAR OPTION: Force visibility no matter what state
             from PySide6.QtCore import Qt
         
             # Clear any window state flags that might hide it
@@ -17762,10 +16934,10 @@ class NakshaApp(QMainWindow):
             except Exception:
                 pass
         
-            print("âœ… Display Mode dialog FORCED visible")
+            print("✅ Display Mode dialog FORCED visible")
 
     def open_fields_panel(self):
-        """Open the Nakshatech-style point data table for the loaded cloud."""
+        """Open the MicroStation-style point data table for the loaded cloud."""
         from PySide6.QtWidgets import QMessageBox
         from gui.dialogs.view_fields_table import ViewFieldsTableDialog
 
@@ -17786,7 +16958,7 @@ class NakshaApp(QMainWindow):
             )
             return
 
-        # Only one table window at a time â€” if one is already open, just
+        # Only one table window at a time — if one is already open, just
         # bring it to the front instead of creating a duplicate.
         existing = getattr(self, "_view_fields_table_dialog", None)
         if existing is not None and existing.isVisible():
@@ -17812,7 +16984,7 @@ class NakshaApp(QMainWindow):
     def load_las_for_grid(self, grid_name):
         """
         Load LAZ/LAS file matching the clicked grid name - AUTO-DETECT folder
-        âœ… FIXED: Now actually loads the file using same path as menu bar
+        ✅ FIXED: Now actually loads the file using same path as menu bar
         """
         try:
             from pathlib import Path
@@ -17824,10 +16996,10 @@ class NakshaApp(QMainWindow):
             import numpy as np
             
             print(f"\n{'='*60}")
-            print(f"ðŸ“‚ LOADING LAZ/LAS FOR GRID: {grid_name}")
+            print(f"📂 LOADING LAZ/LAS FOR GRID: {grid_name}")
             print(f"{'='*60}")
             
-            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+            settings = QSettings("NakshaAI", "LidarApp")
             
             # ============================================================================
             # STEP 1: FIND THE LAZ FOLDER (your existing logic)
@@ -17835,7 +17007,7 @@ class NakshaApp(QMainWindow):
             las_folder = None
             
             # Strategy 1: Check DXF file locations
-            print(f"\nðŸ“‹ STRATEGY 1: Check DXF locations")
+            print(f"\n📋 STRATEGY 1: Check DXF locations")
             if hasattr(self, 'dxf_actors') and self.dxf_actors:
                 for dxf_data in self.dxf_actors:
                     filename = dxf_data.get('filename', '') or dxf_data.get('full_path', '')
@@ -17850,7 +17022,7 @@ class NakshaApp(QMainWindow):
                             las_files = list(dxf_folder.glob("*.laz")) + list(dxf_folder.glob("*.las"))
                             if las_files:
                                 las_folder = dxf_folder
-                                print(f"   âœ… FOUND in DXF folder: {las_folder}")
+                                print(f"   ✅ FOUND in DXF folder: {las_folder}")
                                 break
                             
                             # Check common subfolder names first
@@ -17860,7 +17032,7 @@ class NakshaApp(QMainWindow):
                                     las_files = list(potential_folder.glob("*.laz")) + list(potential_folder.glob("*.las"))
                                     if las_files:
                                         las_folder = potential_folder
-                                        print(f"   âœ… FOUND in subfolder: {las_folder}")
+                                        print(f"   ✅ FOUND in subfolder: {las_folder}")
                                         break
                             
                             # Also check ALL immediate subfolders
@@ -17871,7 +17043,7 @@ class NakshaApp(QMainWindow):
                                             las_files = list(entry.glob("*.laz")) + list(entry.glob("*.las"))
                                             if las_files:
                                                 las_folder = entry
-                                                print(f"   âœ… FOUND in subfolder: {las_folder}")
+                                                print(f"   ✅ FOUND in subfolder: {las_folder}")
                                                 break
                                 except Exception:
                                     pass
@@ -17881,17 +17053,17 @@ class NakshaApp(QMainWindow):
             
             # Strategy 2: Check saved settings
             if not las_folder:
-                print(f"\nðŸ“‹ STRATEGY 2: Check saved settings")
+                print(f"\n📋 STRATEGY 2: Check saved settings")
                 last_las_path = settings.value("last_las_folder", "")
                 if last_las_path:
                     path_obj = Path(last_las_path)
                     if path_obj.exists():
                         las_folder = path_obj
-                        print(f"   âœ… FOUND: {las_folder}")
+                        print(f"   ✅ FOUND: {las_folder}")
             
             # Strategy 3: Ask user
             if not las_folder:
-                print(f"\nðŸ“‹ STRATEGY 3: Ask user for folder")
+                print(f"\n📋 STRATEGY 3: Ask user for folder")
                 reply = QMessageBox.question(
                     self,
                     "Select LAZ/LAS Folder",
@@ -17924,7 +17096,7 @@ class NakshaApp(QMainWindow):
             # ============================================================================
             # STEP 2: FIND MATCHING FILE
             # ============================================================================
-            print(f"\nðŸ” Searching for file matching: {grid_name}")
+            print(f"\n🔍 Searching for file matching: {grid_name}")
             
             all_files = list(las_folder.glob("*.laz")) + list(las_folder.glob("*.las"))
             print(f"   Total files in folder: {len(all_files)}")
@@ -17945,11 +17117,11 @@ class NakshaApp(QMainWindow):
             grid_name_clean = strip_lidar_extension(grid_name)
             las_file = find_matching_lidar_file(all_files, grid_name_clean)
             if las_file is not None:
-                print(f"   âœ… EXACT GRID MATCH FOUND: {las_file.name}")
+                print(f"   ✅ EXACT GRID MATCH FOUND: {las_file.name}")
             
             if not las_file:
-                print(f"   âŒ No automatic match found for '{grid_name_clean}'")
-                print(f"   ðŸ“„ Available files:")
+                print(f"   ❌ No automatic match found for '{grid_name_clean}'")
+                print(f"   📄 Available files:")
                 for fp in all_files[:10]:
                     print(f"      - {fp.name}")
                 
@@ -17978,18 +17150,18 @@ class NakshaApp(QMainWindow):
                 _class_filtered = getattr(self, '_loaded_with_class_filter', False)
                 if save_path and not _class_filtered:
                     try:
-                        print(f"\nðŸ’¾ AUTO-SAVING CURRENT FILE")
+                        print(f"\n💾 AUTO-SAVING CURRENT FILE")
                         from gui.save_pointcloud import save_pointcloud_quick
                         result = save_pointcloud_quick(self, save_path)
                         if result:
-                            print(f"   âœ… Saved successfully")
+                            print(f"   ✅ Saved successfully")
                     except Exception as e:
-                        print(f"   âš ï¸ Save failed: {e}")
+                        print(f"   ⚠️ Save failed: {e}")
             
             # ============================================================================
             # STEP 4: CLEAR CURRENT PROJECT - SAME AS MENU BAR
             # ============================================================================
-            print(f"\nðŸ§¹ CLEARING CURRENT PROJECT")
+            print(f"\n🧹 CLEARING CURRENT PROJECT")
 
             # Persist current file-specific display/PTC state before data clear.
             try:
@@ -17997,7 +17169,7 @@ class NakshaApp(QMainWindow):
                 _save_display_settings_before_clear(self)
                 print("[RUNTIME-CHECK] pre-clear-save caller=grid-load step=main-window")
             except Exception as e:
-                print(f"âš ï¸ Display settings pre-save skipped: {e}")
+                print(f"⚠️ Display settings pre-save skipped: {e}")
 
             # Stop queued debounced refresh callbacks from previous dataset.
             try:
@@ -18025,7 +17197,7 @@ class NakshaApp(QMainWindow):
                 if mem_guard is not None:
                     mem_guard.force_gc()
             except Exception as mem_exc:
-                print(f"âš ï¸ Memory manager clear hook skipped: {mem_exc}")
+                print(f"⚠️ Memory manager clear hook skipped: {mem_exc}")
             
             # Backup DXF actors
             dxf_backup = []
@@ -18038,7 +17210,7 @@ class NakshaApp(QMainWindow):
                     renderer = self.vtk_widget.renderer
                     for actor in dxf_backup:
                         renderer.RemoveActor(actor)
-                    print(f"   ðŸ’¾ Backed up {len(dxf_backup)} DXF actors")
+                    print(f"   💾 Backed up {len(dxf_backup)} DXF actors")
             
             # Backup SNT actors (same pattern as DXF)
             snt_backup = []
@@ -18052,7 +17224,7 @@ class NakshaApp(QMainWindow):
                         except Exception:
                             pass
                 if snt_backup:
-                    print(f"   ðŸ’¾ Backed up {len(snt_backup)} SNT actors")
+                    print(f"   💾 Backed up {len(snt_backup)} SNT actors")
             
             # Clear VTK
             if hasattr(self, "vtk_widget") and self.vtk_widget:
@@ -18081,15 +17253,15 @@ class NakshaApp(QMainWindow):
             if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
                 try:
                     self.cut_section_controller.clear()
-                    print("   âœ… Cut section cleared")
+                    print("   ✅ Cut section cleared")
                 except Exception as e:
-                    print(f"   âš ï¸ Cut section clear failed: {e}")
+                    print(f"   ⚠️ Cut section clear failed: {e}")
                     try:
                         ctrl = self.cut_section_controller
                         ctrl.cut_points = None
                         ctrl._cut_index_map = None
                         ctrl.is_cut_view_active = False
-                        print("   âœ… Applied fallback cut-state reset")
+                        print("   ✅ Applied fallback cut-state reset")
                     except Exception:
                         pass
             
@@ -18148,7 +17320,7 @@ class NakshaApp(QMainWindow):
                     renderer.AddActor(actor)
                 self.vtk_widget.render()
                 QCoreApplication.processEvents()
-                print(f"   âœ… Restored {len(dxf_backup)} DXF actors")
+                print(f"   ✅ Restored {len(dxf_backup)} DXF actors")
             
             # Restore SNT actors
             if snt_backup:
@@ -18156,14 +17328,14 @@ class NakshaApp(QMainWindow):
                 for actor in snt_backup:
                     renderer.AddActor(actor)
                 self.vtk_widget.render()
-                print(f"   âœ… Restored {len(snt_backup)} SNT actors")
+                print(f"   ✅ Restored {len(snt_backup)} SNT actors")
             
-            print(f"   âœ… Clear complete")
+            print(f"   ✅ Clear complete")
             
             # ============================================================================
             # STEP 5: LOAD FILE - SAME AS MENU BAR
             # ============================================================================
-            print(f"\nðŸ“‚ LOADING: {las_file.name}")
+            print(f"\n📂 LOADING: {las_file.name}")
             
             progress = LoadingProgressDialog(self, show_cancel=False)
             progress.set_filename(las_file.name)
@@ -18192,7 +17364,7 @@ class NakshaApp(QMainWindow):
                     return
                 
                 total_points = len(tile_data.get('xyz', []))
-                print(f"   âœ… Loaded {total_points:,} points")
+                print(f"   ✅ Loaded {total_points:,} points")
                 
                 # Set data
                 update_progress(50, "Setting data...")
@@ -18251,13 +17423,16 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
                 
-                # Build spatial index
+                # Phase 2 shared spatial index (background build, one per dataset)
                 if total_points > 50_000:
                     try:
-                        update_progress(70, "Building spatial index...")
-                        from gui.performance_optimizations import SpatialIndex
-                        self.spatial_index = SpatialIndex(self.data["xyz"])
-                    except Exception:
+                        update_progress(70, "Scheduling shared spatial index...")
+                        from gui.spatial_index import schedule_shared_index_build
+                        self.spatial_index = None
+                        schedule_shared_index_build(self, self.data["xyz"])
+                        print("PHASE2_SPATIAL_INDEX status=scheduled source=grid_reload")
+                    except Exception as exc:
+                        print(f"PHASE2_SPATIAL_INDEX status=schedule_failed error={exc}")
                         self.spatial_index = None
                 
                 # Restore settings
@@ -18299,7 +17474,7 @@ class NakshaApp(QMainWindow):
                         palette_to_apply = clone_palette(palette_to_apply)
                         for _code, _entry in palette_to_apply.items():
                             _entry["show"] = (_code in _sel)
-                        print(f"   ðŸ‘ Initial visibility: showing classes {sorted(_sel)}")
+                        print(f"   👁 Initial visibility: showing classes {sorted(_sel)}")
                     visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
                     update_progress(85, f"Rendering {visible_count} classes...")
                     
@@ -18379,7 +17554,7 @@ class NakshaApp(QMainWindow):
                 total_time = time.time() - load_start
                 
                 print(f"\n{'='*60}")
-                print(f"âœ… GRID LOAD COMPLETE")
+                print(f"✅ GRID LOAD COMPLETE")
                 print(f"   Grid: {grid_name}")
                 print(f"   Points: {total_points:,}")
                 print(f"   Time: {total_time:.1f}s")
@@ -18398,13 +17573,13 @@ class NakshaApp(QMainWindow):
                         prj_data = getattr(prj_dlg, "prj_data", None)
                         if (not prj_data) and prj_path and os.path.exists(prj_path):
                             if hasattr(prj_dlg, "parse_prj_file"):
-                                print(f"ðŸ” Restoring PRJ dialog data: {os.path.basename(prj_path)}")
+                                print(f"🔁 Restoring PRJ dialog data: {os.path.basename(prj_path)}")
                                 prj_dlg.parse_prj_file(prj_path)
                         prj_dlg.reapply_hide_state()
                     except Exception:
                         pass    
                                         
-                # âœ… BULLETPROOF: Re-ensure all overlay actors are in renderer
+                # ✅ BULLETPROOF: Re-ensure all overlay actors are in renderer
                 self._ensure_overlay_actors()
                 
                 progress.finish_success(f"Loaded {total_points:,} points")
@@ -18412,20 +17587,20 @@ class NakshaApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Grid Loaded",
-                    f"âœ… Loaded: {grid_name}\n\n"
+                    f"✅ Loaded: {grid_name}\n\n"
                     f"File: {las_file.name}\n"
                     f"Points: {total_points:,}"
                 )
                 
             except Exception as e:
-                print(f"âŒ Load failed: {e}")
+                print(f"❌ Load failed: {e}")
                 import traceback
                 traceback.print_exc()
                 progress.finish_error(f"Load failed: {e}")
                 QMessageBox.critical(self, "Load Error", f"Failed to load: {e}")
                 
         except Exception as e:
-            print(f"âš ï¸ Failed to load LAZ/LAS for {grid_name}: {e}")
+            print(f"⚠️ Failed to load LAZ/LAS for {grid_name}: {e}")
             import traceback
             traceback.print_exc()
             
@@ -18466,8 +17641,8 @@ class NakshaApp(QMainWindow):
                     'to': to_cls
                 }
         
-        print(f"ðŸ”„ Shortcuts rebuilt: {len(self.shortcuts)} shortcuts loaded")
-        print(f"ðŸ“‹ Current shortcuts: {self.shortcuts}")
+        print(f"🔄 Shortcuts rebuilt: {len(self.shortcuts)} shortcuts loaded")
+        print(f"📋 Current shortcuts: {self.shortcuts}")
 
     # Also add this method to be called whenever settings are saved:
     def save_classification_settings(self):
@@ -18477,10 +17652,10 @@ class NakshaApp(QMainWindow):
         # Your existing save logic here
         # ...
         
-        # âœ… ADD THIS LINE: Rebuild shortcuts after settings change
+        # ✅ ADD THIS LINE: Rebuild shortcuts after settings change
         self.rebuild_shortcuts()
         
-        print("âœ… Classification settings saved and shortcuts reloaded")
+        print("✅ Classification settings saved and shortcuts reloaded")
 
     def _consume_vtk_event(self, obj):
         """Prevent the default interactor style from processing the same wheel event."""
@@ -18709,6 +17884,69 @@ class NakshaApp(QMainWindow):
                     float(display_x), float(display_y), 0.0, renderer):
                 return False
             return cell_picker.GetActor() is actor
+        except Exception:
+            return False
+
+    def _main_view_pick_hits_any_actor(
+        self, actors, display_x=None, display_y=None, tolerance=0.0005,
+    ):
+        """True when the click hits any actor in one logical tiled surface."""
+        candidates = []
+        for actor in list(actors or []):
+            if actor is None:
+                continue
+            try:
+                if hasattr(actor, "GetVisibility") and not actor.GetVisibility():
+                    continue
+            except Exception:
+                pass
+            candidates.append(actor)
+        if not candidates:
+            return False
+        if len(candidates) == 1:
+            return self._main_view_pick_hits_actor(
+                candidates[0], display_x, display_y, tolerance,
+            )
+
+        vtk_widget = getattr(self, "vtk_widget", None)
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        interactor = getattr(vtk_widget, "interactor", None) if vtk_widget is not None else None
+        if renderer is None or interactor is None:
+            return False
+        if display_x is None or display_y is None:
+            try:
+                display_x, display_y = interactor.GetEventPosition()
+            except Exception:
+                return False
+        candidate_ids = {id(actor) for actor in candidates}
+
+        try:
+            prop_picker = vtk.vtkPropPicker()
+            prop_picker.PickFromListOn()
+            for actor in candidates:
+                prop_picker.AddPickList(actor)
+            if not prop_picker.Pick(
+                float(display_x), float(display_y), 0.0, renderer
+            ):
+                return False
+            picked_actor = prop_picker.GetActor()
+            if picked_actor is None and hasattr(prop_picker, "GetViewProp"):
+                picked_actor = prop_picker.GetViewProp()
+            return picked_actor is not None and id(picked_actor) in candidate_ids
+        except Exception:
+            pass
+
+        try:
+            cell_picker = vtk.vtkCellPicker()
+            cell_picker.SetTolerance(float(tolerance))
+            cell_picker.PickFromListOn()
+            for actor in candidates:
+                cell_picker.AddPickList(actor)
+            if not cell_picker.Pick(
+                float(display_x), float(display_y), 0.0, renderer
+            ):
+                return False
+            return id(cell_picker.GetActor()) in candidate_ids
         except Exception:
             return False
 
@@ -19017,7 +18255,7 @@ class NakshaApp(QMainWindow):
             return
         self._pan_nav_suspended_button = pb
         self.panning_button = "scroll"
-        print(f"ðŸ›‘ Left/Tap-Tap pan deactivated (Escape) - was '{pb}'; press Pan shortcut to re-arm")
+        print(f"🛑 Left/Tap-Tap pan deactivated (Escape) - was '{pb}'; press Pan shortcut to re-arm")
         try:
             self.statusBar().showMessage(
                 "Pan deactivated (Escape) - press Pan shortcut to re-arm", 4000
@@ -19032,17 +18270,7 @@ class NakshaApp(QMainWindow):
             return
         self._pan_nav_suspended_button = None
         self.panning_button = saved
-        print(f"âœ… Left/Tap-Tap pan re-armed ({saved})")
-
-    def _vulkan_owns_main_input(self) -> bool:
-        """True when the Vulkan surface is the visible main viewport and owns the
-        main camera: VTK-side main wheel / pan handlers must not mutate it."""
-        rb = getattr(self, "render_backend", None)
-        try:
-            return bool(rb is not None and rb.owns_main_camera()
-                        and rb.vulkan_viewport_is_visible())
-        except Exception:
-            return False
+        print(f"✅ Left/Tap-Tap pan re-armed ({saved})")
 
     def _handle_fast_main_pan_press(self, position, canvas_width, canvas_height):
         """Start one Qt-owned main-view pan before VTK sees the press."""
@@ -19050,9 +18278,6 @@ class NakshaApp(QMainWindow):
             return False
         if getattr(self, "is_3d_mode", False):
             return False
-        _owns_input = getattr(self, "_vulkan_owns_main_input", None)
-        if _owns_input is not None and _owns_input():
-            return False        # the Vulkan surface pans MainCamera2D; VTK must not
         if getattr(self, "active_classify_tool", None) is not None:
             return False
 
@@ -19083,17 +18308,6 @@ class NakshaApp(QMainWindow):
         self._qt_main_pan_last_display = tuple(display_position)
         self._qt_main_pan_active = True
         self._main_view_history_pan_active = True
-        # PART 14: lock ParallelScale for the whole gesture. A pan may move
-        # the centre only; anything that changes the scale mid-pan is a bug
-        # and is rolled back with the offending callback named.
-        try:
-            _cam0 = getattr(self.vtk_widget, "renderer", None)
-            _cam0 = _cam0.GetActiveCamera() if _cam0 is not None else None
-            if _cam0 is not None:
-                from gui.zoom_navigation import note_pan_scale
-                note_pan_scale(self, float(_cam0.GetParallelScale()))
-        except Exception:
-            pass
         try:
             history_timer = getattr(self, "_view_history_timer", None)
             if history_timer is not None:
@@ -19144,12 +18358,6 @@ class NakshaApp(QMainWindow):
         if camera is None:
             self._handle_fast_main_pan_release()
             return True
-        # PART 14: pan must not change ParallelScale.
-        try:
-            from gui.zoom_navigation import enforce_pan_scale
-            enforce_pan_scale(self, "pan_move")
-        except Exception:
-            pass
 
         try:
             current_display = self._main_pan_display_position(
@@ -19214,13 +18422,6 @@ class NakshaApp(QMainWindow):
             return False
 
         self._qt_main_pan_active = False
-        # PART 14: final scale check for the gesture, then release the lock.
-        try:
-            from gui.zoom_navigation import enforce_pan_scale
-            enforce_pan_scale(self, "pan_release")
-        except Exception:
-            pass
-        self._pan_lock_scale = None
         self._qt_main_pan_last_display = None
         self._main_view_history_pan_active = False
         self._set_digitizer_qt_pan_guard(False)
@@ -19291,30 +18492,77 @@ class NakshaApp(QMainWindow):
             return False
 
         try:
-            # PART 2/6/7/8: this route no longer owns a zoom factor of its own.
-            # Raw Qt units are normalised to notches through the shared
-            # accumulator, clamped per event, and turned into ONE absolute
-            # 1.10**steps mutation by the single main-view zoom owner.
-            from gui.zoom_navigation import (apply_zoom_steps, wheel_steps,
-                                             zoom_factor_for)
-            _steps = wheel_steps(wheel_delta)
-            if not apply_zoom_steps(self, _steps,
-                                    display_position=display_position,
-                                    label="qt_event_filter"):
-                return False
-            factor = zoom_factor_for(_steps)
-        except (TypeError, ValueError, ImportError):
+            from gui.zoom_navigation import fast_wheel_zoom_factor
+            factor = fast_wheel_zoom_factor(wheel_delta)
+        except (TypeError, ValueError):
             return False
 
-        # Cursor anchoring, rollback and the runaway check all live inside
-        # apply_zoom_steps(); there is nothing left to undo here. Guard only
-        # against a non-finite result ever reaching the renderer.
+        snapshot = {
+            "position": tuple(camera.GetPosition()),
+            "focal_point": tuple(camera.GetFocalPoint()),
+            "parallel_scale": float(camera.GetParallelScale()),
+            "view_angle": float(camera.GetViewAngle()),
+            "parallel_projection": bool(camera.GetParallelProjection()),
+        }
+
+        def _restore_camera():
+            try:
+                camera.SetPosition(snapshot["position"])
+                camera.SetFocalPoint(snapshot["focal_point"])
+                camera.SetParallelScale(snapshot["parallel_scale"])
+                camera.SetViewAngle(snapshot["view_angle"])
+                if snapshot["parallel_projection"]:
+                    camera.ParallelProjectionOn()
+                else:
+                    camera.ParallelProjectionOff()
+            except Exception:
+                pass
+
+        applied = False
+        try:
+            # Main 2D wheel zoom is always cursor-oriented.  Do not let an old
+            # saved center/picked-point preference move production users away
+            # from the feature currently under the pointer.
+            applied = self._zoom_widget_at_cursor(
+                vtk_widget,
+                factor,
+                interactor=getattr(vtk_widget, "interactor", None),
+                display_position=display_position,
+                render=False,
+            )
+
+            if not applied:
+                # Coordinate conversion can be unavailable during viewport
+                # creation/teardown.  Restore first, then use exactly one safe
+                # center zoom rather than leaving a half-applied anchor update.
+                _restore_camera()
+                camera.Zoom(factor)
+                applied = True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            _restore_camera()
+            return False
+        except Exception:
+            _restore_camera()
+            return False
+
+        if not applied:
+            return False
+
         try:
             if camera.GetParallelProjection():
                 scale = float(camera.GetParallelScale())
                 if not np.isfinite(scale) or scale <= 0.0:
+                    _restore_camera()
                     return False
+                camera.SetParallelScale(max(1.0e-6, min(1.0e12, scale)))
+            else:
+                view_angle = float(camera.GetViewAngle())
+                if not np.isfinite(view_angle) or view_angle <= 0.0:
+                    _restore_camera()
+                    return False
+                camera.SetViewAngle(max(0.1, min(179.0, view_angle)))
         except Exception:
+            _restore_camera()
             return False
 
         self._refresh_main_view_clipping_after_navigation(renderer)
@@ -19403,36 +18651,39 @@ class NakshaApp(QMainWindow):
         )
 
     def _on_main_mouse_wheel(self, obj, evt):
-        """Legacy VTK wheel fallback: swallow stray wheel events only.
-
-        The main 2D view must not start a second smooth-zoom animation here.
-        The Qt event filter owns all 2D camera mutation, and the VTK callback
-        only exists to consume native wheel events that slip through so they do
-        not reach any lower-priority observer and trigger a duplicate zoom.
-        """
-        from gui.zoom_navigation import main_2d_wheel_legacy_zoom_allowed
-
-        if not main_2d_wheel_legacy_zoom_allowed(
-            is_3d_mode=bool(getattr(self, "is_3d_mode", False))
-        ):
-            # 2D main view: the fast Qt path is the sole mutator.  Consume the
-            # native event, but leave the camera and zoom state alone.
-            self._consume_vtk_event(obj)
+        # In 3D mode, do not run 2D cursor/picked-point zoom logic.
+        # Let vtkInteractorStyleTrackballCamera handle wheel zoom normally.
+        if getattr(self, "is_3d_mode", False):
+            self._schedule_main_view_history_commit("3d_mouse_wheel_zoom", delay_ms=120)
             return
 
-        # 3D mode keeps the native trackball zoom path.
-        #
-        # CORRECTED 2026-10: the comment above claimed 3D zoom was handled by a
-        # "native trackball" path, but this branch was byte-identical to the 2D
-        # one - it consumed the event and mutated nothing. Combined with
-        # apply_zoom_steps' `if is_3d_mode: return False`, that left NO owner for
-        # the 3D wheel, which is exactly why Shift+P zoom did nothing.
-        #
-        # The single 3D owner is now AppRenderBackendOwner.apply_3d_wheel,
-        # reached from VulkanSurface.wheelEvent (the visible main viewport),
-        # which consumes the Qt event so it never reaches this observer. This
-        # observer therefore stays a pure defensive consume in BOTH modes: it
-        # must not mutate, or a wheel that both surfaces see would zoom twice.
+        zoom_behavior = getattr(self, "zoom_behavior", "center")
+
+        # Accumulate each standard notch into the eased target multiplier.
+        notch = self._zoom_notch_factor if evt == "MouseWheelForwardEvent" else (1.0 / self._zoom_notch_factor)
+        self._zoom_target_factor *= notch
+
+        # This high-priority handler consumes the VTK event, so the render
+        # manager's lower-priority wheel observer will not see it.  Explicitly
+        # mark the whole eased animation as an interaction: intermediate frames
+        # are then coalesced and one full-quality frame is drawn when it settles.
+        render_manager = getattr(self, "gpu_render_manager", None)
+        if render_manager is not None and hasattr(render_manager, "begin_wheel_interaction"):
+            render_manager.begin_wheel_interaction()
+
+        # For picked_point mode, capture the anchor once per gesture.
+        if zoom_behavior == "picked_point":
+            self._zoom_anchor_pending = getattr(self, "_zoom_anchor_points", {}).get(id(self.vtk_widget))
+
+        self._start_smooth_zoom()
+
+        digitizer = getattr(self, "digitizer", None)
+        if digitizer and hasattr(digitizer, "_on_zoom"):
+            try:
+                digitizer._on_zoom(obj, evt)
+            except Exception:
+                pass
+
         self._consume_vtk_event(obj)
 
     def _start_smooth_zoom(self):
@@ -19529,7 +18780,7 @@ class NakshaApp(QMainWindow):
             applied = False
 
         if not applied:
-            # Could not apply (no renderer/camera) â€” abort gesture.
+            # Could not apply (no renderer/camera) — abort gesture.
             self._finish_smooth_zoom()
             return
 
@@ -19584,7 +18835,7 @@ class NakshaApp(QMainWindow):
         except ValueError:
             pass # Ignore incomplete or invalid text inputs like 'a'
         except Exception as e:
-            print(f"âš ï¸ Magnifier Error: {e}")
+            print(f"⚠️ Magnifier Error: {e}")
 
     def fit_view(self):
         """
@@ -19607,7 +18858,7 @@ class NakshaApp(QMainWindow):
                 self.magnifier_combo.blockSignals(False)
             
             print(f"\n{'='*60}")
-            print(f"ðŸ§² FIT VIEW (Point Cloud + DXF)")
+            print(f"🧲 FIT VIEW (Point Cloud + DXF)")
             print(f"{'='*60}")
             
             # ============================================================
@@ -19621,9 +18872,9 @@ class NakshaApp(QMainWindow):
                     short_filter = getattr(self, "short_cut_filter", None)
                     if short_filter and hasattr(short_filter, "_clear_main_camera_lock_observer"):
                         short_filter._clear_main_camera_lock_observer(self.vtk_widget.renderer.GetActiveCamera())
-                        print("ðŸ§¹ Cleared owned camera lock observer")
+                        print("🧹 Cleared owned camera lock observer")
                 except Exception as lock_clear_error:
-                    print(f"âš ï¸ Could not clear main camera lock observer: {lock_clear_error}")
+                    print(f"⚠️ Could not clear main camera lock observer: {lock_clear_error}")
             
             # ============================================================
             # 1. Get point cloud bounds
@@ -19651,7 +18902,7 @@ class NakshaApp(QMainWindow):
                                     'ymax': visible_xyz[:, 1].max(),
                                 })
                                 point_cloud_bounds_added = True
-                                print(f"   âœ… Point cloud bounds added")
+                                print(f"   ✅ Point cloud bounds added")
                     else:
                         # No palette - use all points
                         bounds_list.append({
@@ -19661,34 +18912,16 @@ class NakshaApp(QMainWindow):
                             'ymax': xyz[:, 1].max(),
                         })
                         point_cloud_bounds_added = True
-                        print(f"   âœ… Point cloud bounds added (all points)")
-
-            if not point_cloud_bounds_added:
-                # STREAMING (cache-first) datasets keep app.data empty by design;
-                # the manager's index header is the only authoritative bounds
-                # source. Without this, Fit printed "No visible data to fit" and
-                # did nothing for every streamed cloud.
-                try:
-                    _stream = getattr(self, 'naksha_stream', None)
-                    _sb = _stream.dataset_bounds() if _stream is not None else None
-                    if _sb is not None:
-                        (_x0, _y0, _z0), (_x1, _y1, _z1) = _sb
-                        if np.isfinite([_x0, _y0, _x1, _y1]).all() and _x1 > _x0 and _y1 > _y0:
-                            bounds_list.append({'xmin': _x0, 'xmax': _x1,
-                                                'ymin': _y0, 'ymax': _y1})
-                            point_cloud_bounds_added = True
-                            print("   âœ… Point cloud bounds added (streaming index)")
-                except Exception as _stream_bounds_error:
-                    print(f"   âš ï¸ Streaming bounds unavailable: {_stream_bounds_error}")
+                        print(f"   ✅ Point cloud bounds added (all points)")
 
             if point_cloud_bounds_added:
-                print("   ðŸŽ¯ Point cloud bounds present â€” skipping DXF/SNT bounds for main fit")
+                print("   🎯 Point cloud bounds present — skipping DXF/SNT bounds for main fit")
             else:
                 # ============================================================
                 # 2. Get DXF grid bounds (fallback)
                 # ============================================================
                 if hasattr(self, 'dxf_actors') and self.dxf_actors:
-                    print(f"   ðŸ“ Checking {len(self.dxf_actors)} DXF grids...")
+                    print(f"   📐 Checking {len(self.dxf_actors)} DXF grids...")
                     
                     for i, dxf_data in enumerate(self.dxf_actors):
                         try:
@@ -19699,7 +18932,7 @@ class NakshaApp(QMainWindow):
                             
                             # Check first actor's visibility
                             if not actors[0].GetVisibility():
-                                print(f"      â­ï¸ DXF {i}: Hidden - skipping")
+                                print(f"      ⏭️ DXF {i}: Hidden - skipping")
                                 continue
                             
                             # Get DXF bounds
@@ -19712,18 +18945,18 @@ class NakshaApp(QMainWindow):
                                     'ymin': dxf_bounds[2],
                                     'ymax': dxf_bounds[3],
                                 })
-                                print(f"      âœ… DXF {i}: Bounds added")
+                                print(f"      ✅ DXF {i}: Bounds added")
                             else:
-                                print(f"      âš ï¸ DXF {i}: No bounds data")
+                                print(f"      ⚠️ DXF {i}: No bounds data")
                                 
                         except Exception as e:
-                            print(f"      âš ï¸ DXF {i}: Error - {e}")
+                            print(f"      ⚠️ DXF {i}: Error - {e}")
 
                 # ============================================================
                 # 3. Get SNT grid bounds (fallback)
                 # ============================================================
                 if hasattr(self, 'snt_actors') and self.snt_actors:
-                    print(f"   ðŸ—‚ï¸ Checking {len(self.snt_actors)} SNT grids...")
+                    print(f"   🗂️ Checking {len(self.snt_actors)} SNT grids...")
 
                     for i, snt_data in enumerate(self.snt_actors):
                         try:
@@ -19734,7 +18967,7 @@ class NakshaApp(QMainWindow):
 
                             # Check first actor's visibility
                             if not actors[0].GetVisibility():
-                                print(f"      â­ï¸ SNT {i}: Hidden - skipping")
+                                print(f"      ⏭️ SNT {i}: Hidden - skipping")
                                 continue
 
                             # Get SNT bounds. Prefer camera-fit bounds because
@@ -19747,12 +18980,12 @@ class NakshaApp(QMainWindow):
                                     'ymin': snt_bounds[2],
                                     'ymax': snt_bounds[3],
                                 })
-                                print(f"      âœ… SNT {i}: Bounds added")
+                                print(f"      ✅ SNT {i}: Bounds added")
                             else:
-                                print(f"      âš ï¸ SNT {i}: No bounds data")
+                                print(f"      ⚠️ SNT {i}: No bounds data")
 
                         except Exception as e:
-                            print(f"      âš ï¸ SNT {i}: Error - {e}")
+                            print(f"      ⚠️ SNT {i}: Error - {e}")
 
                 # ============================================================
                 # 4. Get digitized drawing bounds (fallback)
@@ -19760,7 +18993,7 @@ class NakshaApp(QMainWindow):
                 digitizer = getattr(self, 'digitizer', None)
                 drawings = list(getattr(digitizer, 'drawings', []) or [])
                 if drawings:
-                    print(f"   âœï¸ Checking {len(drawings)} drawing(s)...")
+                    print(f"   ✏️ Checking {len(drawings)} drawing(s)...")
 
                     for i, drawing in enumerate(drawings):
                         try:
@@ -19786,13 +19019,13 @@ class NakshaApp(QMainWindow):
                                 'ymax': max(ys),
                             })
                         except Exception as e:
-                            print(f"      âš ï¸ Drawing {i}: Error - {e}")
+                            print(f"      ⚠️ Drawing {i}: Error - {e}")
 
             # ============================================================
             # 5. Calculate combined bounds
             # ============================================================
             if not bounds_list:
-                print(f"   âš ï¸ No visible data to fit")
+                print(f"   ⚠️ No visible data to fit")
                 print(f"{'='*60}\n")
                 return
             
@@ -19802,15 +19035,15 @@ class NakshaApp(QMainWindow):
             ymin = min(b['ymin'] for b in bounds_list)
             ymax = max(b['ymax'] for b in bounds_list)
             
-            print(f"\n   ðŸ“Š Combined bounds:")
-            print(f"      X: {xmin:.2f} â†’ {xmax:.2f} (width: {xmax-xmin:.2f})")
-            print(f"      Y: {ymin:.2f} â†’ {ymax:.2f} (height: {ymax-ymin:.2f})")
+            print(f"\n   📊 Combined bounds:")
+            print(f"      X: {xmin:.2f} → {xmax:.2f} (width: {xmax-xmin:.2f})")
+            print(f"      Y: {ymin:.2f} → {ymax:.2f} (height: {ymax-ymin:.2f})")
             
             # ============================================================
             # 6. Set camera to fit combined bounds
             # ============================================================
             if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
-                print(f"   âš ï¸ No VTK widget")
+                print(f"   ⚠️ No VTK widget")
                 return
             
             renderer = self.vtk_widget.renderer
@@ -19831,50 +19064,38 @@ class NakshaApp(QMainWindow):
                 if xyz is not None and len(xyz) > 0:
                     center_z = float(np.median(xyz[:, 2]))
 
-            # STAGE E: when the Vulkan MAIN viewport owns the camera, Fit sets
-            # MainCamera2D (VTK ResetCamera is not the authority) and mirrors the
-            # identical top-view pose into VTK.
-            _cam_owner = getattr(self, 'render_backend', None)
-            _fit_done = False
-            try:
-                if _cam_owner is not None and _cam_owner.owns_main_camera():
-                    _fit_done = bool(_cam_owner.apply_main_fit(
-                        center_x, center_y, center_z, max_dim / 2.0, renderer))
-            except Exception as _fit_owner_error:
-                print(f"   Fit via MainCamera2D failed ({_fit_owner_error}); using VTK path")
-            if not _fit_done:
-                # Set camera for top view
-                camera.SetPosition(center_x, center_y, center_z + 5000)
-                camera.SetFocalPoint(center_x, center_y, center_z)
-                camera.SetViewUp(0, 1, 0)
-                camera.ParallelProjectionOn()
-                camera.SetParallelScale(max_dim / 2.0)
+            # Set camera for top view
+            camera.SetPosition(center_x, center_y, center_z + 5000)
+            camera.SetFocalPoint(center_x, center_y, center_z)
+            camera.SetViewUp(0, 1, 0)
+            camera.ParallelProjectionOn()
+            camera.SetParallelScale(max_dim / 2.0)
 
-                # Update clipping range
-                renderer.ResetCameraClippingRange()
+            # Update clipping range
+            renderer.ResetCameraClippingRange()
             
             # Render
             self.vtk_widget.render()
             
-            print(f"   âœ… Camera fitted to combined bounds")
+            print(f"   ✅ Camera fitted to combined bounds")
             
             # ============================================================
             # 7. REFRESH 2D LOCK IF ACTIVE
             # ============================================================
             if is_2d_locked:
-                print(f"â„¹ï¸ Already 2D locked â€” re-fitting bounds only (no view reset)")
+                print(f"ℹ️ Already 2D locked — re-fitting bounds only (no view reset)")
                 self._refresh_2d_lock()
-                print(f"ðŸ”’ Main view 2D lock REFRESHED")
+                print(f"🔒 Main view 2D lock REFRESHED")
             
             print(f"{'='*60}\n")
             
             self._schedule_main_view_history_commit("fit_view", delay_ms=120)
 
             if hasattr(self, 'statusBar'):
-                self.statusBar().showMessage("ðŸ§² View fitted to all visible data", 2000)
+                self.statusBar().showMessage("🧲 View fitted to all visible data", 2000)
             
         except Exception as e:
-            print(f"âš ï¸ Fit view failed: {e}")
+            print(f"⚠️ Fit view failed: {e}")
             import traceback
             traceback.print_exc()
 
@@ -19895,7 +19116,7 @@ class NakshaApp(QMainWindow):
                 return True
 
         except Exception as e:
-            print(f"âš ï¸ fit_view_with_2d_lock shortcut-path failed ({source}): {e}")
+            print(f"⚠️ fit_view_with_2d_lock shortcut-path failed ({source}): {e}")
 
         try:
             self.fit_view()
@@ -19906,7 +19127,7 @@ class NakshaApp(QMainWindow):
             self._main_view_2d_locked = True
             return True
         except Exception as e:
-            print(f"âš ï¸ fit_view_with_2d_lock fallback failed ({source}): {e}")
+            print(f"⚠️ fit_view_with_2d_lock fallback failed ({source}): {e}")
             return False
 
     def _refresh_2d_lock(self):
@@ -19938,7 +19159,7 @@ class NakshaApp(QMainWindow):
             }
             self._main_view_locked_params = lock_params
             self._main_view_2d_locked = True
-            print("ðŸ“¸ Captured new lock target")
+            print("📸 Captured new lock target")
 
             short_filter = getattr(self, "short_cut_filter", None)
             if not short_filter or not hasattr(short_filter, "_install_main_camera_lock_observer"):
@@ -19994,10 +19215,10 @@ class NakshaApp(QMainWindow):
                     _enforcing[0] = False
 
             short_filter._install_main_camera_lock_observer(camera, enforce_camera_lock_main)
-            print("ðŸ”’ Fresh camera lock observer installed")
+            print("🔒 Fresh camera lock observer installed")
             
         except Exception as e:
-            print(f"âš ï¸ Failed to refresh 2D lock: {e}")
+            print(f"⚠️ Failed to refresh 2D lock: {e}")
         
     def _save_quick_no_dialog(self):
         from .save_pointcloud import save_pointcloud, has_fenced_parent_writeback
@@ -20042,7 +19263,7 @@ class NakshaApp(QMainWindow):
         Cleanup camera sync resources on app close.
         Call this in your closeEvent() method.
         """
-        print("ðŸ§¹ Cleaning up camera sync...")
+        print("🧹 Cleaning up camera sync...")
         
         # Stop all debounce timers
         if hasattr(self, '_camera_debounce_timers'):
@@ -20068,7 +19289,7 @@ class NakshaApp(QMainWindow):
         if hasattr(self, '_last_camera_states'):
             self._last_camera_states.clear()
         
-        print("âœ… Camera sync cleanup complete")       
+        print("✅ Camera sync cleanup complete")       
 
     def on_curve_tool_selected(self, tool_name):
         """Handle curve tool selection from ribbon"""
@@ -20083,7 +19304,7 @@ class NakshaApp(QMainWindow):
                     self.curvetool.resume()
                 else:
                     self.curvetool.activate()
-                print(f"ðŸ”® Curve tool '{tool_name}' activated")
+                print(f"🔮 Curve tool '{tool_name}' activated")
  
     def on_curve_button_clicked(self):
         """Activate the curve drawing tool"""
@@ -20117,25 +19338,25 @@ class NakshaApp(QMainWindow):
             from .undo_context_manager import get_undo_context_manager
         if get_undo_context_manager(self).is_classification_active():
             try:
-                print("ðŸ›‘ Draw tool 'curve' selected â€” deactivating classification tool")
+                print("🛑 Draw tool 'curve' selected — deactivating classification tool")
                 self.deactivate_classification_tool(preserve_cross_section=True)
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate classification before curve tool: {e}")
+                print(f"⚠️ Failed to deactivate classification before curve tool: {e}")
 
         if getattr(self, 'cross_section_active', False):
             try:
-                print("ðŸ›‘ Draw tool 'curve' selected â€” deactivating cross-section tool")
+                print("🛑 Draw tool 'curve' selected — deactivating cross-section tool")
                 self.deactivate_cross_section_tool()
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate cross-section before curve tool: {e}")
+                print(f"⚠️ Failed to deactivate cross-section before curve tool: {e}")
 
         if getattr(self, 'cut_section_mode_on', False):
             try:
-                print("ðŸ›‘ Draw tool 'curve' selected â€” deactivating cut-section tool")
+                print("🛑 Draw tool 'curve' selected — deactivating cut-section tool")
                 self.cut_section_controller.cancel_cut_section()
                 self.cut_section_mode_on = False
             except Exception as e:
-                print(f"âš ï¸ Failed to deactivate cut-section before curve tool: {e}")
+                print(f"⚠️ Failed to deactivate cut-section before curve tool: {e}")
 
         # Deactivate other tools first (safe checks)
         for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
@@ -20164,7 +19385,7 @@ class NakshaApp(QMainWindow):
             except Exception:
                 pass
        
-        # âœ… Deactivate digitizer when starting curve tool
+        # ✅ Deactivate digitizer when starting curve tool
         if hasattr(self, 'digitizer') and self.digitizer:
             try:
                 self.digitizer.deactivate_element_select_tool()
@@ -20184,13 +19405,13 @@ class NakshaApp(QMainWindow):
                 self.curve_tool.resume()
             else:
                 self.curve_tool.activate()
-        print("ðŸ”® Curve tool activated")
+        print("🔮 Curve tool activated")
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    # Phase 3: GPU Uniform Sync handler (palette_changed â†’ sync_palette_to_gpu)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3: GPU Uniform Sync handler (palette_changed → sync_palette_to_gpu)
+    # ═══════════════════════════════════════════════════════════════════
     #     """
-    #     Instant GPU uniform poke â€” O(1) palette update.
+    #     Instant GPU uniform poke — O(1) palette update.
     #     Connected to DisplayModeDialog.palette_changed signal.
     #     """
 
@@ -20207,14 +19428,14 @@ class NakshaApp(QMainWindow):
             if self.data is None:
                 return
 
-            # For the main view only sync in class-based modes â€” pushing class
+            # For the main view only sync in class-based modes — pushing class
             # palette uniforms in depth/rgb/intensity/elevation mode overwrites
             # the active color buffer and corrupts the display.
             if slot_idx == 0:
                 current_mode = getattr(self, "display_mode", "class")
                 CLASS_MODES = {"class", "shaded_class"}
                 if current_mode not in CLASS_MODES:
-                    print(f"âš¡ _on_palette_changed slot 0 skipped (mode={current_mode})")
+                    print(f"⚡ _on_palette_changed slot 0 skipped (mode={current_mode})")
                     return
 
             if slot_idx == 0:
@@ -20237,21 +19458,85 @@ class NakshaApp(QMainWindow):
                 )
 
         except Exception as e:
-            print(f"âŒ Error in _on_palette_changed (Slot {slot_idx}): {e}")
+            print(f"❌ Error in _on_palette_changed (Slot {slot_idx}): {e}")
 
     # Add this inside the NakshaApp class
-    def _on_classification_finished(self, changed_mask):
+    def _on_classification_finished(self, changed_payload):
+        """Synchronize views after a classification transaction.
+
+        Phase 1 accepts either the new SparseClassificationDelta/index payload
+        or the historical bool[N] mask.  Class-mode synchronization stays
+        sparse end-to-end; Surface materializes the old mask representation
+        only at its existing topology boundary.
         """
-        FIXED: Never reads from _naksha_section_class mirror.
-        Always derives colors from self.data["classification"] (ground truth).
-        """
+        import numpy as np
+        from gui.classification_delta import (
+            SparseClassificationDelta,
+            materialize_changed_mask,
+            resolve_changed_indices,
+        )
+
+        delta = changed_payload if isinstance(changed_payload, SparseClassificationDelta) else None
+        changed_idx = resolve_changed_indices(changed_payload, app=self)
+        if changed_idx.size == 0:
+            changed_idx = resolve_changed_indices(
+                getattr(self, "_last_classification_delta", None), app=self
+            )
+        legacy_mask = (
+            changed_payload
+            if isinstance(changed_payload, np.ndarray) and changed_payload.dtype == bool
+            else None
+        )
+
         try:
-            from gui.unified_actor_manager import fast_cross_section_update, sync_palette_to_gpu, build_section_unified_actor
+            # STEP-2 shading journal.  Native Phase-1 commits already contain
+            # the exact old/new transition, so do not recover it by rescanning
+            # the dataset.  Legacy mask emitters keep the established recovery.
+            try:
+                from gui.shading_display import (
+                    _recover_classification_delta,
+                    record_shading_classification_delta,
+                )
+                if delta is not None and delta.indices.size:
+                    record_shading_classification_delta(
+                        self,
+                        delta.indices,
+                        delta.old_classes,
+                        delta.new_classes,
+                        operation=delta.operation,
+                        origin_view=delta.origin_view,
+                    )
+                elif changed_idx.size:
+                    _delta = getattr(self, '_pending_shading_delta', None)
+                    if _delta is None or not np.array_equal(
+                        np.asarray(getattr(_delta, 'changed_indices', []), dtype=np.int64).ravel(),
+                        changed_idx,
+                    ):
+                        _delta = _recover_classification_delta(
+                            self, changed_idx, operation='classification_finished'
+                        )
+                    if _delta is not None:
+                        record_shading_classification_delta(
+                            self, _delta.changed_indices, _delta.old_classes,
+                            _delta.new_classes, operation=_delta.operation,
+                            origin_view=_delta.origin_view,
+                        )
+            except Exception as _delta_record_err:
+                print(
+                    'SHADING_DELTA_JOURNAL status=signal_record_skipped '
+                    f'reason={_delta_record_err}'
+                )
+
+            from gui.unified_actor_manager import (
+                build_section_unified_actor,
+                fast_cross_section_update,
+                sync_palette_to_gpu,
+            )
 
             if hasattr(self, 'section_vtks') and self.section_vtks:
                 for view_idx in self.section_vtks.keys():
-
-                    # [CS-MESH-DISPLAY] classification dispatcher
+                    # Mesh dispatcher currently ignores the changed-mask data;
+                    # pass the payload through to preserve its public contract.
                     try:
                         from gui.cross_section.section_mesh_display import (
                             refresh_section_display_after_classification,
@@ -20259,36 +19544,39 @@ class NakshaApp(QMainWindow):
                         if refresh_section_display_after_classification(
                             self,
                             view_idx,
-                            changed_mask,
-                            operation=str(getattr(self, "_classification_refresh_operation", "classification") or "classification"),
+                            changed_payload,
+                            operation=str(
+                                getattr(
+                                    self,
+                                    "_classification_refresh_operation",
+                                    "classification",
+                                ) or "classification"
+                            ),
                         ):
                             continue
                     except Exception as _cs_mesh_refresh_err:
                         print(
-                            f"SECTION_MESH view={view_idx + 1} status=classification_refresh_failed "
+                            f"SECTION_MESH view={view_idx + 1} "
+                            "status=classification_refresh_failed "
                             f"reason={_cs_mesh_refresh_err}"
                         )
-                    if (changed_mask is not None
-                            and isinstance(changed_mask, np.ndarray)
-                            and changed_mask.dtype == bool):
-                        # *** CRITICAL FIX ***
-                        # Before calling fast_cross_section_update,
-                        # ensure the section mirror is in sync with
-                        # self.data["classification"] for the WHOLE section,
-                        # not just changed_mask. This prevents stale mirror
-                        # data from being used as source of truth.
+
+                    if changed_idx.size:
                         self._sync_section_mirror_from_data(view_idx)
                         slot_idx = view_idx + 1
                         palette = self._get_cross_section_palette(slot_idx)
                         ok = fast_cross_section_update(
                             self,
                             view_idx,
-                            changed_mask,
+                            changed_indices=changed_idx,
+                            delta=delta,
                             palette=palette,
                             force_visibility_refresh=False,
                         )
                         if not ok:
-                            border = float(getattr(self, "view_borders", {}).get(slot_idx, 0) or 0.0)
+                            border = float(
+                                getattr(self, "view_borders", {}).get(slot_idx, 0) or 0.0
+                            )
                             view_mode = getattr(self, "cross_view_mode", "front")
                             rebuilt = build_section_unified_actor(
                                 self,
@@ -20301,53 +19589,78 @@ class NakshaApp(QMainWindow):
                                 fast_cross_section_update(
                                     self,
                                     view_idx,
-                                    changed_mask,
+                                    changed_indices=changed_idx,
+                                    delta=delta,
                                     palette=palette,
                                     force_visibility_refresh=False,
                                 )
                     else:
                         sync_palette_to_gpu(self, slot_idx=view_idx + 1, render=True)
 
-            # Refresh the main view immediately after the cross-section commit.
-            # This is the actual repaint path the user expects after classification,
-            # independent of any display-sync shortcut.
-            try:
-                from gui.unified_actor_manager import guarantee_main_view_visual_refresh
-
-                if changed_mask is None:
-                    changed_mask = getattr(self, "_last_changed_mask", None)
-
-                main_refresh_ok = guarantee_main_view_visual_refresh(
-                    self,
-                    changed_mask=changed_mask,
-                    to_class=getattr(self, "to_class", None),
-                    reason="cross_section_classification_finished",
+            skip_signal_main_refresh = bool(
+                getattr(self, "_cross_section_interactor_owns_main_refresh", False)
+            )
+            if skip_signal_main_refresh:
+                print(
+                    "MAIN_REFRESH signal subscriber skipped: "
+                    "cross-section interactor owns sparse Main View commit"
                 )
-                if not main_refresh_ok and str(getattr(self, "display_mode", "") or "").lower() == "class":
-                    from gui.class_display import update_class_mode
-                    update_class_mode(self, force_refresh=True)
-                    if hasattr(self, "vtk_widget") and self.vtk_widget is not None:
-                        self.vtk_widget.render()
-                print("   âœ… Main View refreshed after cross-section classification")
-            except Exception as _main_refresh_err:
-                print(f"   âš ï¸ Main View refresh failed after classification: {_main_refresh_err}")
+            else:
+                try:
+                    from gui.unified_actor_manager import guarantee_main_view_visual_refresh
+
+                    main_refresh_ok = guarantee_main_view_visual_refresh(
+                        self,
+                        changed_indices=changed_idx,
+                        delta=delta,
+                        changed_mask=legacy_mask,
+                        to_class=getattr(self, "to_class", None),
+                        reason="cross_section_classification_finished",
+                    )
+                    if (
+                        not main_refresh_ok
+                        and str(getattr(self, "display_mode", "") or "").lower() == "class"
+                    ):
+                        from gui.class_display import update_class_mode
+                        update_class_mode(self, force_refresh=True)
+                        if hasattr(self, "vtk_widget") and self.vtk_widget is not None:
+                            self.vtk_widget.render()
+                    print("   Main View refreshed after cross-section classification")
+                except Exception as _main_refresh_err:
+                    print(
+                        "   Main View refresh failed after classification: "
+                        f"{_main_refresh_err}"
+                    )
 
             if str(getattr(self, "display_mode", "") or "").lower() == "surface":
                 try:
                     if bool(getattr(self, "_surface_refresh_already_scheduled", False)):
                         self._surface_refresh_already_scheduled = False
-
-                    elif bool(getattr(self, "_surface_skip_next_classification_finished_refresh", False)):
+                    elif bool(
+                        getattr(
+                            self,
+                            "_surface_skip_next_classification_finished_refresh",
+                            False,
+                        )
+                    ):
                         self._surface_skip_next_classification_finished_refresh = False
-
                     else:
+                        surface_mask = legacy_mask
+                        if surface_mask is None and changed_idx.size:
+                            surface_mask = materialize_changed_mask(
+                                self,
+                                delta if delta is not None else changed_idx,
+                                reason="surface_classification_finished",
+                            )
                         self.refresh_surface_after_classification(
                             reason="classification finished",
-                            changed_mask=changed_mask,
+                            changed_mask=surface_mask,
                         )
                 except Exception as _surface_refresh_err:
-                    print(f"Surface post-classification refresh failed: {_surface_refresh_err}")
-
+                    print(
+                        "Surface post-classification refresh failed: "
+                        f"{_surface_refresh_err}"
+                    )
 
             if hasattr(self, 'cut_section_controller'):
                 ctrl = self.cut_section_controller
@@ -20358,16 +19671,21 @@ class NakshaApp(QMainWindow):
             from gui.point_count_widget import refresh_point_statistics
             refresh_point_statistics(self)
 
+            print(
+                "CLASSIFY_PHASE1_SIGNAL "
+                f"changed={changed_idx.size} sparse={int(delta is not None)} "
+                f"legacy_mask={int(legacy_mask is not None)}"
+            )
+
         except Exception as e:
-            print(f"âš ï¸ Global Sync Error: {e}")
+            print(f"⚠️ Global Sync Error: {e}")
             import traceback
             traceback.print_exc()
 
         finally:
-            # Keep header accounting off the render hot path: inspect only the
-            # changed subset and reuse the edit's existing undo metadata.
             try:
-                if self._apply_classified_point_count_delta(changed_mask):
+                accounting_payload = changed_idx if changed_idx.size else legacy_mask
+                if self._apply_classified_point_count_delta(accounting_payload):
                     self._refresh_window_title_classification_count()
             except Exception as title_error:
                 print(f"Window title classification count refresh failed: {title_error}")
@@ -20386,7 +19704,7 @@ class NakshaApp(QMainWindow):
             delay_ms > 0 (or for undo/redo, which always rebuild regardless).
             Forcing delay_ms=0 here silently routes every live classification
             commit into the local plane-fit patch (_apply_surface_bridge_update),
-            which never adds/removes triangles â€” so terrain-support class
+            which never adds/removes triangles — so terrain-support class
             changes go stale until the next undo/redo or mode switch.
             """
             if str(getattr(self, "display_mode", "") or "").lower() != "surface":
@@ -20414,7 +19732,7 @@ class NakshaApp(QMainWindow):
                     delay_ms=delay_ms,
                 )
             except Exception as e:
-                print(f"âš ï¸ refresh_surface_after_classification failed: {e}")
+                print(f"⚠️ refresh_surface_after_classification failed: {e}")
             return False
 
     def _normalize_main_view_2d_camera(self, camera=None):
@@ -20597,7 +19915,7 @@ class NakshaApp(QMainWindow):
 
             style = interactor.GetInteractorStyle()
             style_name = style.GetClassName() if style is not None else "None"
-            # âœ… BUG FIX: Always clear stuck interaction states (like panning) 
+            # ✅ BUG FIX: Always clear stuck interaction states (like panning) 
             if style is not None:
                 try:
                     if hasattr(style, "OnMiddleButtonUp"):
@@ -20631,7 +19949,7 @@ class NakshaApp(QMainWindow):
                 fp = np.array(camera.GetFocalPoint())
                 dist = max(1.0, np.linalg.norm(pos - fp))
                 camera.SetClippingRange(dist * 0.001, dist * 100.0)
-            # âœ… FIX: After resetting clip planes, ensure all SNT/DXF overlay actors
+            # ✅ FIX: After resetting clip planes, ensure all SNT/DXF overlay actors
             # are still present in the renderer. ResetCameraClippingRange() does not
             # evict actors, but any upstream classification pass or display-mode change
             # that ran before this call may have stripped the renderer. Calling
@@ -20646,11 +19964,11 @@ class NakshaApp(QMainWindow):
             self.vtk_widget.render()
 
             suffix = f" ({reason})" if reason else ""
-            print(f"ðŸ”’ Main view kept in 2D interaction mode{suffix}")
+            print(f"🔒 Main view kept in 2D interaction mode{suffix}")
             return True
 
         except Exception as e:
-            print(f"âš ï¸ Failed to enforce 2D main interaction: {e}")
+            print(f"⚠️ Failed to enforce 2D main interaction: {e}")
             return False        
 
 
@@ -20697,7 +20015,7 @@ class NakshaApp(QMainWindow):
                     break
 
             if section_global_indices is None or len(section_global_indices) == 0:
-                # No index map â†’ mark mirror invalid so downstream rebuilds fully
+                # No index map → mark mirror invalid so downstream rebuilds fully
                 if hasattr(actor, '_naksha_section_class'):
                     actor._naksha_section_class = None
                 return
@@ -20707,7 +20025,7 @@ class NakshaApp(QMainWindow):
             actor._naksha_section_class = fresh_classes.copy()
 
         except Exception as e:
-            print(f"âš ï¸ _sync_section_mirror_from_data view={view_idx}: {e}")
+            print(f"⚠️ _sync_section_mirror_from_data view={view_idx}: {e}")
 
     def _setup_interactor_swapper(
         self,
@@ -20728,7 +20046,7 @@ class NakshaApp(QMainWindow):
                 # Main view's persistent "Panning button: Left Mouse Button"
                 # setting is implemented separately, deep in the digitizer's
                 # own click/drag tracking (Digitizer checks app.panning_button
-                # directly) â€” this flag must stay False there so this swapper
+                # directly) — this flag must stay False there so this swapper
                 # never also reacts to the same setting and fights that
                 # system. Cross-section/cut-section views have no such
                 # drag-tracking of their own, so for them this is the only
@@ -20774,7 +20092,7 @@ class NakshaApp(QMainWindow):
                     "point_sync_tool",
                     "snt_layer_pick_tool",
                     # Cross-section measurement owns left-click in section
-                    # views to place points â€” without this, honoring the
+                    # views to place points — without this, honoring the
                     # persistent left-pan setting there would swallow those
                     # clicks as pan gestures instead.
                     "cross_section_measurement_tool",
@@ -20782,7 +20100,7 @@ class NakshaApp(QMainWindow):
                     tool = getattr(self.app, tool_name, None)
                     if tool is not None and getattr(tool, "active", False):
                         return True
-                # âœ… FIX: A pending cut-section placement (center/depth pick)
+                # ✅ FIX: A pending cut-section placement (center/depth pick)
                 # must never be swallowed by the left-click-pan swap, whether
                 # it originated from the cut dock ('cut') or a cross-section
                 # view ('cross'). Without this, left-click panning steals the

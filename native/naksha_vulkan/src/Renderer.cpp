@@ -333,8 +333,13 @@ void Renderer::Shutdown() {
     imageCount_ = 0;
 }
 
-bool Renderer::BeginFrame() {
+bool Renderer::BeginFrame(bool nonblocking) {
     if (!initialized_) return false;
+    // Full-detail Shading must never park the Qt input thread behind GPU work.
+    // One outstanding frame also prevents a queue of obsolete camera views.
+    if(nonblocking&&!frameManager_.AllFramesComplete()){
+        ++lastTimings_.framesDeferred;++stats_.framesSkipped;return false;
+    }
 
     const double frameT0 = NowMs();
     // --- fence wait: measured on its own because an UNBOUNDED wait here is
@@ -393,8 +398,12 @@ bool Renderer::BeginFrame() {
 
     uint32_t imageIndex = 0;
     const double acquireT0 = NowMs();
-    VkResult r = swapchain_.AcquireNextImage(frame.imageAvailable, &imageIndex);
+    VkResult r = swapchain_.AcquireNextImage(frame.imageAvailable, &imageIndex,
+                                            nonblocking?0:UINT64_MAX);
     lastTimings_.acquireMs = NowMs() - acquireT0;
+    if(nonblocking&&(r==VK_TIMEOUT||r==VK_NOT_READY)){
+        frameManager_.AbortFrame();++lastTimings_.framesDeferred;++stats_.framesSkipped;return false;
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateRequested_ = true;
         frameManager_.EndFrame();
@@ -885,6 +894,14 @@ void StoreLut(float* dst, const uint8_t* rgb) {
 
 }  // namespace
 
+void Renderer::SetClipVolume(const float* planesAbcd, uint32_t count) {
+    if (count > 4) count = 4;
+    if (planesAbcd == nullptr) count = 0;
+    for (uint32_t i = 0; i < 16; ++i)
+        clipPlanes_[i] = (i < count * 4) ? planesAbcd[i] : 0.0f;
+    clipCount_ = count;
+}
+
 void Renderer::SetPointLUTs(const uint8_t* classRgb, const uint8_t* elevationRgb,
                             const uint8_t* intensityRgb) {
     StoreLut(lutClass_, classRgb);
@@ -1276,7 +1293,8 @@ void Renderer::ShutdownInstantPass() {
 }
 
 void Renderer::RecordInstantShadedPass(VkCommandBuffer cmd, uint32_t frameSlot,
-                                       PointCloudRenderer& pointCloud) {
+                                       PointCloudRenderer& pointCloud,
+                                       VkFramebuffer targetFramebuffer, bool endOpenPass) {
     if (!initialized_ || !instantPassReady_) return;
     if (!EnsureInstantTargets()) return;
 
@@ -1284,7 +1302,7 @@ void Renderer::RecordInstantShadedPass(VkCommandBuffer cmd, uint32_t frameSlot,
 
     // ---- 1) Close the render pass BeginFrame() opened. Nothing has been
     // drawn into it yet, so this only costs a clear we are about to redo.
-    vkCmdEndRenderPass(cmd);
+    if (endOpenPass) vkCmdEndRenderPass(cmd);   // offscreen capture has not opened it yet
 
     // ---- 2) SPLAT PASS: the resident points into the offscreen target -----
     VkRenderPassBeginInfo rb{};
@@ -1361,7 +1379,8 @@ void Renderer::RecordInstantShadedPass(VkCommandBuffer cmd, uint32_t frameSlot,
     VkRenderPassBeginInfo mb{};
     mb.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     mb.renderPass = renderPass_.GetRenderPass();
-    mb.framebuffer = framebuffers_[currentImageIndex_];
+    mb.framebuffer = targetFramebuffer != VK_NULL_HANDLE ? targetFramebuffer
+                                                         : framebuffers_[currentImageIndex_];
     mb.renderArea.offset = {0, 0};
     mb.renderArea.extent = ext;
     VkClearValue mclear[2]{};
@@ -1420,7 +1439,7 @@ void Renderer::RecordInstantShadedPass(VkCommandBuffer cmd, uint32_t frameSlot,
     lp.background[0] = clearColor_[0];
     lp.background[1] = clearColor_[1];
     lp.background[2] = clearColor_[2];
-    lp.background[3] = clearColor_[3];
+    lp.background[3] = instantEdl_;      // spare slot: Eye-Dome Lighting strength (0 = off)
 
     // invMvp is what turns a depth texel back into a render-space position.
     // GetLastMvp() reads the UBO BeginFrame() already refreshed this frame, so
@@ -1512,6 +1531,8 @@ void Renderer::UpdateFrameUbo(uint32_t slot) {
     std::memcpy(ubo.classPalette, lutClass_, sizeof(ubo.classPalette));
     std::memcpy(ubo.elevationLut, lutElevation_, sizeof(ubo.elevationLut));
     std::memcpy(ubo.intensityLut, lutIntensity_, sizeof(ubo.intensityLut));
+    std::memcpy(ubo.clipPlanes, clipPlanes_, sizeof(ubo.clipPlanes));
+    ubo.clipInfo[0] = clipCount_;
     std::memcpy(frameUboBuffers_[slot].mappedData, &ubo, sizeof(ubo));
     // Host-visible memory is not guaranteed to be HOST_COHERENT, and VMA only
     // flushes automatically on vmaUnmapMemory - these buffers stay mapped for
@@ -1754,23 +1775,31 @@ bool Renderer::CaptureOffscreenRGBA8(PointCloudRenderer* pointCloud, SurfaceRend
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &bar);
 
-    VkRenderPassBeginInfo rp{};
-    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = renderPass_.GetRenderPass();
-    rp.framebuffer = captureFramebuffer_;
-    rp.renderArea.offset = {0, 0};
-    rp.renderArea.extent = extent_;
-    VkClearValue clears[2]{};
-    clears[0].color.float32[0] = clearColor_[0];
-    clears[0].color.float32[1] = clearColor_[1];
-    clears[0].color.float32[2] = clearColor_[2];
-    clears[0].color.float32[3] = clearColor_[3];
-    clears[1].depthStencil = {1.0f, 0};
-    rp.clearValueCount = 2;
-    rp.pClearValues = clears;
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    if (pointCloud && pointCloud->IsLoaded()) pointCloud->Record(cmd, slot);
-    if (surface && surface->IsLoaded()) surface->Record(cmd, slot);
+    // Instant Shaded / NormalShading: the presented frame is a splat pass plus a lighting
+    // pass, so the capture must run the SAME two passes or it would show a different image
+    // than the window. The lighting pass opens the main render pass itself, on the capture
+    // framebuffer, and leaves it open for the vkCmdEndRenderPass below.
+    if (pointCloud && pointCloud->IsLoaded() && IsInstantShadedAvailable()) {
+        RecordInstantShadedPass(cmd, slot, *pointCloud, captureFramebuffer_, /*endOpenPass=*/false);
+    } else {
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = renderPass_.GetRenderPass();
+        rp.framebuffer = captureFramebuffer_;
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = extent_;
+        VkClearValue clears[2]{};
+        clears[0].color.float32[0] = clearColor_[0];
+        clears[0].color.float32[1] = clearColor_[1];
+        clears[0].color.float32[2] = clearColor_[2];
+        clears[0].color.float32[3] = clearColor_[3];
+        clears[1].depthStencil = {1.0f, 0};
+        rp.clearValueCount = 2;
+        rp.pClearValues = clears;
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        if (pointCloud && pointCloud->IsLoaded()) pointCloud->Record(cmd, slot);
+        if (surface && surface->IsLoaded()) surface->Record(cmd, slot);
+    }
     vkCmdEndRenderPass(cmd);
 
     // BUG FOUND AND FIXED THIS ROUND (confirmed via validation layers): this

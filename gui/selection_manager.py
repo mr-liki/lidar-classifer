@@ -1,5 +1,5 @@
 """
-SelectionManager — Nakshatech-style centralized selection set.
+SelectionManager — MicroStation-style centralized selection set.
 
 Single source of truth for "which digitized elements are currently selected".
 Sits beside DigitizeManager.drawings without modifying it; mutation hooks
@@ -12,7 +12,7 @@ Design notes:
 - All highlight/unhighlight goes through DigitizeManager's existing
   _highlight_line / _unhighlight_line so visuals stay consistent with the
   legacy single-click path.
-- Operates in four modes mirroring Nakshatech: NEW, ADD, SUBTRACT, INVERT.
+- Operates in four modes mirroring MicroStation: NEW, ADD, SUBTRACT, INVERT.
 - Polygon-closing expansion: when selected line segments form part of a
   closed polygon, the remaining boundary segments are automatically included
   in the selection (GIS digitizing behavior).
@@ -181,9 +181,27 @@ class SelectionManager(QObject):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _drawing_in_edit_scope(self, drawing):
+        """True when `drawing` may join the selection.
+
+        While a creation-dialog edit scope is active (Block "Edit Before
+        Split"), drawings from the other Create feature (Cell circles) must
+        never become selected. Always True when no scope is active or when
+        the digitizer does not provide the scope helper.
+        """
+        helper = getattr(self._digitizer, "drawing_in_edit_scope", None)
+        if helper is None:
+            return True
+        try:
+            return bool(helper(drawing))
+        except Exception:
+            return True
+
     def _add_one(self, drawing):
         did = id(drawing)
         if did in self._selected_ids:
+            return
+        if not self._drawing_in_edit_scope(drawing):
             return
         drawings = self._live_drawings()
         try:

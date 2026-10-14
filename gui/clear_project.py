@@ -1318,6 +1318,8 @@ def clear_project(app):
     """
     # ✅ FIX: Explicitly clear the shading cache to prevent stale data between projects
     clear_shading_cache(reason="project_clear")
+    from .shading_large_cloud import clear_large_shading_preset_cache
+    clear_large_shading_preset_cache(app)
     # Also null out the rendered-cache-key and stale mesh actors so that
     app._rendered_shading_cache_key = None
     app._shaded_mesh_actor = None
@@ -1377,6 +1379,9 @@ def clear_project(app):
         else:
             print("🧹 CLEARING PROJECT (NOT SAVING - DISPLAY SETTINGS WILL BE PRESERVED)")
         print("="*60)
+        if getattr(app, "_lnt_main_view", None) is not None:
+            from .lnt_open import close_lnt_view
+            close_lnt_view(app)
 
         # ============================================================================
         # ✅ SAVE THE PROJECT IF USER CHOSE TO SAVE
@@ -1809,6 +1814,8 @@ def clear_point_cloud(app):
     """
     # Explicitly clear the shading cache to prevent stale data
     clear_shading_cache(reason="point_cloud_clear")
+    from .shading_large_cloud import clear_large_shading_preset_cache
+    clear_large_shading_preset_cache(app)
     app._rendered_shading_cache_key = None
     app._shaded_mesh_actor = None
     app._shaded_mesh_polydata = None

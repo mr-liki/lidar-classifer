@@ -31,6 +31,55 @@ from PySide6.QtWidgets import (
 _TITLE_BAR_HEIGHT = 36
 _CORNER_RADIUS = 20
 
+# Select CL rubber band -----------------------------------------------------
+# Minimum pointer travel (in display pixels) before a press/release is treated
+# as a drag rectangle instead of a plain click-to-select.
+_CL_DRAG_THRESHOLD_PX = 4
+# Attribute name the screen-space rectangle actor is stored under on the
+# digitizer (see DigitizeManager._update_preview_actor_screen).
+_CL_DRAG_ACTOR_ATTR = "_block_cl_rubber_band_actor"
+
+
+def _is_snt_selectable_line_entity(entity):
+    """Return whether an SNT entity is genuine open linework usable as a CL.
+
+    Do not require a particular level name: real centerlines can live on custom
+    levels. Known support-data levels are excluded, and both the entity's closed
+    flag and coincident first/last coordinates are treated as closed geometry.
+    """
+    if not isinstance(entity, dict):
+        return False
+    layer = str(entity.get("layer", "")).strip().casefold()
+    layer_tokens = set(re.findall(r"[a-z0-9]+", layer))
+    if layer_tokens.intersection({"grid", "bbox", "trajectory", "traj", "trj"}):
+        return False
+    entity_type = str(entity.get("type", "")).strip().upper()
+    if entity_type not in ("LINE", "POLYLINE", "LWPOLYLINE"):
+        return False
+    if entity_type != "LINE" and bool(entity.get("closed", False)):
+        return False
+    vertices = (
+        entity.get("vertices")
+        or entity.get("coords")
+        or entity.get("points")
+        or []
+    )
+    if len(vertices) < 2:
+        return False
+    try:
+        first = np.asarray(vertices[0], dtype=np.float64).reshape(-1)
+        last = np.asarray(vertices[-1], dtype=np.float64).reshape(-1)
+        dimensions = min(len(first), len(last), 3)
+        if dimensions < 2 or not np.all(np.isfinite(first[:dimensions])):
+            return False
+        if not np.all(np.isfinite(last[:dimensions])):
+            return False
+        if np.allclose(first[:dimensions], last[:dimensions], rtol=0.0, atol=1e-9):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
 
 class _BlockTitleBar(QWidget):
     """Drag-capable custom title bar for the frameless BlockCreationSettingsDialog."""
@@ -225,96 +274,6 @@ QPushButton#splitButton:pressed {{
 """
 
 
-class CLSelectionPopup(QDialog):
-    selection_confirmed = Signal(list)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setModal(False)
-        self.selected_lines = []
-        self._build_ui()
-
-    def _build_ui(self):
-        from gui.theme_manager import ThemeColors as _TC
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-
-        self.setStyleSheet(f"""
-QDialog {{
-    background-color: {_TC.get('bg_secondary')};
-    border: 1px solid {_TC.get('border_light')};
-    border-radius: 6px;
-}}
-QListWidget {{
-    background-color: {_TC.get('bg_input')};
-    color: {_TC.get('text_primary')};
-    border: 1px solid {_TC.get('border_light')};
-    border-radius: 4px;
-    padding: 2px;
-    font-size: 9pt;
-}}
-QListWidget::item {{
-    padding: 3px 6px;
-}}
-QPushButton {{
-    background-color: {_TC.get('bg_button')};
-    color: {_TC.get('text_primary')};
-    border: 1px solid {_TC.get('border_light')};
-    border-radius: 4px;
-    padding: 3px 12px;
-    font-weight: bold;
-    font-size: 9pt;
-    min-height: 20px;
-    max-height: 20px;
-}}
-QPushButton:hover {{
-    background-color: {_TC.get('bg_button_hover')};
-    border-color: {_TC.get('accent')};
-}}
-QPushButton#okButton {{
-    background-color: {_TC.get('accent')};
-    color: {_TC.get('text_on_active')};
-}}
-QPushButton#okButton:hover {{
-    background-color: {_TC.get('accent_hover')};
-}}
-""")
-
-        small_font = QFont(self.font().family(), 8)
-
-        self.list_widget = QListWidget()
-        self.list_widget.setFixedWidth(150)
-        self.list_widget.setFixedHeight(160)
-        self.list_widget.setFont(small_font)
-        layout.addWidget(self.list_widget)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        self.done_btn = QPushButton("Done")
-        self.done_btn.setObjectName("okButton")
-        self.done_btn.setFont(small_font)
-        self.done_btn.setFixedSize(56, 22)
-        self.done_btn.clicked.connect(self._on_done)
-        btn_layout.addWidget(self.done_btn)
-
-        layout.addLayout(btn_layout)
-
-    def update_selection(self, lines):
-        self.selected_lines = lines
-        self.list_widget.clear()
-        for idx, line in enumerate(lines, 1):
-            item = QListWidgetItem(f"Line {idx}")
-            self.list_widget.addItem(item)
-
-    def _on_done(self):
-        self.selection_confirmed.emit(self.selected_lines)
-        self.hide()
-
-
 class DistanceSpinBox(QDoubleSpinBox):
     """Accepts 'km' suffix and auto-converts to meters."""
 
@@ -349,6 +308,60 @@ class DistanceSpinBox(QDoubleSpinBox):
         if re.match(pat2, t):
             return QValidator.Intermediate, text, pos
         return QValidator.Invalid, text, pos
+
+
+def _points_in_polygon(x, y, polygon):
+    """Vectorised ray cast: which of the (x, y) points lie inside ``polygon``."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    inside = np.zeros(x.shape[0], dtype=bool)
+    j = polygon.shape[0] - 1
+    for i in range(polygon.shape[0]):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        crosses = ((yi > y) != (yj > y)) & (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi
+        )
+        inside ^= crosses
+        j = i
+    return inside
+
+
+def _effective_block_rings(block):
+    """World rings of a block after the sliver merge ([] when unchanged)."""
+    rings = []
+    for ring in (block or {}).get("effective_polygon") or []:
+        try:
+            pts = [(float(point[0]), float(point[1])) for point in ring]
+        except Exception:
+            continue
+        if len(pts) >= 4:
+            rings.append(pts)
+    return rings
+
+
+def _block_mask_rings(block):
+    """Rings deciding which points belong to a block (merged geometry wins).
+
+    Module level on purpose: the Block Creation Settings save path and the Split
+    Blocks dialog both need it, so the post-merge ``effective_polygon`` is
+    honoured by every writer instead of only whichever class defined it.
+    """
+    rings = _effective_block_rings(block)
+    if rings:
+        return [np.asarray(ring, dtype=np.float64) for ring in rings]
+    polygon = np.asarray((block or {}).get("polygon"), dtype=np.float64)
+    if polygon.ndim != 2 or polygon.shape[0] < 3:
+        return []
+    return [polygon]
+
+
+def _points_in_ring_list(x, y, rings):
+    """Union of the point-in-polygon masks of several rings."""
+    mask = np.zeros(np.shape(x), dtype=bool)
+    for ring in rings:
+        mask |= _points_in_polygon(x, y, ring)
+    return mask
 
 
 class BlockSplitSaveDialog(QDialog):
@@ -442,7 +455,20 @@ class BlockSplitSaveDialog(QDialog):
                     return Path(value)
                 except Exception:
                     pass
+        for snt_file in self._loaded_snt_paths():
+            return snt_file
         return None
+
+    def _loaded_snt_paths(self):
+        paths = []
+        for attachment in getattr(self.app, "snt_attachments", []) or []:
+            full_path = attachment.get("full_path") if isinstance(attachment, dict) else None
+            if full_path:
+                try:
+                    paths.append(Path(full_path))
+                except Exception:
+                    pass
+        return paths
 
     def _get_output_ext(self):
         if self.source_path and self.source_path.suffix.lower() in (".las", ".laz"):
@@ -550,11 +576,24 @@ class BlockSplitSaveDialog(QDialog):
     def _write_block_files(self, output_dir):
         data = getattr(self.app, "data", None)
         if not isinstance(data, dict) or data.get("xyz") is None:
-            raise RuntimeError("No point cloud data is loaded.")
+            prj_sources = self._prj_source_files()
+            if prj_sources:
+                self._report_missing_prj_sources(len(prj_sources))
+                return self._write_block_files_from_prj(output_dir, prj_sources)
+            raise RuntimeError(
+                "No point cloud data is loaded, and no LAZ/LAS files could be "
+                "found from the PRJ next to the loaded SNT."
+            )
 
         xyz = np.asarray(data["xyz"])
         if xyz.ndim != 2 or xyz.shape[1] < 3 or xyz.shape[0] == 0:
             raise RuntimeError("Loaded point cloud data is empty or invalid.")
+        # Which cloud is being split decides whether the output can be complete:
+        # a loaded cloud may be one file, or a decimated display copy, so say so.
+        print(
+            f"[BlockSplit] points source = in-memory loaded cloud "
+            f"points={int(xyz.shape[0]):,}"
+        )
 
         assigned = np.zeros(xyz.shape[0], dtype=bool)
         saved = 0
@@ -563,11 +602,12 @@ class BlockSplitSaveDialog(QDialog):
 
         for block in self.blocks:
             polygon = np.asarray(block.get("polygon"), dtype=np.float64)
-            if polygon.ndim != 2 or polygon.shape[0] < 3:
+            mask_rings = _block_mask_rings(block)
+            if not mask_rings:
                 skipped += 1
                 continue
 
-            inside = self._points_in_polygon(xyz[:, 0], xyz[:, 1], polygon)
+            inside = _points_in_ring_list(xyz[:, 0], xyz[:, 1], mask_rings)
             mask = inside & ~assigned
             if not np.any(mask):
                 skipped += 1
@@ -584,8 +624,321 @@ class BlockSplitSaveDialog(QDialog):
                 "polygon": polygon,
                 "point_count": int(np.count_nonzero(mask)),
             })
+            self._report_block_written(output_path, block, int(np.count_nonzero(mask)))
 
+        print(
+            f"[BlockSplit] summary files={saved} skipped={skipped} "
+            f"blocks={len(self.blocks)} points={int(np.count_nonzero(assigned))}"
+        )
+        self._report_unassigned_points(int(xyz.shape[0]) - int(np.count_nonzero(assigned)), xyz.shape[0])
         return saved, skipped, saved_blocks
+
+    @staticmethod
+    def _report_block_written(output_path, block, point_count):
+        """Per block: how many points it took, and with which geometry/CL.
+
+        ``mask=merged`` means the post-merge outline decided the points (the
+        right answer for a block that absorbed a sliver); ``mask=outline`` means
+        its own stored polygon did, which is how a dropped merge shows up.
+        """
+        merged_rings = _effective_block_rings(block)
+        carried = [
+            chain for chain in (block.get("absorbed_cl_chains") or [])
+            if len(chain) >= 2
+        ]
+        own_cl = 1 if len(block.get("cl_pts") or []) >= 2 else 0
+        print(
+            f"[BlockSplit] file={Path(output_path).name} points={int(point_count)} "
+            f"mask={'merged' if merged_rings else 'outline'} "
+            f"rings={len(merged_rings) or 1} clChains={own_cl + len(carried)}"
+            + (f" absorbedCl={len(carried)}" if carried else "")
+        )
+
+    @staticmethod
+    def _report_unassigned_points(unassigned, total):
+        """Say so when points land in no block, instead of dropping them silently.
+
+        After a sliver is absorbed the copied points must still be covered by the
+        parent's merged rings; if they are not, they would vanish from every
+        output file without a word.
+        """
+        total = int(total)
+        if total <= 0:
+            return
+        unassigned = int(unassigned)
+        if unassigned <= 0:
+            print(f"[BlockSplit] all {total} loaded points assigned to a block")
+            return
+        print(
+            f"[BlockSplit] WARNING {unassigned}/{total} points "
+            f"({100.0 * unassigned / total:.3f}%) lie outside every block outline "
+            f"and were not written (the blocks only cover the corridor around the "
+            f"CL lines, so points beyond its width belong to no block)"
+        )
+
+    def _prj_source_files(self):
+        """LAZ/LAS files listed in the PRJ that sits next to each loaded SNT."""
+        try:
+            from gui.snt_attachment import _parse_snt_adjacent_prj_blocks
+        except Exception:
+            return []
+        files = []
+        seen = set()
+        missing = []
+        for snt_file in self._loaded_snt_paths():
+            for entry in _parse_snt_adjacent_prj_blocks(str(snt_file)) or []:
+                file_path = entry.get("file_path")
+                if not file_path:
+                    # Listed in the project but not resolvable on disk.  Blocks over
+                    # its footprint can never receive points, so remember it.
+                    name = entry.get("block_file") or entry.get("label")
+                    if name:
+                        missing.append(str(name))
+                    continue
+                key = os.path.normcase(os.path.abspath(file_path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                files.append(Path(file_path))
+        self._missing_prj_sources = missing
+        return files
+
+    def _report_missing_prj_sources(self, split_count):
+        """Say which project point clouds the split cannot read, and why it matters.
+
+        A PRJ commonly lists a whole tiling while only part of it is present.  The
+        split reads what exists, so every created block outside those files gets
+        no points and is skipped - which looks like the split gave up.
+        """
+        missing = list(getattr(self, "_missing_prj_sources", []) or [])
+        if not missing:
+            return
+        listed = split_count + len(missing)
+        preview = ", ".join(missing[:6])
+        if len(missing) > 6:
+            preview += f", ... (+{len(missing) - 6} more)"
+        print(
+            f"[BlockSplit] WARNING only {split_count} of {listed} point cloud(s) "
+            f"listed in the PRJ are on disk. The missing {len(missing)} CANNOT be "
+            f"split, so any block over their footprint will get no points: {preview}"
+        )
+
+    def _write_block_files_from_prj(self, output_dir, source_files, chunk_size=2_000_000):
+        """Split PRJ-listed LAZ/LAS files one by one, streaming points into per-block outputs."""
+        import laspy
+
+        blocks = []
+        for block in self.blocks:
+            polygon = np.asarray(block.get("polygon"), dtype=np.float64)
+            mask_rings = _block_mask_rings(block)
+            if not mask_rings:
+                continue
+            corners = np.vstack([ring[:, :2] for ring in mask_rings])
+            blocks.append({
+                "block": block,
+                "polygon": polygon,
+                "mask_rings": mask_rings,
+                "min": corners.min(axis=0),
+                "max": corners.max(axis=0),
+                "path": output_dir / (self._block_file_stem(block) + self.output_ext),
+                "writer": None,
+                "count": 0,
+            })
+        skipped = len(self.blocks) - len(blocks)
+
+        def open_writer(entry, src_header):
+            header = laspy.LasHeader(
+                point_format=src_header.point_format, version=src_header.version
+            )
+            header.scales = src_header.scales
+            header.offsets = src_header.offsets
+            for vlr in src_header.vlrs:
+                try:
+                    header.vlrs.append(vlr)
+                except Exception:
+                    pass
+            drawing_data = self._serialize_block_drawings(entry["block"])
+            if drawing_data:
+                header.vlrs.append(laspy.VLR(
+                    user_id="NakshaAI",
+                    record_id=1002,
+                    description="Digitized drawings (lines, polygons, annotations)",
+                    record_data=drawing_data,
+                ))
+            entry["header"] = header
+            return laspy.open(str(entry["path"]), mode="w", header=header)
+
+        total_seen = 0
+        total_assigned = 0
+        source_bounds = {}
+        empty_blocks = []
+        print(
+            f"[BlockSplit] points source = {len(source_files)} LAZ/LAS file(s) "
+            f"listed in the PRJ next to the loaded SNT"
+        )
+        try:
+            for source in source_files:
+                file_seen = 0
+                file_assigned = 0
+                with laspy.open(str(source)) as reader:
+                    src_header = reader.header
+                    source_bounds[source.name] = (
+                        np.asarray(src_header.mins, dtype=float)[:2],
+                        np.asarray(src_header.maxs, dtype=float)[:2],
+                    )
+                    for chunk in reader.chunk_iterator(chunk_size):
+                        x = np.asarray(chunk.x)
+                        y = np.asarray(chunk.y)
+                        assigned = np.zeros(x.shape[0], dtype=bool)
+                        total_seen += int(x.shape[0])
+                        file_seen += int(x.shape[0])
+                        for entry in blocks:
+                            lo, hi = entry["min"], entry["max"]
+                            cand = (
+                                (x >= lo[0]) & (x <= hi[0]) & (y >= lo[1]) & (y <= hi[1])
+                                & ~assigned
+                            )
+                            idx = np.flatnonzero(cand)
+                            if idx.size == 0:
+                                continue
+                            inside = _points_in_ring_list(x[idx], y[idx], entry["mask_rings"])
+                            sel = idx[inside]
+                            if sel.size == 0:
+                                continue
+                            assigned[sel] = True
+                            if entry["writer"] is None:
+                                entry["writer"] = open_writer(entry, src_header)
+                            subset = chunk[sel]
+                            out_header = entry["header"]
+                            if (
+                                subset.point_format.id != out_header.point_format.id
+                                or not np.allclose(src_header.scales, out_header.scales)
+                                or not np.allclose(src_header.offsets, out_header.offsets)
+                            ):
+                                converted = laspy.ScaleAwarePointRecord.zeros(
+                                    sel.size, header=out_header
+                                )
+                                converted.copy_fields_from(subset)
+                                converted.x = x[sel]
+                                converted.y = y[sel]
+                                converted.z = np.asarray(chunk.z)[sel]
+                                subset = converted
+                            entry["writer"].write_points(subset)
+                            entry["count"] += int(sel.size)
+                        total_assigned += int(np.count_nonzero(assigned))
+                        file_assigned += int(np.count_nonzero(assigned))
+                # Per source file: proves every input was read whole and how much
+                # of it the blocks claimed, instead of one opaque grand total.
+                print(
+                    f"[BlockSplit] source={source.name} points={file_seen:,} "
+                    f"assigned={file_assigned:,} "
+                    f"outsideBlocks={file_seen - file_assigned:,} "
+                    f"({100.0 * (file_seen - file_assigned) / max(file_seen, 1):.3f}%)"
+                )
+        finally:
+            for entry in blocks:
+                if entry["writer"] is not None:
+                    try:
+                        entry["writer"].close()
+                    except Exception as exc:
+                        print(f"Failed to close split file {entry['path']}: {exc}")
+
+        self._report_unassigned_points(total_seen - total_assigned, total_seen)
+        self._report_unsplit_siblings(source_files)
+
+        saved = 0
+        saved_blocks = []
+        for entry in blocks:
+            if entry["count"] == 0:
+                skipped += 1
+                empty_blocks.append(entry)
+                continue
+            saved += 1
+            self._report_block_written(entry["path"], entry["block"], entry["count"])
+            saved_blocks.append({
+                "block": entry["block"],
+                "file_name": entry["path"].name,
+                "label": entry["path"].stem,
+                "polygon": entry["polygon"],
+                "point_count": entry["count"],
+            })
+        self._report_empty_blocks(empty_blocks, source_bounds, len(blocks))
+        print(
+            f"[BlockSplit] summary files={saved} skipped={skipped} "
+            f"blocks={len(self.blocks)} points={total_assigned}"
+        )
+        return saved, skipped, saved_blocks
+
+    @staticmethod
+    def _report_empty_blocks(entries, source_bounds, total_blocks):
+        """Say which blocks received no points, and whether data even exists there.
+
+        Distinguishes the two very different causes: a block outside every source
+        file's footprint (no points exist to take) versus one that overlaps a
+        source file and still came back empty (a block-outline problem).
+        """
+        if not entries:
+            return
+        outside = 0
+        overlapping = []
+        for entry in entries:
+            lo, hi = entry["min"], entry["max"]
+            hits = [
+                name for name, (slo, shi) in source_bounds.items()
+                if hi[0] >= slo[0] and lo[0] <= shi[0]
+                and hi[1] >= slo[1] and lo[1] <= shi[1]
+            ]
+            if hits:
+                overlapping.append((entry["path"].name, hits))
+            else:
+                outside += 1
+        print(
+            f"[BlockSplit] {len(entries)} of {total_blocks} block(s) got no points: "
+            f"{outside} lie outside every split point cloud, "
+            f"{len(overlapping)} overlap a cloud"
+        )
+        for name, hits in overlapping[:8]:
+            print(f"[BlockSplit]   block={name} points=0 but overlaps "
+                  f"{', '.join(hits[:2])} - check the block outline")
+        if len(overlapping) > 8:
+            print(f"[BlockSplit]   ... {len(overlapping) - 8} more overlapping but empty")
+
+    @staticmethod
+    def _report_unsplit_siblings(source_files):
+        """Name point clouds that sit beside the sources but are not split.
+
+        The split reads what the project PRJ lists.  Any other LAZ/LAS in the same
+        folder (a ``_deleted_001``/``_backup`` copy, for instance) is therefore
+        left untouched, which otherwise looks like the split stopped early.
+        """
+        try:
+            import laspy
+        except Exception:
+            return
+        folders = {Path(str(path)).parent for path in source_files}
+        referenced = {
+            os.path.normcase(os.path.abspath(str(path))) for path in source_files
+        }
+        extra = []
+        for folder in folders:
+            for pattern in ("*.laz", "*.las"):
+                for candidate in sorted(folder.glob(pattern)):
+                    key = os.path.normcase(os.path.abspath(str(candidate)))
+                    if key in referenced:
+                        continue
+                    try:
+                        with laspy.open(str(candidate)) as reader:
+                            count = int(reader.header.point_count)
+                    except Exception:
+                        count = 0
+                    extra.append((candidate.name, count))
+        if not extra:
+            return
+        listed = ", ".join(f"{name} ({count:,} points)" for name, count in extra)
+        print(
+            f"[BlockSplit] NOTE {len(extra)} point cloud(s) in the source folder are "
+            f"NOT listed in the PRJ and were not split: {listed}"
+        )
 
     def _write_prj_manifest(self, output_path, saved_blocks):
         distance = 0.0
@@ -597,7 +950,7 @@ class BlockSplitSaveDialog(QDialog):
 
         block_size = int(round(distance)) if distance > 0 else 0
         lines = [
-            "[Nakshatech project]",
+            "[TerraScan project]",
             "Scanner=AirborneLidar",
             f"Storage={self.output_ext.lstrip('.').upper()}1.2",
             "StoreTime=1",
@@ -665,7 +1018,19 @@ class BlockSplitSaveDialog(QDialog):
                         dxfattribs={"layer": "CL", "color": 1},
                     )
 
-                bl_line_chains = self._block_bl_line_chains(item)
+                # CL chains of the side blocks this block absorbed: their points
+                # went into this block, so their CL belongs in its export too.
+                for carried_chain in item["block"].get("absorbed_cl_chains") or []:
+                    carried_points = self._polyline_xyz(carried_chain)
+                    if len(carried_points) >= 2:
+                        msp.add_polyline3d(
+                            carried_points,
+                            dxfattribs={"layer": "CL", "color": 1},
+                        )
+
+                bl_line_chains = self._open_block_line_chains(
+                    self._block_bl_line_chains(item)
+                )
                 rings = item.get("export_rings") or [self._closed_polygon_xy(item["polygon"])]
                 rings = [ring for ring in rings if len(ring) >= 4]
                 if not bl_line_chains and not rings:
@@ -752,7 +1117,24 @@ class BlockSplitSaveDialog(QDialog):
 
         for item in saved_blocks:
             original_ring = self._closed_polygon_xy(item["polygon"])
+            effective_rings = _effective_block_rings(item.get("block"))
             try:
+                if effective_rings:
+                    # A small intersection sliver was absorbed into this block, so its
+                    # stored rings are already the final topology: export them as-is and
+                    # clip later blocks against them (no sliver is written out twice).
+                    rings = [list(ring) for ring in effective_rings]
+                    label_position = self._label_position_from_geometry(Polygon(rings[0]), item)
+                    prepared.append({
+                        **item,
+                        "export_rings": rings,
+                        "label_position": label_position,
+                    })
+                    merged_geom = unary_union([Polygon(ring) for ring in rings])
+                    if not merged_geom.is_empty:
+                        higher_priority_geoms.append(merged_geom)
+                    continue
+
                 geom = Polygon(original_ring)
                 if not geom.is_valid:
                     geom = geom.buffer(0)
@@ -875,6 +1257,42 @@ class BlockSplitSaveDialog(QDialog):
         return chains
 
     @staticmethod
+    def _open_block_line_chains(chains):
+        """Cut self-closing drawn lines into open chains - geometry unchanged.
+
+        A block whose whole boundary survives the merge ends up with ONE closed
+        loop of drawn lines (its neighbours did not take any of its edges).  The
+        SNT loader reads a closed polyline sitting on a block-boundary layer as a
+        block outline and hides it from the line pass, so such a block would
+        export - and reload - with no visible block lines at all.  Splitting the
+        loop in two leaves every coordinate in place but makes both halves open
+        chains, which are drawn as ordinary lines.
+        """
+        out = []
+        for chain in chains or []:
+            points = list(chain)
+            if len(points) < 3:
+                if len(points) >= 2:
+                    out.append(points)
+                continue
+            first, last = points[0], points[-1]
+            closes = (
+                abs(float(first[0]) - float(last[0])) <= 1e-3
+                and abs(float(first[1]) - float(last[1])) <= 1e-3
+            )
+            if not closes:
+                out.append(points)
+                continue
+            loop = points[:-1]
+            if len(loop) < 3:
+                out.append(points)
+                continue
+            middle = len(loop) // 2
+            out.append(loop[: middle + 1])
+            out.append(loop[middle:] + [loop[0]])
+        return out
+
+    @staticmethod
     def _block_label_position(block, polygon):
         above = list(block.get("above_pts") or [])
         below = list(block.get("below_pts") or [])
@@ -897,22 +1315,6 @@ class BlockSplitSaveDialog(QDialog):
         block_span = max(span_x, span_y, 1.0)
         by_name = block_span / max(len(str(label or "")) * 0.75, 1.0)
         return max(1.0, min(25.0, by_name))
-
-    @staticmethod
-    def _points_in_polygon(x, y, polygon):
-        x = np.asarray(x, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64)
-        inside = np.zeros(x.shape[0], dtype=bool)
-        j = polygon.shape[0] - 1
-        for i in range(polygon.shape[0]):
-            xi, yi = polygon[i]
-            xj, yj = polygon[j]
-            crosses = ((yi > y) != (yj > y)) & (
-                x < (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi
-            )
-            inside ^= crosses
-            j = i
-        return inside
 
     def _write_las_subset(self, output_path, data, mask, block):
         import laspy
@@ -950,9 +1352,9 @@ class BlockSplitSaveDialog(QDialog):
         try:
             import pyproj
             if getattr(self.app, "project_crs_wkt", None):
-                header.parse_crs(pyproj.CRS.from_wkt(self.app.project_crs_wkt))
+                header.add_crs(pyproj.CRS.from_wkt(self.app.project_crs_wkt))
             elif getattr(self.app, "project_crs_epsg", None):
-                header.parse_crs(pyproj.CRS.from_epsg(self.app.project_crs_epsg))
+                header.add_crs(pyproj.CRS.from_epsg(self.app.project_crs_epsg))
         except Exception as exc:
             print(f"Failed to embed split-file CRS: {exc}")
 
@@ -1016,6 +1418,710 @@ class BlockSplitSaveDialog(QDialog):
         return json.dumps(serializable, separators=(",", ":")).encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+#  Small intersection-fragment merge (block post-processing)
+# ---------------------------------------------------------------------------
+# Where two CL lines meet, the corridors generated for them overlap.  Clipping a
+# corridor against an earlier one can split it into a large remainder plus one or
+# more small leftover slivers (typically a stub poking out past the other
+# corridor, or a wedge trapped between two blocks).  Such a sliver is really
+# attached to the neighbour it shares a boundary with, but it is polygonized,
+# exported and queried as a block of its own.
+#
+# This stage dissolves those slivers into that neighbour: the shared internal
+# separation line disappears, the sliver's own exterior edges and area stay, and
+# the neighbour becomes ONE (unioned) block.  Only slivers are candidates - two
+# normal neighbouring blocks are never merged.
+# A SIDE / JUNCTION block is additionally treated as a small-fragment candidate
+# when its longitudinal distance along its own CL is less than this fraction of
+# the user's configured Block Settings -> Distance.  Kept in one place: the
+# business rule is exactly 50%, and it is a strict "less than", so a side block
+# measured at exactly half the configured distance stays a normal block.
+SIDE_BLOCK_SMALL_RATIO = 0.50
+
+_SMALL_BLOCK_MERGE_CONFIG = {
+    "enabled": True,
+    # Verbose diagnostics: logs every candidate, its neighbours, the scores of
+    # every possible parent and the reason a merge was accepted or refused.
+    "debug": False,
+    # Optional absolute cap in squared model units.  None disables it; the
+    # decision is then purely relative to the neighbouring blocks.
+    "smallBlockAreaThreshold": None,
+    # A piece counts as a sliver when it is at most this fraction of the largest
+    # piece of its own chunk, or of the smallest block that is larger than it.
+    # A corridor cut into comparable halves (an X crossing) stays untouched.
+    "smallBlockRelativeAreaRatio": 0.25,
+    # User's Block Settings -> Distance for the current run.  Filled in per call
+    # by the caller; 0 disables the distance-based side-block rule.
+    "blockDistance": 0.0,
+    # Fraction of the configured distance below which a side/junction block also
+    # counts as a small fragment.  Central definition - never inline a 0.5.
+    "sideBlockSmallRatio": SIDE_BLOCK_SMALL_RATIO,
+    # Numeric slack on the strict "<" comparison, so a block whose chainage span
+    # evaluates to 124.9999999998 for an intended 125.0 does not flicker into a
+    # merge.  Deliberately tiny: this must not become a fuzzy threshold.
+    "sideBlockDistanceTolerance": 1e-6,
+    # Two block boundaries closer than this are the SAME separator.  Noding and
+    # floating-point noise must not turn one shared edge into "no neighbour".
+    "snapTolerance": 1e-6,
+    # Model-space tolerance for the geometry cleanliness checks.
+    "geometryTolerance": 1e-6,
+    # Line contact shorter than this is vertex-only contact -> not a neighbour.
+    "minimumAttachmentLength": 1e-6,
+    # Two candidate parents whose attachment ratios differ by less than this
+    # (relative) are treated as ambiguous and deliberately left unmerged.
+    "ambiguousMergeTolerance": 0.05,
+    # Relative tolerance of the area-preservation check on a union.
+    "areaTolerance": 1e-6,
+    # The dissolved interface must not survive anywhere on the merged boundary.
+    "separatorResidualTolerance": 1e-6,
+    # Re-derive every drawn block edge from the FINAL faces after a merge, so a
+    # separator can never survive inside a block that grew.
+    "rebuildLinework": True,
+}
+
+
+def _polyline_length(points):
+    """Arc length along a polyline - a block's chainage span along its own CL.
+
+    The distance-based small-block rule measures a block along the CL that
+    generated it, so a curved CL keeps its true along-the-line length instead of
+    the straight-line distance between the block's first and last vertices.
+    """
+    if points is None:
+        return 0.0
+    try:
+        pts = np.asarray(points, dtype=np.float64)
+    except Exception:
+        return 0.0
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 2:
+        return 0.0
+    deltas = np.diff(pts[:, :2], axis=0)
+    if deltas.size == 0:
+        return 0.0
+    return float(np.sum(np.hypot(deltas[:, 0], deltas[:, 1])))
+
+
+def _normalize_polygon(geom, grid=0.0, area_floor=1e-9):
+    """Snap a polygon onto a common precision grid and make it valid.
+
+    Snap rounding is what makes noding noise disappear: two boundaries that only
+    differed by a hair end up with *exactly* the same coordinates, so their
+    complete shared edge is later found by an exact intersection and a real
+    polygon union can dissolve it.  Self-intersecting (bow-tie) or spiky faces
+    are repaired, and zero-area leftovers are dropped.
+
+    Returns a list of valid polygons.
+    """
+    if geom is None or geom.is_empty:
+        return []
+    snapped = geom
+    if grid and grid > 0.0:
+        try:
+            from shapely import set_precision
+
+            snapped = set_precision(geom, grid)
+        except Exception:
+            snapped = geom
+    if snapped is None or snapped.is_empty:
+        return []
+    if not snapped.is_valid:
+        try:
+            snapped = snapped.buffer(0)
+        except Exception:
+            return []
+    parts = (
+        list(snapped.geoms)
+        if getattr(snapped, "geom_type", "") == "MultiPolygon"
+        else [snapped]
+    )
+    out = []
+    for part in parts:
+        if getattr(part, "geom_type", "") != "Polygon" or part.is_empty:
+            continue
+        if not part.is_valid:
+            try:
+                part = part.buffer(0)
+            except Exception:
+                continue
+            if getattr(part, "geom_type", "") != "Polygon" or part.is_empty:
+                continue
+        if float(part.area) <= area_floor:
+            continue
+        out.append(part)
+    return out
+
+
+def _block_piece_geometries(corridor_geometries, area_floor=1e-9, grid=0.0):
+    """Realize each corridor against the higher-priority corridors before it.
+
+    Mirrors the polygonization the export path performs, so the pieces seen here
+    are exactly the faces that would be written out as separate blocks.  Every
+    corridor and every resulting face is snapped to the model-space ``grid`` and
+    repaired, so the decomposition is topologically clean and neighbouring faces
+    share exactly coincident edges.
+    """
+    from shapely.ops import unary_union
+    from shapely.strtree import STRtree
+
+    normalized = []
+    for geom in corridor_geometries:
+        parts = _normalize_polygon(geom, grid, area_floor)
+        normalized.append(unary_union(parts) if len(parts) > 1 else (parts[0] if parts else None))
+
+    # Index the corridors once, so each one is only clipped against the (few)
+    # higher-priority corridors it actually overlaps instead of re-unioning the
+    # whole prefix of the list for every block - that prefix union is quadratic
+    # and dominates the stage on a large selection.
+    indexed = [geom for geom in normalized if geom is not None and not geom.is_empty]
+    tree = STRtree(indexed) if indexed else None
+    owners = {id(geom): index for index, geom in enumerate(normalized) if geom is not None}
+
+    realized = []
+    for index, geom in enumerate(normalized):
+        if geom is None or geom.is_empty:
+            realized.append([])
+            continue
+        higher_geoms = []
+        if tree is not None:
+            try:
+                for position in tree.query(geom):
+                    candidate = indexed[int(position)]
+                    if owners.get(id(candidate), index) < index:
+                        higher_geoms.append(candidate)
+            except Exception:
+                higher_geoms = [
+                    other for other in normalized[:index] if other is not None and not other.is_empty
+                ]
+        effective = geom.difference(unary_union(higher_geoms)) if higher_geoms else geom
+        if effective.is_empty:
+            realized.append([])          # fully absorbed by higher-priority blocks
+            continue
+        pieces = (
+            list(effective.geoms)
+            if getattr(effective, "geom_type", "") == "MultiPolygon"
+            else [effective]
+        )
+        kept = []
+        for piece in pieces:
+            # The overlay already ran on grid-snapped inputs, so the faces only
+            # need a validity/area check - re-snapping every face is expensive
+            # and changes nothing.
+            kept.extend(_normalize_polygon(piece, 0.0, area_floor))
+        realized.append(kept)
+    return realized
+
+
+def _boundary_overlap(geom_a, geom_b, tolerance=1e-6, minimum_length=1e-6):
+    """The COMPLETE separator between two blocks, as one geometry.
+
+    Returns ``(separator, exact_length, tolerant_length)``.  The exact stage
+    intersects the two boundaries and keeps *all* linear components (a noded
+    separator arrives as e1+e2+e3 and is never reduced to the first segment).
+    When noding nudged one of the two copies of the line, the tolerant stage
+    matches each boundary against a thin band around the other one, so a shared
+    edge whose coordinates differ by a hair is still recognised as a neighbour.
+    A vertex-only contact yields an empty separator and zero lengths.
+    """
+    if geom_a is None or geom_b is None or geom_a.is_empty or geom_b.is_empty:
+        return None, 0.0, 0.0
+    try:
+        exact = geom_a.boundary.intersection(geom_b.boundary)
+    except Exception:
+        exact = None
+    exact_length = float(exact.length) if exact is not None and not exact.is_empty else 0.0
+    tolerant, tolerant_length = None, 0.0
+    if tolerance > 0.0 and exact_length <= minimum_length:
+        # Only the exact stage failing makes the (expensive) tolerant match
+        # worthwhile, and only for polygons that are actually close by.
+        try:
+            if geom_a.distance(geom_b) <= tolerance:
+                band = geom_b.boundary.buffer(
+                    tolerance, quad_segs=1, cap_style=2, join_style=2
+                )
+                tolerant = geom_a.boundary.intersection(band)
+                if tolerant is not None and tolerant.is_empty:
+                    tolerant = None
+                else:
+                    tolerant_length = float(tolerant.length)
+        except Exception:
+            tolerant, tolerant_length = None, 0.0
+    # A tolerant match no longer than a few band widths is the two boundaries
+    # grazing each other at a shared corner - that is point contact, not an
+    # interface, and must never make two blocks neighbours.
+    if tolerant_length <= max(minimum_length, 10.0 * tolerance):
+        tolerant, tolerant_length = None, 0.0
+    if tolerant_length > exact_length:
+        geometry, length = tolerant, tolerant_length
+    else:
+        geometry, length = exact, exact_length
+    if length <= minimum_length:
+        return None, exact_length, tolerant_length
+    return geometry, exact_length, tolerant_length
+
+
+def _shared_boundary_length(geom_a, geom_b, minimum_length=1e-6, tolerance=1e-6):
+    """Length of the boundary two polygons really share (0 for vertex-only contact)."""
+    separator, _exact, _tolerant = _boundary_overlap(
+        geom_a, geom_b, tolerance, minimum_length
+    )
+    return 0.0 if separator is None else float(separator.length)
+
+
+def _search_envelope(geom, tolerance):
+    """Bounding box of ``geom`` grown by ``tolerance``.
+
+    A spatial-index query only reports boxes that overlap, so a neighbour that
+    sits a few microns away (snap rounding, noding noise) would be invisible and
+    the fragment would be reported as having no parent at all.
+    """
+    from shapely.geometry import box
+
+    minx, miny, maxx, maxy = geom.bounds
+    return box(minx - tolerance, miny - tolerance, maxx + tolerance, maxy + tolerance)
+
+
+def _fragment_components(fragment_keys, block_pieces, minimum_shared, tolerance=1e-6):
+    """Group small faces that touch each other, so a chain LARGE-s1-s2 merges as one."""
+    parent_of = {key: key for key in fragment_keys}
+
+    def _find(key):
+        while parent_of[key] != key:
+            parent_of[key] = parent_of[parent_of[key]]
+            key = parent_of[key]
+        return key
+
+    keys = list(fragment_keys)
+    for index, key_a in enumerate(keys):
+        for key_b in keys[index + 1:]:
+            if not _shared_boundary_length(
+                block_pieces[key_a[0]][key_a[1]],
+                block_pieces[key_b[0]][key_b[1]],
+                minimum_shared,
+                tolerance,
+            ):
+                continue
+            root_a, root_b = _find(key_a), _find(key_b)
+            if root_a != root_b:
+                parent_of[root_b] = root_a
+
+    components = {}
+    for key in keys:
+        components.setdefault(_find(key), []).append(key)
+    return [sorted(members) for members in components.values()]
+
+
+def _plan_small_fragment_merges(block_pieces, config, source_ids=None, longitudinal_spans=None):
+    """Decide which small faces are absorbed by which neighbouring block.
+
+    ``block_pieces`` is one list of shapely polygons per block, in priority
+    order.  ``source_ids`` optionally carries the originating CL line of every
+    block, so two chunks cut from the SAME CL line are never merged into each
+    other (that would weld ordinary distance-split blocks together).
+
+    ``longitudinal_spans`` optionally carries ``(startChainage, endChainage,
+    length)`` per block - how far the block runs ALONG its own CL.  It feeds the
+    additive distance rule: a SIDE / JUNCTION block shorter than half of the
+    configured Block Distance becomes a small-fragment candidate too.
+
+    Classification runs on the ORIGINAL faces only and the resulting set is
+    frozen: a parent that grew during a merge can never become a new candidate.
+
+    Returns ``{"merges", "skipped", "details", "fragments", "distanceFragments"}``:
+    * ``merges``  - ``{(block, piece) of the parent: [(block, piece), ...] faces}``
+    * ``skipped`` - ``[((block, piece), reason), ...]`` left untouched on purpose
+    * ``details`` - per-face separator, attachment ratio, areas, neighbour count
+    * ``distanceFragments`` - candidates that ONLY the distance rule added
+    """
+    result = {
+        "merges": {},
+        "skipped": [],
+        "details": {},
+        "fragments": [],
+        "distanceFragments": [],
+    }
+    if not config.get("enabled", True):
+        return result
+
+    ratio = float(config.get("smallBlockRelativeAreaRatio") or 0.0)
+    raw_threshold = config.get("smallBlockAreaThreshold")
+    threshold = float(raw_threshold) if raw_threshold is not None else None
+    tolerance = float(config.get("snapTolerance") or 0.0)
+    minimum_attachment = float(config.get("minimumAttachmentLength") or 1e-6)
+    ambiguity = float(config.get("ambiguousMergeTolerance") or 0.0)
+    debug = bool(config.get("debug"))
+
+    # Additive distance rule configuration (see SIDE_BLOCK_SMALL_RATIO).
+    block_distance = float(config.get("blockDistance") or 0.0)
+    side_ratio = float(config.get("sideBlockSmallRatio") or SIDE_BLOCK_SMALL_RATIO)
+    distance_tolerance = float(config.get("sideBlockDistanceTolerance") or 0.0)
+    short_threshold = block_distance * side_ratio if block_distance > 0.0 else None
+    primary_source = min(source_ids) if source_ids else None
+
+    def _span_for(block_index):
+        """``(start, end, length)`` along the CL for one block, or ``None``."""
+        if not longitudinal_spans or block_index >= len(longitudinal_spans):
+            return None
+        span = longitudinal_spans[block_index]
+        if not span:
+            return None
+        try:
+            return float(span[0]), float(span[1]), float(span[2])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    keys = [
+        (block_index, piece_index)
+        for block_index, pieces in enumerate(block_pieces)
+        for piece_index in range(len(pieces))
+    ]
+    if not keys:
+        return result
+
+    def _area(key):
+        return float(block_pieces[key[0]][key[1]].area)
+
+    def _same_source(block_a, block_b):
+        return source_ids is not None and source_ids[block_a] == source_ids[block_b]
+
+    # ---- Phase 1: true edge adjacency and the COMPLETE separator per pair ----
+    # The separator is kept in full (every noded component), exact first and
+    # tolerant second, so a boundary split into e1+e2+e3 is never half-matched.
+    from shapely.strtree import STRtree
+
+    tree = STRtree([block_pieces[block][piece] for block, piece in keys])
+    adjacency = {}
+    for key in keys:
+        piece = block_pieces[key[0]][key[1]]
+        try:
+            positions = tree.query(_search_envelope(piece, tolerance))
+        except Exception:
+            continue
+        for position in positions:
+            other_key = keys[int(position)]
+            if other_key == key or other_key[0] == key[0]:
+                continue
+            if _same_source(key[0], other_key[0]):
+                continue
+            other = block_pieces[other_key[0]][other_key[1]]
+            separator, exact_length, tolerant_length = _boundary_overlap(
+                piece, other, tolerance, minimum_attachment
+            )
+            if separator is None:
+                continue
+            adjacency.setdefault(key, {})[other_key] = {
+                "separator": separator,
+                "exactLength": exact_length,
+                "tolerantLength": tolerant_length,
+                "length": float(separator.length),
+            }
+
+    # ---- Phase 2: classify the ORIGINAL faces, then freeze the candidate set ----
+    fragments = set()
+    # Candidates that ONLY the distance rule contributed, tracked separately so
+    # the two criteria stay distinguishable in the logs.
+    distance_fragments = set()
+    reasons = {}
+    for block_index, pieces in enumerate(block_pieces):
+        if not pieces:
+            continue
+        largest_own = max(float(piece.area) for piece in pieces)
+
+        # A SIDE / JUNCTION block is a block generated from a CL other than the
+        # highest-priority one that is ALSO in contact with another block's
+        # corridor.  Cross-CL contact can only exist where two corridors meet,
+        # i.e. at a junction, so an ordinary terminal chunk of one long CL never
+        # qualifies - and a side block merely shorter than the target distance
+        # does not qualify on its own either.
+        span = _span_for(block_index)
+        side_block = bool(
+            source_ids is not None
+            and primary_source is not None
+            and source_ids[block_index] != primary_source
+            and any((block_index, index) in adjacency for index in range(len(pieces)))
+        )
+        short_side = bool(
+            side_block
+            and short_threshold is not None
+            and span is not None
+            and span[2] < short_threshold - distance_tolerance
+        )
+
+        for piece_index, piece in enumerate(pieces):
+            key = (block_index, piece_index)
+            area = float(piece.area)
+            neighbours = adjacency.get(key) or {}
+            bigger = [other for other in neighbours if _area(other) > area]
+            is_small, reason = False, "not_small"
+            if len(pieces) > 1 and ratio > 0.0 and area <= ratio * largest_own:
+                is_small, reason = True, "leftover_of_own_chunk"
+            elif bigger and ratio > 0.0 and area <= ratio * min(_area(other) for other in bigger):
+                is_small, reason = True, "small_vs_neighbour"
+            if not is_small and threshold is not None and area <= threshold:
+                is_small, reason = True, "below_area_threshold"
+            existing_small = is_small
+
+            # Additive rule: an eligible side block running less than half of the
+            # configured Block Distance along its CL is a small fragment as well.
+            # It only ever ADDS candidates - the existing detection above still
+            # decides on its own, and ``fragments`` is a set, so a face that both
+            # tests flag is still exactly one candidate.
+            if short_side:
+                reasons.setdefault(key, []).append("short_side_block")
+                distance_fragments.add(key)
+                if not is_small:
+                    is_small, reason = True, "short_side_block"
+
+            if is_small:
+                fragments.add(key)
+            if debug and (is_small or bigger):
+                print(
+                    f"[SmallBlockMerge] classify block{block_index + 1}/piece{piece_index} "
+                    f"area={area:.4f} ownChunkLargest={largest_own:.4f} "
+                    f"biggerNeighbours={len(bigger)} isSmall={is_small} reason={reason}"
+                )
+            if side_block and span is not None and (debug or short_side):
+                print(
+                    f"[SmallBlockCandidate] id=block{block_index + 1}/piece{piece_index} "
+                    f"type=SIDE_BLOCK sourceCL={source_ids[block_index]} "
+                    f"startChainage={span[0]:.2f} endChainage={span[1]:.2f} "
+                    f"blockDistance={span[2]:.2f} "
+                    f"configuredDistance={block_distance:.2f} "
+                    f"threshold50={short_threshold:.2f} "
+                    f"existingSmall={existing_small} shortSide={short_side} "
+                    f"finalClassification="
+                    f"{'SMALL_FRAGMENT' if is_small else 'NORMAL_BLOCK'}"
+                )
+
+    result["fragments"] = sorted(fragments)
+    result["distanceFragments"] = sorted(distance_fragments)
+    if not fragments:
+        return result
+
+    def _adjacent_keys(key):
+        return list((adjacency.get(key) or {}).keys())
+
+    # ---- Phase 3: one parent per connected component of small faces ----
+    # Components are processed smallest-first and every face can be claimed by
+    # exactly one of them: two components that grow into each other must not both
+    # hand the same face to the same parent (that would double its area).
+    components = _fragment_components(fragments, block_pieces, minimum_attachment, tolerance)
+    components = sorted(components, key=lambda members: (len(members), members))
+    claimed = set()
+    for component in components:
+        component = [key for key in component if key not in claimed]
+        if not component:
+            continue
+        component_area = sum(_area(key) for key in component)
+        total_perimeter = sum(float(block_pieces[b][p].length) for b, p in component)
+
+        candidates = {}
+        separator_lengths = {}
+        for key in component:
+            for parent_key, info in (adjacency.get(key) or {}).items():
+                if parent_key in fragments:
+                    continue          # a real block is always preferred over a sliver
+                if _area(parent_key) <= component_area:
+                    continue          # only ever absorb into a LARGER neighbour
+                separator_lengths.setdefault(parent_key, []).append(float(info["length"]))
+                entry = candidates.setdefault(parent_key, {"shared": 0.0, "area": 0.0})
+                entry["shared"] += float(info["length"])
+                entry["area"] = max(entry["area"], _area(parent_key))
+
+        if not candidates or total_perimeter <= 0.0:
+            claimed.update(component)
+            for key in component:
+                result["skipped"].append((key, "no_parent"))
+            if debug:
+                for key in component:
+                    print(
+                        f"[SmallBlockMerge] fragment=block{key[0] + 1}/piece{key[1]} "
+                        f"area={_area(key):.4f} isSmall=true candidateParents=0 "
+                        f"result=NO_PARENT_FOUND"
+                    )
+            continue
+
+        scored = [
+            (info["shared"] / total_perimeter, info["shared"], info["area"], key)
+            for key, info in candidates.items()
+        ]
+        scored.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+        best = scored[0]
+
+        # ---- Phase 4: grow the component along touching small faces ----
+        # LARGE - s1 - s2 is allowed to become LARGE + (s1 + s2), but never
+        # across another chunk of a CL line already taking part in this merge.
+        parent_area = _area(best[3])
+        members = set(component)
+        blocked_sources = set()
+        if source_ids is not None:
+            blocked_sources = {source_ids[best[3][0]]}
+            blocked_sources.update(source_ids[block_index] for block_index, _ in component)
+        growing = ratio > 0.0
+        while growing:
+            growing = False
+            for member in list(members):
+                for neighbour_key in _adjacent_keys(member):
+                    if neighbour_key in members:
+                        continue
+                    if source_ids is not None and source_ids[neighbour_key[0]] in blocked_sources:
+                        continue
+                    if neighbour_key in claimed:
+                        continue
+                    if _area(neighbour_key) > ratio * parent_area:
+                        continue
+                    members.add(neighbour_key)
+                    if source_ids is not None:
+                        blocked_sources.add(source_ids[neighbour_key[0]])
+                    growing = True
+        component = sorted(members)
+
+        if parent_area <= sum(_area(key) for key in component):
+            claimed.update(component)
+            for key in component:
+                result["skipped"].append((key, "no_parent"))
+            continue
+
+        if len(scored) > 1 and best[0] > 0.0:
+            runner_up = scored[1]
+            if best[0] - runner_up[0] <= ambiguity * best[0]:
+                claimed.update(component)
+                for key in component:
+                    result["skipped"].append((key, "ambiguous"))
+                if debug:
+                    print(
+                        f"[SmallBlockMerge] result=SKIPPED_AMBIGUOUS "
+                        f"parentA=block{best[3][0] + 1} scoreA={best[0]:.3f} "
+                        f"parentB=block{runner_up[3][0] + 1} scoreB={runner_up[0]:.3f}"
+                    )
+                continue
+
+        claimed.update(component)
+        result["merges"].setdefault(best[3], []).extend(component)
+        for block_index, piece_index in component:
+            key = (block_index, piece_index)
+            separator = (adjacency.get(key) or {}).get(best[3])
+            if separator is None:
+                for other in component:
+                    separator = (adjacency.get(key) or {}).get(other)
+                    if separator is not None:
+                        break
+            result["details"][key] = {
+                "parent": best[3],
+                "separator": (separator or {}).get("separator"),
+                "sharedLength": float(sum(separator_lengths.get(best[3], [0.0]))),
+                "exactSharedLength": float((separator or {}).get("exactLength", 0.0)),
+                "attachmentRatio": float(best[0]),
+                "area": _area(key),
+                "neighbourArea": float(candidates[best[3]]["area"]),
+                "neighbourCount": len(candidates),
+                # Which rule(s) made this face a candidate.  Lets a debug overlay
+                # or reader tell an existing small fragment from a block that is
+                # small only because of the distance rule.
+                "reasons": tuple(reasons.get(key, ())),
+            }
+    return result
+
+
+def _snap_pair(first, second, tolerance):
+    """Move each geometry's vertices onto the other one within ``tolerance``.
+
+    Two faces that came from different corridors routinely share an edge that is
+    *almost* coincident (the two copies of the line differ by ~1e-14).  A plain
+    union then keeps that hair-thin crack and the separator survives on the
+    merged boundary.  Reconciling the interface first makes the two copies
+    exactly equal, so the overlay can dissolve the whole thing.
+    """
+    if tolerance <= 0.0:
+        return first, second
+    try:
+        import shapely
+
+        first_snapped = shapely.snap(first, second, tolerance)
+        second_snapped = shapely.snap(second, first_snapped, tolerance)
+    except Exception:
+        return first, second
+    if first_snapped is None or first_snapped.is_empty:
+        first_snapped = first
+    if second_snapped is None or second_snapped.is_empty:
+        second_snapped = second
+    return first_snapped, second_snapped
+
+
+def _union_faces(parent_geom, fragment_geoms, config):
+    """Union a parent block with its small faces; ``None`` when unusable.
+
+    Returns ``(merged, reason, detail)``.  The union is a real polygon overlay -
+    no edge is deleted by hand - and the result is only accepted when it is one
+    valid connected polygon, its area equals parent + fragments, and the whole
+    dissolved interface has left the merged boundary.
+    """
+    from shapely.ops import unary_union
+
+    tolerance = float(config.get("geometryTolerance") or 1e-6)
+    snap_tolerance = float(config.get("snapTolerance") or tolerance)
+    area_tolerance = float(config.get("areaTolerance") or 1e-6)
+    residual_tolerance = float(config.get("separatorResidualTolerance") or tolerance)
+    minimum_attachment = float(config.get("minimumAttachmentLength") or 1e-6)
+
+    # Reconcile every interface before the overlay (see _snap_pair).
+    parent_snapped = parent_geom
+    fragments_snapped = []
+    for fragment in fragment_geoms:
+        parent_snapped, fragment_snapped = _snap_pair(
+            parent_snapped, fragment, snap_tolerance
+        )
+        fragments_snapped.append(fragment_snapped)
+
+    try:
+        merged = unary_union([parent_snapped, *fragments_snapped])
+    except Exception as exc:
+        return None, "UNION_INVALID", str(exc)
+    if merged is None or merged.is_empty:
+        return None, "UNION_INVALID", "empty"
+    if merged.geom_type != "Polygon":
+        return None, "MULTIPOLYGON_RESULT", merged.geom_type
+    if not merged.is_valid:
+        merged = merged.buffer(0)
+        if merged.is_empty or merged.geom_type != "Polygon":
+            return None, "UNION_INVALID", "still invalid after buffer(0)"
+
+    expected = float(parent_snapped.area) + sum(
+        float(geom.area) for geom in fragments_snapped
+    )
+    merged_area = float(merged.area)
+    if abs(merged_area - expected) > max(tolerance, expected * area_tolerance):
+        return None, "AREA_CHECK_FAILED", f"{merged_area:.6f} != {expected:.6f}"
+
+    # Every interface that was supposed to be dissolved must now be interior
+    # geometry - never a drawable part of the merged exterior boundary.  The
+    # residual is judged against the separator length, not a bare epsilon, so a
+    # sub-micron noding crumb is fine while a surviving half-edge is not.
+    pairs = [(parent_snapped, geom) for geom in fragments_snapped]
+    for index, first in enumerate(fragments_snapped):
+        for second in fragments_snapped[index + 1:]:
+            pairs.append((first, second))
+    residual = 0.0
+    for first, second in pairs:
+        separator, _exact, _tolerant = _boundary_overlap(
+            first, second, snap_tolerance, minimum_attachment
+        )
+        if separator is None:
+            continue
+        try:
+            leftover = separator.intersection(merged.boundary)
+        except Exception:
+            continue
+        if not leftover.is_empty:
+            residual = max(
+                residual, float(leftover.length) / max(float(separator.length), tolerance)
+            )
+    if residual > residual_tolerance:
+        return None, "RESIDUAL_SEPARATOR", f"fraction={residual:.6f}"
+
+    return merged, "SUCCESS", f"area {expected:.4f} -> {merged_area:.4f}"
+
+
 class BlockCreationSettingsDialog(QDialog):
     def __init__(self, app, parent=None):
         _parent = parent if isinstance(parent, QWidget) else (app if isinstance(app, QWidget) else None)
@@ -1025,6 +2131,9 @@ class BlockCreationSettingsDialog(QDialog):
         self.selected_cl_lines = []
         self._hovered_cl_line = None
         self._cl_select_active = False
+        # Rubber-band drag state (display coords, bottom-left origin).
+        self._cl_drag_start = None      # (x, y) where the left button went down
+        self._cl_drag_active = False    # True once past the drag threshold
         self._snt_cl_pseudo_drawings = []
         self._snt_hover_actor = None       # transient VTK actor for hovered SNT CL line
         self._snt_selected_actors = {}     # id(drawing) -> VTK actor for selected SNT CL lines
@@ -1039,13 +2148,19 @@ class BlockCreationSettingsDialog(QDialog):
         self._value_editors = []
         self.setWindowTitle("Block Creation Settings")
         self.setModal(False)
-        self.setWindowFlags(Qt.Dialog | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
-        self.setMinimumSize(400, 380)
-        self.resize(400, 460)
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowSystemMenuHint | Qt.WindowCloseButtonHint)
+        self.setMinimumSize(400, 344)
+        self.resize(400, 360)
 
         self.setStyleSheet(_get_block_dialog_style())
         self._build_ui()
         self._refresh_mode_ui()
+
+        # Lock the window height: the dialog can no longer be dragged taller
+        # or shorter. It only changes when an optional section (the edit
+        # controls) appears or disappears, so the content always fits.
+        self._base_height = max(self.height(), self.layout().sizeHint().height())
+        self._sync_locked_height()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -1081,9 +2196,6 @@ class BlockCreationSettingsDialog(QDialog):
         cl_layout.addStretch()
         root.addWidget(cl_group)
 
-        self.cl_popup = CLSelectionPopup(self)
-        self.cl_popup.selection_confirmed.connect(self._on_cl_popup_done)
-
         settings_group = QGroupBox("Block Settings")
         form = QFormLayout(settings_group)
         form.setLabelAlignment(Qt.AlignRight)
@@ -1102,7 +2214,7 @@ class BlockCreationSettingsDialog(QDialog):
         self.total_width_spin.setRange(0.0, 999999.0)
         self.total_width_spin.setSingleStep(0.05)
         self.total_width_spin.setSuffix(" m")
-        self.total_width_spin.setValue(2.0)
+        self.total_width_spin.setValue(60.0)
         self.total_width_spin.valueChanged.connect(self._refresh_summary)
         self._register_value_editor(self.total_width_spin)
         form.addRow("Total width:", self.total_width_spin)
@@ -1131,7 +2243,7 @@ class BlockCreationSettingsDialog(QDialog):
         self.distance_spin.setDecimals(4)
         self.distance_spin.setRange(0.0, 999999.0)
         self.distance_spin.setSingleStep(0.05)
-        self.distance_spin.setValue(0.0)
+        self.distance_spin.setValue(250.0)
         self.distance_spin.valueChanged.connect(self._refresh_summary)
         self._register_value_editor(self.distance_spin)
         form.addRow("Distance:", self.distance_spin)
@@ -1153,7 +2265,7 @@ class BlockCreationSettingsDialog(QDialog):
         edit_row_one = QHBoxLayout()
         edit_row_one.setSpacing(8)
 
-        self.edit_select_btn = QPushButton("Select")
+        self.edit_select_btn = QPushButton("Enable")
         self.edit_select_btn.setAutoDefault(False)
         self.edit_select_btn.setDefault(False)
         self.edit_select_btn.setCursor(Qt.PointingHandCursor)
@@ -1235,14 +2347,11 @@ class BlockCreationSettingsDialog(QDialog):
         self.create_btn.setObjectName("okButton")
         self.create_btn.setAutoDefault(False)
         self.create_btn.setDefault(False)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setAutoDefault(False)
-        cancel_btn.setDefault(False)
         self.create_btn.clicked.connect(self._on_create_clicked)
-        cancel_btn.clicked.connect(self._on_cancel_clicked)
 
+        # No Cancel button: the window is closed with the title-bar X, and
+        # "Clear" already resets the generated blocks and the settings.
         btn_row.addWidget(self.create_btn)
-        btn_row.addWidget(cancel_btn)
         root.addLayout(btn_row)
 
         self._set_edit_controls_visible(False)
@@ -1284,10 +2393,12 @@ class BlockCreationSettingsDialog(QDialog):
         return
 
     def _build_snt_cl_pseudo_drawings(self):
-        """Return lightweight drawing-like dicts for CL-layer polylines in loaded SNT files.
+        """Return drawing-like dicts for selectable open lines in loaded SNTs.
 
         These are transient; they are rebuilt each time Select CL is armed and discarded
-        when it is disarmed, so they hold no VTK resources and cannot leak.
+        when it is disarmed, so they hold no VTK resources and cannot leak. Only genuine
+        open line geometry is admitted; grid/bbox/trajectory (including TRJ) support
+        data is excluded.
         """
         result = []
         for attachment in getattr(self.app, "snt_attachments", []) or []:
@@ -1297,15 +2408,9 @@ class BlockCreationSettingsDialog(QDialog):
             for ent in entities:
                 if not isinstance(ent, dict):
                     continue
-                layer = str(ent.get("layer", "")).strip().upper()
-                if layer != "CL":
-                    continue
-                etype = str(ent.get("type", "")).strip().upper()
-                if etype not in ("POLYLINE", "LWPOLYLINE", "LINE"):
+                if not _is_snt_selectable_line_entity(ent):
                     continue
                 vertices = ent.get("vertices") or ent.get("coords") or ent.get("points") or []
-                if len(vertices) < 2:
-                    continue
                 coords = [
                     (float(v[0]), float(v[1]), float(v[2]) if len(v) > 2 else 0.0)
                     for v in vertices
@@ -1313,8 +2418,11 @@ class BlockCreationSettingsDialog(QDialog):
                 result.append({
                     "type": "smartline",
                     "source": "snt_cl",
-                    "layer": "CL",
+                    "layer": str(ent.get("layer", "")).strip(),
                     "snt_filename": fname,
+                    "snt_entity_id": ent.get("_snt_entity_id"),
+                    "snt_entity_type": str(ent.get("type", "")).strip().upper(),
+                    "snt_open_line": True,
                     "coords": coords,
                 })
         return result
@@ -1403,7 +2511,7 @@ class BlockCreationSettingsDialog(QDialog):
         self.select_cl_btn.blockSignals(True)
         self.select_cl_btn.setChecked(self._cl_select_active)
         self.select_cl_btn.blockSignals(False)
-        self.cl_selection_label.setVisible(bool(self.selected_cl_lines) and not self._cl_select_active)
+        self.cl_selection_label.setVisible(bool(self.selected_cl_lines))
 
         vtk_widget = getattr(self.app, "vtk_widget", None)
         if vtk_widget is not None:
@@ -1413,13 +2521,15 @@ class BlockCreationSettingsDialog(QDialog):
                 vtk_widget.setCursor(Qt.PointingHandCursor)
                 if hasattr(self.app, "statusBar"):
                     n_snt = len(self._snt_cl_pseudo_drawings)
-                    snt_hint = f" or a CL line from SNT ({n_snt} available)" if n_snt else ""
+                    snt_hint = f" or an SNT line ({n_snt} available)" if n_snt else ""
                     self.app.statusBar().showMessage(
                         f"Select CL active: click a smart line{snt_hint}, "
-                        "or Shift+click to select multiple",
+                        "or drag a dotted box to select several "
+                        "(Shift+click/drag to add more)",
                         0,
                     )
             else:
+                self._cancel_cl_drag()
                 self._snt_cl_pseudo_drawings = []
                 vtk_widget.removeEventFilter(self)
                 vtk_widget.setCursor(Qt.ArrowCursor)
@@ -1442,14 +2552,29 @@ class BlockCreationSettingsDialog(QDialog):
 
         event_type = event.type()
         if event_type == QEvent.MouseMove:
+            if self._cl_drag_start is not None:
+                # While the rubber band is live, swallow the move so the VTK
+                # interactor cannot start its own gesture underneath the box.
+                self._update_cl_drag(event)
+                return True
             self._update_hover_cl_line(event)
             return False
 
         if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            self._select_hovered_cl_line(event)
+            # Selection is committed on release: a press/release that never
+            # moves past the threshold is treated as the plain click-select,
+            # anything further becomes a rubber-band rectangle selection.
+            self._begin_cl_drag(event)
             return True
 
+        if event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self._cl_drag_start is not None:
+                self._finish_cl_drag(event)
+                return True
+            return False
+
         if event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            self._cancel_cl_drag()
             self._toggle_cl_selection(False)
             return True
 
@@ -1463,6 +2588,169 @@ class BlockCreationSettingsDialog(QDialog):
         height = vtk_widget.height() if vtk_widget is not None else 0
         return x, max(0, height - y)
 
+    # ── Rubber-band (drag rectangle) selection ──────────────────────────────
+
+    def _begin_cl_drag(self, event):
+        """Remember where the left button went down; no selection yet."""
+        self._cl_drag_start = self._event_display_pos(event)
+        self._cl_drag_active = False
+
+    def _update_cl_drag(self, event):
+        """Extend the live rubber band once the pointer moves far enough."""
+        if self._cl_drag_start is None:
+            return
+        pos = self._event_display_pos(event)
+        if not self._cl_drag_active:
+            sx, sy = self._cl_drag_start
+            if (
+                abs(pos[0] - sx) < _CL_DRAG_THRESHOLD_PX
+                and abs(pos[1] - sy) < _CL_DRAG_THRESHOLD_PX
+            ):
+                return
+            self._cl_drag_active = True
+            # Drop the hover highlight so it does not sit under the box.
+            self._clear_hover_cl_line()
+        self._draw_cl_drag_rect(self._cl_drag_start, pos)
+
+    def _finish_cl_drag(self, event):
+        """Release: plain click selects one line, a drag selects a rectangle."""
+        start = self._cl_drag_start
+        dragged = self._cl_drag_active
+        self._cl_drag_start = None
+        self._cl_drag_active = False
+
+        if not dragged:
+            # Unchanged click-to-select behaviour (hover/Shift+click).
+            self._select_hovered_cl_line(event)
+            return
+
+        end = self._event_display_pos(event)
+        self._clear_cl_drag_rect()
+        drawings = self._drawings_in_display_rect(start, end)
+        if not drawings:
+            self._render_view()
+            return
+        self._select_cl_drawings(drawings)
+
+    def _cancel_cl_drag(self):
+        """Abandon an in-flight drag and remove its rectangle."""
+        had_drag = self._cl_drag_start is not None or self._cl_drag_active
+        self._cl_drag_start = None
+        self._cl_drag_active = False
+        if had_drag:
+            self._clear_cl_drag_rect()
+
+    def _draw_cl_drag_rect(self, start, end):
+        """Show the dotted rubber-band rectangle in screen space."""
+        digitizer = getattr(self.app, "digitizer", None)
+        update = getattr(digitizer, "_update_preview_actor_screen", None)
+        if update is None:
+            return
+        x0, y0 = float(start[0]), float(start[1])
+        x1, y1 = float(end[0]), float(end[1])
+        points = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        try:
+            update(
+                _CL_DRAG_ACTOR_ATTR,
+                points,
+                color=(0.0, 1.0, 1.0),
+                width=1,
+                line_style="dotted",
+            )
+        except Exception as exc:
+            print(f"Failed to draw CL selection rectangle: {exc}")
+            return
+        self._render_view()
+
+    def _clear_cl_drag_rect(self):
+        """Remove the dotted rubber-band rectangle from the scene."""
+        digitizer = getattr(self.app, "digitizer", None)
+        remover = getattr(digitizer, "_remove_preview_actor_2d", None)
+        if remover is not None:
+            try:
+                remover(_CL_DRAG_ACTOR_ATTR)
+            except Exception:
+                pass
+        self._render_view()
+
+    @staticmethod
+    def _segment_intersects_rect(p1, p2, rect):
+        """Liang-Barsky test: does a 2D segment touch an axis-aligned box?"""
+        xmin, xmax, ymin, ymax = rect
+        x1 = float(p1[0])
+        y1 = float(p1[1])
+        dx = float(p2[0]) - x1
+        dy = float(p2[1]) - y1
+        t0 = 0.0
+        t1 = 1.0
+        for p, q in (
+            (-dx, x1 - xmin),
+            (dx, xmax - x1),
+            (-dy, y1 - ymin),
+            (dy, ymax - y1),
+        ):
+            if abs(p) < 1e-12:
+                if q < 0.0:
+                    return False
+                continue
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return False
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return False
+                if r < t1:
+                    t1 = r
+        return t0 <= t1
+
+    def _drawings_in_display_rect(self, start, end):
+        """Every selectable CL/smart line crossing the dragged screen box."""
+        digitizer = getattr(self.app, "digitizer", None)
+        if digitizer is None:
+            return []
+        renderer = getattr(digitizer, "renderer", None)
+        if renderer is None:
+            return []
+
+        xmin, xmax = sorted((float(start[0]), float(end[0])))
+        ymin, ymax = sorted((float(start[1]), float(end[1])))
+        rect = (xmin, xmax, ymin, ymax)
+
+        candidates = list(getattr(digitizer, "drawings", []))
+        candidates += list(self._snt_cl_pseudo_drawings or [])
+
+        hits = []
+        for drawing in candidates:
+            if not self._is_selectable_cl_line(drawing):
+                continue
+
+            coords = drawing.get("coords", [])
+            if len(coords) < 2:
+                continue
+
+            for idx in range(len(coords) - 1):
+                p1 = coords[idx]
+                p2 = coords[idx + 1]
+
+                renderer.SetWorldPoint(p1[0], p1[1], p1[2], 1.0)
+                renderer.WorldToDisplay()
+                s1 = renderer.GetDisplayPoint()
+
+                renderer.SetWorldPoint(p2[0], p2[1], p2[2], 1.0)
+                renderer.WorldToDisplay()
+                s2 = renderer.GetDisplayPoint()
+
+                if self._segment_intersects_rect(s1, s2, rect):
+                    hits.append(drawing)
+                    break
+
+        return hits
+
+    # ────────────────────────────────────────────────────────────────────────
+
     def _find_smartline_at_event(self, event):
         drawings = self._find_smartlines_at_event(event)
         return drawings[0] if drawings else None
@@ -1472,7 +2760,7 @@ class BlockCreationSettingsDialog(QDialog):
             return False
         source = drawing.get("source", "")
         if source == "snt_cl":
-            return True
+            return drawing.get("snt_open_line") is True
         return (
             drawing.get("type") in ("smartline", "smart_line")
             and source != "block_creation"
@@ -1556,38 +2844,42 @@ class BlockCreationSettingsDialog(QDialog):
                 digitizer._highlight_line(drawing)
                 self._render_view()
 
-    def _select_hovered_cl_line(self, event=None):
-        if self._is_shift_selection(event):
-            drawings = self._find_smartlines_at_event(event)
-        else:
-            drawings = [self._hovered_cl_line]
-
+    def _select_cl_drawings(self, drawings):
+        """Add the given lines to the current CL selection (additive)."""
         drawings = [drawing for drawing in drawings if self._is_selectable_cl_line(drawing)]
         if not drawings:
-            return
+            return False
 
         # Remove the hover actor before promoting to selection actor.
         self._unhighlight_snt_cl_line()
 
+        digitizer = getattr(self.app, "digitizer", None)
         for drawing in drawings:
             if not self._has_selected_cl_line(drawing):
                 self.selected_cl_lines.append(drawing)
                 if drawing.get("source") == "snt_cl":
                     self._select_snt_cl_line(drawing)
                 else:
-                    digitizer = getattr(self.app, "digitizer", None)
                     if digitizer is not None and hasattr(digitizer, "_highlight_line"):
                         digitizer._highlight_line(drawing)
 
         self._hovered_cl_line = None
         self._refresh_cl_selection_label()
         self._render_view()
+        return True
+
+    def _select_hovered_cl_line(self, event=None):
+        if self._is_shift_selection(event):
+            drawings = self._find_smartlines_at_event(event)
+        else:
+            drawings = [self._hovered_cl_line]
+
+        self._select_cl_drawings(drawings)
 
     def _refresh_cl_selection_label(self):
         if not self.selected_cl_lines:
             self.cl_selection_label.setText("No CL selected")
             self.cl_selection_label.setVisible(False)
-            self.cl_popup.hide()
             return
 
         labels = []
@@ -1598,40 +2890,9 @@ class BlockCreationSettingsDialog(QDialog):
             else:
                 labels.append(f"Line {idx}")
         self.cl_selection_label.setText(", ".join(labels))
-        self.cl_selection_label.setVisible(not self._cl_select_active)
-
-        if not self._cl_select_active:
-            self.cl_popup.hide()
-            return
-
-        self.cl_popup.update_selection(self.selected_cl_lines)
-        self._position_cl_popup()
-        self.cl_popup.show()
-        # Keep the main dialog in front of the app window after the popup appears.
-        # On Windows, showing a Qt.Tool child can push the parentless Qt.Window dialog
-        # behind the main application window; raise_() restores the correct z-order.
-        self.raise_()
-        self.activateWindow()
-
-    def _position_cl_popup(self):
-        if not hasattr(self, "cl_popup") or self.cl_popup is None:
-            return
-        # mapToGlobal is unreliable when the dialog is not yet shown; ensure it is visible.
-        if not self.isVisible():
-            self.show()
-        popup_pos = self.select_cl_btn.mapToGlobal(
-            QPoint(self.select_cl_btn.width() + 5, 0)
-        )
-        self.cl_popup.move(popup_pos)
-
-    def moveEvent(self, event):
-        super().moveEvent(event)
-        if hasattr(self, "cl_popup") and self.cl_popup.isVisible():
-            self._position_cl_popup()
-
-    def _on_cl_popup_done(self, lines):
-        self.selected_cl_lines = lines
-        self._toggle_cl_selection(False)
+        # Selecting the lines IS the confirmation, so the list is shown live while
+        # picking instead of behind a "Done" popup the user had to dismiss.
+        self.cl_selection_label.setVisible(True)
 
     def _clear_hover_cl_line(self):
         drawing = self._hovered_cl_line
@@ -1668,16 +2929,14 @@ class BlockCreationSettingsDialog(QDialog):
         self.selected_cl_lines = []
         self._hovered_cl_line = None
         self._snt_cl_pseudo_drawings = []
-        if hasattr(self, "cl_popup"):
-            self.cl_popup.hide()
         self._refresh_cl_selection_label()
 
     def _reset_settings_fields(self):
         self.mode_combo.setCurrentIndex(0)
-        self.total_width_spin.setValue(2.0)
+        self.total_width_spin.setValue(60.0)
         self.tol_above_spin.setValue(1.0)
         self.tol_below_spin.setValue(1.0)
-        self.distance_spin.setValue(0.0)
+        self.distance_spin.setValue(250.0)
         self._refresh_mode_ui()
 
     def _clear_generated_blocks_and_reset(self):
@@ -1693,10 +2952,6 @@ class BlockCreationSettingsDialog(QDialog):
         if hasattr(self, "split_btn"):
             self.split_btn.setVisible(False)
             self.split_btn.setEnabled(False)
-
-    def _on_cancel_clicked(self):
-        self._clear_generated_blocks_and_reset()
-        self.reject()
 
     def _remove_generated_block_drawings(self):
         self._stop_generated_block_editing()
@@ -1730,6 +2985,7 @@ class BlockCreationSettingsDialog(QDialog):
                 button.setEnabled(bool(visible))
             except Exception:
                 pass
+        self._sync_locked_height()
 
     def _set_edit_status(self, message):
         if hasattr(self, "edit_status_label") and self.edit_status_label is not None:
@@ -1786,7 +3042,14 @@ class BlockCreationSettingsDialog(QDialog):
             pass
 
         live_ids = {id(drawing) for drawing in live_drawings}
-        setattr(digitizer, "_move_vertex_allowed_drawing_ids", set(live_ids))
+        setattr(digitizer, "_edit_scope_allowed_drawing_ids", set(live_ids))
+
+        # Drop stale selections (e.g. Cell circles picked before the scope
+        # was armed) so Extend / Delete / Move cannot act on them.
+        try:
+            digitizer.prune_selection_to_edit_scope()
+        except Exception:
+            pass
 
         for drawing in list(getattr(digitizer, "drawings", []) or []):
             actor = drawing.get("actor") if isinstance(drawing, dict) else None
@@ -1846,11 +3109,11 @@ class BlockCreationSettingsDialog(QDialog):
         except Exception:
             pass
 
-        if hasattr(digitizer, "_move_vertex_allowed_drawing_ids"):
+        if hasattr(digitizer, "_edit_scope_allowed_drawing_ids"):
             try:
-                delattr(digitizer, "_move_vertex_allowed_drawing_ids")
+                delattr(digitizer, "_edit_scope_allowed_drawing_ids")
             except Exception:
-                setattr(digitizer, "_move_vertex_allowed_drawing_ids", None)
+                setattr(digitizer, "_edit_scope_allowed_drawing_ids", None)
         self._restore_generated_block_pickability()
 
         if self._generated_block_snap_state is not None:
@@ -1943,7 +3206,7 @@ class BlockCreationSettingsDialog(QDialog):
                     (copied, vertex_index, original[vertex_index])
                 )
 
-        conflicts = []
+        reconciled = []
         for junction_id, members in junctions.items():
             moved = [
                 copied["coords"][vertex_index]
@@ -1952,8 +3215,16 @@ class BlockCreationSettingsDialog(QDialog):
             ]
             target = moved[0] if moved else members[0][0]["coords"][members[0][1]]
             if any(not self._same_block_vertex(point, target, tolerance=0.02) for point in moved[1:]):
-                conflicts.append(junction_id)
-                continue
+                # Two edits dragged the same shared corner to different spots.
+                # Stitch at the average of the moved members instead of
+                # rejecting the whole split: the block still closes and every
+                # edit stays approximately honoured.  (Previously this flagged
+                # the block invalid and blocked Split entirely.)
+                target = tuple(
+                    float(np.mean([point[axis] for point in moved]))
+                    for axis in range(3)
+                )
+                reconciled.append(junction_id)
             for copied, vertex_index, _original in members:
                 copied["coords"][vertex_index] = tuple(target)
 
@@ -1993,7 +3264,45 @@ class BlockCreationSettingsDialog(QDialog):
                 endpoint_drawing, endpoint_vertex = endpoints[endpoint_index]
                 endpoint_drawing["coords"][endpoint_vertex] = target
 
-        return normalised, conflicts
+        return normalised, reconciled
+
+    @classmethod
+    def _map_original_to_current(cls, original, current, tolerance=1e-6):
+        """Pair pre-edit vertices with their edited counterparts.
+
+        Extend / vertex-delete edits insert or drop points, which used to make
+        the whole drawing unmappable (strict length equality) so its edits were
+        invisible to Split and the block was rejected as "not closed".  An extra
+        current point is treated as an insertion and a missing one as a
+        deletion; everything else pairs in order so a moved vertex still maps
+        back onto its original ring position.
+        """
+        pairs = []
+        i = j = 0
+        while i < len(original) and j < len(current):
+            original_point = original[i]
+            current_point = current[j]
+            if cls._same_block_vertex(original_point, current_point, tolerance):
+                pairs.append((original_point, current_point))
+                i += 1
+                j += 1
+            elif j + 1 < len(current) and cls._same_block_vertex(
+                original_point, current[j + 1], tolerance
+            ):
+                j += 1  # a vertex was inserted at j
+            elif i + 1 < len(original) and cls._same_block_vertex(
+                original[i + 1], current_point, tolerance
+            ):
+                i += 1  # a vertex was deleted from the original
+            else:
+                pairs.append((original_point, current_point))
+                i += 1
+                j += 1
+        while i < len(original) and j < len(current):
+            pairs.append((original[i], current[j]))
+            i += 1
+            j += 1
+        return pairs
 
     def _cached_block_polygon(self, block):
         try:
@@ -2025,9 +3334,9 @@ class BlockCreationSettingsDialog(QDialog):
         for drawing in list(drawings or []):
             original = drawing.get("block_creation_original_coords") or []
             current = self._clean_block_edit_chain(drawing.get("coords"))
-            if len(original) != len(current):
-                continue
-            for original_point, current_point in zip(original, current):
+            for original_point, current_point in self._map_original_to_current(
+                original, current
+            ):
                 if self._same_block_vertex(original_point, current_point):
                     continue
                 distances = np.hypot(ring[:, 0] - original_point[0], ring[:, 1] - original_point[1])
@@ -2134,21 +3443,26 @@ class BlockCreationSettingsDialog(QDialog):
         invalid_blocks = []
 
         for block in current_blocks:
+            priority = int(block.get("priority", len(refreshed) + 1))
             original_drawings = list(block.get("drawings", []) or [])
             live_drawings = [
                 drawing for drawing in original_drawings
                 if id(drawing) in live_ids
             ]
             if not live_drawings:
-                invalid_blocks.append(int(block.get("priority", len(refreshed) + 1)))
+                invalid_blocks.append(
+                    (priority, "none of its cyan edges remain in the view - undo the deletion or rebuild the preview")
+                )
                 continue
 
             has_deleted_drawing = len(live_drawings) != len(original_drawings)
             changed = self._block_drawings_changed(block, live_drawings)
-            normalised_drawings, conflicts = self._normalised_block_drawings(live_drawings)
-            if conflicts:
-                invalid_blocks.append(int(block.get("priority", len(refreshed) + 1)))
-                continue
+            normalised_drawings, reconciled = self._normalised_block_drawings(live_drawings)
+            if reconciled:
+                print(
+                    f"[Split] block priority {priority}: stitched shared corner(s) "
+                    f"{', '.join(reconciled)} that separate edits had pulled apart"
+                )
 
             if not changed:
                 # Overlap clipping deliberately leaves some visible edge groups open.
@@ -2162,24 +3476,49 @@ class BlockCreationSettingsDialog(QDialog):
                 )
                 if polygon is None:
                     polygon = self._polygon_from_block_drawings(normalised_drawings)
+                if polygon is None:
+                    # The edits could not be mapped onto a closed outline (a
+                    # deleted edge, clipped helper edges, an ambiguous shape).
+                    # The cached ring still describes this block, so proceed
+                    # with it rather than blocking the entire Split.
+                    polygon = self._cached_block_polygon(block)
+                    if polygon is not None:
+                        print(
+                            f"[Split] block priority {priority}: edited edges do not close "
+                            "on their own - proceeding with the last valid outline"
+                        )
             if polygon is None or len(polygon) < 4:
-                invalid_blocks.append(int(block.get("priority", len(refreshed) + 1)))
+                invalid_blocks.append(
+                    (priority, "its edited edges do not close into a polygon - fix or undo that edit")
+                )
                 continue
 
             updated = dict(block)
             updated["drawings"] = live_drawings
             updated["polygon"] = polygon
+            # Vertex edits invalidate the small-fragment merge FOR THAT BLOCK: its
+            # merged rings no longer describe these drawings, so export is left to
+            # re-polygonize.  An untouched block keeps its merged rings - dropping
+            # them here would undo the merge on every plain Create -> Split, and the
+            # points of an absorbed sliver would then belong to no block at all.
+            updated["effective_polygon"] = (
+                None if changed else block.get("effective_polygon")
+            )
             updated["above_pts"] = []
             updated["below_pts"] = []
             refreshed.append(updated)
 
         if invalid_blocks:
-            labels = ", ".join(str(item) for item in invalid_blocks)
+            lines = "\n".join(
+                f"- Priority {priority}: {reason}"
+                for priority, reason in invalid_blocks
+            )
+            print(f"[Split] blocks rejected:\n{lines}")
             QMessageBox.warning(
                 self,
                 "Split Blocks",
                 "Some edited blocks no longer form a closed polygon. "
-                f"Fix or undo the edits for block priority: {labels}.",
+                "Fix or undo the edits for these blocks:\n" + lines,
             )
             return None
 
@@ -2368,6 +3707,486 @@ class BlockCreationSettingsDialog(QDialog):
 
         return chunks
 
+    # ---------------------------------------------------------------------
+    #  Small intersection-fragment merge (post-processing stage)
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _ring_to_world(geom, origin):
+        """Closed world-coord ring of (x, y) tuples for one shapely polygon."""
+        try:
+            coords = list(geom.exterior.coords)
+        except Exception:
+            return []
+        ox, oy = float(origin[0]), float(origin[1])
+        return [(float(x) + ox, float(y) + oy) for x, y in coords]
+
+    def _discard_block_drawings(self, record):
+        """Drop only this block's cyan edges from the overlay and from the bookkeeping."""
+        digitizer = getattr(self.app, "digitizer", None)
+        for drawing in list(record.get("drawings") or []):
+            if digitizer is not None:
+                try:
+                    if any(existing is drawing for existing in getattr(digitizer, "drawings", [])):
+                        if hasattr(digitizer, "_remove_drawing"):
+                            digitizer._remove_drawing(drawing)
+                        else:
+                            actor = drawing.get("actor")
+                            if actor is not None and hasattr(digitizer, "_remove_actor_from_overlay"):
+                                digitizer._remove_actor_from_overlay(actor)
+                            digitizer.drawings.remove(drawing)
+                except Exception as exc:
+                    print(f"⚠️ Failed to clear block drawing: {exc}")
+            if drawing in self._generated_block_drawings:
+                self._generated_block_drawings.remove(drawing)
+        record["drawings"] = []
+
+    def _outline_z_for_xy(self, record, xy_points, z_reference=None):
+        """Lift rebuilt outline vertices back onto the block's original 3-D edges."""
+        reference = list(z_reference or [])
+        for drawing in record.get("drawings") or []:
+            for point in drawing.get("coords") or []:
+                if point is not None and len(point) > 2:
+                    reference.append((float(point[0]), float(point[1]), float(point[2])))
+        if not reference:
+            return [0.0] * len(xy_points)
+        ref_xy = np.array([[point[0], point[1]] for point in reference], dtype=np.float64)
+        ref_z = np.array([point[2] for point in reference], dtype=np.float64)
+        heights = []
+        for x, y in xy_points:
+            distances = np.hypot(ref_xy[:, 0] - float(x), ref_xy[:, 1] - float(y))
+            heights.append(float(ref_z[int(np.argmin(distances))]))
+        return heights
+
+    def _replace_block_outline(self, record, world_rings, block_color=(0.0, 0.7, 1.0), z_reference=None):
+        """Redraw one block from its (possibly merged) outline polylines."""
+        digitizer = getattr(self.app, "digitizer", None)
+        if digitizer is None or not world_rings:
+            return
+        chains = []
+        for ring in world_rings:
+            xy = [(float(point[0]), float(point[1])) for point in ring]
+            if len(xy) < 2:
+                continue
+            if max(abs(xy[i + 1][0] - xy[i][0]) + abs(xy[i + 1][1] - xy[i][1])
+                   for i in range(len(xy) - 1)) <= 1e-12:
+                continue
+            heights = self._outline_z_for_xy(record, xy, z_reference)
+            chains.append([(x, y, z) for (x, y), z in zip(xy, heights)])
+        if not chains:
+            return
+
+        self._discard_block_drawings(record)
+        new_drawings = []
+        for chain in chains:
+            try:
+                actor = digitizer._make_polyline_actor(
+                    chain, color=block_color, width=3, line_style="solid"
+                )
+                if actor is None:
+                    continue
+                actor.PickableOn()
+                digitizer._add_actor_to_overlay(actor)
+                drawing = {
+                    "type": "smartline",
+                    "coords": chain,
+                    "actor": actor,
+                    "bounds": actor.GetBounds(),
+                    "original_color": block_color,
+                    "original_width": 3,
+                    "original_style": "solid",
+                    "source": "block_creation",
+                }
+                digitizer.drawings.append(drawing)
+                self._generated_block_drawings.append(drawing)
+                new_drawings.append(drawing)
+            except Exception as exc:
+                print(f"[SmallBlockMerge] failed to draw merged outline: {exc}")
+        record["drawings"] = new_drawings
+        self._tag_block_vertex_groups(new_drawings)
+
+    @staticmethod
+    def _linework_chains(geometry):
+        """Every linear component of a shapely geometry as a list of 2-D points."""
+        if geometry is None or geometry.is_empty:
+            return []
+        chains = []
+        for part in (getattr(geometry, "geoms", None) or [geometry]):
+            kind = getattr(part, "geom_type", "")
+            if kind == "LineString":
+                coords = [(float(point[0]), float(point[1])) for point in part.coords]
+                if len(coords) >= 2:
+                    chains.append(coords)
+            elif kind in ("MultiLineString", "GeometryCollection"):
+                chains.extend(BlockCreationSettingsDialog._linework_chains(part))
+        return chains
+
+    def _rebuild_block_linework(self, block_records, block_faces, origin, z_extra=None, tolerance=1e-6):
+        """Re-derive EVERY drawn block edge from the final face geometry.
+
+        ``drawn(block) = boundary(faces of the block)`` minus everything covered
+        by the faces of higher-priority blocks.  That is the same linework the
+        per-chain clipping produces, except it is computed from the FINAL faces:
+        after a merge no separator can survive inside the block that grew, and no
+        boundary is drawn twice by two different blocks.
+        """
+        from shapely.ops import unary_union
+        from shapely.strtree import STRtree
+
+        if not block_records:
+            return
+        all_faces = []
+        owners = []
+        for record_index, faces in enumerate(block_faces):
+            for geom in faces:
+                all_faces.append(geom)
+                owners.append(record_index)
+        if not all_faces:
+            return
+        tree = STRtree(all_faces)
+        ox, oy = float(origin[0]), float(origin[1])
+        z_extra = z_extra or {}
+
+        for index, record in enumerate(block_records):
+            faces = block_faces[index]
+            if not faces:
+                self._discard_block_drawings(record)
+                continue
+            own = unary_union(faces) if len(faces) > 1 else faces[0]
+            if own is None or own.is_empty:
+                self._discard_block_drawings(record)
+                continue
+            lines = own.boundary
+            try:
+                positions = tree.query(_search_envelope(own, tolerance))
+            except Exception:
+                positions = range(len(all_faces))
+            higher = [all_faces[int(pos)] for pos in positions if owners[int(pos)] < index]
+            if higher:
+                try:
+                    blocker = unary_union(higher) if len(higher) > 1 else higher[0]
+                    lines = lines.difference(blocker)
+                except Exception as exc:
+                    print(f"[SmallBlockMerge] linework clip failed for block {index + 1}: {exc}")
+
+            world_chains = [
+                [(float(x) + ox, float(y) + oy) for x, y in chain]
+                for chain in self._linework_chains(lines)
+            ]
+            if not world_chains:
+                self._discard_block_drawings(record)
+                continue
+            self._replace_block_outline(
+                record, world_chains, z_reference=z_extra.get(index)
+            )
+
+    def _verify_linework(self, block_records, block_faces, tolerance=1e-6):
+        """Count drawn edges that cross the INSIDE of another block.
+
+        After a correct rebuild this must be zero: every drawn edge belongs to
+        the boundary of the block that drew it or of a higher-priority block.
+        """
+        from shapely.geometry import Point
+
+        faces = [geom for group in block_faces for geom in group]
+        if not faces:
+            return 0
+        violations = 0
+        for index, record in enumerate(block_records):
+            own = set(id(geom) for geom in block_faces[index])
+            for drawing in record.get("drawings") or []:
+                coords = np.asarray(drawing.get("coords"), dtype=np.float64)
+                if coords.ndim != 2 or coords.shape[0] < 2:
+                    continue
+                step = max(1, coords.shape[0] - 1)
+                for offset in range(0, coords.shape[0] - 1, step):
+                    a = coords[offset, :2]
+                    b = coords[min(offset + step, coords.shape[0] - 1), :2]
+                    probe = Point(0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]))
+                    for geom in faces:
+                        if id(geom) in own:
+                            continue
+                        if not geom.covers(probe):
+                            continue
+                        if geom.boundary.distance(probe) > tolerance:
+                            violations += 1
+                            break
+        return violations
+
+    def _block_setting_distance(self, block_records=None):
+        """The user's live Block Settings -> Distance, else the recorded value."""
+        try:
+            value = float(self.distance_spin.value())
+        except Exception:
+            value = 0.0
+        if value > 0.0:
+            return value
+        for record in block_records or []:
+            try:
+                recorded = float(record.get("distance") or 0.0)
+            except (TypeError, ValueError):
+                recorded = 0.0
+            if recorded > 0.0:
+                return recorded
+        return 0.0
+
+    @staticmethod
+    def _record_chainage_span(record):
+        """``(start, end, length)`` of one block along its own CL, or ``None``.
+
+        ``length`` is the block's chainage span measured ALONG the CL polyline,
+        which is what the distance-based small-block rule compares against the
+        configured Block Distance.  It is never derived from polygon area, a
+        bounding box or a longest edge; for a curved CL the arc length and the
+        straight-line endpoint distance genuinely differ.
+        """
+        def _number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        start = _number(record.get("start_chainage"))
+        end = _number(record.get("end_chainage"))
+        length = _number(record.get("longitudinal_distance"))
+        if length is None:
+            if start is not None and end is not None:
+                length = abs(end - start)
+            else:
+                length = _polyline_length(record.get("cl_pts"))
+        if not length or length <= 0.0:
+            return None
+        if start is None:
+            start = 0.0
+        if end is None:
+            end = start + length
+        return float(start), float(end), float(length)
+
+    def _dissolve_small_intersection_fragments(self, block_records, origin):
+        """Absorb small faces near CL junctions into one neighbouring block.
+
+        Runs once, on freshly generated records, before they are displayed,
+        exported or queried.  Only small faces can start a merge, the absorbed
+        area is kept (a real polygon union), the whole shared interface
+        disappears and normal blocks are left untouched.  The drawn block edges
+        are re-derived from the final faces afterwards, so no stale separator
+        can survive inside a block that grew.
+        """
+        config = dict(_SMALL_BLOCK_MERGE_CONFIG)
+        if not config.get("enabled", True) or not block_records:
+            return block_records
+        try:
+            from shapely.geometry import Polygon
+        except Exception:
+            return block_records
+
+        # The short side-block rule is driven by the user's live Block Settings
+        # -> Distance, so the threshold always matches what is on screen.
+        block_distance = self._block_setting_distance(block_records)
+        config["blockDistance"] = block_distance
+        config["sideBlockSmallRatio"] = SIDE_BLOCK_SMALL_RATIO
+
+        ox, oy = float(origin[0]), float(origin[1])
+
+        def _local_polygon(record):
+            ring = np.asarray(record.get("polygon"), dtype=np.float64)
+            if ring.ndim != 2 or ring.shape[0] < 3:
+                return None
+            coords = [(float(px) - ox, float(py) - oy) for px, py in ring[:, :2]]
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            try:
+                geom = Polygon(coords)
+                if not geom.is_valid:
+                    geom = geom.buffer(0)
+            except Exception:
+                return None
+            if geom.is_empty or geom.geom_type != "Polygon":
+                return None
+            return geom
+
+        grid = float(config.get("snapTolerance") or 0.0)
+        pieces = [
+            list(group)
+            for group in _block_piece_geometries(
+                [_local_polygon(r) for r in block_records], grid=grid
+            )
+        ]
+        plan = _plan_small_fragment_merges(
+            pieces,
+            config,
+            [record.get("cl_priority", index) for index, record in enumerate(block_records)],
+            [self._record_chainage_span(record) for record in block_records],
+        )
+
+        def _log_summary(merged_count, rejected):
+            if not plan["fragments"]:
+                return
+            distance_candidates = len(plan.get("distanceFragments") or [])
+            print(
+                f"[SmallBlockMerge] summary fragments={len(plan['fragments'])} "
+                f"merged={merged_count} skipped={len(plan['skipped'])} "
+                f"rejected={rejected} areaRatio={config.get('smallBlockRelativeAreaRatio')} "
+                f"areaThreshold={config.get('smallBlockAreaThreshold')} "
+                f"blockDistance={block_distance:.4f} "
+                f"sideBlockThreshold="
+                f"{block_distance * SIDE_BLOCK_SMALL_RATIO:.4f} "
+                f"distanceRuleCandidates={distance_candidates} "
+                f"snapTolerance={config.get('snapTolerance')}"
+            )
+
+        if not plan["merges"]:
+            for key, reason in plan["skipped"]:
+                print(
+                    f"[SmallBlockMerge] fragment=block{key[0] + 1}/piece{key[1]} "
+                    f"result=SKIPPED_{str(reason).upper()}"
+                )
+            _log_summary(0, 0)
+            return block_records
+
+        absorbed = set()
+        merged_count = 0
+        rejected = 0
+        changed_blocks = set()
+        z_extra = {}
+        # parent block index -> [(donor block index, CL chain)] collected while
+        # planning, applied after we know which donors ended up fully removed.
+        carry_requests = {}
+        for parent_key, fragment_keys in plan["merges"].items():
+            parent_geom = pieces[parent_key[0]][parent_key[1]]
+            fragment_geoms = [pieces[block][piece] for block, piece in fragment_keys]
+            merged, reason, detail = _union_faces(parent_geom, fragment_geoms, config)
+            if merged is None:
+                rejected += 1
+                print(
+                    f"[SmallBlockMerge] parent=block{parent_key[0] + 1} "
+                    f"fragments={len(fragment_keys)} result=REJECTED_{reason} detail={detail}"
+                )
+                for key in fragment_keys:
+                    plan["skipped"].append((key, str(reason).lower()))
+                continue
+
+            area_before = float(parent_geom.area)
+            # Keep the absorbed blocks' original 3-D edges as a z reference for
+            # the parts of the merged outline they contributed.
+            for block_index, _piece_index in fragment_keys:
+                if block_index == parent_key[0]:
+                    continue
+                bucket = z_extra.setdefault(parent_key[0], [])
+                for drawing in block_records[block_index].get("drawings") or []:
+                    for point in drawing.get("coords") or []:
+                        if point is not None and len(point) > 2:
+                            bucket.append(
+                                (float(point[0]), float(point[1]), float(point[2]))
+                            )
+
+            pieces[parent_key[0]][parent_key[1]] = merged
+            changed_blocks.add(parent_key[0])
+            for key in fragment_keys:
+                absorbed.add(key)
+                changed_blocks.add(key[0])
+                merged_count += 1
+                # Remember the absorbed block's own CL chain: if that block ends
+                # up fully removed it must not take its CL out of the export.
+                # Applied after the survivor pass, because a block that is only
+                # PARTLY absorbed stays a block of its own and keeps its CL, so
+                # copying it to the parent as well would duplicate the line.
+                if key[0] != parent_key[0]:
+                    chain = list(block_records[key[0]].get("cl_pts") or [])
+                    if len(chain) >= 2:
+                        carry_requests.setdefault(parent_key[0], []).append(
+                            (key[0], chain)
+                        )
+                info = plan["details"].get(key) or {}
+                print(
+                    f"[SmallBlockMerge] fragment=block{key[0] + 1}/piece{key[1]} "
+                    f"area={float(info.get('area', 0.0)):.4f} isSmall=true "
+                    f"neighbourCount={int(info.get('neighbourCount', 0))} "
+                    f"selectedParent=block{parent_key[0] + 1} "
+                    f"exactSharedLength={float(info.get('exactSharedLength', 0.0)):.4f} "
+                    f"totalSeparatorLength={float(info.get('sharedLength', 0.0)):.4f} "
+                    f"attachmentRatio={float(info.get('attachmentRatio', 0.0)):.3f} "
+                    f"mergeAreaBefore={area_before:.4f} "
+                    f"mergeAreaAfter={float(merged.area):.4f} "
+                    f"rules={'+'.join(info.get('reasons') or ()) or 'area'} "
+                    f"result=SUCCESS"
+                )
+
+        if not changed_blocks:
+            _log_summary(0, rejected)
+            return block_records
+
+        survivors = []
+        survivor_faces = []
+        for block_index, record in enumerate(block_records):
+            remaining = [
+                geom
+                for piece_index, geom in enumerate(pieces[block_index])
+                if (block_index, piece_index) not in absorbed
+            ]
+            pieces[block_index] = remaining
+            if not remaining:
+                self._discard_block_drawings(record)
+                print(f"[SmallBlockMerge] block={block_index + 1} result=ABSORBED_REMOVED")
+                continue
+            if block_index in changed_blocks:
+                world_rings = [self._ring_to_world(geom, origin) for geom in remaining]
+                record["effective_polygon"] = [ring for ring in world_rings if ring]
+            survivors.append(record)
+            survivor_faces.append(remaining)
+
+        # A block that was fully absorbed would take its CL out of the export
+        # with it, so hand that CL to the surviving block that took its points.
+        # Donors that still exist are skipped: they export their own CL already.
+        survivor_indices = {
+            index for index in range(len(block_records)) if pieces[index]
+        }
+        for parent_index, requests in carry_requests.items():
+            for donor_index, chain in requests:
+                if donor_index in survivor_indices:
+                    continue
+                target = parent_index
+                seen = set()
+                while target not in survivor_indices and target not in seen:
+                    seen.add(target)
+                    following = next(
+                        (
+                            other_parent
+                            for other_parent, other_requests in carry_requests.items()
+                            if any(donor == target for donor, _chain in other_requests)
+                        ),
+                        None,
+                    )
+                    if following is None:
+                        break
+                    target = following
+                if target not in survivor_indices:
+                    continue
+                carried = block_records[target].setdefault("absorbed_cl_chains", [])
+                if chain not in carried:
+                    carried.append(chain)
+
+        # Single source of truth: the drawn edges are re-derived from the final
+        # faces, so the dissolved separators cannot survive anywhere.
+        if config.get("rebuildLinework", True) and survivors:
+            self._rebuild_block_linework(
+                survivors, survivor_faces, origin, z_extra, grid if grid > 0.0 else 1e-6
+            )
+            if config.get("debug"):
+                stale = self._verify_linework(
+                    survivors, survivor_faces, float(config.get("geometryTolerance") or 1e-6)
+                )
+                print(f"[SmallBlockMerge] verify staleInteriorEdges={stale}")
+
+        for key, reason in plan["skipped"]:
+            if key not in absorbed:
+                print(
+                    f"[SmallBlockMerge] fragment=block{key[0] + 1}/piece{key[1]} "
+                    f"result=SKIPPED_{str(reason).upper()}"
+                )
+        _log_summary(merged_count, rejected)
+        return survivors
+
     def _generate_block_lines(self):
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
@@ -2442,6 +4261,7 @@ class BlockCreationSettingsDialog(QDialog):
             chunks = self._split_polyline_by_distance(pts, distance) if distance > 0 else [pts]
 
             cl_blocks = []
+            chainage = 0.0
             for idx, chunk_pts in enumerate(chunks):
                 block_data = self._compute_block_geometry(
                     chunk_pts, tol_above, tol_below,
@@ -2450,6 +4270,15 @@ class BlockCreationSettingsDialog(QDialog):
                 )
                 if block_data is not None:
                     block_data["cl_pts"] = [tuple(p) for p in chunk_pts]
+                    # Chainage provenance: how far this block runs ALONG its own
+                    # CL.  The distance-based small-block rule measures the block
+                    # here rather than from its polygon shape, so a curved CL
+                    # keeps its true along-the-line length.
+                    chunk_length = _polyline_length(chunk_pts)
+                    block_data["start_chainage"] = chainage
+                    block_data["end_chainage"] = chainage + chunk_length
+                    block_data["longitudinal_distance"] = chunk_length
+                    chainage += chunk_length
                     cl_blocks.append(block_data)
             all_block_data.append(cl_blocks)
 
@@ -2537,11 +4366,28 @@ class BlockCreationSettingsDialog(QDialog):
                         "source_path": self._current_source_path(),
                         "polygon": poly_world,
                         "cl_pts": _to_world(list(block_data.get("cl_pts", []))),
+                        # Block chainage along its own CL (per chunk, so the last
+                        # chunk of a CL carries the remainder distance).
+                        "start_chainage": float(block_data.get("start_chainage", 0.0)),
+                        "end_chainage": float(block_data.get("end_chainage", 0.0)),
+                        "longitudinal_distance": float(
+                            block_data.get("longitudinal_distance", 0.0)
+                        ),
                         "above_pts": _to_world(list(above_pts)),
                         "below_pts": _to_world(list(below_pts)),
                         "drawings": drawing_group,
                     })
 
+        # ---- Post-processing: dissolve small slivers at CL intersections ----
+        # Where CL lines meet, a corridor can be clipped into a large remainder
+        # plus a small leftover sliver (a stub past the other corridor, or a wedge
+        # trapped between two blocks).  Such a sliver is absorbed into the block it
+        # shares a boundary with, so the shared internal separation line goes away
+        # and the area stays inside ONE block.
+        block_records = self._dissolve_small_intersection_fragments(
+            block_records, (_ox, _oy)
+        )
+        count = sum(len(record.get("drawings") or []) for record in block_records)
         print(f"Created {count} block lines")
         if count > 0:
             self.app.vtk_widget.render()
@@ -2866,10 +4712,37 @@ class BlockCreationSettingsDialog(QDialog):
     def accept(self):
         super().accept()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "cl_popup") and self.cl_popup.isVisible():
-            self._position_cl_popup()
+    def _sync_locked_height(self):
+        """Re-apply the locked window height for the current content state.
+
+        Height is pinned to the opening height, or to the natural height of
+        the visible sections when those need more room. Width stays free.
+        Qt only refreshes layout hints after it processes the pending
+        LayoutRequest, so the height is re-pinned once more on the next
+        event-loop turn.
+        """
+        if getattr(self, "_base_height", None) is None or self.layout() is None:
+            return
+        self._apply_locked_height()
+        QTimer.singleShot(0, self._apply_locked_height)
+
+    def _apply_locked_height(self):
+        base = getattr(self, "_base_height", None)
+        if base is None or self.layout() is None:
+            return
+
+        try:
+            target = max(base, self.layout().sizeHint().height())
+
+            # Release the previous lock so Qt can re-measure freely.
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+            self.resize(self.width(), target)
+
+            self.setMinimumHeight(target)
+            self.setMaximumHeight(target)
+        except RuntimeError:
+            pass  # underlying C++ widget already destroyed
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -2962,8 +4835,6 @@ class BlockCreationSettingsDialog(QDialog):
         self._clear_generated_blocks_and_reset()
         self._toggle_cl_selection(False)
         self._clear_all_snt_cl_actors()
-        if hasattr(self, "cl_popup"):
-            self.cl_popup.hide()
         if self._chip is not None:
             status_bar = self._status_bar_for_chip()
             if status_bar is not None:

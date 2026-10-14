@@ -21,6 +21,12 @@ _LARGE_CANVAS_EXTERNAL_SVGS = {
     "snt.svg",
     "prj.svg",
 }
+# Icons whose artwork already reaches its own viewBox edges: the standard
+# 1.12 ribbon upscale would push them past the pixmap and shave a flat spot
+# off the outermost stroke, so they are rendered at 1:1 instead.
+_EDGE_TO_EDGE_EXTERNAL_SVGS = {
+    "icons8-round.svg",
+}
 
 
 def _normalize_lookup_text(value: str | None) -> str:
@@ -239,7 +245,8 @@ def _resolve_ribbon_icon_color(
         ("airibbon", "ai", "start"): "icon_start",
 
         # Block
-        ("blockribbon", "block", "create block"): "icon_create_block",
+        ("blockribbon", "create", "create block"): "icon_create_block",
+        ("blockribbon", "create", "create cell"): "icon_create_cell",
     }
 
     color_key = contextual_map.get((normalized_scope, normalized_section, normalized_button))
@@ -336,6 +343,7 @@ def _resolve_ribbon_icon_color(
         "curve": "icon_curve",
         "start": "icon_start",
         "create block": "icon_create_block",
+        "create cell": "icon_create_cell",
     }
 
     color_key = button_only_map.get(normalized_button)
@@ -425,6 +433,7 @@ _ICON_DATA = {
     "fields": '<rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="9" x2="9" y2="20"/><line x1="15" y1="9" x2="15" y2="20"/>',
     "section_width": '<path d="M4 4v16"/><path d="M20 4v16"/><line x1="4" y1="12" x2="20" y2="12"/><polyline points="7 9 4 12 7 15"/><polyline points="17 9 20 12 17 15"/>',
     "neon_block": '<rect x="5" y="5" width="14" height="14" rx="2" opacity="0.24" fill="{color}"/><rect x="4.5" y="4.5" width="15" height="15" rx="2.5" stroke-width="1.4"/><path d="M8 8h8v8H8z" stroke-width="1.4"/><path d="M4.5 9.5H2.5M4.5 14.5H2.5M19.5 9.5h2M19.5 14.5h2M9.5 4.5v-2M14.5 4.5v-2M9.5 19.5v2M14.5 19.5v2"/><circle cx="12" cy="12" r="2" fill="{color}" opacity="0.9"/><path d="M8 12h8M12 8v8" opacity="0.75"/>',
+    "neon_cell": '<path d="M3.8 12a8.2 8.2 0 1 0 16.4 0a8.2 8.2 0 1 0 -16.4 0zM7.6 12a4.4 4.4 0 1 0 8.8 0a4.4 4.4 0 1 0 -8.8 0z" fill="{color}" fill-rule="evenodd" stroke="none"/>',
     "parallel": '<line x1="4" y1="19" x2="18" y2="5"/><line x1="8" y1="19" x2="22" y2="5"/><circle cx="4" cy="19" r="1.5" fill="{color}"/><circle cx="18" cy="5" r="1.5" fill="{color}"/><circle cx="8" cy="19" r="1.5" fill="{color}"/><circle cx="22" cy="5" r="1.5" fill="{color}"/>',
     "centerline": '<path d="M4 7c4-3 8-3 16 0"/><path d="M4 17c4-3 8-3 16 0"/><path d="M4 12c4-3 8-3 16 0" stroke-dasharray="2.4,2.4"/><circle cx="4" cy="7" r="1.2" fill="{color}"/><circle cx="4" cy="17" r="1.2" fill="{color}"/><circle cx="20" cy="7" r="1.2" fill="{color}"/><circle cx="20" cy="17" r="1.2" fill="{color}"/>',
     "rotate_transform": '<path d="M19 8a7.5 7.5 0 1 0 1.2 6.1"/><polyline points="19 3.8 19 8 14.8 8"/>',
@@ -482,6 +491,8 @@ def _load_icon_from_file(
             scale = _EXTERNAL_SVG_SCALE
             if icon_path.name in _LARGE_CANVAS_EXTERNAL_SVGS:
                 scale = 1.18
+            elif icon_path.name in _EDGE_TO_EDGE_EXTERNAL_SVGS:
+                scale = 1.0
             svg_data = _apply_svg_current_color(icon_path.read_bytes(), color)
             return _render_svg_bytes(svg_data, size, scale=scale)
         except Exception:
@@ -540,6 +551,8 @@ _SCOPED_EXTERNAL_RIBBON_ICON_FILES = {
     ("classifyribbon", "shapes", "circle"): "circle.svg",
     ("classifyribbon", "shapes", "polygon"): "polygon.svg",
     ("classifyribbon", "shapes", "free"): "freehand.svg",
+    ("blockribbon", "create", "create block"): "cube-faces-svgrepo-com.svg",
+    ("blockribbon", "create", "create cell"): "icons8-round.svg",
 }
 
 
@@ -639,6 +652,8 @@ _EXTERNAL_RIBBON_ICON_FILES = {
     ("select", "deselect all"): "deselect.svg",
     ("settings", "draw settings"): "draw-settings.svg",
     ("curve tools", "curve"): "curve.svg",
+    ("create", "create block"): "cube-faces-svgrepo-com.svg",
+    ("create", "create cell"): "icons8-round.svg",
 }
 
 def get_external_ribbon_icon_path(button_text: str, section_title: str = None,
@@ -763,6 +778,7 @@ RIBBON_ICONS = {
     "Display": "config_display",
     "Fields": "fields",
     "Create Block": "neon_block",
+    "Create Cell": "neon_cell",
     "Rotate": "rotate_transform",
     "Mirror": "mirror_transform",
     "Trace": "polyline",

@@ -7285,23 +7285,23 @@ def sync_main_view_instant(app, global_mask, new_class):
     fast_classify_update(app, global_mask, new_class, border_percent=border_percent)
 
 def update_main_view_scalars_direct(app, changed_indices):
-    """🚀 Millisecond Refresh: Injects new colors directly into GPU buffer."""
-    from gui.unified_actor_manager import fast_classify_update
-    # Generate full mask
+    """🚀 Phase-1 sparse Main View scalar refresh."""
     if hasattr(app, "data") and "classification" in app.data:
-        mask = np.zeros(len(app.data["classification"]), dtype=bool)
         try:
             idx = np.asarray(changed_indices, dtype=np.int64).ravel()
         except Exception:
             idx = np.array([], dtype=np.int64)
-        if idx.size > 0:
-            idx = idx[(idx >= 0) & (idx < mask.shape[0])]
-            if idx.size > 0:
-                mask[idx] = True
+        if idx.size == 0:
+            return
+        n = len(app.data["classification"])
+        idx = idx[(idx >= 0) & (idx < n)]
+        if idx.size == 0:
+            return
         border_percent = float(getattr(app, "point_border_percent", 0.0))
-        # Wait, this function doesn't know to_class. It's meant for undo/redo.
         from gui.unified_actor_manager import fast_undo_update
-        fast_undo_update(app, mask, border_percent=border_percent)
+        fast_undo_update(
+            app, changed_indices=idx, border_percent=border_percent
+        )
 
 def _get_display_mode_settings(app):
     """
@@ -7528,10 +7528,18 @@ def _get_cut_section_or_default(app, mask, section_points):
             core_mask_fb  = getattr(app, f"section_{active_view}_core_mask",   None)
             buf_mask_fb   = getattr(app, f"section_{active_view}_buffer_mask",  None)
             if core_mask_fb is not None and buf_mask_fb is not None:
-                gi = np.concatenate([np.flatnonzero(core_mask_fb),
-                                     np.flatnonzero(buf_mask_fb)])
+                core_idx_fb = getattr(app, f"section_{active_view}_core_indices", None)
+                buf_idx_fb = getattr(app, f"section_{active_view}_buffer_indices", None)
+                if core_idx_fb is not None and buf_idx_fb is not None:
+                    gi = np.concatenate([
+                        np.asarray(core_idx_fb, dtype=np.int64),
+                        np.asarray(buf_idx_fb, dtype=np.int64),
+                    ])
+                else:
+                    gi = np.concatenate([np.flatnonzero(core_mask_fb),
+                                         np.flatnonzero(buf_mask_fb)])
             else:
-                gi = np.flatnonzero(combined_mask)  # best-effort scan-order
+                gi = np.flatnonzero(combined_mask)  # legacy best-effort scan-order
             if len(gi) == len(points_transformed):
                 print(f"📋 Classification mask: PRE-COMPUTED combined (core + buffer)")
                 print(f"   Total: {len(gi):,} points (transformed)")
@@ -7629,10 +7637,20 @@ def _get_section_data_with_buffer(app, mask=None, section_points=None):
     if core_mask is None:
         return (mask, section_points) if (mask is not None and section_points is not None) else (None, None)
 
-    # Build core-first index array
-    core_idx = np.flatnonzero(core_mask)
+    # Build core-first index array. Phase 2 stores the exact ordered
+    # canonical IDs used to create the transformed point arrays; prefer those
+    # over mask scans, which sort by source index and can break alignment.
+    core_idx = getattr(app, f"section_{active_view}_core_indices", None)
+    if core_idx is None:
+        core_idx = np.flatnonzero(core_mask)
+    else:
+        core_idx = np.asarray(core_idx, dtype=np.int64)
     if include_buffer and buffer_mask is not None:
-        buf_idx = np.flatnonzero(buffer_mask)
+        buf_idx = getattr(app, f"section_{active_view}_buffer_indices", None)
+        if buf_idx is None:
+            buf_idx = np.flatnonzero(buffer_mask)
+        else:
+            buf_idx = np.asarray(buf_idx, dtype=np.int64)
         gi = np.concatenate([core_idx, buf_idx])
         print(f"📋 Using BUILT combined indices (core + buffer)")
         print(f"   Core: {len(core_idx):,}, Buffer: {len(buf_idx):,}, Total: {len(gi):,}")
@@ -7736,13 +7754,14 @@ def _section_view_has_data(app, view_idx: int) -> bool:
 def _refresh_cross_section_with_fallback(
     app,
     view_idx: int,
-    changed_mask: np.ndarray,
-    palette: dict,
+    changed_mask=None,
+    palette: dict = None,
     skip_render: bool = True,
+    *,
+    changed_indices=None,
+    delta=None,
 ) -> bool:
-    """
-    Fast section refresh; if actor was cleared in blank state, rebuild then refresh.
-    """
+    """Fast section refresh with sparse-index support and legacy mask fallback."""
     from gui.unified_actor_manager import fast_cross_section_update, build_section_unified_actor
 
     ok = fast_cross_section_update(
@@ -7752,36 +7771,31 @@ def _refresh_cross_section_with_fallback(
         palette=palette,
         skip_render=skip_render,
         force_visibility_refresh=False,
+        changed_indices=changed_indices,
+        delta=delta,
     )
     if ok:
         return True
-
     if not _section_view_has_data(app, view_idx):
         return False
-
     slot_idx = view_idx + 1
     border = float(getattr(app, "view_borders", {}).get(slot_idx, 0) or 0.0)
     view_mode = getattr(app, "cross_view_mode", "front")
     rebuilt = build_section_unified_actor(
-        app,
-        view_idx,
-        palette=palette,
-        border_percent=border,
-        view=view_mode,
+        app, view_idx, palette=palette, border_percent=border, view=view_mode
     )
     if rebuilt is None:
         return False
-
-    return bool(
-        fast_cross_section_update(
-            app,
-            view_idx,
-            changed_mask,
-            palette=palette,
-            skip_render=skip_render,
-            force_visibility_refresh=False,
-        )
-    )
+    return bool(fast_cross_section_update(
+        app,
+        view_idx,
+        changed_mask,
+        palette=palette,
+        skip_render=skip_render,
+        force_visibility_refresh=False,
+        changed_indices=changed_indices,
+        delta=delta,
+    ))
 
 
 def classify_with_stats_update(classify_func):
@@ -7789,12 +7803,8 @@ def classify_with_stats_update(classify_func):
     _to_class_pos = _arg_names.index("to_class") - 1 if "to_class" in _arg_names else None
 
     def wrapper(app, *args, **kwargs):
-        # A classification gesture is a transaction.  Only the outermost
-        # decorated classifier owns the transaction because helpers such as
-        # classify_freehand delegate to other decorated classifiers.
         depth = int(getattr(app, "_classification_tx_depth", 0) or 0)
         outermost = depth == 0
-
         if outermost:
             tx_id = int(getattr(app, "_classification_tx_id", 0) or 0) + 1
             app._classification_tx_id = tx_id
@@ -7802,8 +7812,9 @@ def classify_with_stats_update(classify_func):
             app._section_visibility_refresh_required = False
             app._last_changed_mask = None
             app._last_changed_indices = None
+            app._last_classification_delta = None
             app._classification_tx_changed = False
-
+            app._classification_main_refresh_tx_id = None
             target = getattr(app, "active_classify_target", None)
             to_class_for_log = kwargs.get("to_class", None)
             if to_class_for_log is None:
@@ -7814,10 +7825,7 @@ def classify_with_stats_update(classify_func):
             tool_name = str(getattr(classify_func, "__name__", "classifier"))
             if tool_name.startswith("classify_"):
                 tool_name = tool_name[len("classify_"):]
-            print(
-                f"CLASSIFY_TX_BEGIN id={tx_id} tool={tool_name} "
-                f"target={target} to_class={to_class_for_log}"
-            )
+            print(f"CLASSIFY_TX_BEGIN id={tx_id} tool={tool_name} target={target} to_class={to_class_for_log}")
 
         app._classification_tx_depth = depth + 1
         try:
@@ -7825,279 +7833,215 @@ def classify_with_stats_update(classify_func):
         finally:
             app._classification_tx_depth = max(0, int(getattr(app, "_classification_tx_depth", 1)) - 1)
 
-        # Nested decorated helpers do not own refresh/commit bookkeeping.
         if not outermost:
             return result
 
-        changed_idx = getattr(app, "_last_changed_indices", None)
-        changed_mask = getattr(app, "_last_changed_mask", None)
-        has_changes = (
-            isinstance(changed_idx, np.ndarray)
-            and changed_idx.size > 0
-            and isinstance(changed_mask, np.ndarray)
-            and changed_mask.dtype == bool
-            and changed_mask.ndim == 1
-        )
-
-        if not has_changes:
+        from gui.classification_delta import resolve_changed_indices
+        changed_idx = resolve_changed_indices(app=app)
+        delta = getattr(app, "_last_classification_delta", None)
+        if changed_idx.size == 0:
             app._gpu_sync_done = False
             app._section_visibility_refresh_required = False
             app._last_changed_mask = None
             app._last_changed_indices = None
-            print(
-                f"CLASSIFY_EMPTY id={getattr(app, '_classification_tx_id', 0)} "
-                f"tool={getattr(classify_func, '__name__', 'classifier')} "
-                f"target={getattr(app, 'active_classify_target', None)} changed=0"
-            )
+            app._last_classification_delta = None
+            print(f"CLASSIFY_EMPTY id={getattr(app, '_classification_tx_id', 0)} tool={getattr(classify_func, '__name__', 'classifier')} target={getattr(app, 'active_classify_target', None)} changed=0")
             print("CLASSIFY_COMMIT skipped reason=no_current_transaction_changes")
             return result
 
         app._classification_tx_changed = True
-
         if getattr(app, "_suppress_section_refresh", False):
-            return result  # 🔒 NO REFRESH DURING DRAG
+            return result
 
-        # Skip redundant refresh if _apply_classification already completed the
-        # GPU sync.  The changed mask above is guaranteed to belong to THIS
-        # transaction, so a previous operation can never leak through here.
-        if getattr(app, "_gpu_sync_done", False):
-            app._gpu_sync_done = False
-            if not getattr(app, "_section_visibility_refresh_required", False):
-                try:
-                    from gui.unified_actor_manager import guarantee_main_view_visual_refresh
-                    guarantee_main_view_visual_refresh(
-                        app,
-                        changed_mask=changed_mask,
-                        to_class=None,
-                        reason="decorator_fastpath",
-                    )
-                except Exception:
-                    pass
-                print(f"CLASSIFY_COMMIT changed={int(changed_idx.size)}")
-                return result
+        if getattr(app, "_gpu_sync_done", False) and not getattr(app, "_section_visibility_refresh_required", False):
+            try:
+                from gui.unified_actor_manager import guarantee_main_view_visual_refresh
+                guarantee_main_view_visual_refresh(
+                    app,
+                    changed_indices=changed_idx,
+                    delta=delta,
+                    to_class=None,
+                    reason="decorator_fastpath",
+                )
+            except Exception:
+                pass
+            print(f"CLASSIFY_COMMIT changed={int(changed_idx.size)} sparse=1")
+            return result
 
-        # Determine which view is actually active.
         is_cut_active = (
             hasattr(app, 'cut_section_controller') and
             getattr(app.cut_section_controller, 'is_locked', False) and
             getattr(app, "active_classify_target", None) == "cut"
         )
-
-        # Refresh CUT SECTION only for a successful transaction.
         if is_cut_active:
             try:
                 app.cut_section_controller._refresh_cut_colors_fast()
                 if hasattr(app.cut_section_controller, 'cut_vtk') and app.cut_section_controller.cut_vtk:
                     app.cut_section_controller.cut_vtk.render()
-            except Exception as e:
-                print(f"   ⚠️ Cut section refresh failed: {e}")
+            except Exception as exc:
+                print(f"   ⚠️ Cut section refresh failed: {exc}")
 
-        # Refresh cross-section views only for a successful transaction.
         if not is_cut_active and hasattr(app, 'section_vtks') and app.section_vtks:
-            try:
-                for view_idx, vtk_widget in app.section_vtks.items():
-                    if vtk_widget is None:
-                        continue
-                    try:
-                        view_palette = _get_cross_view_palette(app, view_idx)
-                        _refresh_cross_section_with_fallback(
-                            app,
-                            view_idx,
-                            changed_mask,
-                            palette=view_palette,
-                            skip_render=True,
-                        )
-                        vtk_widget.render()
-                    except Exception:
-                        pass
-            except ImportError:
-                pass
+            for view_idx, vtk_widget in app.section_vtks.items():
+                if vtk_widget is None:
+                    continue
+                try:
+                    view_palette = _get_cross_view_palette(app, view_idx)
+                    _refresh_cross_section_with_fallback(
+                        app,
+                        view_idx,
+                        palette=view_palette,
+                        skip_render=True,
+                        changed_indices=changed_idx,
+                        delta=delta,
+                    )
+                    vtk_widget.render()
+                except Exception:
+                    pass
 
         app._section_visibility_refresh_required = False
-
         try:
             from gui.unified_actor_manager import guarantee_main_view_visual_refresh
-            _main_refresh_ok = guarantee_main_view_visual_refresh(
+            display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+            refresh_reason = "cross_section_gpu_commit" if display_mode == "shaded_class" else "decorator_commit"
+            ok = guarantee_main_view_visual_refresh(
                 app,
-                changed_mask=changed_mask,
+                changed_indices=changed_idx,
+                delta=delta,
                 to_class=None,
-                reason="decorator_commit",
+                reason=refresh_reason,
+                origin_view="cross_section",
             )
-            print(f"   ✅ decorator_commit main-view refresh ok={bool(_main_refresh_ok)}")
-        except Exception as _main_refresh_err:
-            print(f"⚠️ decorator_commit main-view refresh failed: {_main_refresh_err}")
-
-        print(f"CLASSIFY_COMMIT changed={int(changed_idx.size)}")
+            if ok:
+                app._classification_main_refresh_tx_id = int(getattr(app, "_classification_tx_id", 0) or 0)
+            print(f"   ✅ decorator_commit main-view refresh ok={bool(ok)}")
+        except Exception as exc:
+            print(f"⚠️ decorator_commit main-view refresh failed: {exc}")
+        print(f"CLASSIFY_COMMIT changed={int(changed_idx.size)} sparse=1")
         return result
 
     return wrapper
 
 
-def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: int) -> bool:
-    """
-    Vectorized classification engine — zero Python loops.
-
-    All filtering, index mapping, and GPU pokes are O(k) NumPy C-layer operations
-    where k = number of changed points.  No set(), no range(len()), no list.append().
-    """
+def _apply_classification(app, update_selection, from_classes, to_class: int) -> bool:
+    """Phase-1 sparse classification engine. Accepts legacy bool masks or indices."""
     if app.data is None or to_class is None:
         return False
 
-    app._gpu_sync_done     = False
+    from gui.classification_delta import (
+        make_delta,
+        materialize_changed_mask,
+        publish_delta,
+        resolve_changed_indices,
+    )
+
+    app._gpu_sync_done = False
     app._section_visibility_refresh_required = False
     app._last_changed_mask = None
     app._last_changed_indices = None
-    # Stamp BEFORE the GPU sync calls (which trigger main-view render via
-    # the wrapped vtk_widget.render). GPURenderManager reads this to coalesce
-    # main-view renders during a classify streak — see request_render().
-    app._last_classify_ts  = time.time()
+    app._last_classification_delta = None
+    app._last_classify_ts = time.time()
 
-    classes    = app.data["classification"]
-    orig_dtype = classes.dtype                   # capture dtype — must not drift
-
-    # ── 1. Candidate indices (vectorized flatnonzero, faster than np.where()[0]) ─
-    update_idx = np.flatnonzero(update_mask)
+    classes = app.data["classification"]
+    orig_dtype = classes.dtype
+    update_idx = resolve_changed_indices(update_selection, app=app, n_points=len(classes))
     if update_idx.size == 0:
         return False
 
-    # Authoritative line guard for every shared geometry classifier.
-    from gui.flight_line_filter import (
-        active_classification_flight_line_slot,
-        filter_visible_flight_line_indices,
-    )
+    from gui.flight_line_filter import active_classification_flight_line_slot, filter_visible_flight_line_indices
     flight_slot = active_classification_flight_line_slot(app)
-    update_idx = filter_visible_flight_line_indices(
-        app, update_idx, len(classes), slot=flight_slot
-    )
+    update_idx = filter_visible_flight_line_indices(app, update_idx, len(classes), slot=flight_slot)
     if update_idx.size == 0:
         if hasattr(app, "statusBar"):
-            app.statusBar().showMessage(
-                "No points from enabled flight lines in selection.", 2500
-            )
+            app.statusBar().showMessage("No points from enabled flight lines in selection.", 2500)
         return False
 
-    # ── 2. Visibility filter — O(k) vectorized isin, no Python loop ──────
     visible_classes = _get_visible_classes_for_current_view(app)
     if visible_classes is not None:
-        update_idx = update_idx[np.isin(classes[update_idx], visible_classes,
-                                        assume_unique=False)]
-
-    # ── 3. from_classes filter — O(k) vectorized isin ────────────────────
+        update_idx = update_idx[np.isin(classes[update_idx], visible_classes, assume_unique=False)]
     if from_classes:
-        update_idx = update_idx[np.isin(classes[update_idx], from_classes,
-                                        assume_unique=False)]
-
+        update_idx = update_idx[np.isin(classes[update_idx], from_classes, assume_unique=False)]
     if update_idx.size == 0:
         if hasattr(app, "statusBar"):
             app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
         return False
 
-    # Sparse changed-index cache for GPU fast paths (avoids full-mask scans in section inject).
-    app._last_changed_indices = update_idx.copy()
+    # Remove no-op writes. This also makes brush/index callers naturally idempotent.
+    update_idx = update_idx[classes[update_idx] != orig_dtype.type(to_class)]
+    if update_idx.size == 0:
+        return False
 
-    # ── 4. Undo entry — dtype preserved, no extra allocation ─────────────
-    final_bool_mask             = np.zeros(len(classes), dtype=bool)
-    final_bool_mask[update_idx] = True
-
-    # Keep old classes once. Used by undo AND Surface rebuild decision.
-    old_classes_for_surface = classes[update_idx].copy()
-
+    old_classes = classes[update_idx].copy()
+    new_classes = np.full(update_idx.size, to_class, dtype=orig_dtype)
     app.undo_stack.append({
-        "indices":     update_idx.copy(),
-        "old_classes": old_classes_for_surface,
-        "new_classes": np.full(update_idx.size, to_class, dtype=orig_dtype),
+        "indices": update_idx.copy(),
+        "old_classes": old_classes,
+        "new_classes": new_classes,
     })
-
     app.redo_stack.clear()
-    # Enforce undo stack size limit immediately — prevents unbounded memory growth
-    # during 8+ hour sessions (each entry ≈ 3×N_changed bytes of numpy arrays).
     try:
         from gui.memory_manager import current_recommended_undo_steps
-        _max_undo = int(current_recommended_undo_steps(app))
+        max_undo = int(current_recommended_undo_steps(app))
     except Exception:
-        _max_undo = int(getattr(app, '_max_undo_steps', 30))
-    while len(app.undo_stack) > _max_undo:
-        app.undo_stack.pop(0)   # drop oldest; FIFO
+        max_undo = int(getattr(app, '_max_undo_steps', 30))
+    while len(app.undo_stack) > max_undo:
+        app.undo_stack.pop(0)
 
-    # ── 5. Apply to CPU array — dtype-safe, in-place ─────────────────────
-    classes[update_idx] = orig_dtype.type(to_class)
-    assert classes.dtype == orig_dtype, (
-        f"dtype drift: expected {orig_dtype}, got {classes.dtype}"
-    )
-    app._last_changed_mask = final_bool_mask
+    classes[update_idx] = new_classes
+    assert classes.dtype == orig_dtype
     app._last_from_classes = list(from_classes or [])
 
-    # Runtime proof logs — gated behind ENABLE_DEBUG_LOGGING because they
-    # do per-view `section_mask & final_bool_mask` + `count_nonzero` scans
-    # over the full N-point arrays. On a 300M-point cloud with 4 section
-    # views that was ~500-800 ms of pure logging overhead PER classify click.
-    try:
-        from gui.optimization_config import ENABLE_DEBUG_LOGGING
-    except Exception:
-        ENABLE_DEBUG_LOGGING = False
-    changed_count = int(update_idx.size)
+    edit_bb = None
+    xyz = app.data.get("xyz")
+    if xyz is not None and update_idx.size:
+        edit_bb = _edit_bbox(xyz, update_idx)
 
-    # Show the exact count of classified points in the top bar center.
+    delta = make_delta(
+        app,
+        update_idx,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        operation="classification",
+        origin_view=str(getattr(app, 'active_classify_target', None) or 'main_view'),
+        edit_bbox=edit_bb,
+    )
+    publish_delta(app, delta)
+
+    app.classification_revision = int(getattr(app, "classification_revision", 0) or 0) + 1
+    try:
+        from gui.shading_display import record_shading_classification_delta
+        record_shading_classification_delta(
+            app, update_idx, old_classes, new_classes,
+            operation='classification',
+            origin_view=delta.origin_view,
+        )
+    except Exception as exc:
+        print(f"SHADING_DELTA_JOURNAL status=record_failed reason={exc}")
+
+    changed_count = int(update_idx.size)
     try:
         app._update_classify_count_display(changed_count)
     except Exception:
         pass
+    print(
+        f"CLASSIFY_PHASE1_COMMIT changed={changed_count} dataset={len(classes)} "
+        f"mask_materialized=0 sparse_bytes={delta.nbytes} origin={delta.origin_view}"
+    )
 
-    if ENABLE_DEBUG_LOGGING:
-        print("[CLASS-COMMIT]")
-        print(f"  changed_count={changed_count}")
-        print(f"  to_class={to_class}")
-        if hasattr(app, "section_vtks") and app.section_vtks:
-            for view_idx in app.section_vtks:
-                slot_idx = view_idx + 1
-                palette = _get_cross_view_palette(app, view_idx)
-                show_to_class = bool((palette or {}).get(int(to_class), {}).get("show", True))
-                section_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
-                if (
-                    isinstance(section_mask, np.ndarray)
-                    and section_mask.dtype == bool
-                    and len(section_mask) == len(final_bool_mask)
-                ):
-                    changed_in_view = int(np.count_nonzero(section_mask & final_bool_mask))
-                else:
-                    changed_in_view = -1
-                print(
-                    f"[VIEW-REFRESH-CHECK] View {view_idx + 1} slot={slot_idx} "
-                    f"changed_in_view={changed_in_view} "
-                    f"to_class={to_class} show_to_class={show_to_class}"
-                )
-
-    # ── 6. Edit bounding box — computed ONCE for section-view culling ─────
-    edit_bb = None
-    xyz = app.data.get("xyz")
-    if xyz is not None and update_idx.size > 0:
-        edit_bb = _edit_bbox(xyz, update_idx)    # O(k) min/max, single NumPy pass
-
-    # ── 7. GPU sync ───────────────────────────────────────────────────────
     try:
-        from gui.unified_actor_manager import (
-            fast_classify_update,
-            fast_cross_section_update,
-            is_unified_actor_ready,
-        )
+        from gui.unified_actor_manager import fast_classify_update, is_unified_actor_ready
         palette = getattr(app, 'class_palette', {})
+        current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
 
-        # 7a. Main view — targeted RGB poke only on changed points.
-        # Surface mode must not receive class-color patches; it refreshes the
-        # Surface mesh in elevation + shading form only.
-        current_display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-        if current_display_mode == "surface":
+        if current_mode == "surface":
             try:
-                from gui.surface_mode import (
-                    refresh_surface_after_classification,
-                    surface_class_change_needs_rebuild,
-                )
-
-                if surface_class_change_needs_rebuild(app, old_classes_for_surface, to_class):
+                from gui.surface_mode import refresh_surface_after_classification, surface_class_change_needs_rebuild
+                if surface_class_change_needs_rebuild(app, old_classes, to_class):
                     app._surface_refresh_already_scheduled = True
+                    legacy_mask = materialize_changed_mask(app, delta, reason="surface_classification")
                     refresh_surface_after_classification(
                         app,
-                        changed_mask=final_bool_mask,
+                        changed_mask=legacy_mask,
                         operation="classification",
                         delay_ms=int(getattr(app, "surface_classification_rebuild_delay_ms", 300) or 300),
                     )
@@ -8108,32 +8052,30 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
             except Exception:
                 pass
         elif is_unified_actor_ready(app):
-            fast_classify_update(app, final_bool_mask, to_class, palette=palette)
-            if current_display_mode == "shaded_class":
+            fast_classify_update(
+                app,
+                changed_indices=update_idx,
+                delta=delta,
+                to_class=to_class,
+                palette=palette,
+                skip_render=True,
+            )
+            if current_mode == "shaded_class":
                 try:
                     from gui.shading_display import ClassificationDelta
-                    # The decorator's main-view guarantee is the single owner
-                    # of the shading refresh.  Preserve the full transition
-                    # until that commit point instead of refreshing twice.
                     app._pending_shading_delta = ClassificationDelta(
                         changed_indices=update_idx.copy(),
-                        old_classes=old_classes_for_surface,
-                        new_classes=np.full(
-                            update_idx.size, to_class, dtype=orig_dtype
-                        ),
+                        old_classes=old_classes,
+                        new_classes=new_classes,
                         operation="classification",
                         origin_view="main_or_section_tool",
                     )
                 except Exception:
                     app._pending_shading_delta = None
 
-        # 7b. Section views — bbox-culled, render deferred (skip_render=True)
-        #     fast_classify_update already called app.vtk_widget.render() once.
-        #     We do NOT render section views a second time here.
         section_refresh_failed = False
         if hasattr(app, 'section_vtks') and app.section_vtks:
             for view_idx in app.section_vtks:
-                # Dirty flag: skip section entirely if edit bbox doesn't overlap
                 if edit_bb is not None and not _section_bbox_overlaps(app, view_idx, edit_bb):
                     continue
                 try:
@@ -8142,74 +8084,58 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
                     ok = _refresh_cross_section_with_fallback(
                         app,
                         view_idx,
-                        final_bool_mask,
                         palette=view_palette,
-                        skip_render=True,            # render batched in step 7e below
+                        skip_render=True,
+                        changed_indices=update_idx,
+                        delta=delta,
                     )
                     if had_data and not ok:
                         section_refresh_failed = True
                 except Exception:
                     if _section_view_has_data(app, view_idx):
                         section_refresh_failed = True
-                    pass
 
-        # 7c. Cut section — vectorized update of BOTH Colors and Classification ID
         if hasattr(app, 'cut_section_controller') and app.cut_section_controller:
             ctrl = app.cut_section_controller
             if getattr(ctrl, 'is_cut_view_active', False) and ctrl._cut_index_map is not None:
                 try:
                     target_actor = getattr(ctrl, 'cut_core_actor', None)
                     if target_actor and hasattr(target_actor, 'GetMapper'):
-                        _mapper = target_actor.GetMapper()
-                        polydata = _mapper.GetInput() if _mapper is not None else None
+                        mapper = target_actor.GetMapper()
+                        polydata = mapper.GetInput() if mapper is not None else None
                         if polydata:
-                            # 1. Resolve which palette to use for color lookup (Slot 5)
                             from gui.unified_actor_manager import _get_slot_palette, _push_uniforms_direct
                             view_palette = _get_slot_palette(app, 5)
                             new_color = view_palette.get(to_class, {}).get('color', (128, 128, 128))
-
-                            # 2. Map global indices to cut-local indices
-                            cut_map = ctrl._cut_index_map
+                            cut_map = np.asarray(ctrl._cut_index_map, dtype=np.int64)
                             _, _, local_arr = np.intersect1d(
-                                update_idx, cut_map,
-                                return_indices=True,
-                                assume_unique=True,
+                                update_idx, cut_map, return_indices=True, assume_unique=False
                             )
-                            
-                            if local_arr.size > 0:
-                                # 3. Update Colors (Scalars)
+                            if local_arr.size:
                                 vtk_colors = polydata.GetPointData().GetScalars()
                                 if vtk_colors:
                                     vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
                                     vtk_ptr[local_arr] = new_color
                                     vtk_colors.Modified()
-
-                                # 4. Update Classification ID (Used by shader for weight lookup)
                                 class_arr = polydata.GetPointData().GetArray("Classification")
                                 if class_arr:
                                     cls_ptr = numpy_support.vtk_to_numpy(class_arr)
                                     cls_ptr[local_arr] = cls_ptr.dtype.type(to_class)
                                     class_arr.Modified()
-                                
                                 polydata.Modified()
-
-                                # 5. Sync Uniforms (Ensure weight_lut is fresh)
                                 ctx = getattr(target_actor, '_naksha_shader_ctx', None)
                                 if ctx:
                                     last_gen = getattr(target_actor, '_last_uniform_gen', -1)
                                     if ctx._generation != last_gen:
                                         ctx.force_reload()
-                                        _bsz = float(getattr(app, 'point_size', 2.5))
-                                        ctx.load_from_palette(view_palette, 0, _bsz)
+                                        ctx.load_from_palette(view_palette, 0, float(getattr(app, 'point_size', 2.5)))
                                         _push_uniforms_direct(target_actor, ctx)
                                         target_actor._last_uniform_gen = ctx._generation
-
                             if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
                                 ctrl.cut_vtk.render()
-                except Exception as ce:
-                    print(f"   ⚠️ Cut Section GPU sync failed: {ce}")
+                except Exception as exc:
+                    print(f"   ⚠️ Cut Section GPU sync failed: {exc}")
 
-        # 7d. Section view renders — one pass, bbox-culled, no duplicate calls
         if hasattr(app, 'section_vtks'):
             for view_idx, sw in app.section_vtks.items():
                 if sw is None:
@@ -8221,20 +8147,14 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
                 except Exception:
                     pass
 
-        # 7e. Signal GPU sync complete (suppresses decorator double-refresh)
-        if str(getattr(app, "display_mode", "class") or "class").lower() not in ("shaded_class", "surface"):
+        if current_mode not in ("shaded_class", "surface"):
             app._gpu_sync_done = True
-            # Post optimizer refresh is needed only if any section fast update failed.
             app._section_visibility_refresh_required = bool(section_refresh_failed)
-    except Exception:
-        pass    # classification already applied to CPU — do not surface GPU errors
+    except Exception as exc:
+        print(f"CLASSIFY_PHASE1_GPU status=deferred reason={exc}")
 
-    # Mark active-classify timestamp so MemoryLeakGuard defers its gen-2 GC
-    # while the user is mid-streak (avoids the random 100–300 ms hitch).
     app._last_classify_ts = time.time()
-
     return True
-
 
 
 def classify_points_example(app, selected_indices, target_class):
@@ -8523,10 +8443,8 @@ def classify_above_line(app, line_pts=None, from_classes=None, to_class=None,
     if not np.any(local_mask):
         return
 
-    update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
     selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
-    update_mask[selected_indices] = True
-    _apply_classification(app, update_mask, from_classes, to_class)
+    _apply_classification(app, selected_indices, from_classes, to_class)
 
 @classify_with_stats_update
 def classify_below_line(app, line_pts=None, from_classes=None, to_class=None,
@@ -8575,10 +8493,8 @@ def classify_below_line(app, line_pts=None, from_classes=None, to_class=None,
     if not np.any(local_mask):
         return
 
-    update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
     selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
-    update_mask[selected_indices] = True
-    _apply_classification(app, update_mask, from_classes, to_class)
+    _apply_classification(app, selected_indices, from_classes, to_class)
 
 
 def _resolve_parallel_line_band_tolerances(app):
@@ -8681,13 +8597,11 @@ def classify_parallel_line_band(app, line_pts=None, from_classes=None, to_class=
     if not np.any(local_mask):
         return
 
-    update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
     if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
         selected_indices = np.flatnonzero(mask_or_indices)[local_mask]
     else:
         selected_indices = mask_or_indices[local_mask]
-    update_mask[selected_indices] = True
-    _apply_classification(app, update_mask, from_classes, to_class)
+    _apply_classification(app, selected_indices, from_classes, to_class)
     
 def _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode):
 
@@ -8855,10 +8769,8 @@ def classify_rectangle(app, rect_bounds=None, from_classes=None, to_class=None,
         if not np.any(local_mask):
             return
 
-        update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
         selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
-        update_mask[selected_indices] = True
-        _apply_classification(app, update_mask, from_classes, to_class)
+        _apply_classification(app, selected_indices, from_classes, to_class)
 
 
 @classify_with_stats_update
@@ -8894,10 +8806,8 @@ def classify_circle(app, center=None, radius=None, from_classes=None, to_class=N
         if not np.any(local_mask):
             return
 
-        update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
         selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
-        update_mask[selected_indices] = True
-        _apply_classification(app, update_mask, from_classes, to_class)
+        _apply_classification(app, selected_indices, from_classes, to_class)
 
 
 @classify_with_stats_update
@@ -8953,10 +8863,8 @@ def classify_polygon(app, polygon_xy=None, from_classes=None, to_class=None,
         if not np.any(local_mask):
             return
 
-        update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
         selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
-        update_mask[selected_indices] = True
-        _apply_classification(app, update_mask, from_classes, to_class)
+        _apply_classification(app, selected_indices, from_classes, to_class)
     else:
         xyz = app.data["xyz"]
         pts = xyz[mask_or_indices]
@@ -8971,11 +8879,15 @@ def classify_polygon(app, polygon_xy=None, from_classes=None, to_class=None,
             return
 
         path = Path(poly, closed=True)
-        inside = np.zeros(len(pts), dtype=bool)
-        inside[candidate_idx] = path.contains_points(pts[candidate_idx, :2])
-        update_mask = np.zeros(len(xyz), dtype=bool)
-        update_mask[mask_or_indices] = inside
-        _apply_classification(app, update_mask, from_classes, to_class)
+        inside_candidates = path.contains_points(pts[candidate_idx, :2])
+        selected_local = candidate_idx[inside_candidates]
+        if selected_local.size == 0:
+            return
+        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
+            base_indices = np.flatnonzero(mask_or_indices)
+        else:
+            base_indices = np.asarray(mask_or_indices, dtype=np.int64).ravel()
+        _apply_classification(app, base_indices[selected_local], from_classes, to_class)
 
 
 # @classify_with_stats_update
@@ -9133,13 +9045,12 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
     if not hasattr(app, "undo_stack"):
         app.undo_stack = []
     
-    update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-    update_mask[global_indices] = True
+    new_classes = np.full(len(global_indices), to_class, dtype=old_classes.dtype)
 
     app.undo_stack.append({
         "indices": global_indices.copy(),
         "old_classes": old_classes,
-        "new_classes": np.full(len(global_indices), to_class, dtype=old_classes.dtype),
+        "new_classes": new_classes,
         "is_cut_locked": is_cut_section
     })
     # Clear stale redo entries and cap undo stack
@@ -9154,9 +9065,25 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
         from gui.memory_manager import _free_undo_entry
         _free_undo_entry(app.undo_stack.pop(0))
 
-    app._last_changed_mask = update_mask
-    app._last_changed_indices = global_indices.copy()
-    
+    from gui.classification_delta import make_delta, publish_delta
+    delta = make_delta(
+        app, global_indices,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        operation="classification",
+        origin_view="cut_brush" if is_cut_section else "cross_section_brush",
+    )
+    publish_delta(app, delta)
+    app.classification_revision = int(getattr(app, "classification_revision", 0) or 0) + 1
+    try:
+        from gui.shading_display import record_shading_classification_delta
+        record_shading_classification_delta(
+            app, global_indices, old_classes, new_classes,
+            operation="classification", origin_view=delta.origin_view,
+        )
+    except Exception as exc:
+        print(f"SHADING_DELTA_JOURNAL status=record_failed reason={exc}")
+
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 6: Fast GPU color update (NO actor rebuild!)
     # ═══════════════════════════════════════════════════════════════════════
@@ -9434,9 +9361,9 @@ def classify_point(app, point=None, radius=None, from_classes=None, to_class=Non
     chosen_local = int(eligible_local[int(np.argmin(eligible_dist2))])
     chosen_global = int(section_indices[chosen_local])
 
-    update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-    update_mask[chosen_global] = True
-    _apply_classification(app, update_mask, from_classes, to_class)
+    _apply_classification(
+        app, np.asarray([chosen_global], dtype=np.int64), from_classes, to_class
+    )
 
 
 @classify_with_stats_update
@@ -9594,10 +9521,8 @@ def onclassificationchanged(self, changed_indices=None):
     # Mark changed indices for priority rendering
     if changed_indices is not None and self._cut_index_map is not None:
         app = self.app
-        if not hasattr(app, '_last_changed_mask'):
-            app._last_changed_mask = np.zeros(len(app.data['classification']), dtype=bool)
-        app._last_changed_mask[changed_indices] = True
         app._last_changed_indices = np.asarray(changed_indices, dtype=np.int64).copy()
+        app._last_changed_mask = None
 
 # ============================
 # CUT-SECTION CLASSIFICATION FIX

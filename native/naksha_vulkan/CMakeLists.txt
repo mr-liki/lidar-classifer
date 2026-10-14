@@ -72,8 +72,22 @@ naksha_compile_shader(point.vert)
 naksha_compile_shader(point.frag)
 naksha_compile_shader(surface.vert)
 naksha_compile_shader(surface.frag)
+# Compact crisp Shaded-Class mesh: surface.frag compiled a second time with
+# -DCRISP_INDEXED (one source, so the shading math cannot drift).
+naksha_compile_shader(surface_crisp_indexed.vert)
+add_custom_command(
+    OUTPUT "${SPIRV_DIR}/surface_crisp_indexed.frag.spv"
+    COMMAND "${GLSLC}" --target-env=vulkan1.3 -DCRISP_INDEXED
+            "${SHADER_DIR}/surface.frag"
+            -o "${SPIRV_DIR}/surface_crisp_indexed.frag.spv"
+    DEPENDS "${SHADER_DIR}/surface.frag"
+    COMMENT "Compiling surface.frag (CRISP_INDEXED)")
+add_custom_target(naksha_shader_surface_crisp_indexed.frag ALL
+    DEPENDS "${SPIRV_DIR}/surface_crisp_indexed.frag.spv")
 naksha_compile_shader(surface_indexed.vert)
 naksha_compile_shader(surface_indexed.frag)
+naksha_compile_shader(surface_indexed_vc.vert)
+naksha_compile_shader(surface_indexed_vc.frag)
 # Instant Shaded lighting pass (fullscreen; reads the stored oct16 normal).
 naksha_compile_shader(instant.vert)
 naksha_compile_shader(instant.frag)
@@ -82,7 +96,9 @@ naksha_compile_shader(splat.vert)
 naksha_compile_shader(splat.frag)
 set(SHADER_TARGETS naksha_shader_point.vert naksha_shader_point.frag
                     naksha_shader_surface.vert naksha_shader_surface.frag
+                    naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_crisp_indexed.frag
                     naksha_shader_surface_indexed.vert naksha_shader_surface_indexed.frag
+                    naksha_shader_surface_indexed_vc.vert naksha_shader_surface_indexed_vc.frag
                     naksha_shader_instant.vert naksha_shader_instant.frag
                     naksha_shader_splat.vert naksha_shader_splat.frag)
 
@@ -123,6 +139,7 @@ target_compile_definitions(naksha_vulkan_core PUBLIC
 add_dependencies(naksha_vulkan_core ${SHADER_TARGETS})
 
 # ---- Benchmark harness ----
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_main.cpp")
 add_executable(naksha_vulkan_benchmark
     tests/benchmark_main.cpp
 )
@@ -148,6 +165,7 @@ add_custom_command(TARGET naksha_vulkan_benchmark POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/surface.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan_benchmark>/surface.frag.spv"
 )
+endif()
 # ---- Shared library C ABI (Python/ctypes bridge, no pybind11 available) ----
 add_library(naksha_vulkan SHARED
     src/naksha_vulkan_c_api.cpp
@@ -158,7 +176,9 @@ target_link_libraries(naksha_vulkan PRIVATE naksha_vulkan_core user32 gdi32)
 # this DLL with only the calling process's PATH, which does not include
 # H:/tools/mingw1310_64/bin, so a dynamic dependency on those runtime DLLs
 # would make every load fail with FileNotFoundError.
-target_link_options(naksha_vulkan PRIVATE -static-libgcc -static-libstdc++ -static -lwinpthread)
+if(MINGW)
+    target_link_options(naksha_vulkan PRIVATE -static-libgcc -static-libstdc++ -static -lwinpthread)
+endif()
 target_compile_definitions(naksha_vulkan PRIVATE NAKSHA_VULKAN_C_API_BUILD)
 set_target_properties(naksha_vulkan PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -174,9 +194,17 @@ add_custom_command(TARGET naksha_vulkan POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/surface.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface.frag.spv"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/surface_crisp_indexed.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_crisp_indexed.vert.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/surface_crisp_indexed.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_crisp_indexed.frag.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/surface_indexed.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_indexed.vert.spv"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/surface_indexed.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_indexed.frag.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/surface_indexed_vc.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_indexed_vc.vert.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/surface_indexed_vc.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/surface_indexed_vc.frag.spv"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/instant.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/instant.vert.spv"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -196,14 +224,17 @@ target_link_libraries(naksha_startup_core_probe PRIVATE naksha_vulkan_core user3
 # Pure CPU, no Vulkan and no window: this is the regression gate for the
 # spatial logic the draw path depends on (no holes, no duplicate triangles,
 # contiguous tile runs, conservative AABB culling, real LOD reduction).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tiling_test_main.cpp")
 add_executable(naksha_vulkan_tiling_test tests/tiling_test_main.cpp src/SurfaceTiling.cpp)
 target_include_directories(naksha_vulkan_tiling_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(naksha_vulkan_tiling_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
 
 # End-to-end acceptance test for the tiled surface path, driven through the real
 # nkv_* C ABI on a real window with the validation layer ENABLED. Separate from
 # the pure-CPU spatial tests above because it needs a live swapchain.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/surface_acceptance_main.cpp")
 add_executable(naksha_surface_acceptance
     tests/surface_acceptance_main.cpp
     src/naksha_vulkan_c_api.cpp)
@@ -231,5 +262,6 @@ add_custom_command(TARGET naksha_surface_acceptance POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/splat.frag.spv" "$<TARGET_FILE_DIR:naksha_surface_acceptance>/splat.frag.spv"
 )
+endif()
 
 

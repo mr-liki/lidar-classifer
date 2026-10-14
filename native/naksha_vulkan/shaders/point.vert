@@ -36,7 +36,9 @@ layout(set = 0, binding = 0) uniform FrameUbo {
     vec4 origin;
     vec4 classPalette[256];    // class id  -> RGBA
     vec4 elevationLut[256];    // normalized z -> RGBA
-    vec4 intensityLut[256];    // normalized intensity -> RGBA
+    vec4 intensityLut[256];
+    vec4 clipPlanes[4];        // cross-section clip volume (render space), A,B,C,D
+    uvec4 clipInfo;            // x = active plane count (0 = clipping off)
 } ubo;
 
 layout(push_constant) uniform PointParams {
@@ -135,6 +137,16 @@ vec3 depthColor(vec3 renderPos) {
 
 void main() {
     gl_Position = ubo.mvp * vec4(inPos, 1.0);
+    // Cross-section clip volume: a point on the negative side of any active plane
+    // is moved outside the clip volume, so the rasteriser drops it. Done per point
+    // in the vertex stage; no CPU buffer is modified.
+    for (uint i = 0u; i < ubo.clipInfo.x; ++i) {
+        if (dot(ubo.clipPlanes[i].xyz, inPos) + ubo.clipPlanes[i].w < 0.0) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);   // z > w: outside the view volume
+            gl_PointSize = 1.0;
+            return;
+        }
+    }
 
     // ---- VTK-equivalent screen-space point size ---------------------------
     // SOURCE OF TRUTH: gui/unified_actor_manager.py _attach_view_shader_context()

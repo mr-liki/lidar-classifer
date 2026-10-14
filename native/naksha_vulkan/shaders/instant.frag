@@ -47,7 +47,7 @@ layout(push_constant) uniform LightingParams {
     vec4 sun;         // xyz = light direction (render space), w = ambient floor
     vec4 params;      // x = debug stage, y = normal radius (texels), z = 1/width, w = 1/height
     vec4 camera;      // xyz = camera position, w = NORMAL SOURCE (0 stored, 1 screen)
-    vec4 background;  // rgb = viewport clear colour, a = unused
+    vec4 background;  // rgb = viewport clear colour, a = Eye-Dome Lighting strength (0 = off)
     mat4 invMvp;      // clip -> render space (Vulkan NDC z in [0,1])
 } pc;
 
@@ -170,5 +170,33 @@ void main() {
         outColor = vec4(vec3(light), 1.0);
         return;
     }
-    outColor = vec4(base * light, 1.0);
+
+    // ------------------------------------------------------------------------
+    // EYE-DOME LIGHTING (ambient depth shading).
+    // A pixel is darkened by how much nearer its neighbours are: the response is the
+    // sum over the four direct neighbours of max(0, log2(d_centre) - log2(d_neighbour)),
+    // and the shade is exp(-response * 300 * strength) (the Potree formulation). It
+    // outlines depth edges and gives a sparse cloud a sense of form without any normal.
+    // d is the distance ALONG THE PIXEL'S OWN RAY from its near-plane point, i.e. view
+    // depth in an orthographic view and radial depth in a perspective one. A neighbour
+    // with no data (cleared depth) does not darken: it is "farther than anything".
+    // ------------------------------------------------------------------------
+    float edl = 1.0;
+    if (pc.background.a > 0.0) {
+        vec3 near0 = reconstruct(vUV, 0.0);
+        float dc = max(length(reconstruct(vUV, depth) - near0), 1e-6);
+        vec2 step1 = pc.params.zw;
+        vec2 offs[4] = vec2[4](vec2(step1.x, 0.0), vec2(-step1.x, 0.0),
+                               vec2(0.0, step1.y), vec2(0.0, -step1.y));
+        float response = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            vec2 uv = vUV + offs[i];
+            float dn = sampleDepth(uv);
+            if (dn >= 1.0) continue;
+            float dd = max(length(reconstruct(uv, dn) - reconstruct(uv, 0.0)), 1e-6);
+            response += max(0.0, log2(dc) - log2(dd));
+        }
+        edl = exp(-response * 300.0 * pc.background.a);
+    }
+    outColor = vec4(base * light * edl, 1.0);
 }

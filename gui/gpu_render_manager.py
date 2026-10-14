@@ -39,6 +39,16 @@ class GPURenderManager(QObject):
         self._wheel_idle_timer.setSingleShot(True)
         self._wheel_idle_timer.timeout.connect(self._on_wheel_idle)
         self._wheel_idle_delay_ms = 150
+
+        # Phase 2C.3: full-resolution tile actors are a navigation working-set
+        # cache.  Do not evict them immediately after every wheel/pan settle;
+        # that caused the same ~90-110 ms tiles to be rebuilt on the next zoom.
+        # Instead retain a bounded hot working set across normal navigation.
+        # Long-idle cleanup enforces the hot cap; real memory pressure is the
+        # only path that collapses immediately to the smaller soft budget.
+        self._tile_residency_trim_timer = QTimer(self)
+        self._tile_residency_trim_timer.setSingleShot(True)
+        self._tile_residency_trim_timer.timeout.connect(self._trim_main_tile_residency)
         # Frame budget (ms) used to coalesce renders during an active pan/zoom/
         # rotate gesture. ~33ms = 30 FPS, which is imperceptibly smooth during a
         # drag while roughly halving GPU work versus rendering every tick.
@@ -77,191 +87,9 @@ class GPURenderManager(QObject):
         # Track installed VTK observer IDs for clean removal
         self._camera_observer_ids: list = []
         self._camera_interactor = None
-
-        # ── DIAGNOSTIC KILL-SWITCH (NVIDIA OpenGL driver reset hunt) ──────────
-        # NAKSHA_VULKAN_DISABLE_ALL_VTK_RENDER=1 stops EVERY VTK/OpenGL draw
-        # from this manager while the Vulkan main viewport owns the window.
-        # DIAGNOSTIC only: it also disables the overlays the product needs.
-        #
-        # It exists because the crash survived LiDAR-only suppression: the VTK
-        # render window was still being asked to draw every frame underneath
-        # the opaque Vulkan HWND, so whatever OpenGL component was resetting
-        # the driver kept being exercised. Removing ALL of it isolates the
-        # cause. The guard in _execute_render only fires when Vulkan actually
-        # owns the viewport, so VTK-as-viewport behaviour is untouched.
-        self._vtk_render_calls_blocked = 0
-        self._all_vtk_render_disabled = False
-        self._apply_vtk_render_killswitch(app)
-
+        
         print("✅ GPU Render Manager initialized")
 
-    @staticmethod
-    def vtk_render_killswitch_requested() -> bool:
-        """True when NAKSHA_VULKAN_DISABLE_ALL_VTK_RENDER is truthy."""
-        import os
-        return os.environ.get("NAKSHA_VULKAN_DISABLE_ALL_VTK_RENDER", "").strip().lower() \
-            in ("1", "true", "yes", "on")
-
-    def _apply_vtk_render_killswitch(self, app) -> None:
-        """Turn every VTK draw off (or back on) for the MAIN view.
-
-        Three independent paths can issue a VTK render, and all three must be
-        covered or the driver keeps being hit:
-          1. vtk_widget.render()      - already funnelled through this manager
-          2. the interactor's own auto-render on interaction (EnableRenderOff)
-          3. the render timer
-        """
-        self._all_vtk_render_disabled = self.vtk_render_killswitch_requested()
-        if app is None:
-            return
-        try:
-            vtk_widget = getattr(app, "vtk_widget", None)
-            if vtk_widget is None:
-                return
-            # Stop the timer so a queued render cannot fire behind our back.
-            timer = getattr(vtk_widget, "render_timer", None)
-            if timer is not None:
-                try:
-                    if self._all_vtk_render_disabled:
-                        timer.stop()
-                    else:
-                        timer.start()
-                except Exception:
-                    pass
-            # The interactor renders on its own schedule unless told otherwise.
-            inter = getattr(vtk_widget, "interactor", None)
-            if inter is not None and hasattr(inter, "EnableRenderOff"):
-                try:
-                    if self._all_vtk_render_disabled:
-                        inter.EnableRenderOff()
-                    else:
-                        inter.EnableRenderOn()
-                    # Keep our mirror of the interactor flag in sync, or the
-                    # ownership report would claim auto-render is ON while the
-                    # interactor is actually off.
-                    self._interactor_render_disabled = \
-                        self._all_vtk_render_disabled
-                except Exception:
-                    pass
-            print(f"[VULKAN OPENGL OWNERSHIP] VTK render kill-switch: "
-                  f"{'ON - all VTK draws blocked' if self._all_vtk_render_disabled else 'OFF'}")
-        except Exception as e:
-            print(f"[VULKAN OPENGL OWNERSHIP] kill-switch setup failed: {e!r}")
-
-    def vulkan_owns_viewport(self) -> bool:
-        """True when the Vulkan surface is visible and is THE main viewport.
-
-        The kill-switch must only bite then: with VTK as the visible viewport,
-        blocking its renders would leave a black window and hide a real bug.
-        """
-        app = self.app
-        if app is None:
-            return False
-        try:
-            rb = getattr(app, "render_backend", None)
-            if rb is None or not getattr(rb, "active", False):
-                return False
-            w = getattr(rb, "vulkan_widget", None)
-            return w is not None and bool(w.isVisible())
-        except Exception:
-            return False
-
-    def opengl_ownership_report(self) -> str:
-        """[VULKAN OPENGL OWNERSHIP] - who is drawing what right now.
-
-        Vulkan only ever owns LiDAR content (point cloud / surface / shaded
-        class); the VTK main render loop, its overlay renderer (SNT,
-        digitizer, measurements, text, vectors) and Qt's own UI rendering are
-        never touched here, regardless of whether Vulkan owns the viewport.
-        See render_backend.AppRenderBackendOwner.set_vtk_lidar_rendering for
-        the actor-level switch that actually turns LiDAR actors off.
-
-        The kill-switch / blocked-draw lines are diagnostic only: they report
-        what the NAKSHA_VULKAN_DISABLE_ALL_VTK_RENDER switch is doing.
-        """
-        app = self.app
-        v_owns = self.vulkan_owns_viewport()
-
-        widget = getattr(app, "vtk_widget", None) if app is not None else None
-        ren = getattr(widget, "renderer", None) if widget is not None else None
-
-        lidar_actors_on = 0
-        rb = getattr(app, "render_backend", None) if app is not None else None
-        try:
-            if rb is not None:
-                pt_on, sf_on, n_pt, n_sf = rb._group_visibility()
-                lidar_actors_on = (n_pt if pt_on else 0) + (n_sf if sf_on else 0)
-        except Exception:
-            pass
-
-        # 2D actor layer: text, vector, digitizer and measurement overlays all
-        # live here, so a non-empty collection means overlays are drawing.
-        overlays_active = False
-        try:
-            overlays_active = ren is not None and bool(ren.GetActors2D().GetNumberOfItems() > 0)
-        except Exception:
-            overlays_active = False
-
-        render_loop_active = False
-        try:
-            rw = widget.GetRenderWindow() if widget is not None and hasattr(widget, "GetRenderWindow") else None
-            render_loop_active = rw is not None
-        except Exception:
-            render_loop_active = False
-
-        # The diagnostic kill-switch only bites while Vulkan owns the viewport;
-        # otherwise the "VTK main render" state is the normal, correct one.
-        killswitch = bool(self._all_vtk_render_disabled)
-        main_on = (not killswitch) or not v_owns
-        inter = getattr(widget, "interactor", None) if widget is not None else None
-        inter_on = False
-        if inter is not None:
-            # No VTK getter exists for the interactor's auto-render flag, so
-            # report the manager's own mirror of it. Both
-            # _apply_vtk_render_killswitch and _wrap_vtk_widget keep this in
-            # sync with EnableRenderOff/On.
-            inter_on = not self._interactor_render_disabled
-
-        lines = [
-            "[VULKAN OPENGL OWNERSHIP]",
-            "",
-            "Vulkan owns main viewport:",
-            "YES" if v_owns else "NO",
-            "",
-            "Kill-switch requested:",
-            str(killswitch),
-            "",
-            "VTK main render:",
-            "ON" if main_on else "OFF (suppressed)",
-            "",
-            "VTK LiDAR actors:",
-            str(lidar_actors_on),
-            "",
-            "VTK overlays:",
-            "ACTIVE" if overlays_active else "INACTIVE",
-            "",
-            "Text renderer:",
-            "(part of 2D layer)" if overlays_active else "none/off",
-            "",
-            "Interactor auto-render:",
-            "ON" if inter_on else "OFF",
-            "",
-            "VTK render loop:",
-            "ACTIVE" if render_loop_active else "INACTIVE",
-            "",
-            "VTK render calls blocked after takeover:",
-            f"{int(getattr(self, '_vtk_render_calls_blocked', 0)):,}",
-            "",
-            "VTK render calls executed:",
-            f"{int(getattr(self, 'render_count', 0)):,}",
-        ]
-        return "\n".join(lines)
-
-    def print_opengl_ownership_report(self) -> None:
-        try:
-            print(self.opengl_ownership_report(), flush=True)
-        except Exception as e:
-            print(f"[VULKAN OPENGL OWNERSHIP] report failed: {e!r}")
 
     @property
     def app(self):
@@ -403,6 +231,41 @@ class GPURenderManager(QObject):
         except Exception as e:
             print(f"      ⚠️  Camera observer warning: {e}")
 
+    def _cancel_tile_residency_trim(self):
+        try:
+            self._tile_residency_trim_timer.stop()
+        except Exception:
+            pass
+
+    def _schedule_tile_residency_trim(self):
+        app = self.app
+        if app is None or getattr(app, "_shutdown_in_progress", False):
+            return
+        try:
+            from gui.tile_residency import residency_idle_trim_ms
+            delay_ms = int(residency_idle_trim_ms())
+        except Exception:
+            delay_ms = 60000
+        try:
+            self._tile_residency_trim_timer.start(max(1000, delay_ms))
+        except Exception:
+            pass
+
+    def _trim_main_tile_residency(self):
+        app = self.app
+        if app is None or getattr(app, "_shutdown_in_progress", False):
+            return
+        # A new gesture always cancels/restarts this timer.  Normal idle trim
+        # only enforces the bounded HOT working-set cap; it does not collapse
+        # straight to the small soft budget, because that would recreate the
+        # same zoom-thrash we are fixing.  The residency policy automatically
+        # falls back to the soft budget if real memory pressure is detected.
+        try:
+            from gui.unified_actor_manager import trim_main_tile_residency
+            trim_main_tile_residency(app, force_soft=False, reason="navigation_idle")
+        except Exception as exc:
+            print(f"PHASE2C3_RESIDENCY_TRIM status=error reason=navigation_idle error={exc}")
+
     def _on_pan_start(self, obj, event):
         """Middle mouse pressed — disable render throttle for smooth pan."""
         app = self.app
@@ -421,6 +284,7 @@ class GPURenderManager(QObject):
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return False
+        self._cancel_tile_residency_trim()
 
         # Pan becomes the sole camera interaction. A wheel-idle callback or a
         # render queued by the preceding gesture must not wake up mid-drag and
@@ -466,12 +330,14 @@ class GPURenderManager(QObject):
         except Exception:
             pass
         self.force_render()
+        self._schedule_tile_residency_trim()
         return True
 
     def _on_interaction_start(self, obj, event):
         """Any camera interaction (pan/zoom/rotate) began — mark active so the
         throttle can treat interaction renders specially (immediate during pan,
         debounced otherwise) and LOD can engage."""
+        self._cancel_tile_residency_trim()
         self._interaction_active = True
         GPURenderManager._set_snt_text_interaction_visibility(self, True)
         self._engage_lod()
@@ -493,12 +359,14 @@ class GPURenderManager(QObject):
             pass
         # Single final render at full quality.
         self.force_render()
+        self._schedule_tile_residency_trim()
 
     def begin_wheel_interaction(self, *, point_count: int = 0):
         """Start/restart a Qt-routed wheel gesture without invoking VTK events."""
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return False
+        self._cancel_tile_residency_trim()
 
         try:
             from gui.zoom_navigation import interaction_frame_interval_ms
@@ -542,6 +410,7 @@ class GPURenderManager(QObject):
             except Exception:
                 pass
         self.force_render()
+        self._schedule_tile_residency_trim()
 
     def _engage_lod(self):
         """Keep the production actor unchanged throughout navigation.
@@ -791,23 +660,6 @@ class GPURenderManager(QObject):
         # Enough time passed - render immediately
         self._execute_render()
     
-    def _poll_first_presented_frame(self, app):
-        """Release the loading overlay once the engine has presented a frame.
-
-        Safe to call after every render: one cheap counter read, and the
-        app-side handler returns immediately unless the state is POINTS_READY.
-        """
-        try:
-            rb = getattr(app, "render_backend", None)
-            if rb is None or not getattr(rb, "active", False):
-                return
-            vb = getattr(rb, "vulkan_backend", None)
-            if vb is None:
-                return
-            vb._poll_first_presented_frame(app)
-        except Exception:
-            pass
-
     def _execute_render(self):
         """Execute the actual render (called after debounce delay)"""
         try:
@@ -825,18 +677,6 @@ class GPURenderManager(QObject):
             if not self._is_widget_renderable(widget):
                 return
 
-            # DIAGNOSTIC: with the Vulkan main viewport visible and the
-            # kill-switch set, this VTK draw is the one we are trying to prove
-            # is unnecessary. Count the attempt so the report shows how much
-            # OpenGL work was actually suppressed.
-            if self._all_vtk_render_disabled and self.vulkan_owns_viewport():
-                self._vtk_render_calls_blocked += 1
-                if self._vtk_render_calls_blocked == 1:
-                    print("[VULKAN OPENGL OWNERSHIP] blocked a VTK render "
-                          "(Vulkan owns the viewport) - all further VTK draws "
-                          "suppressed")
-                return
-
             # Measure pan cadence from render start. If drawing the 30M+ point
             # actor already consumes the frame budget, the next coalesced
             # camera position may render immediately instead of waiting again.
@@ -847,6 +687,15 @@ class GPURenderManager(QObject):
             if self._interaction_active:
                 self._interaction_frame_started = True
                 self._interaction_last_frame_monotonic = time.monotonic()
+
+            # Phase 2B: refresh spatial Main-tile visibility against the
+            # current camera before the draw. This keeps pan/zoom cost tied to
+            # visible geographic tiles rather than total project points.
+            try:
+                from gui.unified_actor_manager import update_main_tile_visibility
+                update_main_tile_visibility(app)
+            except Exception:
+                pass
 
             # Use original render method
             if self._original_render:
@@ -860,13 +709,7 @@ class GPURenderManager(QObject):
             
             self.last_render_time = time.time()
             self.render_count += 1
-
-            # FIRST FRAME RULE: a frame has now been drawn. Ask the engine
-            # whether it actually reached vkQueuePresentKHR; if so, the load
-            # overlay can be released for good. One cheap counter read per
-            # frame, and a no-op once the state has left POINTS_READY.
-            self._poll_first_presented_frame(app)
-
+            
             # Log performance every 50 renders
             if self.render_count % 50 == 0:
                 efficiency = (self.skipped_renders / (self.render_count + self.skipped_renders + 1)) * 100

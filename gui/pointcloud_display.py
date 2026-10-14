@@ -137,8 +137,10 @@ def _remove_pyvista_point_actors(app):
             if actor is None:
                 continue
 
-            # Skip unified actor managed by unified_actor_manager
+            # Skip unified/tiled class actors managed by unified_actor_manager
             if unified_actor is not None and actor is unified_actor:
+                continue
+            if getattr(actor, '_naksha_main_tile', False):
                 continue
 
             # Skip SNT/DXF overlay actors
@@ -235,9 +237,9 @@ class ColorUpdateWorker(QObject):
 import numpy as np
 
 
-def _nakshatech_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero=False, return_clip=False):
+def _microstation_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero=False, return_clip=False):
     """
-    Robust auto-normalization similar to Nakshatech display stretching.
+    Robust auto-normalization similar to MicroStation display stretching.
     """
     arr = np.asarray(values, dtype=np.float64)
 
@@ -284,7 +286,7 @@ def _nakshatech_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero=F
     return norm
 
 
-def _nakshatech_rainbow_5color(norm):
+def _microstation_rainbow_5color(norm):
     """
     Blue -> Cyan -> Green -> Yellow -> Red
     """
@@ -326,7 +328,7 @@ def _camera_forward_vector(cam):
         return np.array([0.0, 0.0, -1.0], dtype=np.float64)
     return v / n
 
-def _nakshatech_view_depth_values(points, cam):
+def _microstation_view_depth_values(points, cam):
     """
     Depth along the camera viewing direction.
     This matches display/eye-space depth much better than Euclidean distance.
@@ -336,7 +338,7 @@ def _nakshatech_view_depth_values(points, cam):
     fwd = _camera_forward_vector(cam)
     return np.dot(pts - pos, fwd)
 
-def _nakshatech_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0, 
+def _microstation_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0, 
                                         color_scheme="grayscale", gamma=1.0, 
                                         return_debug=False):
     """
@@ -351,8 +353,8 @@ def _nakshatech_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0,
         gamma: Contrast adjustment (0.5=dark, 1.0=normal, 2.0=bright)
         return_debug: Return debug info
     """
-    depth_vals = _nakshatech_view_depth_values(points, cam)
-    norm, lo, hi = _nakshatech_auto_normalize(
+    depth_vals = _microstation_view_depth_values(points, cam)
+    norm, lo, hi = _microstation_auto_normalize(
         depth_vals,
         low_pct=low_pct,
         high_pct=high_pct,
@@ -370,7 +372,7 @@ def _nakshatech_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0,
         rgb = np.stack([gray, gray, gray], axis=1)
     
     elif color_scheme == "rainbow":
-        rgb = _nakshatech_rainbow_5color(norm)
+        rgb = _microstation_rainbow_5color(norm)
     
     elif color_scheme == "heatmap":
         # Dark blue → Purple → Red → Yellow
@@ -408,7 +410,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
 
     ramp = sorted(color_ramp, key=lambda x: x[0])
     if len(ramp) < 2:
-        return _nakshatech_rainbow_5color(norm)
+        return _microstation_rainbow_5color(norm)
 
     for i, val in enumerate(norm):
         if val <= ramp[0][0]:
@@ -435,7 +437,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
     return colors
 
 
-def _nakshatech_intensity_rgb(
+def _microstation_intensity_rgb(
     intensity,
     low_pct=0.5,
     high_pct=99.8,
@@ -443,7 +445,7 @@ def _nakshatech_intensity_rgb(
     return_debug=False,
 ):
     """
-    Nakshatech-like intensity display:
+    MicroStation-like intensity display:
     - ignore zero / invalid intensity
     - robust histogram stretch
     - perceptual darkening of mid-tones
@@ -488,7 +490,7 @@ def _nakshatech_intensity_rgb(
     norm = (arr - lo) / (hi - lo)
     norm = np.clip(norm, 0.0, 1.0)
 
-    # Darken the mid-tones to match Nakshatech look
+    # Darken the mid-tones to match MicroStation look
     norm = np.power(norm, gamma)
 
     gray = (norm * 255.0).astype(np.uint8)
@@ -499,7 +501,7 @@ def _nakshatech_intensity_rgb(
     return rgb
 
 
-def _nakshatech_rgb_enhancement(
+def _microstation_rgb_enhancement(
     rgb_norm,
     auto_stretch=True,
     gamma=1.1,
@@ -508,7 +510,7 @@ def _nakshatech_rgb_enhancement(
     return_debug=False
 ):
     """
-    Nakshatech-style RGB enhancement for natural photo-realistic display.
+    MicroStation-style RGB enhancement for natural photo-realistic display.
     
     Args:
         rgb_norm: RGB values in 0.0-1.0 range (N x 3 array)
@@ -532,7 +534,7 @@ def _nakshatech_rgb_enhancement(
         return result
     
     # ══════════════════════════════════════════════════════════════
-    # STEP 1: Per-Channel Histogram Stretching (like Nakshatech)
+    # STEP 1: Per-Channel Histogram Stretching (like MicroStation)
     # ══════════════════════════════════════════════════════════════
     if auto_stretch:
         stretched = np.zeros_like(rgb)
@@ -575,7 +577,7 @@ def _nakshatech_rgb_enhancement(
     # ══════════════════════════════════════════════════════════════
     # STEP 2: Gamma Correction (Perceptual Brightness)
     # ══════════════════════════════════════════════════════════════
-    # Nakshatech typically uses gamma 1.0-1.2 for natural look
+    # MicroStation typically uses gamma 1.0-1.2 for natural look
     # Lower gamma = brighter midtones (good for dark LiDAR scans)
     if gamma != 1.0:
         rgb = np.power(rgb, 1.0 / gamma)
@@ -583,7 +585,7 @@ def _nakshatech_rgb_enhancement(
     # ══════════════════════════════════════════════════════════════
     # STEP 3: Black Point Lift (Prevent Muddy Shadows)
     # ══════════════════════════════════════════════════════════════
-    # Add slight lift to very dark values (like Nakshatech's "shadow detail")
+    # Add slight lift to very dark values (like MicroStation's "shadow detail")
     black_lift = 0.02  # 2% lift for darkest values
     rgb = rgb * (1.0 - black_lift) + black_lift
     rgb = np.clip(rgb, 0.0, 1.0)
@@ -605,21 +607,21 @@ def _nakshatech_rgb_enhancement(
     return rgb_u8
 
 
-def _nakshatech_elevation_rgb(z_values, color_ramp=None, low_pct=1.0, high_pct=99.0, return_debug=False):
-    norm, lo, hi = _nakshatech_auto_normalize(z_values, low_pct, high_pct, return_clip=True)
+def _microstation_elevation_rgb(z_values, color_ramp=None, low_pct=1.0, high_pct=99.0, return_debug=False):
+    norm, lo, hi = _microstation_auto_normalize(z_values, low_pct, high_pct, return_clip=True)
 
     if color_ramp and len(color_ramp) >= 2:
         rgb = _apply_custom_color_ramp(norm, color_ramp)
     else:
-        rgb = _nakshatech_rainbow_5color(norm)
+        rgb = _microstation_rainbow_5color(norm)
 
     if return_debug:
         return rgb, lo, hi
     return rgb
 
 
-def _nakshatech_depth_rgb_from_distance(distances, low_pct=1.0, high_pct=99.0, return_debug=False):
-    norm, lo, hi = _nakshatech_auto_normalize(distances, low_pct, high_pct, return_clip=True)
+def _microstation_depth_rgb_from_distance(distances, low_pct=1.0, high_pct=99.0, return_debug=False):
+    norm, lo, hi = _microstation_auto_normalize(distances, low_pct, high_pct, return_clip=True)
     gray = ((1.0 - norm) * 255.0).astype(np.uint8)
     rgb = np.stack([gray, gray, gray], axis=1)
     if return_debug:
@@ -664,7 +666,7 @@ def _normalize_rgb_to_uint8(rgb):
 def compute_colors(app, mask=None, section_points=None):
     """
     Compute per-point colors for non-shaded modes.
-    Main logic aligned with Nakshatech-like display stretch.
+    Main logic aligned with MicroStation-like display stretch.
     """
     mode = app.display_mode
     xyz = app.data["xyz"]
@@ -683,7 +685,7 @@ def compute_colors(app, mask=None, section_points=None):
     # INTENSITY
     elif mode == "intensity" and app.data.get("intensity") is not None:
         intens = app.data["intensity"][mask].astype(np.float64)
-        colors = _nakshatech_intensity_rgb(
+        colors = _microstation_intensity_rgb(
             intens,
             low_pct=getattr(app, "intensity_clip_low", 0.5),
             high_pct=getattr(app, "intensity_clip_high", 99.8),
@@ -700,7 +702,7 @@ def compute_colors(app, mask=None, section_points=None):
         else:
             z = pts[:, 2]
 
-        colors = _nakshatech_elevation_rgb(
+        colors = _microstation_elevation_rgb(
             z,
             color_ramp=getattr(app, "elevation_color_ramp", None),
             low_pct=getattr(app, "elevation_clip_low", 1.0),
@@ -712,7 +714,7 @@ def compute_colors(app, mask=None, section_points=None):
         try:
             if section_points is not None and hasattr(app, "sec_vtk") and app.sec_vtk is not None:
                 cam = app.sec_vtk.renderer.GetActiveCamera()
-                colors = _nakshatech_depth_rgb_from_camera(
+                colors = _microstation_depth_rgb_from_camera(
                     section_points,
                     cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
@@ -722,7 +724,7 @@ def compute_colors(app, mask=None, section_points=None):
                 )
             else:
                 cam = app.vtk_widget.renderer.GetActiveCamera()
-                colors = _nakshatech_depth_rgb_from_camera(
+                colors = _microstation_depth_rgb_from_camera(
                     pts,
                     cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
@@ -760,9 +762,9 @@ def compute_colors(app, mask=None, section_points=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HELPER: Nakshatech 5-Color Rainbow (EXACT)
+# HELPER: MicroStation 5-Color Rainbow (EXACT)
 # ═══════════════════════════════════════════════════════════════════════════
-def _nakshatech_rainbow_5color(norm):
+def _microstation_rainbow_5color(norm):
     """
     Fast vectorized Blue -> Cyan -> Green -> Yellow -> Red
     """
@@ -827,7 +829,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
 
     ramp = sorted(color_ramp, key=lambda x: x[0])
     if len(ramp) < 2:
-        return _nakshatech_rainbow_5color(norm)
+        return _microstation_rainbow_5color(norm)
 
     pos = np.array([float(p) for p, _ in ramp], dtype=np.float32)
     cols = np.array([c for _, c in ramp], dtype=np.float32)
@@ -985,11 +987,21 @@ def update_pointcloud(app, mode="rgb"):
     except Exception:
         pass
 
+    # Park any currently displayed shading graph before entering a non-shading
+    # point mode. This is visibility-only; no barycentric geometry or VTK
+    # buffers are destroyed.
+    if mode != "shaded_class":
+        try:
+            from gui.shading_display import detach_shading_before_non_shading_mode
+            detach_shading_before_non_shading_mode(app)
+        except Exception as _shading_park_err:
+            print(f"  ⚠️ Shading park skipped before {mode}: {_shading_park_err}")
+
     # ─────────────────────────────────────────────────────────
     # SHADED CLASS MODE
     # ─────────────────────────────────────────────────────────
     if mode == "shaded_class":
-        from gui.shading_display import update_shaded_class, clear_shading_cache
+        from gui.shading_display import update_shaded_class
 
         classes = app.data.get("classification")
         if classes is None:
@@ -1001,13 +1013,14 @@ def update_pointcloud(app, mode="rgb"):
         _remove_pyvista_point_actors(app)
 
         app.display_mode = "shaded_class"
-        clear_shading_cache("mode switch from menu")
+        # A menu switch is presentation-only. First try exact resident restore;
+        # shading_display falls back automatically if state is stale.
         update_shaded_class(
             app,
             getattr(app, "last_shade_azimuth", 45.0),
             getattr(app, "last_shade_angle", 45.0),
             getattr(app, "shade_ambient", 0.2),
-            force_rebuild=True
+            force_rebuild=False
         )
         _restore_snt_after_clear(app)
         return
@@ -1127,15 +1140,13 @@ def update_pointcloud(app, mode="rgb"):
             colors = np.clip(colors_float, 0, 255).astype(np.uint8)
             print(f"   ✅ Saturation applied: {saturation:.2f}x")
 
-    # ✅ FIX: Remove the unified actor if it exists, so it doesn't
-    # render underneath the pyvista-added actors
+    # Hide every class render unit (single actor or Phase-2B tiles) so it
+    # cannot bleed through RGB/Depth/Intensity/Elevation point modes.
     try:
-        unified_actor = getattr(app, '_unified_actor', None)
-        if unified_actor is not None:
-            renderer = app.vtk_widget.renderer
-            if renderer is not None:
-                renderer.RemoveActor(unified_actor)
-                print("  🧹 Removed unified actor before pyvista mode")
+        from gui.unified_actor_manager import set_main_class_actor_visibility
+        hidden = set_main_class_actor_visibility(app, False)
+        if hidden:
+            print(f"  🧹 Hidden {hidden} Main class render actor(s) before pyvista mode")
     except Exception:
         pass
 
@@ -1277,17 +1288,6 @@ def update_pointcloud(app, mode="rgb"):
     # Expand clipping range to include SNT overlay actors
     _sync_overlay_clipping_range(app)
 
-    # Native Vulkan viewport: mirror the display state VTK just received
-    # (colour LUTs, elevation/intensity ranges, display mode, point size) -
-    # uniform-only, never a re-upload, and a no-op unless Vulkan is active
-    # and already holds this cloud.
-    try:
-        _rb = getattr(app, "render_backend", None)
-        if _rb is not None and getattr(_rb, "active", False):
-            _rb.sync_point_shading(mode=mode)
-    except Exception as _rb_err:
-        print(f"⚠️ Vulkan shading sync failed (ignored): {_rb_err}")
-
 
 def force_interactor_ready(app, delay_ms=200):
     """Fully re-initialize VTK interactor."""
@@ -1375,20 +1375,9 @@ def fast_update_colors(app, changed_mask=None):
     from gui.unified_actor_manager import fast_palette_refresh, fast_undo_update
 
     if changed_mask is None:
-        result = fast_palette_refresh(app, border_percent=getattr(app, "point_border_percent", 0.0))
+        return fast_palette_refresh(app, border_percent=getattr(app, "point_border_percent", 0.0))
     else:
-        result = fast_undo_update(app, changed_mask, border_percent=getattr(app, "point_border_percent", 0.0))
-
-    # Palette / class-weight edits only change COLOURS: re-push the colour
-    # tables + ranges to the native viewport (uniform-only, no re-upload).
-    # No-op unless Vulkan is active and already holds this cloud.
-    try:
-        _rb = getattr(app, "render_backend", None)
-        if _rb is not None and getattr(_rb, "active", False):
-            _rb.sync_point_shading()
-    except Exception as _rb_err:
-        print(f"⚠️ Vulkan shading sync failed (ignored): {_rb_err}")
-    return result
+        return fast_undo_update(app, changed_mask, border_percent=getattr(app, "point_border_percent", 0.0))
 
 
 def fast_update_main_view(app):

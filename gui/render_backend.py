@@ -799,7 +799,7 @@ def build_point_luts(app=None) -> tuple:
         try:
             ramp = getattr(app, "elevation_color_ramp", None)
             elev_lut = (pcd._apply_custom_color_ramp(t, ramp) if ramp and len(ramp) >= 2
-                        else pcd._nakshatech_rainbow_5color(t))
+                        else pcd._microstation_rainbow_5color(t))
         except Exception:
             _log.exception("elevation LUT sampling failed; using built-in ramp")
             elev_lut = None

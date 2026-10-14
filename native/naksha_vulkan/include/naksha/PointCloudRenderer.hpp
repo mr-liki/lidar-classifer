@@ -154,10 +154,12 @@ public:
     // streams for [first, first+count) in ONE staged submit. All streams use the
     // SAME point offset, so XYZ i / class i / intensity i / normal i stay one
     // canonical point. Returns bytes==0 on failure.
+    // rgb8 (optional, count*3 bytes) is the true-colour stream of the RGB display mode.
     UploadStats UploadArenaTile(std::size_t first, std::size_t count,
                                 const double* xyzWorldF64, const RenderOrigin& origin,
                                 const uint8_t* classification, const float* intensity,
-                                const uint8_t* normalsOct16);
+                                const uint8_t* normalsOct16,
+        const uint8_t* rgb8 = nullptr);
     bool ArenaMode() const { return arenaMode_; }
     std::size_t ArenaCapacity() const { return arenaCapacity_; }
     std::size_t ArenaUploadedTiles() const { return arenaTilesUploaded_; }

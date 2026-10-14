@@ -32,7 +32,8 @@ public:
     bool Recreate(uint32_t width, uint32_t height,
                   const SwapchainSupportDetails& support);
 
-    VkResult AcquireNextImage(VkSemaphore signalSemaphore, uint32_t* imageIndex);
+    VkResult AcquireNextImage(VkSemaphore signalSemaphore, uint32_t* imageIndex,
+                              uint64_t timeout = UINT64_MAX);
     VkResult Present(VkSemaphore waitSemaphore, uint32_t imageIndex);
 
     VkSwapchainKHR GetSwapchain() const { return swapchain_; }

@@ -336,14 +336,14 @@ def release_data_arrays(app) -> None:
 
     if hasattr(app, "spatial_index") and app.spatial_index is not None:
         try:
-            del app.spatial_index.tree
-            del app.spatial_index.xyz
+            from gui.spatial_index import invalidate_cache
+            invalidate_cache()
         except Exception:
             pass
         _si = app.spatial_index
         app.spatial_index = None
-        del _si          # drops last Python ref → triggers C destructor now
-        gc.collect()     # flush C-heap immediately, don't wait for next GC cycle
+        del _si
+        gc.collect()
 
     for attr in ("current_gpu_indices", "current_visibility_mask"):
         if hasattr(app, attr):

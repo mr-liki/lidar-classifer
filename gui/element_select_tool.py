@@ -1,5 +1,5 @@
 """
-ElementSelectTool — Nakshatech-style element selection on top of
+ElementSelectTool — MicroStation-style element selection on top of
 DigitizeManager + SelectionManager.
 
 Pick methods:
@@ -7,6 +7,7 @@ Pick methods:
   block      : drag a rectangle; enclosed elements
   shape      : click polygon vertices, right-click to close; enclosed
   cline      : click two points; elements crossed by that segment
+  snt_text   : drag a rectangle; select only SNT labels for clipboard copy
 
 Selection modes (taken from Qt keyboard modifiers each click):
   plain         -> NEW
@@ -24,6 +25,7 @@ import time
 
 import vtk
 from PySide6.QtCore import QObject, QTimer
+from PySide6.QtWidgets import QApplication
 
 from gui.selection_manager import SelectionMode
 
@@ -33,12 +35,13 @@ class PickMethod:
     BLOCK = "block"
     SHAPE = "shape"
     CLINE = "cline"
+    SNT_TEXT = "snt_text"
 
 
 class EncloseMode:
     """How Block/Shape decide whether a drawing is 'picked'.
 
-    OVERLAP — any vertex inside the fence picks the element (Nakshatech default,
+    OVERLAP — any vertex inside the fence picks the element (MicroStation default,
               most forgiving — what users intuitively expect).
     INSIDE  — every vertex must be inside the fence (strict containment).
     """
@@ -47,7 +50,7 @@ class EncloseMode:
 
 
 class ElementSelectTool(QObject):
-    """Nakshatech-style element selection layer."""
+    """MicroStation-style element selection layer."""
 
     HOVER_COLOR = (1.0, 0.85, 0.2)   # warm yellow preview
     HOVER_WIDTH_BOOST = 1.5
@@ -63,7 +66,7 @@ class ElementSelectTool(QObject):
 
         self._active = False
         self._method = PickMethod.INDIVIDUAL
-        self._enclose_mode = EncloseMode.OVERLAP  # Nakshatech default
+        self._enclose_mode = EncloseMode.OVERLAP  # MicroStation default
         self._observer_ids = []
         self._key_press_observer_id = None
         self._char_observer_id = None
@@ -86,6 +89,10 @@ class ElementSelectTool(QObject):
         self._dragging_block = False
         self._block_start_screen = None
         self._block_overlay_actor = None
+
+        # Attachment labels are actors, not editable digitizer drawings, so
+        # their selection must stay separate from SelectionManager.
+        self._selected_snt_text = {}
 
         # Shape-polygon state  — stored as WORLD coords so zoom/pan never distorts preview
         self._shape_pts_world = []   # list of (wx, wy, wz)
@@ -165,10 +172,15 @@ class ElementSelectTool(QObject):
     def set_method(self, method):
         """Change pick method without deactivating."""
         if method not in (PickMethod.INDIVIDUAL, PickMethod.BLOCK,
-                          PickMethod.SHAPE, PickMethod.CLINE):
+                          PickMethod.SHAPE, PickMethod.CLINE,
+                          PickMethod.SNT_TEXT):
             return
+        if self._method == PickMethod.SNT_TEXT and method != PickMethod.SNT_TEXT:
+            self.clear_snt_text_selection()
         self._cancel_in_progress_pick()
         self._method = method
+        if method == PickMethod.SNT_TEXT:
+            self._notify_snt_text_count()
         self._status(f"Element Select: {method}")
 
     def set_enclose_mode(self, mode):
@@ -775,7 +787,7 @@ class ElementSelectTool(QObject):
             pass
 
         # ✅ Show usage instructions
-        if method == PickMethod.BLOCK:
+        if method in (PickMethod.BLOCK, PickMethod.SNT_TEXT):
             self._status(f"Element Select: {method} — Drag rectangle, RIGHT-CLICK to finalize (Overlap mode)")
         else:
             self._status(f"Element Select active — {method} (Overlap mode)")
@@ -792,6 +804,7 @@ class ElementSelectTool(QObject):
             self.exit_intersect_mode()
         self._cancel_intersect_history_render()
         self._cancel_in_progress_pick()
+        self.clear_snt_text_selection()
         self._clear_hover()
         self._reset_hover_pick_state()
         self._reset_pick_caches()
@@ -951,7 +964,7 @@ class ElementSelectTool(QObject):
 
         if self._method == PickMethod.INDIVIDUAL:
             self._handle_individual_pick(x, y)
-        elif self._method == PickMethod.BLOCK:
+        elif self._method in (PickMethod.BLOCK, PickMethod.SNT_TEXT):
             self._dragging_block = True
             self._block_start_screen = (x, y)
         elif self._method == PickMethod.SHAPE:
@@ -992,12 +1005,15 @@ class ElementSelectTool(QObject):
             return
         # ─────────────────────────────────────────────────────────────
 
-        if self._method == PickMethod.BLOCK and self._dragging_block:
+        if self._method in (PickMethod.BLOCK, PickMethod.SNT_TEXT) and self._dragging_block:
             x, y = self.interactor.GetEventPosition()
             self._dragging_block = False
             self._remove_overlay("_block_overlay_actor")
             if self._block_start_screen is not None:
-                self._commit_block(self._block_start_screen, (x, y))
+                if self._method == PickMethod.SNT_TEXT:
+                    self._commit_snt_text_block(self._block_start_screen, (x, y))
+                else:
+                    self._commit_block(self._block_start_screen, (x, y))
             self._block_start_screen = None
             try:
                 obj.AbortFlagOn()
@@ -1044,7 +1060,7 @@ class ElementSelectTool(QObject):
 
         if self._method == PickMethod.INDIVIDUAL:
             self._update_hover(x, y)
-        elif self._method == PickMethod.BLOCK and self._dragging_block:
+        elif self._method in (PickMethod.BLOCK, PickMethod.SNT_TEXT) and self._dragging_block:
             # ✅ Show visual feedback during block drag
             self._refresh_block_overlay(self._block_start_screen, (x, y))
         elif self._method == PickMethod.SHAPE and self._shape_pts_world:
@@ -1087,13 +1103,16 @@ class ElementSelectTool(QObject):
                 pass
             return True
 
-        # BLOCK — right-click finalizes the drag (Nakshatech behavior).
-        if self._method == PickMethod.BLOCK and self._dragging_block:
+        # BLOCK — right-click finalizes the drag (MicroStation behavior).
+        if self._method in (PickMethod.BLOCK, PickMethod.SNT_TEXT) and self._dragging_block:
             x, y = self.interactor.GetEventPosition()
             self._dragging_block = False
             self._remove_overlay("_block_overlay_actor")
             if self._block_start_screen is not None:
-                self._commit_block(self._block_start_screen, (x, y))
+                if self._method == PickMethod.SNT_TEXT:
+                    self._commit_snt_text_block(self._block_start_screen, (x, y))
+                else:
+                    self._commit_block(self._block_start_screen, (x, y))
             self._block_start_screen = None
             handled = True
 
@@ -1169,6 +1188,11 @@ class ElementSelectTool(QObject):
             self._abort_owned_observer(self._key_press_observer_id)
             return
 
+        if ctrl and key in ("c", "C") and self._method == PickMethod.SNT_TEXT:
+            self.copy_selected_snt_text_to_clipboard()
+            self._abort_owned_observer(self._key_press_observer_id)
+            return
+
         if (ctrl and key in ("y", "Y")) or (ctrl and shift and key in ("z", "Z")):
             if self._intersect_mode:
                 # Inside intersect: redo the most recently undone part deletion.
@@ -1182,7 +1206,10 @@ class ElementSelectTool(QObject):
             return
 
         if key in ("Delete", "delete", "BackSpace"):
-            # Refuses classified by default — matches Nakshatech Delete behavior.
+            if self._method == PickMethod.SNT_TEXT:
+                self._status("SNT Text selection is copy-only; labels were not deleted.")
+                return
+            # Refuses classified by default — matches MicroStation Delete behavior.
             try:
                 self.digitizer.delete_selection(include_classified=False)
             except Exception as e:
@@ -1190,6 +1217,9 @@ class ElementSelectTool(QObject):
             return
 
         if ctrl and key in ("a", "A"):
+            if self._method == PickMethod.SNT_TEXT:
+                self.select_all_snt_text()
+                return
             try:
                 self.selection.select_all(
                     predicate=lambda d: not d.get("classified_fence", False)
@@ -1200,6 +1230,9 @@ class ElementSelectTool(QObject):
             return
 
         if ctrl and key in ("d", "D"):
+            if self._method == PickMethod.SNT_TEXT:
+                self.clear_snt_text_selection()
+                return
             try:
                 self.selection.clear()
                 self._status("Deselected all")
@@ -1208,6 +1241,9 @@ class ElementSelectTool(QObject):
             return
 
         if ctrl and key in ("i", "I"):
+            if self._method == PickMethod.SNT_TEXT:
+                self.invert_snt_text_selection()
+                return
             try:
                 self.selection.invert_all()
                 self._status(f"Inverted — {self.selection.count()} selected")
@@ -1217,15 +1253,183 @@ class ElementSelectTool(QObject):
 
     def _on_char(self, obj, evt):
         """Block VTK character handling after intersect history shortcuts."""
-        if not self._active or not self._intersect_mode:
+        if not self._active:
             return
         try:
             key = self.interactor.GetKeySym() or ""
             ctrl = bool(self.interactor.GetControlKey())
         except Exception:
             return
-        if ctrl and key in ("z", "Z", "y", "Y"):
+        if ctrl and ((self._intersect_mode and key in ("z", "Z", "y", "Y")) or
+                     (self._method == PickMethod.SNT_TEXT and key in ("c", "C"))):
             self._abort_owned_observer(self._char_observer_id)
+
+    # ------------------------------------------------------------------
+    # SNT text-label rectangle selection and clipboard copy
+    # ------------------------------------------------------------------
+    def _iter_snt_text_actors(self):
+        """Yield unique, visible text actors belonging to loaded SNT files."""
+        seen = set()
+        for entry in getattr(self.app, "snt_actors", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            for actor in entry.get("actors", []) or []:
+                if actor is None or id(actor) in seen:
+                    continue
+                if getattr(actor, "_naksha_snt_group_kind", None) != "text":
+                    continue
+                try:
+                    if not actor.GetVisibility():
+                        continue
+                except Exception:
+                    continue
+                seen.add(id(actor))
+                yield actor
+
+    @staticmethod
+    def _snt_text_color_target(actor):
+        try:
+            text_prop = actor.GetTextProperty()
+            if text_prop is not None:
+                return text_prop
+        except Exception:
+            pass
+        try:
+            return actor.GetProperty()
+        except Exception:
+            return None
+
+    def _set_snt_text_selected(self, actor, selected):
+        key = id(actor)
+        if selected:
+            if key in self._selected_snt_text:
+                return
+            prop = self._snt_text_color_target(actor)
+            if prop is None:
+                return
+            try:
+                original = tuple(prop.GetColor())
+                prop.SetColor(0.0, 1.0, 1.0)
+                actor.Modified()
+                self._selected_snt_text[key] = (actor, original)
+            except Exception:
+                return
+        else:
+            saved = self._selected_snt_text.pop(key, None)
+            if saved is None:
+                return
+            saved_actor, original = saved
+            prop = self._snt_text_color_target(saved_actor)
+            try:
+                if prop is not None:
+                    prop.SetColor(*original)
+                saved_actor.Modified()
+            except Exception:
+                pass
+
+    def clear_snt_text_selection(self):
+        for actor, _original in list(self._selected_snt_text.values()):
+            self._set_snt_text_selected(actor, False)
+        self._notify_snt_text_count()
+        self._render()
+
+    def select_all_snt_text(self):
+        self.clear_snt_text_selection()
+        for actor in self._iter_snt_text_actors():
+            self._set_snt_text_selected(actor, True)
+        self._notify_snt_text_count()
+        self._render()
+
+    def invert_snt_text_selection(self):
+        for actor in list(self._iter_snt_text_actors()):
+            self._set_snt_text_selected(actor, id(actor) not in self._selected_snt_text)
+        self._notify_snt_text_count()
+        self._render()
+
+    def _snt_actor_screen_rect(self, actor):
+        try:
+            bounds = actor.GetBounds()
+            if bounds is None or len(bounds) < 6:
+                return None
+            xs = (float(bounds[0]), float(bounds[1]))
+            ys = (float(bounds[2]), float(bounds[3]))
+            zs = (float(bounds[4]), float(bounds[5]))
+            points = []
+            for wx in xs:
+                for wy in ys:
+                    for wz in zs:
+                        sp = self._world_to_screen(wx, wy, wz)
+                        if sp is not None:
+                            points.append(sp)
+            if not points:
+                return None
+            return (min(p[0] for p in points), min(p[1] for p in points),
+                    max(p[0] for p in points), max(p[1] for p in points))
+        except Exception:
+            return None
+
+    def _commit_snt_text_block(self, p0, p1):
+        rx_min, rx_max = sorted((p0[0], p1[0]))
+        ry_min, ry_max = sorted((p0[1], p1[1]))
+        if abs(rx_max - rx_min) < 3 and abs(ry_max - ry_min) < 3:
+            rx_min, rx_max = p1[0] - 5, p1[0] + 5
+            ry_min, ry_max = p1[1] - 5, p1[1] + 5
+
+        picked = []
+        for actor in self._iter_snt_text_actors():
+            rect = self._snt_actor_screen_rect(actor)
+            if rect is None:
+                continue
+            ax0, ay0, ax1, ay1 = rect
+            if not (ax1 < rx_min or ax0 > rx_max or ay1 < ry_min or ay0 > ry_max):
+                picked.append(actor)
+
+        mode = self._current_mode()
+        if mode == SelectionMode.NEW:
+            self.clear_snt_text_selection()
+        for actor in picked:
+            if mode == SelectionMode.SUBTRACT:
+                self._set_snt_text_selected(actor, False)
+            elif mode == SelectionMode.INVERT:
+                self._set_snt_text_selected(actor, id(actor) not in self._selected_snt_text)
+            else:
+                self._set_snt_text_selected(actor, True)
+        self._notify_snt_text_count()
+        self._render()
+        self._status(
+            f"SNT Text: matched {len(picked)} — total {len(self._selected_snt_text)} selected"
+        )
+
+    def _notify_snt_text_count(self):
+        dialog = getattr(self.app, "_element_selection_dialog", None)
+        if dialog is not None and hasattr(dialog, "lbl_count"):
+            try:
+                dialog.lbl_count.setText(
+                    f"SNT Text Selection: {len(self._selected_snt_text)}"
+                )
+            except Exception:
+                pass
+
+    def copy_selected_snt_text_to_clipboard(self):
+        rows = []
+        for actor, _original in self._selected_snt_text.values():
+            text = str(getattr(actor, "text_content", "") or
+                       getattr(actor, "grid_name", "")).strip()
+            if not text:
+                continue
+            try:
+                pos = actor.GetPosition()
+                sort_key = (-float(pos[1]), float(pos[0]), text)
+            except Exception:
+                sort_key = (0.0, 0.0, text)
+            rows.append((sort_key, text))
+        if not rows:
+            self._status("SNT Text: no labels selected to copy.")
+            return False
+        rows.sort(key=lambda item: item[0])
+        QApplication.clipboard().setText("\n".join(text for _key, text in rows))
+        self._status(f"Copied {len(rows)} SNT text label(s) to clipboard.")
+        return True
 
     # ------------------------------------------------------------------
     # Individual pick + hover preview
@@ -1239,7 +1443,7 @@ class ElementSelectTool(QObject):
             self._set_selected_measurement_refs([picked_measurement])
         if drawing is None:
             # Click on empty space:
-            # - NEW mode  -> clear selection (Nakshatech behavior)
+            # - NEW mode  -> clear selection (MicroStation behavior)
             # - other     -> no-op
             mode = self._current_mode()
             if mode == SelectionMode.NEW:
@@ -1498,6 +1702,11 @@ class ElementSelectTool(QObject):
         actor = self._pick_overlay_actor(x, y)
         if actor:
             d = self._drawing_owning_actor(actor)
+        if d is not None and not self._drawing_in_edit_scope(d):
+            # Out-of-scope drawing (e.g. a Cell circle while Block "Edit
+            # Before Split" is armed) — keep searching so an in-scope edge
+            # underneath can still be hit.
+            d = None
 
         # Keep the old main-renderer pick as a compatibility fallback for
         # legacy actors that may not live in the digitize overlay.
@@ -1508,15 +1717,29 @@ class ElementSelectTool(QObject):
                 actor = None
             if actor:
                 d = self._drawing_owning_actor(actor)
+            if d is not None and not self._drawing_in_edit_scope(d):
+                d = None
 
         if d is None and allow_fallback:
             # Match the digitizer's own single-click tolerance (25px) so thin
             # lines and smartlines pick on the first try, not the third.
+            # _get_drawing_under_cursor honours the edit scope itself.
             try:
                 d = self.digitizer._get_drawing_under_cursor(x, y, tolerance=25.0)
             except Exception:
                 d = None
         return d
+
+    def _drawing_in_edit_scope(self, drawing):
+        """True when the drawing may be edited under the active creation-
+        dialog edit scope; True whenever no scope is active."""
+        helper = getattr(self.digitizer, "drawing_in_edit_scope", None)
+        if helper is None:
+            return True
+        try:
+            return bool(helper(drawing))
+        except Exception:
+            return True
 
     def _pick_overlay_actor(self, x, y):
         renderer = self.overlay_renderer
@@ -2036,6 +2259,9 @@ class ElementSelectTool(QObject):
         if not self._is_live_drawing(drawing):
             self._status("Nothing to delete.")
             return
+        if not self._drawing_in_edit_scope(drawing):
+            self._status("Delete blocked: element is outside the active Block edit scope.")
+            return
         # Refuse classified fences (matches Shift+C behavior elsewhere).
         if drawing.get("classified_fence", False):
             self._status("Classified fence: refused. Use 'Clear Classified' to remove.")
@@ -2052,6 +2278,11 @@ class ElementSelectTool(QObject):
 
     def _delete_many_with_undo(self, drawings):
         drawings = [d for d in drawings if self._is_live_drawing(d)]
+        in_scope = [d for d in drawings if self._drawing_in_edit_scope(d)]
+        if drawings and not in_scope:
+            self._status("Delete blocked: elements are outside the active Block edit scope.")
+            return
+        drawings = in_scope
         targets = [d for d in drawings if not d.get("classified_fence", False)]
         skipped = len(drawings) - len(targets)
         if not targets:

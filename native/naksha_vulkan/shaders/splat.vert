@@ -30,6 +30,8 @@ layout(set = 0, binding = 0) uniform FrameUbo {
     vec4 classPalette[256];    // class id -> RGBA (alpha = visibility)
     vec4 elevationLut[256];
     vec4 intensityLut[256];
+    vec4 clipPlanes[4];        // cross-section clip volume (render space), A,B,C,D
+    uvec4 clipInfo;            // x = active plane count (0 = clipping off)
 } ubo;
 
 layout(push_constant) uniform PointParams {
@@ -61,6 +63,16 @@ vec3 toDisplayByte(vec3 c) {
 
 void main() {
     gl_Position = ubo.mvp * vec4(inPos, 1.0);
+    // Cross-section clip volume: a point on the negative side of any active plane
+    // is moved outside the clip volume, so the rasteriser drops it. Done per point
+    // in the vertex stage; no CPU buffer is modified.
+    for (uint i = 0u; i < ubo.clipInfo.x; ++i) {
+        if (dot(ubo.clipPlanes[i].xyz, inPos) + ubo.clipPlanes[i].w < 0.0) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);   // z > w: outside the view volume
+            gl_PointSize = 1.0;
+            return;
+        }
+    }
 
     // Splat sizing: the sprite covers the world footprint this point stands
     // for, projected to pixels at this point's depth, clamped to the 1..3 px

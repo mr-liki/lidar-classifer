@@ -1,7 +1,10 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <unordered_map>
+#include <string>
 #include <vector>
 
 #include "naksha/Buffer.hpp"
@@ -72,6 +75,9 @@ struct SurfaceResourceSet {
     uint32_t selectedLod = 0;                // level actually drawn last frame
     bool isPreview = false;                  // coarse stand-in, not final
     bool indexedCells = false;
+    bool vertexColored = false;
+    GPUBuffer coveragePositions, coverageColors;
+    std::size_t coverageCount = 0;
     // Stale-guard identity. A pending set whose revisions no longer match the
     // renderer's current ones is discarded instead of swapped in.
     uint64_t datasetRevision = 0;
@@ -176,8 +182,24 @@ public:
                                           const uint32_t* indices, std::size_t indexCount,
                                           const uint32_t* cellColors,
                                           const uint32_t* blockCounts, uint32_t blockCount,
-                                          uint64_t datasetRevision, uint64_t surfaceRevision);
+                                          uint64_t datasetRevision, uint64_t surfaceRevision,
+                                          const uint32_t* vertexColors = nullptr);
 
+    bool UploadPendingCoverage(const float* positions, const uint32_t* colors, std::size_t count,
+                               uint64_t datasetRevision, uint64_t surfaceRevision);
+    void DiscardPending() { if (pending_) retired_.push_back(std::move(pending_)); }
+    // The Shaded-Class (crisp) mesh is ONE resident buffer set drawn through the
+    // legacy branch of Record(), and that branch is only reachable while no
+    // tiled (LOD/culling) set is live. Uploading it must therefore retire the
+    // tiled sets: otherwise a view that showed the tiled elevation surface and
+    // then switched back to Shaded Classification keeps drawing the elevation
+    // mesh and the crisp mesh never appears on screen. The sets are RETIRED
+    // (fence-deferred), never destroyed here, so a frame still in flight cannot
+    // lose the buffers it is reading.
+    void RetireTiledSets() {
+        if (active_) retired_.push_back(std::move(active_));
+        if (pending_) retired_.push_back(std::move(pending_));
+    }
     // Promotes PENDING -> ACTIVE when its revisions still match the current
     // ones. Called once per frame from nkv_render, at the frame boundary.
     // Returns true when a swap happened. A stale pending set is retired
@@ -272,6 +294,61 @@ public:
         const float* overlayPositions, const float* overlayNormals, const uint8_t* overlayColorsRGB,
         std::size_t overlayVertexCount, const uint32_t* overlayIndices, std::size_t overlayIndexCount);
 
+    // ---- Compact crisp Shaded-Class mesh (surface.frag built with CRISP_INDEXED) ----
+    // The same crisp-hybrid look as UploadShadedClassMesh, drawn ONCE from shared
+    // vertices: float3 position + RGBA8 class colour per vertex (16 B) and one
+    // uint32 index buffer (12 B per triangle) - about 28 B per point, against
+    // ~190 B per point for the two-pass triangle soup. The fragment shader fetches
+    // each triangle's vertices by gl_PrimitiveID for the flat normal and the
+    // pure/mixed split. Unmeshed points (coverage) are drawn as points, so no point
+    // of the cut is ever missing. Positions are world doubles, converted to render
+    // space with the renderer's current origin and streamed through the staging
+    // buffer in bounded chunks. The previous surface is released FIRST (after a
+    // device idle) so the GPU never holds two full-detail meshes at once.
+    bool HasCrispIndexed() const { return crispIdxPipeline_ != VK_NULL_HANDLE; }
+    bool UploadCrispIndexedMesh(const double* positions, uint64_t vertexCount,
+                                const int32_t* faces, uint64_t faceCount,
+                                const uint8_t* vertexClass, const uint8_t* classLutRGB,
+                                const double* coveragePositions, const uint8_t* coverageRGB,
+                                uint64_t coverageCount, std::string* error);
+    bool IsCrispIndexedActive() const { return crispIndexedActive_; }
+    bool SetCrispIndexBlocks(const double* positions,uint64_t vertexCount,
+                            const int32_t* faces,const uint32_t* counts,uint32_t count);
+
+    // ---- Viewport-LOD surface tiles (same compact crisp look and shaders) ----------
+    // Independently resident tiles share one vertex arena (float3 + RGBA8 class colour),
+    // one index arena (absolute uint32 indices, so gl_PrimitiveID + firstInstance stay
+    // the absolute triangle identity the fragment shader reads) and one coverage arena.
+    // Tiles are uploaded in batches through ONE staging submit, evicted individually
+    // (their ranges are reused only after every frame that may read them has retired),
+    // frustum-culled per tile and drawn from a host-supplied list of tile-local triangle
+    // ranges; adjacent ranges share a draw. Configuring the arena releases every other
+    // surface resource; any other surface upload releases the arena.
+    struct TileUploadDesc {
+        uint64_t key;
+        const double* positions;
+        const uint8_t* vertexClass;
+        const int32_t* faces;            // local vertex indices
+        const double* coveragePositions;
+        const uint8_t* coverageClass;
+        uint32_t vertexCount, faceCount, coverageCount;
+        int32_t result;                  // out: 1 resident, 0 rejected, -1 arena full
+    };
+    struct TileDrawItem {
+        uint64_t key;
+        uint32_t firstFace, faceCount;   // tile-local triangle range
+        uint32_t coverage, pad;
+    };
+    bool ConfigureTiles(uint64_t vertexCapacity, uint64_t faceCapacity, uint64_t coverageCapacity,
+                        std::string* error);
+    void ReleaseTiles();
+    bool TilesActive() const { return tilesActive_; }
+    uint32_t UploadTiles(TileUploadDesc* tiles, uint32_t count, std::string* error);
+    uint32_t EvictTiles(const uint64_t* keys, uint32_t count);
+    bool SetTilePalette(const uint8_t* lutRgb, float coverageShade, std::string* error);
+    bool SetTileDrawList(const TileDrawItem* items, uint32_t count);
+    void GetTileStats(uint64_t* out, uint32_t count) const;
+
     void SetCrispHybridActive(bool active) { crispHybridActive_ = active; }
     bool GetCrispHybridActive() const { return crispHybridActive_; }
     void SetCrispShadingParams(float azimuthDeg, float sharpnessRaw, float ambient,
@@ -333,6 +410,53 @@ private:
     GPUBuffer indices2_;
     std::size_t overlayIndexCount_ = 0;
     bool crispHybridActive_ = false;
+
+    // Viewport-LOD tile arena (ConfigureTiles / UploadTiles / RecordTiles).
+    struct RangeAllocator {
+        std::map<uint64_t, uint64_t> free;   // offset -> length
+        uint64_t capacity = 0, used = 0;
+        void Reset(uint64_t cap);
+        bool Alloc(uint64_t n, uint64_t& offset);
+        void Free(uint64_t offset, uint64_t n);
+    };
+    struct TileSlot {
+        uint64_t vbase = 0, vcount = 0, fbase = 0, fcount = 0, cbase = 0, ccount = 0;
+        float bmin[3]{}, bmax[3]{};
+        std::vector<uint8_t> cls, covCls;    // kept for palette recolouring
+    };
+    struct RetiredRanges { uint64_t vbase, vcount, fbase, fcount, cbase, ccount, frame; };
+    void RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot);
+    void RecycleTileRanges(bool all);
+    bool tilesActive_ = false;
+    RangeAllocator tileV_, tileF_, tileC_;
+    GPUBuffer tilePositions_, tileColors_, tileIndices_, tileCovPositions_, tileCovColors_;
+    std::unordered_map<uint64_t, TileSlot> tileSlots_;
+    std::vector<RetiredRanges> tileRetired_;
+    std::vector<TileDrawItem> tileDraw_;
+    uint8_t tileLut_[768]{};
+    float tileShade_ = 1.0f;
+    uint64_t tileDrawnTiles_ = 0, tileDrawnFaces_ = 0, tileDrawnCoverage_ = 0, tileDraws_ = 0;
+    uint64_t tileUploads_ = 0, tileUploadBytes_ = 0, tileEvictions_ = 0, tileRecolors_ = 0;
+
+    // Compact crisp mesh (UploadCrispIndexedMesh) and its pipeline.
+    void RecordCrispIndexed(VkCommandBuffer cmd, uint32_t frameSlot);
+    void ReleaseCrispIndexed();
+    void ReleaseSoupBuffers();
+    void FillCrispPushConstants(PushConstants& pc) const;
+    GPUBuffer crispPositions_, crispColors_, crispIndices_;
+    GPUBuffer crispCovPositions_, crispCovColors_;
+    uint64_t crispIndexCount_ = 0, crispCoverageCount_ = 0;
+    bool crispIndexedActive_ = false;
+    std::vector<SurfaceTile> crispTiles_;
+    uint32_t crispVisibleTiles_=0;
+    uint64_t crispSubmittedTriangles_=0;
+    VkPipeline crispIdxPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout crispIdxLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout crispIdxSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool crispIdxPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet crispIdxSet_ = VK_NULL_HANDLE;
+    ShaderModule crispIdxVs_ = {}, crispIdxFs_ = {};
+
     float crispAzimuthDeg_ = 45.0f;
     float crispSharpnessRaw_ = 45.0f;
     float crispAmbient_ = 0.25f;
@@ -361,6 +485,9 @@ private:
 
     VkPipeline pipelineSolid_ = VK_NULL_HANDLE;
     VkPipeline indexedPipeline_ = VK_NULL_HANDLE;
+    VkPipeline indexedVcPipeline_ = VK_NULL_HANDLE;
+    VkPipeline coveragePipeline_ = VK_NULL_HANDLE;
+    ShaderModule indexedVcVs_ = {}, indexedVcFs_ = {};
     VkPipeline indexedWireframePipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout indexedLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout cellLayout_ = VK_NULL_HANDLE;
