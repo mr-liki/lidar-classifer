@@ -4,18 +4,31 @@ import numpy as np
 
 
 def flight_line_visibility_for_slot(app, slot=0):
-    """Return one view slot's line checks, with legacy Main View fallback."""
+    """Return one view slot's line checks, with Main View fallback.
+
+    The Lines dialog writes a per-slot selection only for views the user
+    actually configured (Main View always; section/cut views only when their
+    own Lines popup was opened).  Every other slot INHERITS the Main View
+    selection so hiding a line in Main View also hides it in cross-section,
+    cut, and classification tools that never got an explicit selection.
+    """
     slot = int(slot or 0)
     by_slot = getattr(app, "flight_line_visibility_by_slot", None)
     if isinstance(by_slot, dict):
         value = by_slot.get(slot, by_slot.get(str(slot)))
-        if isinstance(value, dict):
+        if isinstance(value, dict) and len(value):
             return {int(k): bool(v) for k, v in value.items()}
+        fallback = by_slot.get(0, by_slot.get("0"))
+        if isinstance(fallback, dict) and len(fallback):
+            return {int(k): bool(v) for k, v in fallback.items()}
     if slot == 0:
         return {
             int(k): bool(v)
             for k, v in dict(getattr(app, "flight_line_visibility", {}) or {}).items()
         }
+    legacy = dict(getattr(app, "flight_line_visibility", {}) or {})
+    if len(legacy):
+        return {int(k): bool(v) for k, v in legacy.items()}
     return {}
 
 

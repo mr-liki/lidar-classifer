@@ -53,6 +53,8 @@ public:
     // submit that will re-signal it. This guarantees a fence is never left
     // unsignaled when a frame is skipped (e.g. VK_ERROR_OUT_OF_DATE_KHR).
     void BeginFrame();
+    bool AllFramesComplete() const;
+    void AbortFrame() { frames_[currentFrame_].frameInFlight=false; }
     void ResetFence();
     void EndFrame();
 

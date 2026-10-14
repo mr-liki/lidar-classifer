@@ -6,7 +6,7 @@
 //   location 0  class colour (RGBA8)   - one class per splat, LUT lookup only
 //   location 1  the splat's oct16x2 normal, written verbatim
 //
-// Discarding outside the disc (VTK parity) keeps the sprite round. Discarding
+// The sprite is a full square (no disc discard) so neighbours tile. Discarding
 // a hidden class (alpha 0 from the visibility LUT) means it writes NEITHER a
 // colour NOR a normal NOR a depth entry, so the lighting pass shows the
 // viewport background through it.
@@ -31,9 +31,10 @@ void main() {
     // Hidden class: no colour, no normal, no depth.
     if (vColor.a < 0.5) discard;
 
-    // Same disc test as VTK / point.frag.
-    vec2 offset = gl_PointCoord - vec2(0.5);
-    if (dot(offset, offset) > 0.25) discard;
+    // No disc test: a splat is a SQUARE tile. Round sprites left uncovered corners
+    // between neighbours, which showed up as isolated dots (background and flat
+    // colour) once the sprite grew to the LOD spacing while zooming. Squares of
+    // the LOD spacing tile the surface without gaps.
 
     outColor = vec4(vColor.rgb, 1.0);
     outNormal = vOct;

@@ -315,6 +315,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
             actor = self.digitizer._pick_actor(x, y)
             if actor:
                 for drawing in self._iter_pickable_drawings():
+                    if not self.digitizer.drawing_in_edit_scope(drawing):
+                        # Protected Cell circle / outside the active edit scope.
+                        continue
                     if drawing.get("actor") is actor:
                         return drawing
                     for key in ("start_marker", "end_marker"):

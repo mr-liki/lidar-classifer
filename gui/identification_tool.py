@@ -765,35 +765,38 @@ class IdentificationTool(QObject):
             Original index in app.data, or None if not found
         """
         try:
-            # Get masks for this section
+            # Phase 2 sections preserve an explicit canonical-ID vector in the
+            # exact same order as the rendered/transformed point array. Use it
+            # first; rebuilding IDs from boolean masks sorts by LAS index and
+            # can map a clicked point to the wrong source point.
+            ordered = getattr(self.app, f'_section_{view_index}_global_indices', None)
+            if ordered is None:
+                ordered = getattr(self.app, f'section_{view_index}_indices', None)
+            if ordered is not None:
+                ordered = np.asarray(ordered, dtype=np.int64).reshape(-1)
+                if 0 <= int(section_local_idx) < len(ordered):
+                    return int(ordered[int(section_local_idx)])
+
+            # Legacy compatibility fallback for sections created by older code.
             core_mask = getattr(self.app, f'section_{view_index}_core_mask', None)
             buffer_mask = getattr(self.app, f'section_{view_index}_buffer_mask', None)
-            
             if core_mask is None:
                 return None
-            
-            # Get core and buffer point counts
+
             core_pts = getattr(self.app, f'section_{view_index}_core_points', None)
-            buf_pts = getattr(self.app, f'section_{view_index}_buffer_points', None)
-            
             num_core = len(core_pts) if core_pts is not None else 0
-            
-            # Check if index is in core or buffer
+
             if section_local_idx < num_core:
-                # It's in core - find the Nth true value in core_mask
                 core_indices = np.where(core_mask)[0]
                 if section_local_idx < len(core_indices):
                     return core_indices[section_local_idx]
-            else:
-                # It's in buffer
-                if buffer_mask is not None:
-                    buffer_local_idx = section_local_idx - num_core
-                    # Find indices that are in buffer but not in core
-                    buffer_only = buffer_mask & ~core_mask
-                    buffer_indices = np.where(buffer_only)[0]
-                    if buffer_local_idx < len(buffer_indices):
-                        return buffer_indices[buffer_local_idx]
-            
+            elif buffer_mask is not None:
+                buffer_local_idx = section_local_idx - num_core
+                buffer_only = buffer_mask & ~core_mask
+                buffer_indices = np.where(buffer_only)[0]
+                if buffer_local_idx < len(buffer_indices):
+                    return buffer_indices[buffer_local_idx]
+
             return None
             
         except Exception as e:

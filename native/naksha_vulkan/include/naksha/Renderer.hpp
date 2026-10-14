@@ -39,6 +39,11 @@ struct FrameUbo {
     float classPalette[256 * 4];    // GLSL: vec4 classPalette[256]
     float elevationLut[256 * 4];    // GLSL: vec4 elevationLut[256]
     float intensityLut[256 * 4];    // GLSL: vec4 intensityLut[256]
+    // Cross-section clip volume, appended AFTER the LUTs so every shader that
+    // declares only a prefix of this block is unaffected. Planes are RENDER-space
+    // (A,B,C,D); a point is kept when dot(n, p) + D >= 0. 16-byte aligned.
+    float clipPlanes[4 * 4];        // GLSL: vec4 clipPlanes[4]
+    uint32_t clipInfo[4];           // GLSL: uvec4 clipInfo; x = active plane count (0 = off)
 };
 
 struct RendererConfig {
@@ -84,7 +89,7 @@ struct GpuTimings {
 
 struct FrameStatistics {
     uint64_t framesRendered = 0;
-    uint64_t framesSkipped = 0;   // minimized / out-of-date, no submit
+    uint64_t framesSkipped = 0;   // busy / minimized / out-of-date, no submit
     uint64_t swapchainRecreates = 0;
 };
 
@@ -120,7 +125,7 @@ public:
     // (minimized / VK_ERROR_OUT_OF_DATE_KHR). The fence for a skipped
     // frame is NOT reset (BeginFrame waits on it and the submit that
     // re-signals it is deferred until restore).
-    bool BeginFrame();
+    bool BeginFrame(bool nonblocking = false);
     void EndFrame();
 
     // Monotonic count of submitted frames, and the true "is every frame up to
@@ -158,6 +163,10 @@ public:
     // edit; copied into the mapped UBO every frame.
     void SetPointLUTs(const uint8_t* classRgb, const uint8_t* elevationRgb,
                       const uint8_t* intensityRgb);
+    // Cross-section clip volume (nkv_set_clip_volume): up to 4 planes in RENDER
+    // space, kept side where dot(n,p)+D >= 0. count 0 / null planes = off. Only the
+    // frame UBO changes - no point buffer is touched or re-uploaded.
+    void SetClipVolume(const float* planesAbcd, uint32_t count);
     // How many times a colour table was replaced. Must increase on a PTC /
     // palette / visibility / weight change while the point upload count does
     // not (see GetPositionUploadCount in PointCloudRenderer).
@@ -177,6 +186,10 @@ public:
         instantNormalSource_ = (screenSpace != 0) ? 1 : 0;
     }
     int GetInstantNormalSource() const { return instantNormalSource_; }
+    // Eye-Dome Lighting strength of the instant lighting pass (0 = off). Pushed in the
+    // lighting constants' spare slot, so changing it costs one float.
+    void SetInstantEdl(float strength) { instantEdl_ = strength < 0.0f ? 0.0f : strength; }
+    float GetInstantEdl() const { return instantEdl_; }
     VkDescriptorSetLayout GetFrameSetLayout() const;
     const VkDescriptorSet& GetFrameDescriptorSet() const { return frameSets_[frameManager_.GetCurrentFrameIndex()]; }
     UploadContext& GetUploadContext();
@@ -278,7 +291,9 @@ public:
     // the fullscreen lighting pass into the swapchain. EndFrame() then ends and
     // submits exactly as it always does.
     void RecordInstantShadedPass(VkCommandBuffer cmd, uint32_t frameSlot,
-                                 class PointCloudRenderer& pointCloud);
+                                 class PointCloudRenderer& pointCloud,
+                                VkFramebuffer targetFramebuffer = VK_NULL_HANDLE,
+                                bool endOpenPass = true);
 
     // Class visibility: 256 bytes (1 = shown). Stored beside the class colour
     // LUT and folded into the palette's alpha, so a Display Mode checkbox
@@ -406,6 +421,7 @@ private:
     float instantAmbient_ = 0.25f;
     int instantDebugStage_ = 0;
     int instantNormalRadius_ = 2;
+    float instantEdl_ = 0.0f;
     int instantNormalSource_ = 0;   // 0 = stored oct16 (production)
     uint64_t instantFrames_ = 0;
     uint64_t instantTargetRebuilds_ = 0;
@@ -456,6 +472,8 @@ private:
     float lutClass_[256 * 4];
     float lutElevation_[256 * 4];
     float lutIntensity_[256 * 4];
+    float clipPlanes_[16] = {};
+    uint32_t clipCount_ = 0;
     // Number of nkv_set_point_luts() calls that actually changed a table.
     // Together with PointCloudRenderer::GetPositionUploadCount() this is the
     // measured form of "the GPU re-tints on a palette change, the point buffer

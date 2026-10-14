@@ -894,7 +894,7 @@ def _drawing_to_shapefile_feature(drawing: dict):
 def _geometry_to_linestring(geom, shape_type: str):
     """
     Convert ANY Shapely geometry to a LineString for single-file SHP export.
-    This is the Nakshatech "linework" approach — everything is represented as
+    This is the MicroStation "linework" approach — everything is represented as
     line work in the output Shapefile so all shapes go into one file.
 
     Conversion rules:
@@ -945,7 +945,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
     """
     Export ALL drawings to a SINGLE Shapefile (.shp).
 
-    Uses the Nakshatech "linework" approach: every geometry type
+    Uses the MicroStation "linework" approach: every geometry type
     (point, line, polyline, polygon, rectangle, circle, text) is converted
     to a LineString so that all features share one common geometry type and
     can be stored in a single .shp file without any splitting.
@@ -1001,6 +1001,28 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
                 import traceback
                 traceback.print_exc()
                 skipped += 1
+
+        # ── Create Cell: add the SNT CL lines the cells were built on ──────
+        # (SNT lines are not digitizer drawings, so the loop above never sees
+        # them). Only when cell circles are still present in the drawings.
+        cl_records = list(getattr(app, "cell_source_cl_lines", None) or [])
+        if cl_records and any(d.get("source") == "cell_creation" for d in drawings):
+            added = 0
+            for rec in cl_records:
+                pts = [(float(c[0]), float(c[1])) for c in rec.get("coords") or []]
+                if len(pts) < 2:
+                    continue
+                all_features.append({
+                    "geometry": LineString(pts),
+                    "type": "cl_line",
+                    "color_r": 255, "color_g": 255, "color_b": 255,
+                    "text": str(rec.get("layer") or ""),
+                    "radius": 0.0,
+                    "lwidth": 2,
+                    "lstyle": "solid",
+                })
+                added += 1
+            print(f"   ✅ Added {added} CL line(s) used for cell creation")
 
         if not all_features:
             print("   ❌ No valid geometries to export")
@@ -1155,6 +1177,36 @@ def _collect_visible_digitizer_entities_for_snt_export(app) -> List[Dict[str, An
                 }
             )
             continue
+
+        # Preserve digitizer/cell circles as native circles. Flattening a
+        # small circle into absolute-coordinate polyline vertices is lossy in
+        # SNT v1.2 because every vertex is stored as float32. At projected
+        # coordinate magnitudes this visibly changes the outline and closure.
+        if shape_type == "circle":
+            center = _coerce_xyz_tuple(drawing.get("center"))
+            try:
+                radius = float(drawing.get("radius", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                radius = 0.0
+            if center is None and coords:
+                center_xy, inferred_radius = _extract_circle_center_and_radius(
+                    drawing, coords
+                )
+                if center_xy is not None:
+                    center = (float(center_xy[0]), float(center_xy[1]), float(coords[0][2]))
+                    if radius <= 0.0:
+                        radius = float(inferred_radius)
+            if center is not None and np.isfinite(radius) and radius > 0.0:
+                out.append(
+                    {
+                        "entity_type": "CIRCLE",
+                        "layer": layer_name,
+                        "color": color,
+                        "center": center,
+                        "radius": radius,
+                    }
+                )
+                continue
 
         if len(coords) < 2:
             continue
@@ -1556,6 +1608,17 @@ def _emit_entity_to_dxf(msp, doc, entity: Dict[str, Any]) -> bool:
         msp.add_point(tuple(pos), dxfattribs=attribs)
         return True
 
+    if etype == "CIRCLE":
+        center = entity.get("center")
+        try:
+            radius = float(entity.get("radius", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if center is None or not np.isfinite(radius) or radius <= 0.0:
+            return False
+        msp.add_circle(tuple(center), radius, dxfattribs=attribs)
+        return True
+
     if etype == "TEXT":
         pos = entity.get("position")
         txt = str(entity.get("text", "") or "")
@@ -1799,6 +1862,23 @@ def _transform_snt_export_entity(entity: Dict[str, Any], target_crs) -> Dict[str
         src = parse_crs(src_wkt)
         dst = parse_crs(target_crs)
         if src is None or dst is None or src.equals(dst):
+            return out
+        if str(out.get("entity_type", "")).upper() == "CIRCLE":
+            center = _coerce_xyz_tuple(out.get("center"))
+            radius = float(out.get("radius", 0.0) or 0.0)
+            if center is not None and radius > 0.0:
+                transformed = transform_point_sequence(
+                    [center, (center[0] + radius, center[1], center[2])], src, dst
+                )
+                if len(transformed) == 2:
+                    new_center, new_edge = transformed
+                    out["center"] = new_center
+                    out["radius"] = float(
+                        np.hypot(
+                            float(new_edge[0]) - float(new_center[0]),
+                            float(new_edge[1]) - float(new_center[1]),
+                        )
+                    )
             return out
         for key in ("points", "vertices"):
             seq = out.get(key)

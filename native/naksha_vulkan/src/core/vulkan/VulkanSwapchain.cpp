@@ -197,8 +197,8 @@ void VulkanSwapchain::CreateImageViews() {
     }
 }
 
-VkResult VulkanSwapchain::AcquireNextImage(VkSemaphore signalSemaphore, uint32_t* imageIndex) {
-    return vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, signalSemaphore,
+VkResult VulkanSwapchain::AcquireNextImage(VkSemaphore signalSemaphore, uint32_t* imageIndex,uint64_t timeout) {
+    return vkAcquireNextImageKHR(device_, swapchain_, timeout, signalSemaphore,
                                   VK_NULL_HANDLE, imageIndex);
 }
 

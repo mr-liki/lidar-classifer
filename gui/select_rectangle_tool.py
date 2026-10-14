@@ -1619,10 +1619,10 @@ class SelectRectangleTool:
                 import pyproj
                 if getattr(self.app, "project_crs_wkt", None):
                     crs = pyproj.CRS.from_wkt(self.app.project_crs_wkt)
-                    header.parse_crs(crs)
+                    header.add_crs(crs)
                 elif getattr(self.app, "project_crs_epsg", None):
                     crs = pyproj.CRS.from_epsg(self.app.project_crs_epsg)
-                    header.parse_crs(crs)
+                    header.add_crs(crs)
             except Exception as e:
                 print(f"⚠️ CRS embedding skipped: {e}")
 

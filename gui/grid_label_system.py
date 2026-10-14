@@ -7568,6 +7568,13 @@ class GridLabelManager:
 
             load_action.triggered.connect(_load_block_file)
 
+            # Shortcut-driven load ("Load Block/Grid" tool): skip the menu and
+            # run the same loader the "Load Block Data" item would.
+            if getattr(self, "_quick_load_mode", False):
+                print(f"[block-click] quick-load via shortcut: '{grid_name}'")
+                _load_block_file()
+                return True
+
             def _confirm_clear_block(_checked=False, gn=grid_name):
                 if not gn:
                     return
@@ -7688,6 +7695,94 @@ class GridLabelManager:
             traceback.print_exc()
             return False
 
+    def load_block_or_grid_under_cursor(self):
+        """Shortcut equivalent of right-click > Load Block/Grid Data.
+
+        The user left-clicks a block (or grid label) and presses the shortcut;
+        the cursor is still over it, so resolve the block/grid at the current
+        cursor position and load it exactly as the context-menu item would.
+        Returns True when a block/grid was found and its load was started.
+        """
+        from PySide6.QtGui import QCursor
+
+        if getattr(self.app, "_shutdown_in_progress", False):
+            return False
+        handles = self._get_main_interactor_handles()
+        if handles is None:
+            return False
+        vtk_widget, _interactor, renderer = handles
+
+        try:
+            local = vtk_widget.mapFromGlobal(QCursor.pos())
+            dpr = float(vtk_widget.devicePixelRatioF())
+            clickPos = (
+                int(local.x() * dpr),
+                int((vtk_widget.height() - 1 - local.y()) * dpr),
+            )
+        except Exception as e:
+            print(f"[quick-load] cursor mapping failed: {e}")
+            return False
+
+        # 1) Block polygon under the cursor (same authority as right-click).
+        self._quick_load_mode = True
+        try:
+            if self._block_polygon_hit_click(None, clickPos, renderer):
+                return True
+        finally:
+            self._quick_load_mode = False
+
+        # 2) Grid label under / nearest the cursor.
+        actor = None
+        try:
+            picker = vtk.vtkPropPicker()
+            picker.Pick(clickPos[0], clickPos[1], 0, renderer)
+            cand = picker.GetActor()
+            if cand is not None and getattr(cand, "is_grid_label", False):
+                actor = cand
+        except Exception:
+            pass
+        if actor is None:
+            best_dist2 = None
+            for dxf_data in getattr(self.app, "dxf_actors", []) or []:
+                for prop in dxf_data.get("actors", []):
+                    if not getattr(prop, "is_grid_label", False):
+                        continue
+                    try:
+                        wx, wy, wz = prop.GetPosition()
+                        coord = vtk.vtkCoordinate()
+                        coord.SetCoordinateSystemToWorld()
+                        coord.SetValue(float(wx), float(wy), float(wz))
+                        sx, sy, _ = coord.GetComputedDisplayValue(renderer)
+                        d2 = (float(sx) - clickPos[0]) ** 2 + (float(sy) - clickPos[1]) ** 2
+                        if d2 <= 400.0 and (best_dist2 is None or d2 < best_dist2):
+                            actor, best_dist2 = prop, d2
+                    except Exception:
+                        pass
+        if actor is None:
+            try:
+                self.app.statusBar().showMessage(
+                    "Load Block/Grid: no block or grid under the cursor", 2500
+                )
+            except Exception:
+                pass
+            return False
+
+        grid_name = getattr(actor, "grid_name", "")
+        if not grid_name:
+            return False
+        snt_filename = (
+            getattr(actor, "_naksha_snt_filename", None)
+            or getattr(actor, "snt_filename", None)
+            or self._infer_snt_filename_for_grid(grid_name)
+        )
+        print(f"[quick-load] loading grid '{grid_name}' via shortcut")
+        self.load_grid_las(
+            grid_name,
+            snt_filename=snt_filename,
+            alt_names=self._get_alt_names_for_grid(grid_name),
+        )
+        return True
+
     def on_right_click(self, obj, event):
         """Handle right-click on grid label OR point cloud"""
         from PySide6.QtWidgets import QMenu, QInputDialog
@@ -7807,8 +7902,24 @@ class GridLabelManager:
                     shaded_actor = getattr(self.app, "_shaded_mesh_actor", None)
                     hit_shading = False
                     hit_tester = getattr(self.app, "_main_view_pick_hits_actor", None)
-                    if callable(hit_tester) and shaded_actor is not None:
-                        hit_shading = bool(hit_tester(shaded_actor, display_x=click_x, display_y=click_y))
+                    tiled_actors = list(getattr(
+                        self.app, "_large_shading_tile_actors", None
+                    ) or [])
+                    tiled_hit_tester = getattr(
+                        self.app, "_main_view_pick_hits_any_actor", None
+                    )
+                    if tiled_actors and callable(tiled_hit_tester):
+                        hit_shading = bool(tiled_hit_tester(
+                            tiled_actors,
+                            display_x=click_x,
+                            display_y=click_y,
+                        ))
+                    elif callable(hit_tester) and shaded_actor is not None:
+                        hit_shading = bool(hit_tester(
+                            shaded_actor,
+                            display_x=click_x,
+                            display_y=click_y,
+                        ))
 
                     opened = False
                     if hit_shading and hasattr(self.app, "show_shading_controls"):
@@ -8971,35 +9082,22 @@ class GridLabelManager:
             # BUILD SPATIAL INDEX - SAME AS MENU BAR
             # ============================================================================
             if total_points > 50_000:
-                # Build the same full-resolution KD-tree after the visible load.
-                # Existing tools retain their vectorized fallback until ready.
+                # Phase 2: one shared dataset-owned XY index.  It is built once
+                # after the visible load and reused by rectangle/circle/polygon,
+                # brush, point-pick candidate queries and cross-section AABBs.
                 self.app.spatial_index = None
                 indexed_xyz = self.app.data["xyz"]
-                indexed_xyz_id = id(indexed_xyz)
 
                 def _start_deferred_spatial_index():
-                    import threading
-
-                    def _worker():
-                        try:
-                            from gui.performance_optimizations import SpatialIndex
-                            built_index = SpatialIndex(indexed_xyz)
-                            current_data = getattr(self.app, "data", None) or {}
-                            if id(current_data.get("xyz")) == indexed_xyz_id:
-                                self.app.spatial_index = built_index
-                                print("   Deferred spatial index installed")
-                            else:
-                                print("   Deferred spatial index discarded: data replaced")
-                        except Exception as exc:
-                            print(f"   Deferred spatial index failed: {exc}")
-
-                    threading.Thread(
-                        target=_worker, name="NakshaSpatialIndex", daemon=True
-                    ).start()
+                    try:
+                        from gui.spatial_index import schedule_shared_index_build
+                        schedule_shared_index_build(self.app, indexed_xyz)
+                    except Exception as exc:
+                        print(f"PHASE2_SPATIAL_INDEX status=schedule_failed error={exc}")
 
                 from PySide6.QtCore import QTimer
-                QTimer.singleShot(1500, _start_deferred_spatial_index)
-                print("   Full-resolution spatial index scheduled after load")
+                QTimer.singleShot(250, _start_deferred_spatial_index)
+                print("PHASE2_SPATIAL_INDEX status=scheduled shared=1")
 
             # ============================================================================
             # RESTORE DISPLAY SETTINGS - SAME AS MENU BAR
@@ -9405,14 +9503,17 @@ class GridLabelManager:
             print(f"  🔄 Rebuilding spatial index...")
             QCoreApplication.processEvents()
             
-            # Rebuild spatial index if it exists
+            # Phase 2: rebuild the single shared index only because point
+            # deletion/repacking changes canonical point ids.
             if hasattr(self.app, 'spatial_index') and remaining > 50_000:
                 try:
-                    from gui.performance_optimizations import SpatialIndex
-                    self.app.spatial_index = SpatialIndex(self.app.data["xyz"])
-                    print(f"  ✅ Spatial index rebuilt")
+                    from gui.spatial_index import invalidate_cache, schedule_shared_index_build
+                    invalidate_cache()
+                    self.app.spatial_index = None
+                    schedule_shared_index_build(self.app, self.app.data["xyz"])
+                    print("PHASE2_SPATIAL_INDEX status=scheduled reason=point_delete")
                 except Exception as e:
-                    print(f"  ⚠️ Spatial index rebuild failed: {e}")
+                    print(f"PHASE2_SPATIAL_INDEX status=rebuild_failed error={e}")
                     self.app.spatial_index = None
             
             # Update display

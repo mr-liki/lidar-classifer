@@ -86,16 +86,17 @@ def _commit_sparse_classification_change(
 ):
     """Commit one classification edit through the canonical sparse refresh bus.
 
-    This is the same contract used by the normal Rectangle/Circle/Polygon/
-    Freehand classification tools.  In all-class shading, classification is
-    metadata only: the existing 34M-point/69M-face topology remains resident
-    and only the incident dirty faces are repainted with the current
-    Azimuth/Sharpness/Ambient presentation.
+    ``changed_mask`` is intentionally backward-compatible: legacy callers may
+    still pass bool[N], while high-volume tools (Fence) pass canonical point
+    indices directly.  The commit itself is always published as a
+    ``SparseClassificationDelta`` so a 47M-point edit never needs a second
+    full-size mask scan just to refresh the renderer.
 
-    If a class-visibility boundary really changes (visible -> hidden or hidden
-    -> visible), ClassificationDelta lets shading_display choose its existing
-    topology-aware fallback.  The dialog itself never guesses and never clears
-    the full shading cache merely because "Any class" was selected.
+    A By-Class/Fence commit is its own classification transaction.  Resetting
+    ``_gpu_sync_done`` here is critical: that flag describes the *current*
+    classification transaction, not an older palette/cross-section render.
+    Leaving a stale True value caused the tiled Main View to render without
+    patching any changed tile buffers (tiles_patched=0).
     """
     if app is None or not isinstance(getattr(app, "data", None), dict):
         return False
@@ -104,11 +105,18 @@ def _commit_sparse_classification_change(
     if classification is None or changed_mask is None:
         return False
 
-    mask = np.asarray(changed_mask)
-    if mask.dtype != bool or mask.ndim != 1 or len(mask) != len(classification):
-        return False
+    from gui.classification_delta import make_delta, publish_delta, resolve_changed_indices
 
-    changed_indices = np.flatnonzero(mask).astype(np.intp, copy=False)
+    arr = np.asarray(changed_mask)
+    if arr.dtype == bool:
+        if arr.ndim != 1 or len(arr) != len(classification):
+            return False
+        changed_indices = np.flatnonzero(arr).astype(np.int64, copy=False)
+    else:
+        changed_indices = resolve_changed_indices(
+            changed_mask, app=app, n_points=len(classification)
+        )
+
     if changed_indices.size == 0:
         return False
 
@@ -128,8 +136,31 @@ def _commit_sparse_classification_change(
         and new_arr.size == changed_indices.size
     )
 
-    app._last_changed_mask = mask
-    app._last_changed_indices = changed_indices.copy()
+    # Start a fresh lightweight transaction.  Normal Rectangle/Brush tools do
+    # this in classify_with_stats_update(); By-Class/Fence paths bypass that
+    # decorator and therefore must establish the same invariants here.
+    tx_id = int(getattr(app, "_classification_tx_id", 0) or 0) + 1
+    app._classification_tx_id = tx_id
+    app._gpu_sync_done = False
+    app._section_visibility_refresh_required = False
+    app._classification_main_refresh_tx_id = None
+    app._last_changed_mask = None
+    app._last_changed_indices = None
+    app._last_classification_delta = None
+
+    delta = make_delta(
+        app,
+        changed_indices,
+        old_classes=old_arr if transition_valid else None,
+        new_classes=new_arr if transition_valid else None,
+        operation=str(operation or "classification"),
+        origin_view=str(origin or "by_class_tool"),
+        tx_id=tx_id,
+    )
+    publish_delta(app, delta)
+    app.classification_revision = int(
+        getattr(app, "classification_revision", 0) or 0
+    ) + 1
 
     if (
         str(getattr(app, "display_mode", "") or "").lower() == "shaded_class"
@@ -153,25 +184,26 @@ def _commit_sparse_classification_change(
     emit = getattr(signal, "emit", None)
     if callable(emit):
         try:
-            emit(mask)
+            emit(delta)
             print(
                 "CLASSIFICATION_SPARSE_COMMIT "
                 f"operation={operation} origin={origin} "
-                f"changed={changed_indices.size:,} "
+                f"changed={changed_indices.size:,} sparse=1 tx={tx_id} "
                 "full_shading_rebuild=0"
             )
             return True
         except Exception as exc:
             print(f"   ⚠️ Sparse classification signal failed: {exc}")
 
-    # Emergency fallback only.  Preserve the same exact transition contract so
-    # the shading backend can still decide color-only/local-topology/full-rebuild.
+    # Emergency fallback only. Preserve the same exact transition contract so
+    # the shading backend can still choose color-only/local-topology fallback.
     try:
         from gui.unified_actor_manager import guarantee_main_view_visual_refresh
 
         ok = guarantee_main_view_visual_refresh(
             app,
-            changed_mask=mask,
+            changed_indices=changed_indices,
+            delta=delta,
             reason=str(operation or "classification"),
             old_classes=old_arr if transition_valid else None,
             new_classes=new_arr if transition_valid else None,
@@ -181,7 +213,8 @@ def _commit_sparse_classification_change(
             print(
                 "CLASSIFICATION_SPARSE_COMMIT "
                 f"operation={operation} origin={origin} "
-                f"changed={changed_indices.size:,} fallback=main_guarantee"
+                f"changed={changed_indices.size:,} sparse=1 tx={tx_id} "
+                "fallback=main_guarantee"
             )
             return True
     except Exception as exc:
@@ -520,9 +553,13 @@ RIBBON_TOOLTIP_META = {
         "title": "Identify Settings",
         "description": "Customise Zoom and Select rectangle colour and width.",
     },
-    ("BlockRibbon", "Block", "Create Block"): {
+    ("BlockRibbon", "Create", "Create Block"): {
         "title": "Create Block",
         "description": "Open block creation settings.",
+    },
+    ("BlockRibbon", "Create", "Create Cell"): {
+        "title": "Create Cell",
+        "description": "Open cell creation settings.",
     },
     ("ByClassRibbon", "By Class", "Convert"): {
         "title": "By Class Conversion",
@@ -1611,7 +1648,8 @@ class ToolsRibbon(QWidget):
         # ✂️ Sections: Cross / Cut / Width
         # ------------------------
         sections = RibbonSection("Sections", self)
-        sections.add_button("Cross", "📐",
+        self.sections_ribbon = sections
+        self.cross_section_btn = sections.add_button("Cross", "📐",
                             lambda: self.tool_activated.emit("cross_section"))
         sections.add_button("Cut", "🔪",
                             lambda: self.tool_activated.emit("cut_section"))
@@ -2959,7 +2997,7 @@ class DrawRibbon(QWidget):
 
 
     def _handle_select_drawing_click(self):
-        """Open the Nakshatech-style Element Selection panel.
+        """Open the MicroStation-style Element Selection panel.
 
         Stands down any conflicting tools (draw, curve, measurement) first,
         then shows the SelectionModeDialog which activates ElementSelectTool.
@@ -3563,14 +3601,20 @@ class BlockRibbon(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        block_section = RibbonSection("Block", self)
-        block_section.add_button(
+        create_section = RibbonSection("Create", self)
+        create_section.add_button(
             "Create Block",
             "▦",
             self._show_block_creation_settings,
             toggleable=False,
         )
-        layout.addWidget(block_section)
+        create_section.add_button(
+            "Create Cell",
+            "◯",
+            self._show_cell_creation_settings,
+            toggleable=False,
+        )
+        layout.addWidget(create_section)
         layout.addStretch()
 
     def _show_block_creation_settings(self):
@@ -3606,6 +3650,37 @@ class BlockRibbon(QWidget):
                 app.block_creation_settings_dialog = show_block_creation_settings_dialog(app)
         except Exception as e:
             print(f"⚠️ Failed to open block creation settings: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    def _show_cell_creation_settings(self):
+        """Open the (currently static) Cell Creation Settings window."""
+        try:
+            app = getattr(self, "app", None) or self.window()
+            existing = getattr(app, "cell_creation_settings_dialog", None)
+
+            # Check if the dialog exists and is valid
+            dialog_valid = False
+            if existing is not None:
+                try:
+                    existing.windowTitle()
+                    dialog_valid = True
+                except (RuntimeError, ReferenceError):
+                    app.cell_creation_settings_dialog = None
+                    existing = None
+
+            if dialog_valid and existing is not None:
+                if existing.isMinimized():
+                    existing.showNormal()
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+            else:
+                from gui.cell_creation_settings_dialog import show_cell_creation_settings_dialog
+                app.cell_creation_settings_dialog = show_cell_creation_settings_dialog(app)
+        except Exception as e:
+            print(f"⚠️ Failed to open cell creation settings: {e}")
             import traceback
 
             traceback.print_exc()
@@ -3715,6 +3790,13 @@ class MeasurementRibbon(QWidget):
                 # clicks and Ctrl+Z/Ctrl+Y.
                 if getattr(main_window, "active_classify_tool", None) is not None:
                     main_window.deactivate_classification_tool(preserve_cross_section=True)
+                # ✅ MUTUAL EXCLUSION: the normal cross-section line tool
+                # (Tools ▸ Sections ▸ Cross) owns the main-view locator; this
+                # tool owns the section-view clicks. They are two halves of one
+                # workflow and must never be armed together, so stand the line
+                # tool down first — a checked XS button has to mean XS is the
+                # tool actually receiving clicks.
+                self._stand_down_cross_section_drawing(main_window)
                 tool.activate()
                 if hasattr(main_window, "statusBar"):
                     main_window.statusBar().showMessage(
@@ -3727,6 +3809,48 @@ class MeasurementRibbon(QWidget):
                     main_window.statusBar().showMessage("📏 Cross-section measurement disabled", 2000)
         except Exception as e:
             print(f"⚠️ Cross-section measurement ribbon toggle failed: {e}")
+
+    def _stand_down_cross_section_drawing(self, main_window):
+        """Turn OFF the normal cross-section line tool (Tools ▸ Sections ▸ Cross).
+
+        Same rule as the mirror-image stand-down in app_window
+        (_stand_down_cross_section_measurement_tool): the line tool arms its
+        locator on the main view, XS measures inside the section views, and the
+        two fight over the same section-view clicks when both are armed — so
+        whichever one the user activates last silently disarms the other.
+
+        Only the locator is cancelled; the cross-section views it already
+        created are left open (deactivate_cross_section_tool() guarantees
+        that), so measuring can start immediately.
+        """
+        try:
+            drawing_armed = (
+                getattr(main_window, "cross_section_active", False)
+                or getattr(main_window, "cross_interactor", None) is not None
+            )
+            if drawing_armed and hasattr(main_window, "deactivate_cross_section_tool"):
+                main_window.deactivate_cross_section_tool()
+        except Exception as e:
+            print(f"⚠️ Cross-section drawing stand-down failed: {e}")
+            try:
+                main_window.cross_section_active = False
+            except Exception:
+                pass
+
+        # Untoggle Tools ▸ Sections ▸ Cross so the ribbon shows the real state
+        # (a stale checked button would make the user's next click read as
+        # "turn off" and do nothing visible).
+        try:
+            ribbon = getattr(main_window, "ribbon_manager", None)
+            tools_ribbon = getattr(ribbon, "ribbons", {}).get("tools") if ribbon else None
+            btn = getattr(tools_ribbon, "cross_section_btn", None)
+            section = getattr(tools_ribbon, "sections_ribbon", None)
+            if btn is not None and btn.isChecked():
+                btn.setChecked(False)
+            if section is not None and getattr(section, "active_button", None) is btn:
+                section.active_button = None
+        except Exception as e:
+            print(f"⚠️ Cross-section ribbon sync failed: {e}")
 
     def _show_measure_settings(self):
         """Open the Measurement Tool Settings dialog."""
@@ -4631,6 +4755,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
                     "polyline",
                     "smartline",
                 ]
+                # Cell circles belong to Create > Cell — never fences.
+                and not digitize.is_cell_creation_drawing(drawing)
             ]
 
     curve_fences = []
@@ -5006,6 +5132,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
                         "polyline",
                         "smartline",
                     ]
+                    # Cell circles belong to Create > Cell — never fences.
+                    and not digitize_live.is_cell_creation_drawing(drawing)
                 ]
         live_curve_fences = []
         if curve_tool_live and hasattr(curve_tool_live, "get_curves_as_fences"):
@@ -5211,6 +5339,9 @@ class ByClassRibbon(QWidget):
         self.isolated_dialog      = None
         self.ground_dialog        = None
         self.below_surface_dialog = None
+        self.find_wires_dialog = None
+        self.centerline_classify_dialog = None
+        self.by_class_macro_dialog = None
         self.build_ribbon()
 
         # These work even when dialogs are closed
@@ -5256,6 +5387,9 @@ class ByClassRibbon(QWidget):
             self.isolated_dialog,
             self.ground_dialog,
             self.below_surface_dialog,
+            self.find_wires_dialog,
+            self.centerline_classify_dialog,
+            self.by_class_macro_dialog,
         ):
             if dlg is not None:
                 yield dlg
@@ -5365,7 +5499,10 @@ class ByClassRibbon(QWidget):
         algo_section.add_button("Low Points", "⬇️", self.open_low_points_dialog,    toggleable=False)
         algo_section.add_button("Isolated",   "🔴", self.open_isolated_dialog,      toggleable=False)
         algo_section.add_button("Ground",     "🏔️", self.open_ground_dialog,        toggleable=False)
+        algo_section.add_button("Find Wires", "⚡", self.open_find_wires_dialog, toggleable=False)
+        algo_section.add_button("Ctrline", "≋", self.open_centerline_classify_dialog, toggleable=False)
         algo_section.add_button("BelowSurface",    "📐", self.open_below_surface_dialog,  toggleable=False)
+        algo_section.add_button("Macro", ">", self.open_by_class_macro_dialog, toggleable=False)
         layout.addWidget(algo_section)
 
         # ℹ️ Info Display
@@ -5717,6 +5854,26 @@ class ByClassRibbon(QWidget):
             open_classify_below_surface(self.app),
         )
 
+    def open_find_wires_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_find_wires
+        except ImportError:
+            from lidar_classification_tools import open_find_wires
+        self._remember_classifier_dialog(
+            "find_wires_dialog",
+            open_find_wires(self.app),
+        )
+
+    def open_centerline_classify_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_by_centerline
+        except ImportError:
+            from lidar_classification_tools import open_classify_by_centerline
+        self._remember_classifier_dialog(
+            "centerline_classify_dialog",
+            open_classify_by_centerline(self.app),
+        )
+
     def update_status(self, message, color_type="neutral"):
         """Update the status label with conversion info"""
         self.status_label.setText(message)
@@ -5754,6 +5911,15 @@ class ByClassRibbon(QWidget):
                 }
             """)
 
+
+
+    def open_by_class_macro_dialog(self):
+        from gui.by_class_macro import ByClassMacroDialog
+        if self.by_class_macro_dialog is None:
+            self.by_class_macro_dialog = ByClassMacroDialog(self.app, self)
+            self.by_class_macro_dialog.destroyed.connect(
+                lambda: setattr(self, 'by_class_macro_dialog', None))
+        self._show_or_raise_dialog(self.by_class_macro_dialog, 'ByClassMacroDialog')
 
 
 from PySide6.QtGui import QShortcut, QKeySequence
@@ -11865,138 +12031,175 @@ class InsideFenceDialog(QDialog):
         return inside
 
     def _calculate_conversion(self, from_classes, to_class, preview=False):
-        """Calculate and optionally apply conversion for InsideFenceDialog"""
+        """Calculate/apply Fence conversion using the shared XY spatial index.
+
+        Large-cloud rule: never create ``xyz[from_class_mask]`` for the entire
+        dataset.  Query the selected polygon(s) first, then apply class/height/
+        flight-line filters only to the bounded canonical candidates.
+        """
+        import time
+
         classification = self.app.data.get("classification")
         xyz = self.app.data.get("xyz")
-        
         if classification is None or xyz is None:
             return None
-            
-        # Get From class mask
-        if from_classes is None:
-            from_class_mask = (classification != to_class)
-        else:
-            from_class_mask = np.isin(classification, from_classes)
+        if not self.selected_fences:
+            return 0
 
-        # Restrict to visible classes — hidden classes cannot be reclassified.
-        _palette = getattr(self.app, 'class_palette', None)
-        if isinstance(_palette, dict) and _palette:
-            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
-            if _vis:
-                from_class_mask &= np.isin(classification, _vis)
-            
-        from_class_count = np.sum(from_class_mask)
-        if from_class_count == 0:
+        t0 = time.perf_counter()
+        query_backend = "full_scan"
+        inside_indices = np.empty(0, dtype=np.int64)
+
+        # Fast path: Phase-2 shared grid index.  query_polygon_2d returns exact
+        # canonical point IDs after a bounded bbox/cell query, so cost scales
+        # with the fence footprint instead of all 47M points.
+        try:
+            from gui.spatial_index import get_cached_index
+
+            sidx = getattr(self.app, "spatial_index", None) or get_cached_index(xyz)
+            if sidx is not None and hasattr(sidx, "query_polygon_2d"):
+                hits = []
+                for fence in self.selected_fences:
+                    coords = np.asarray(fence.get("coords", []), dtype=np.float64)
+                    if coords.ndim != 2 or coords.shape[0] < 3 or coords.shape[1] < 2:
+                        continue
+                    idx = np.asarray(sidx.query_polygon_2d(coords[:, :2]), dtype=np.int64).ravel()
+                    if idx.size:
+                        hits.append(idx)
+                if hits:
+                    inside_indices = hits[0] if len(hits) == 1 else np.unique(np.concatenate(hits))
+                query_backend = str(getattr(sidx, "method", "spatial"))
+        except Exception as exc:
+            print(f"FENCE_QUERY status=spatial_fallback reason={exc}")
+
+        # Compatibility fallback for a dataset whose shared index has not been
+        # installed yet.  It is exact, but intentionally not the production
+        # path for large clouds.
+        if query_backend == "full_scan":
+            combined_inside = np.zeros(len(xyz), dtype=bool)
+            for fence in self.selected_fences:
+                coords = fence.get("coords", [])
+                if coords is None or len(coords) < 3:
+                    continue
+                combined_inside |= self._points_inside_polygon(xyz, coords)
+            inside_indices = np.flatnonzero(combined_inside).astype(np.int64, copy=False)
+
+        query_ms = (time.perf_counter() - t0) * 1000.0
+        if inside_indices.size == 0:
+            print(
+                "FENCE_QUERY status=ok "
+                f"backend={query_backend} dataset={len(classification):,} "
+                f"fences={len(self.selected_fences)} inside=0 query_ms={query_ms:.1f} "
+                f"preview={int(bool(preview))}"
+            )
             return 0
-            
-        # Get indices and coordinates of eligible points
-        from_class_indices = np.where(from_class_mask)[0]
-        from_class_xyz = xyz[from_class_mask]
-        
-        # 1. FENCE FILTER
-        # Check which points are inside any of the selected fences
-        combined_inside = np.zeros(len(from_class_xyz), dtype=bool)
-        for fence in self.selected_fences:
-            fence_coords = fence['coords']
-            inside = self._points_inside_polygon(from_class_xyz, fence_coords)
-            combined_inside |= inside
-            
-        if not np.any(combined_inside):
+
+        tf = time.perf_counter()
+        cand_cls = np.asarray(classification)[inside_indices]
+        if from_classes is None:
+            keep = cand_cls != np.asarray(classification).dtype.type(to_class)
+        else:
+            keep = np.isin(cand_cls, np.asarray(from_classes))
+
+        # Hidden classes cannot be reclassified from this Main View tool.
+        palette = getattr(self.app, "class_palette", None)
+        if isinstance(palette, dict) and palette:
+            visible = [
+                int(c) for c, info in palette.items()
+                if isinstance(info, dict) and info.get("show", True)
+            ]
+            if visible:
+                keep &= np.isin(cand_cls, visible)
+
+        final_convert_indices = inside_indices[keep]
+        if final_convert_indices.size == 0:
+            filter_ms = (time.perf_counter() - tf) * 1000.0
+            print(
+                "FENCE_QUERY status=ok "
+                f"backend={query_backend} dataset={len(classification):,} "
+                f"fences={len(self.selected_fences)} inside={inside_indices.size:,} "
+                f"eligible=0 query_ms={query_ms:.1f} filter_ms={filter_ms:.1f} "
+                f"preview={int(bool(preview))}"
+            )
             return 0
-            
-        # Filter down indices and coordinates to only those inside the fence
-        inside_indices = from_class_indices[combined_inside]
-        inside_xyz = from_class_xyz[combined_inside]
-        
-        # 2. HEIGHT FILTER
+
         if self.height_filter_enabled.isChecked():
             mode = self.height_mode_combo.currentData()
-            heights = inside_xyz[:, 2]
-            
+            heights = np.asarray(xyz)[final_convert_indices, 2]
             if mode == "within":
-                min_h = self.min_height_spin.value()
-                max_h = self.max_height_spin.value()
-                height_mask = (heights >= min_h) & (heights <= max_h)
+                height_keep = (
+                    (heights >= self.min_height_spin.value())
+                    & (heights <= self.max_height_spin.value())
+                )
             elif mode == "above":
-                min_h = self.min_height_spin.value()
-                height_mask = heights >= min_h
+                height_keep = heights >= self.min_height_spin.value()
             elif mode == "below":
-                max_h = self.max_height_spin.value()
-                height_mask = heights <= max_h
+                height_keep = heights <= self.max_height_spin.value()
             else:
-                height_mask = np.ones(len(heights), dtype=bool)
-                
-            if not np.any(height_mask):
-                return 0
-                
-            final_convert_indices = inside_indices[height_mask]
-        else:
-            final_convert_indices = inside_indices
+                height_keep = np.ones(heights.size, dtype=bool)
+            final_convert_indices = final_convert_indices[height_keep]
 
-        # Fence conversion has its own direct classification commit path, so
-        # enforce the Main View's per-view flight-line selection here as the
-        # final eligibility boundary. This also keeps preview/undo/GPU masks
-        # identical to the points that are actually allowed to change.
         from gui.flight_line_filter import filter_visible_flight_line_indices
         final_convert_indices = filter_visible_flight_line_indices(
-            self.app,
-            final_convert_indices,
-            len(classification),
-            slot=0,
+            self.app, final_convert_indices, len(classification), slot=0
         )
-            
-        converted_count = len(final_convert_indices)
+        if final_convert_indices.size:
+            # Guard against overlapping fences and any accidental duplicate IDs.
+            final_convert_indices = np.unique(final_convert_indices.astype(np.int64, copy=False))
+
+        converted_count = int(final_convert_indices.size)
+        filter_ms = (time.perf_counter() - tf) * 1000.0
+        print(
+            "FENCE_QUERY status=ok "
+            f"backend={query_backend} dataset={len(classification):,} "
+            f"fences={len(self.selected_fences)} inside={inside_indices.size:,} "
+            f"eligible={converted_count:,} query_ms={query_ms:.1f} filter_ms={filter_ms:.1f} "
+            f"preview={int(bool(preview))}"
+        )
         if converted_count == 0:
             return 0
-            
         if preview:
             return converted_count
-            
-        # Create final mask for shader update
-        final_mask = np.zeros(len(classification), dtype=bool)
-        final_mask[final_convert_indices] = True
-        
-        old_classes = classification[final_mask].copy()
-        
-        # Perform change in-place
-        classification[final_mask] = to_class
+
+        old_classes = np.asarray(classification)[final_convert_indices].copy()
+        new_classes_arr = np.full(
+            converted_count, to_class, dtype=np.asarray(classification).dtype
+        )
+        classification[final_convert_indices] = new_classes_arr
         self.app._just_did_conversion = True
-        
-        # Save undo
-        new_classes_arr = np.full(np.sum(final_mask), to_class, dtype=classification.dtype)
+
+        # Sparse undo history: storing a bool[47M] mask costs ~45 MiB per Fence
+        # conversion and is unnecessary because the global history engine already
+        # supports canonical ``indices``.
         undo_step = {
-            "mask": final_mask.copy(),
+            "indices": final_convert_indices.copy(),
             "oldclasses": old_classes,
             "old_classes": old_classes,
             "newclasses": new_classes_arr,
-            "new_classes": new_classes_arr
+            "new_classes": new_classes_arr,
         }
-        
-        if hasattr(self.app, 'undostack'):
+        if hasattr(self.app, "undostack"):
             self.app.undostack.append(undo_step)
-        elif hasattr(self.app, 'undo_stack'):
+        elif hasattr(self.app, "undo_stack"):
             self.app.undo_stack.append(undo_step)
-            
-        if hasattr(self.app, 'redostack'):
+        if hasattr(self.app, "redostack"):
             self.app.redostack.clear()
-        elif hasattr(self.app, 'redo_stack'):
+        elif hasattr(self.app, "redo_stack"):
             self.app.redo_stack.clear()
-            
+
         from gui.memory_manager import trim_undo_stack
         trim_undo_stack(self.app)
-        
-        # One canonical sparse commit.  Keep the old/new transition so
-        # shaded_class can prove whether geometry membership changed.
+
         self._last_sparse_commit_ok = _commit_sparse_classification_change(
             self.app,
-            final_mask,
+            final_convert_indices,
             old_classes,
             new_classes_arr,
-            operation='inside_fence_conversion',
-            origin='InsideFenceDialog',
+            operation="inside_fence_conversion",
+            origin="InsideFenceDialog",
         )
 
-        return converted_count, final_mask
+        return converted_count, final_convert_indices
 
     def add_fences_from_selection(self, fence_shapes):
         """Accept a list of drawing dicts and add them as fences.
@@ -12463,10 +12666,10 @@ class InsideFenceDialog(QDialog):
                 return
 
             if isinstance(result, tuple):
-                converted_count, final_mask = result
+                converted_count, final_changed = result
             else:
                 converted_count = result
-                final_mask = None
+                final_changed = None
 
             if not converted_count:
                 return
@@ -12479,7 +12682,7 @@ class InsideFenceDialog(QDialog):
             display_mode = getattr(self.app, 'display_mode', None)
             sparse_ok = bool(getattr(self, '_last_sparse_commit_ok', False))
 
-            if display_mode == "shaded_class" and final_mask is not None:
+            if display_mode == "shaded_class" and final_changed is not None:
                 if sparse_ok:
                     print(
                         "⚡ SHADING MODE: canonical sparse fence refresh already "
@@ -12723,7 +12926,7 @@ class InsideFenceDialog(QDialog):
         """
 class SyncViewsDialog(QDialog):
     """
-    Synchronize Views dialog like Nakshatech.
+    Synchronize Views dialog like MicroStation.
     Rows:
       View N: [No synch | Match]  [View 1..View 5]
     """

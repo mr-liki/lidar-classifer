@@ -133,9 +133,8 @@ class BrushQueryWorker(QThread):
         """
         Spatial query + from_classes filter.
 
-        Uses the persistent cached KDTree (built once per file load).
-        scipy releases the GIL inside query_ball_point so the main thread
-        can handle mouse events concurrently.
+        Uses the persistent shared Phase-2 XY grid built once per dataset.
+        The exact circle test runs only on points from intersecting cells.
 
         Returns 1-D int64 array of matching global point indices.
         """
@@ -144,28 +143,13 @@ class BrushQueryWorker(QThread):
         idx_obj = get_or_build_index(xyz)   # O(1) cache hit after first load
         cx, cy  = float(center_xy[0]), float(center_xy[1])
 
-        # Bounding-sphere query in 3-D (Z center = 0, Z radius >> cloud height).
-        # This over-selects in Z; exact XY filter below cuts it down.
-        z_half  = float(xyz[:, 2].max() - xyz[:, 2].min()) * 0.5 + radius   # covers full Z range
-        r3d     = float(np.hypot(radius, z_half))
-
-        # Use the SpatialIndex public API instead of assuming a KD-tree backend.
-        candidates = np.asarray(
-            idx_obj.query_ball_point(
-                np.array([cx, cy, float(xyz[:, 2].mean())], dtype=np.float64),
-                r3d,
-            ),
+        # Phase 2: the brush is an XY editing tool. Query the shared XY grid
+        # directly instead of creating a huge 3-D bounding sphere and forcing
+        # a KD-tree search across the cloud's complete Z range.
+        hit = np.asarray(
+            idx_obj.query_circle_2d((cx, cy), float(radius)),
             dtype=np.int64,
         )
-
-        if candidates.size == 0:
-            return candidates
-
-        # Exact 2-D (XY) distance filter — vectorized, O(k)
-        pts_xy = xyz[candidates, :2]
-        dxy    = pts_xy - np.array([cx, cy], dtype=pts_xy.dtype)
-        mask   = (dxy[:, 0] ** 2 + dxy[:, 1] ** 2) <= (radius * radius)
-        hit    = candidates[mask]
 
         if hit.size == 0:
             return hit

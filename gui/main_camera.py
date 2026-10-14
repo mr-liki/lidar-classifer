@@ -21,7 +21,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-from gui.naksha_cache.visible_parity import camera_signature as _signature
+def _signature(center, world_size, width_px: int, height_px: int) -> tuple:
+    """Stable plan-camera identity, independent of any point-cache format."""
+    def quantise(value):
+        return round(round(float(value) / 1e-4) * 1e-4, 6)
+    return (quantise(center[0]), quantise(center[1]),
+            quantise(world_size[0]), quantise(world_size[1]),
+            int(width_px), int(height_px))
 
 EPSILON = 1e-9
 _REJECT_LOG_LIMIT = 8

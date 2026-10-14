@@ -35,6 +35,20 @@ TESTIGN _FILES/
 *.dwg
 *.dxf
 
+# Generated artifacts from the Phase 1 builder verification harness
+# (regenerate with: python audit/naksha_phase1_verify.py)
+audit/_nkverify_out/
+
+# C++ .lnt converter: compiled binary and generated test containers
+# (rebuild with: cd native/lnt && g++ -O3 -std=c++17 main.cpp -o main)
+# any executable the converter or its preflight/benchmark tools produce
+native/lnt/main
+native/lnt/*.exe
+native/lnt/*.dll
+native/lnt/*.lnt*
+native/lnt/*.o
+native/lnt/*.obj
+
 # Local archives and transient patches
 NAKSHA-LIDAR.zip
 NAKSHA-LIDAR.rar

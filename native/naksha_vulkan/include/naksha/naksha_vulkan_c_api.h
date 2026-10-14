@@ -209,6 +209,38 @@ NKV_API uint64_t nkv_get_point_normal_upload_count(NkvHandle handle);
 NKV_API int nkv_set_instant_normal_source(NkvHandle handle, int screen_space);
 
 NKV_API int nkv_set_class_visibility(NkvHandle handle, const uint8_t* visible256);
+
+/* ---- Shading modes (MicroStation-style presentation) --------------------------
+ * One call switches the whole presentation: display mode, colour ramp, the elevation
+ * and intensity ranges, the light and the Eye-Dome Lighting strength. It changes
+ * uniforms, the two 256-entry ramp tables and push constants ONLY - no vertex buffer
+ * is touched or re-allocated, so a switch costs one frame.
+ *
+ * Layout is exactly 40 bytes (10 x 32-bit); mirrored by lnt::ShadingUniforms.
+ *   display_mode   0 RGB, 1 Intensity, 2 Elevation, 3 Classification, 4 NormalShading
+ *                  (the LNT enumeration - NOT NkvDisplayMode; the engine maps it)
+ *   color_ramp     0 Grayscale, 1 Hue (blue->green->red), 2 BlueRed, 3 LandTopo
+ *   elevation_*    world Z the elevation ramp spans
+ *   intensity_*    fractions 0..1 of the stored intensity range (8-bit: x255)
+ *   light_direction  direction the light TRAVELS (toward the scene); NormalShading
+ *   edl_strength   Eye-Dome Lighting, 0 = off (about 0.4 is a good start); NormalShading
+ * NormalShading shades with normals reconstructed from the depth buffer (a streamed
+ * .lnt stores none) and multiplies the CLASS colour, as Instant Shaded Class does. */
+typedef struct NkvShadingUniforms {
+    uint32_t display_mode;
+    uint32_t color_ramp;
+    float elevation_min;
+    float elevation_max;
+    float intensity_min;
+    float intensity_max;
+    float light_direction[3];
+    float edl_strength;
+} NkvShadingUniforms;
+NKV_API int nkv_set_shading_mode(NkvHandle handle, const NkvShadingUniforms* config);
+
+/* Cross-section clip volume: plane_count (<= 4) A,B,C,D quadruples in RENDER space
+ * (world - render origin); kept side is A*x+B*y+C*z+D >= 0. 0 planes = off. */
+NKV_API int nkv_set_clip_volume(NkvHandle handle, const float* planes, uint32_t plane_count);
 NKV_API uint64_t nkv_get_class_visibility_update_count(NkvHandle handle);
 
 /* Lighting for NKV_DISPLAY_SHADED_CLASS_INSTANT. azimuth_deg is the compass
@@ -365,6 +397,18 @@ NKV_API int nkv_set_surface_indexed_blocks(NkvHandle handle, const double* posit
     uint64_t vertices, const uint32_t* indices, uint64_t triangles,
     const uint8_t* cell_rgb, const uint32_t* block_index_counts, uint32_t blocks,
     uint64_t dataset_revision, uint64_t surface_revision);
+// RGB per vertex; interpolated in sRGB then converted to linear in fragment stage.
+NKV_API int nkv_set_surface_indexed_blocks_vc(NkvHandle handle, const double* positions,
+    uint64_t vertices, const uint32_t* indices, uint64_t triangles,
+    const uint8_t* vertex_rgb, const uint32_t* block_index_counts, uint32_t blocks,
+    uint64_t dataset_revision, uint64_t surface_revision);
+NKV_API int nkv_set_surface_complete(NkvHandle handle, const double* positions,
+    uint64_t vertices, const uint32_t* indices, uint64_t triangles,
+    const uint8_t* cell_rgb, const uint8_t* vertex_rgb,
+    const uint32_t* block_index_counts, uint32_t blocks,
+    const double* coverage_positions, const uint8_t* coverage_rgb, uint64_t coverage_count,
+    uint64_t dataset_revision, uint64_t surface_revision);
+
 /* 0 = points only, 1 = Surface only. Intended for the streaming mode owner. */
 NKV_API int nkv_set_streaming_surface_active(NkvHandle handle, int active);
 /* DEV-only raster diagnostic. Does not rebuild/upload geometry. Returns 0
@@ -471,13 +515,33 @@ NKV_API int nkv_set_shading_parameters(NkvHandle handle, int formula /* NkvShade
  * measured in the existing Python geometry backend, not the ~1.8s Delaunay
  * stage.
  *
- * Returns 1 on success, 0 on failure. */
+ * Returns 1 on success, 0 on failure. A successful call also RETIRES any
+ * resident tiled (LOD/culling) set: the crisp mesh is presented through
+ * SurfaceRenderer::Record()'s single-mesh branch, which is unreachable while a
+ * tiled set is live, so "Surface elevation -> Shaded Classification" must make
+ * this upload the presented surface. */
 NKV_API int nkv_set_shaded_class_surface(NkvHandle handle,
                                           const double* positions, uint64_t vertex_count,
                                           const int32_t* faces, uint64_t face_count,
                                           const uint8_t* vertex_class_id,
                                           const uint8_t* class_color_lut /* 256*3 RGB */,
                                           const int32_t* mixed_face_ids, uint64_t mixed_face_count);
+
+/* Compact crisp shaded-class surface: shared vertices + one index buffer (~28 B per
+ * point of VRAM), drawn once with surface.frag built as CRISP_INDEXED. Same inputs as
+ * nkv_set_shaded_class_surface, plus the unmeshed coverage points (xyz doubles and RGB
+ * bytes) that are drawn as points so no point of the cut is missing. */
+NKV_API int nkv_set_shaded_class_surface_blocks(NkvHandle handle,
+    const double* positions,uint64_t vertex_count,const int32_t* faces,
+    const uint32_t* block_counts,uint32_t block_count);
+NKV_API int nkv_set_shaded_class_surface_indexed(NkvHandle handle,
+                                                  const double* positions, uint64_t vertex_count,
+                                                  const int32_t* faces, uint64_t face_count,
+                                                  const uint8_t* vertex_class_id,
+                                                  const uint8_t* class_color_lut,
+                                                  const double* coverage_positions,
+                                                  const uint8_t* coverage_rgb,
+                                                  uint64_t coverage_count);
 
 /* Push-constant only - never touches the buffers uploaded by
  * nkv_set_shaded_class_surface. sharpness_raw is the raw 0..999 Sharpness
@@ -489,6 +553,46 @@ NKV_API int nkv_set_crisp_shading_parameters(NkvHandle handle,
                                               float azimuth_deg, float sharpness_raw,
                                               float ambient,
                                               float key_intensity, float fill_intensity);
+
+/* ---- Viewport-LOD surface tiles (compact crisp look, independently resident) -----
+ *
+ * A tile arena replaces the single compact crisp mesh: tiles are uploaded, evicted and
+ * drawn individually, so a pan/zoom never re-uploads the visible surface. Positions are
+ * world doubles (converted with the pinned render origin), faces are LOCAL vertex
+ * indices, vertex/coverage colours come from the palette set by
+ * nkv_surface_tiles_set_palette (coverage colour = palette * coverage_shade).
+ * nkv_surface_tiles_configure releases every other surface resource; any other surface
+ * upload releases the arena (nkv_surface_tiles_active then reports 0). */
+typedef struct NkvSurfaceTileDesc {
+    uint64_t key;
+    const double* positions;            /* vertex_count * 3 */
+    const uint8_t* vertex_class;        /* vertex_count */
+    const int32_t* faces;               /* face_count * 3 local indices */
+    const double* coverage_positions;   /* coverage_count * 3 (may be null when 0) */
+    const uint8_t* coverage_class;      /* coverage_count */
+    uint32_t vertex_count, face_count, coverage_count;
+    int32_t result;                     /* out: 1 resident, 0 rejected, -1 arena full */
+} NkvSurfaceTileDesc;
+typedef struct NkvSurfaceTileDraw {
+    uint64_t key;
+    uint32_t first_face, face_count;    /* tile-local triangle range */
+    uint32_t coverage, _pad;            /* 1 = also draw the tile's coverage points */
+} NkvSurfaceTileDraw;
+NKV_API int nkv_surface_tiles_configure(NkvHandle handle, uint64_t vertex_capacity,
+                                        uint64_t face_capacity, uint64_t coverage_capacity);
+NKV_API int nkv_surface_tiles_release(NkvHandle handle);
+NKV_API int nkv_surface_tiles_active(NkvHandle handle);
+/* Uploads a batch through one staging submit; returns how many became resident. */
+NKV_API int nkv_surface_tiles_upload(NkvHandle handle, NkvSurfaceTileDesc* tiles, uint32_t count);
+NKV_API int nkv_surface_tiles_evict(NkvHandle handle, const uint64_t* keys, uint32_t count);
+NKV_API int nkv_surface_tiles_set_palette(NkvHandle handle, const uint8_t* lut_rgb /* 256*3 */,
+                                          float coverage_shade);
+NKV_API int nkv_surface_tiles_set_draw_list(NkvHandle handle, const NkvSurfaceTileDraw* items,
+                                            uint32_t count);
+/* out[0..15]: resident tiles, vertices used/capacity, faces used/capacity, coverage
+ * used/capacity, drawn tiles/faces/coverage (last frame), uploads, upload bytes, arena
+ * bytes, evictions, draw calls (last frame), palette recolours. */
+NKV_API int nkv_surface_tiles_get_stats(NkvHandle handle, uint64_t* out, uint32_t count);
 
 /* ---- GPU class-colour LUT (Phase C) -------------------------------------
  *
@@ -665,6 +769,14 @@ NKV_API int nkv_upload_point_tile(NkvHandle handle, uint64_t first, uint64_t cou
                                   const uint8_t* classification,
                                   const float* intensity,
                                   const uint8_t* normals_oct16);
+/* Same as nkv_upload_point_tile plus an optional true-colour stream: rgb8 is count*3
+ * bytes (R,G,B per point). It feeds the RGB display mode of a streamed cloud. */
+NKV_API int nkv_upload_point_tile_ex(NkvHandle handle, uint64_t first, uint64_t count,
+                                     const double* xyz_world_f64,
+                                     const uint8_t* classification,
+                                     const float* intensity,
+                                     const uint8_t* normals_oct16,
+                                     const uint8_t* rgb8);
 NKV_API uint64_t nkv_get_point_capacity(NkvHandle handle);
 NKV_API uint64_t nkv_get_arena_uploaded_tiles(NkvHandle handle);
 NKV_API uint32_t nkv_get_point_draw_range_count(NkvHandle handle);

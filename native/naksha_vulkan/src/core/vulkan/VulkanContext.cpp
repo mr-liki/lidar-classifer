@@ -174,7 +174,7 @@ void VulkanContext::PrintDiagnostics() const {
             report_.deviceName.c_str(), report_.vendorId, report_.deviceId,
             report_.deviceType, maj, min, patch, report_.driverVersion,
             static_cast<unsigned long long>(report_.vramBytes / (1024 * 1024)),
-            report_.timestampPeriodNs, report_.timestampValidBits,
+            static_cast<double>(report_.timestampPeriodNs), report_.timestampValidBits,
             static_cast<unsigned long long>(report_.minUniformBufferOffsetAlignment),
             static_cast<unsigned long long>(report_.nonCoherentAtomSize),
             report_.maxPointSize,

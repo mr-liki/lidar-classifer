@@ -3491,57 +3491,73 @@ import threading
 import concurrent.futures
 UNIFIED_ACTOR_NAME = "_naksha_unified_cloud"
 MAIN_INTERACTION_ACTOR_NAME = "_naksha_main_interaction_lod"
+MAIN_TILE_ACTOR_PREFIX = "_naksha_main_tile_"
+MAIN_TILE_LOD_ACTOR_PREFIX = "_naksha_main_tile_lod_"
+MAIN_TILE_MODE_THRESHOLD = 12_000_000
 
 
-# ── PERFORMANCE PHASE 1: VTK LiDAR suppression ───────────────────────────
-# Counters surfaced in [VULKAN PERFORMANCE] so the duplicate pipeline can be
-# proven gone rather than assumed gone.
-_VTK_LIDAR_SKIPPED_BUILDS = 0
-_VTK_LIDAR_SKIPPED_POINTS = 0
-_VTK_LIDAR_BUILT = 0
+def _phase1_changed_indices(app, changed_mask=None, changed_indices=None, delta=None):
+    """Resolve a classification transaction to sparse canonical point IDs."""
+    from gui.classification_delta import resolve_changed_indices
+    source = delta if delta is not None else changed_mask
+    return resolve_changed_indices(source, changed_indices=changed_indices, app=app)
 
 
-def _vulkan_owns_lidar(app) -> bool:
-    """True when Vulkan is the sole LiDAR renderer, so VTK must not build one.
+def _map_global_changed_to_local(
+    global_indices,
+    changed_indices,
+    *,
+    assume_sorted: bool = False,
+    cache_owner=None,
+):
+    """Map sparse canonical IDs to actor-local IDs without an N-sized lookup.
 
-    Delegates to the single runtime check on the backend owner. Any failure
-    (no backend, no such method, an exception) resolves to False so the VTK
-    path keeps working - this is an optimisation, never a correctness
-    dependency.
+    Crucially, this never checks sortedness by scanning ``global_indices`` on
+    every edit. Main-view canonical/LOD maps are created in increasing order and
+    call with ``assume_sorted=True``. Section maps can concatenate core+buffer
+    indices, so they build a section-sized sorted lookup once and cache it on the
+    actor.
     """
-    try:
-        rb = getattr(app, "render_backend", None)
-        if rb is None:
-            return False
-        fn = getattr(rb, "vulkan_owns_lidar_viewport", None)
-        if fn is None:
-            return False
-        return bool(fn())
-    except Exception:
-        return False
+    gi = np.asarray(global_indices, dtype=np.int64).ravel()
+    ci = np.asarray(changed_indices, dtype=np.int64).ravel()
+    if gi.size == 0 or ci.size == 0:
+        return np.empty(0, dtype=np.int64)
 
+    if assume_sorted:
+        sorted_ids = gi
+        sorted_local = None
+    else:
+        sorted_ids = None
+        sorted_local = None
+        cache_key = (id(global_indices), int(gi.size))
+        if cache_owner is not None:
+            if getattr(cache_owner, "_naksha_sparse_map_key", None) == cache_key:
+                sorted_ids = getattr(cache_owner, "_naksha_sparse_sorted_ids", None)
+                sorted_local = getattr(cache_owner, "_naksha_sparse_sorted_local", None)
+        if sorted_ids is None or sorted_local is None:
+            # O(M log M) once per section actor, where M is section size -- not
+            # O(project_points) per classification. Stable sort preserves a
+            # deterministic local ID if legacy data contains duplicates.
+            sorted_local = np.argsort(gi, kind="stable").astype(np.int64, copy=False)
+            sorted_ids = gi[sorted_local]
+            if cache_owner is not None:
+                cache_owner._naksha_sparse_map_key = cache_key
+                cache_owner._naksha_sparse_sorted_ids = sorted_ids
+                cache_owner._naksha_sparse_sorted_local = sorted_local
 
-def _note_vtk_lidar_skipped(app, n_pts: int) -> None:
-    """Record and report one deliberately skipped VTK LiDAR build."""
-    global _VTK_LIDAR_SKIPPED_BUILDS, _VTK_LIDAR_SKIPPED_POINTS
-    _VTK_LIDAR_SKIPPED_BUILDS += 1
-    _VTK_LIDAR_SKIPPED_POINTS += int(n_pts or 0)
-    try:
-        app._naksha_vtk_lidar_skipped = True
-    except Exception:
-        pass
-    print(f"   \u2b1c VTK LiDAR build SKIPPED ({int(n_pts or 0):,} pts) - "
-          f"Vulkan owns the LiDAR viewport; no PolyData/mapper/actor/GL upload")
-
-
-def vtk_lidar_build_counters() -> dict:
-    """(built, skipped, skipped_points) for [VULKAN PERFORMANCE]."""
-    return {
-        "built": _VTK_LIDAR_BUILT,
-        "skipped": _VTK_LIDAR_SKIPPED_BUILDS,
-        "skipped_points": _VTK_LIDAR_SKIPPED_POINTS,
-    }
-
+    pos = np.searchsorted(sorted_ids, ci)
+    valid = pos < sorted_ids.size
+    if not np.any(valid):
+        return np.empty(0, dtype=np.int64)
+    pos_valid = pos[valid]
+    ci_valid = ci[valid]
+    matched = sorted_ids[pos_valid] == ci_valid
+    if not np.any(matched):
+        return np.empty(0, dtype=np.int64)
+    pos_valid = pos_valid[matched]
+    if sorted_local is None:
+        return pos_valid.astype(np.int64, copy=False)
+    return sorted_local[pos_valid].astype(np.int64, copy=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -3905,35 +3921,67 @@ def _safe_direct_render(vtk_widget) -> bool:
         return False
 
 
-def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason="",
-                                       old_classes=None, new_classes=None,
-                                       origin_view="unknown") -> bool:
-    """
-    Commit-time safety net for main-view visual flushes.
-
-    Validates the changed mask, refreshes the active main actor in-place, forces
-    VTK dirty flags, and performs one immediate non-throttled render.
-    """
+def guarantee_main_view_visual_refresh(
+    app,
+    changed_mask=None,
+    to_class=None,
+    reason="",
+    old_classes=None,
+    new_classes=None,
+    origin_view="unknown",
+    changed_indices=None,
+    delta=None,
+) -> bool:
+    """Commit-time sparse Main View visual flush; legacy masks remain supported."""
     if app is None or not hasattr(app, "data") or not app.data:
         return False
-
     classification = app.data.get("classification")
     if classification is None:
         return False
 
-    changed_mask = np.asarray(changed_mask) if changed_mask is not None else None
-    if changed_mask is None or changed_mask.dtype != bool:
-        return False
-    if changed_mask.ndim != 1 or len(changed_mask) != len(classification):
-        return False
-
-    changed_count = int(np.count_nonzero(changed_mask))
-    if changed_count <= 0:
+    ci = _phase1_changed_indices(
+        app, changed_mask=changed_mask, changed_indices=changed_indices, delta=delta
+    )
+    if ci.size == 0:
         return False
 
-    changed_indices = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
-    app._last_changed_mask = changed_mask
-    app._last_changed_indices = changed_indices.copy()
+    try:
+        from gui.classification_delta import make_delta, publish_delta
+        sparse_delta = delta if hasattr(delta, "indices") else None
+        if sparse_delta is None:
+            sparse_delta = make_delta(
+                app, ci, old_classes=old_classes, new_classes=new_classes,
+                operation=reason or "classification", origin_view=origin_view,
+            )
+        publish_delta(app, sparse_delta)
+    except Exception:
+        sparse_delta = delta
+        app._last_changed_indices = ci.copy()
+        app._last_changed_mask = None
+
+    changed_count = int(ci.size)
+
+    # Phase 2 render-tile foundation: map only the sparse changed canonical ids
+    # to shared spatial cells.  The current monolithic actor is still retained
+    # for strict visual compatibility, but dirty-cell state is now authoritative
+    # and ready for the subsequent tiled GPU actor switch without changing the
+    # classification transaction API again.
+    phase2_dirty_cells = np.empty(0, dtype=np.uint32)
+    try:
+        from gui.spatial_index import get_cached_index
+        _xyz = app.data.get("xyz")
+        _sidx = get_cached_index(_xyz) if _xyz is not None else None
+        if _sidx is not None and getattr(_sidx, "method", "") == "grid2d":
+            phase2_dirty_cells = _sidx.dirty_cells_for_indices(ci)
+            _pending = getattr(app, "_phase2_dirty_spatial_cells", None)
+            if _pending is None or len(_pending) == 0:
+                app._phase2_dirty_spatial_cells = phase2_dirty_cells.copy()
+            elif phase2_dirty_cells.size:
+                app._phase2_dirty_spatial_cells = np.union1d(
+                    np.asarray(_pending, dtype=np.uint32), phase2_dirty_cells
+                )
+    except Exception as _dirty_exc:
+        print(f"PHASE2_DIRTY_CELLS status=failed error={_dirty_exc}")
 
     display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
     fast_update = False
@@ -3941,142 +3989,166 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
     render_ok = False
     actor = None
     surface_owns_present = False
+    legacy_mask = None
 
     try:
         if display_mode == "class":
-            # A commit can contain values produced by a height/fence operation,
-            # undo/redo, or another batched classifier.  ``app.to_class`` is a
-            # persistent shortcut selection and can therefore be stale here.
-            # Patch both GPU buffers from the canonical classification array;
-            # never repaint a committed mask from the shortcut hint.
             actor = _get_unified_actor(app)
-            if actor is not None:
-                global_indices = getattr(app, "_main_global_indices", None)
-                if global_indices is not None:
-                    local_changed = np.flatnonzero(changed_mask[global_indices])
+            already_patched = bool(getattr(app, "_gpu_sync_done", False))
+            if _is_main_tiled(app):
+                if not already_patched:
+                    tu, tp = _patch_main_tile_actors(app, ci)
+                    app._phase2b_last_tile_updates = (tu, tp)
+                    dirty_flags = tu > 0
                 else:
-                    local_changed = changed_indices
+                    dirty_flags = actor is not None
+                fast_update = actor is not None
+            elif actor is not None and not already_patched:
+                global_indices = getattr(app, "_main_global_indices", None)
+                local_changed = (
+                    _map_global_changed_to_local(global_indices, ci, assume_sorted=True)
+                    if global_indices is not None else ci
+                )
                 if local_changed.size > 0:
                     _patch_actor_memory(app, actor, local_changed, slot_idx=0)
                 fast_update = True
+                dirty_flags = True
+            elif actor is not None:
+                fast_update = True
+                dirty_flags = True
+
         elif display_mode == "shaded_class":
             try:
-                from gui.shading_display import (
-                    ClassificationDelta,
-                    refresh_shaded_after_classification_fast,
-                )
-
-                delta = None
+                from gui.classification_delta import materialize_changed_mask
+                from gui.shading_display import ClassificationDelta, refresh_shaded_after_classification_fast
+                if bool(getattr(app, "_large_shading_tiled", False)):
+                    # The tiled large-cloud path consumes canonical sparse IDs
+                    # directly. Avoid allocating/scanning a dataset-sized bool
+                    # mask (47 MB for the current production cloud) per stroke.
+                    legacy_mask = (
+                        sparse_delta if sparse_delta is not None else ci
+                    )
+                else:
+                    legacy_mask = materialize_changed_mask(
+                        app, sparse_delta if sparse_delta is not None else ci,
+                        reason="shaded_class_compat",
+                    )
+                shading_delta = None
                 if old_classes is not None and new_classes is not None:
-                    delta = ClassificationDelta(
-                        changed_indices=changed_indices,
+                    shading_delta = ClassificationDelta(
+                        changed_indices=ci,
                         old_classes=np.asarray(old_classes),
                         new_classes=np.asarray(new_classes),
                         operation=reason or "classification",
                         origin_view=origin_view,
                     )
+                elif (sparse_delta is not None and
+                      getattr(sparse_delta, "old_classes", None) is not None and
+                      getattr(sparse_delta, "new_classes", None) is not None):
+                    # The Phase-1 transaction already owns the authoritative
+                    # before/after values. Preserve them for single-class
+                    # shading; a bool mask alone cannot tell whether vertices
+                    # entered or left the visible ground subset.
+                    shading_delta = ClassificationDelta(
+                        changed_indices=np.asarray(
+                            sparse_delta.indices, dtype=np.int64
+                        ),
+                        old_classes=np.asarray(sparse_delta.old_classes),
+                        new_classes=np.asarray(sparse_delta.new_classes),
+                        operation=getattr(
+                            sparse_delta, "operation", None
+                        ) or reason or "classification",
+                        origin_view=getattr(
+                            sparse_delta, "origin_view", None
+                        ) or origin_view,
+                    )
                 elif getattr(app, "_pending_shading_delta", None) is not None:
                     pending = app._pending_shading_delta
-                    pending_idx = np.asarray(
-                        pending.changed_indices, dtype=np.int64
-                    ).ravel()
-                    if np.array_equal(pending_idx, changed_indices):
-                        delta = pending
+                    pending_idx = np.asarray(pending.changed_indices, dtype=np.int64).ravel()
+                    if np.array_equal(pending_idx, ci):
+                        shading_delta = pending
                         app._pending_shading_delta = None
-                refresh_shaded_after_classification_fast(
-                    app, changed_mask, delta=delta
-                )
+                ok = refresh_shaded_after_classification_fast(app, legacy_mask, delta=shading_delta)
+                if ok:
+                    try:
+                        from gui.shading_display import mark_active_shading_delta_applied
+                        mark_active_shading_delta_applied(app)
+                    except Exception as exc:
+                        print(f"SHADING_DELTA_JOURNAL status=stamp_failed reason={exc}")
                 actor = getattr(app, "_shaded_mesh_actor", None)
-                fast_update = True
-            except Exception:
+                fast_update = bool(ok)
+            except Exception as exc:
+                print(
+                    "SHADING_CLASSIFICATION_REFRESH status=failed "
+                    f"reason={type(exc).__name__}:{exc}"
+                )
                 fast_update = False
+
         elif display_mode == "surface":
             try:
+                from gui.classification_delta import materialize_changed_mask
+                legacy_mask = materialize_changed_mask(
+                    app, sparse_delta if sparse_delta is not None else ci,
+                    reason="surface_compat",
+                )
                 refresh_fn = getattr(app, "refresh_surface_after_classification", None)
                 if callable(refresh_fn):
-                    refresh_fn(reason="main_view_commit", changed_mask=changed_mask)
+                    refresh_fn(reason="main_view_commit", changed_mask=legacy_mask)
                 else:
                     from gui.surface_mode import refresh_surface_after_classification
                     refresh_surface_after_classification(
-                        app, changed_mask, operation="main_view_commit", delay_ms=0
+                        app, legacy_mask, operation="main_view_commit", delay_ms=0
                     )
                 fast_update = True
-                # Surface classification refresh owns Surface presentation.
-                # - no-topology edit: nothing in main view changed, do NOT redraw
-                # - exact rebuild: render_surface_mode already presents the mesh
-                # - debounced topology edit: timer will present when ready
                 surface_owns_present = True
                 actor = getattr(app, "_surface_mesh_actor", None)
             except Exception:
                 fast_update = False
                 surface_owns_present = False
 
-        # Never dirty the hidden unified point actor while Surface is active.
-        # Doing so used to turn a metadata-only classification into a large VTK
-        # upload/render even after Surface itself correctly skipped rebuilding.
-        if display_mode != "surface":
+        if display_mode not in ("surface", "class"):
             actor = actor or _get_unified_actor(app)
             if actor is not None:
                 mesh = getattr(actor, "_naksha_mesh", None)
                 vtk_ca = getattr(actor, "_naksha_vtk_array", None)
                 mapper = actor.GetMapper() if hasattr(actor, "GetMapper") else None
                 if vtk_ca is not None:
-                    vtk_ca.Modified()
-                    dirty_flags = True
+                    vtk_ca.Modified(); dirty_flags = True
                 if mesh is not None:
-                    mesh.GetPointData().Modified()
-                    mesh.Modified()
-                    dirty_flags = True
+                    mesh.GetPointData().Modified(); mesh.Modified(); dirty_flags = True
                 if mapper is not None:
-                    mapper.Modified()
-                    dirty_flags = True
-                actor.Modified()
-                dirty_flags = True
-    except Exception as e:
-        print(f"⚠️ guarantee_main_view_visual_refresh prep failed: {e}")
+                    mapper.Modified(); dirty_flags = True
+                actor.Modified(); dirty_flags = True
+    except Exception as exc:
+        print(f"⚠️ guarantee_main_view_visual_refresh prep failed: {exc}")
 
     vtk_widget = getattr(app, "vtk_widget", None)
-    defer_cross_shaded_present = (
-        display_mode == "shaded_class"
-        and reason == "cross_section_gpu_commit"
-    )
+    defer_cross_shaded_present = display_mode == "shaded_class" and reason == "cross_section_gpu_commit"
+    if display_mode == "class" and _is_main_tiled(app):
+        app._main_tiles_mode_visible = True
+        update_main_tile_visibility(app)
     render_started = time.perf_counter()
     if display_mode == "surface" and surface_owns_present:
-        # Surface refresh either changed nothing, already presented an exact
-        # rebuild, or scheduled the exact rebuild.  No synchronous giant-mesh
-        # redraw is required here.
         render_ok = True
     elif defer_cross_shaded_present:
-        # A full faceted draw can take 100+ ms with every class visible. The
-        # canonical buffers are already patched above; let the mouse event
-        # finish, then coalesce rapid cross-section commits into one draw.
         try:
             from gui.shading_display import _schedule_fast_shaded_present
-            pending_present = getattr(app, "_shading_present_timer", None)
-            if pending_present is not None:
+            pending = getattr(app, "_shading_present_timer", None)
+            if pending is not None:
                 try:
-                    pending_present.stop()
-                    pending_present.deleteLater()
+                    pending.stop(); pending.deleteLater()
                 except Exception:
                     pass
                 app._shading_present_timer = None
-            _schedule_fast_shaded_present(
-                app,
-                delay_ms=80,
-                restart=True,
-                wait_while_preview=True,
-            )
+            _schedule_fast_shaded_present(app, delay_ms=80, restart=True, wait_while_preview=True)
             render_ok = True
         except Exception:
             render_ok = _safe_direct_render(vtk_widget)
     else:
-        # A shaded local patch may have scheduled a presentation for direct
-        # callers. A synchronous commit owns presentation, so cancel its copy.
-        pending_present = getattr(app, "_shading_present_timer", None)
-        if pending_present is not None:
+        pending = getattr(app, "_shading_present_timer", None)
+        if pending is not None:
             try:
-                pending_present.stop()
-                pending_present.deleteLater()
+                pending.stop(); pending.deleteLater()
             except Exception:
                 pass
             app._shading_present_timer = None
@@ -4089,33 +4161,37 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
             getattr(app, "_section_visibility_refresh_required", False)
         )
 
-    # A cross-section can independently be in Shaded/Surface mode regardless
-    # of Main View's own display_mode (handled above) -- this function is the
-    # single place every classify/undo/redo commit path funnels through to
-    # refresh Main View, so it is also the single place to refresh any open
-    # section's mesh actor, instead of patching every individual call site.
-    # Reads app.data["classification"] directly (already updated by the time
-    # this function runs), so it does not depend on Main View's own render.
     try:
-        from gui.cross_section.section_shaded_surface import (
-            refresh_all_shaded_surface_sections_after_classify,
-        )
+        from gui.cross_section.section_shaded_surface import refresh_all_shaded_surface_sections_after_classify
         refresh_all_shaded_surface_sections_after_classify(app)
-    except Exception as _section_mesh_err:
-        print(f"   ⚠️ Section Shaded/Surface refresh-after-commit failed: {_section_mesh_err}")
+    except Exception as exc:
+        print(f"   ⚠️ Section Shaded/Surface refresh-after-commit failed: {exc}")
 
     commit_id = int(getattr(app, "_main_refresh_commit_id", 0)) + 1
     app._main_refresh_commit_id = commit_id
-    if commit_id <= 20:
+    if commit_id <= 40:
         print(
-            f"MAIN_REFRESH_GUARANTEE source=canonical_classification_array reason={reason} mode={display_mode} "
-            f"changed={changed_count} fast_update={bool(fast_update)} "
-            f"dirty_flags={bool(dirty_flags)} render={bool(render_ok)} "
-            f"deferred={bool(defer_cross_shaded_present)} "
-            f"render_ms={render_ms:.1f} "
-            f"gpu_sync_done_before={bool(getattr(app, '_gpu_sync_done', False))}"
+            f"MAIN_REFRESH_GUARANTEE source=sparse_classification_delta reason={reason} mode={display_mode} "
+            f"changed={changed_count} fast_update={bool(fast_update)} dirty_flags={bool(dirty_flags)} "
+            f"render={bool(render_ok)} deferred={bool(defer_cross_shaded_present)} "
+            f"render_ms={render_ms:.1f} legacy_mask={int(legacy_mask is not None)}"
         )
-
+        if phase2_dirty_cells.size:
+            print(
+                "PHASE2_DIRTY_CELLS status=recorded "
+                f"changed={changed_count} cells={phase2_dirty_cells.size}"
+            )
+        if display_mode == "class" and _is_main_tiled(app):
+            tu, tp = getattr(app, '_phase2b_last_tile_updates', (0, 0))
+            print(
+                "PHASE2B_CLASS_REFRESH status=ok "
+                f"changed={changed_count} tiles_patched={tu} points_patched={tp} "
+                f"tiles_visible={getattr(app, '_main_visible_tile_count', 0)} "
+                f"lod={int(bool(getattr(app, '_main_lod_active', False)))} "
+                f"source_visible={int(getattr(app, '_main_visible_source_points', 0))} "
+                f"render_points={int(getattr(app, '_main_visible_render_points', 0))} "
+                f"render_ms={render_ms:.1f}"
+            )
     return bool(render_ok)
 
 
@@ -4190,8 +4266,8 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
 
     try:
         from gui.pointcloud_display import (
-            _normalize_rgb_to_uint8, _nakshatech_intensity_rgb,
-            _nakshatech_elevation_rgb, _nakshatech_depth_rgb_from_camera,
+            _normalize_rgb_to_uint8, _microstation_intensity_rgb,
+            _microstation_elevation_rgb, _microstation_depth_rgb_from_camera,
         )
     except Exception:
         return False
@@ -4210,7 +4286,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             raw = data.get("intensity")
             if raw is not None:
                 intens = raw[global_indices].astype(np.float64)
-                colors = _nakshatech_intensity_rgb(
+                colors = _microstation_intensity_rgb(
                     intens,
                     low_pct=getattr(app, "intensity_clip_low", 0.5),
                     high_pct=getattr(app, "intensity_clip_high", 99.8),
@@ -4220,7 +4296,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             xyz = data.get("xyz")
             if xyz is not None:
                 z = xyz[global_indices, 2]
-                colors = _nakshatech_elevation_rgb(
+                colors = _microstation_elevation_rgb(
                     z,
                     color_ramp=getattr(app, "elevation_color_ramp", None),
                     low_pct=getattr(app, "elevation_clip_low", 1.0),
@@ -4231,7 +4307,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             cam = vtk_widget.renderer.GetActiveCamera() if vtk_widget is not None else None
             if xyz is not None and cam is not None:
                 pts = xyz[global_indices]
-                colors = _nakshatech_depth_rgb_from_camera(
+                colors = _microstation_depth_rgb_from_camera(
                     pts, cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
                     high_pct=getattr(app, "depth_clip_high", 99.0),
@@ -4574,6 +4650,15 @@ def _push_uniforms_direct(actor, ctx: 'ViewShaderContext') -> bool:
                 v_uni.SetUniform1fv("weight_lut",     256, ctx.wt_as_list())
                 v_uni.SetUniformf("border_ring_val", float(ctx.border_ring))
                 v_uni.SetUniformf("structured_border_mode", float(getattr(ctx, 'structured_border_mode', 0.0)))
+                # Phase 2B.6 visual-coverage LOD: sampled overview actors
+                # represent several source points each.  Grow only their sprite
+                # footprint (never the canonical data/query set) so zooming out
+                # preserves visual density instead of making points appear to
+                # disappear. Full-res/section/cut actors default to 1.0.
+                v_uni.SetUniformf(
+                    "lod_coverage_scale",
+                    float(max(1.0, getattr(actor, '_naksha_lod_coverage_scale', 1.0))),
+                )
                 v_uni.Modified()
                 sp.Modified()
 
@@ -4721,6 +4806,18 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
     _shader_contexts[actor_name] = ctx
 
     mesh = getattr(actor, '_naksha_mesh', None)
+    # Tile / LOD / section builds call this BEFORE _wire_actor_metadata stores
+    # _naksha_mesh, so fall back to the mapper's live input.  Without it
+    # has_flight_visibility evaluates to False on those actors, the vertex
+    # shader is finalized without the FlightVisible hide branch, and
+    # flight-line OK/Apply changes silently never reach the rendered points.
+    if mesh is None:
+        try:
+            _m = actor.GetMapper()
+            _raw = _m.GetMapper() if hasattr(_m, 'GetMapper') else _m
+            mesh = _raw.GetInput() if _raw is not None else None
+        except Exception:
+            mesh = None
     _ensure_opengl_polydata_mapper(actor, mesh)
 
     vertex_attr_wired = False
@@ -4798,6 +4895,10 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "    v_core_size  = 0.0;\n"
             "  } else {\n"
             "    float ps = max(1.0, weight_lut[c_idx]);\n"
+            "    // Exact PTC-weight contract: LOD must never enlarge point sprites.\n"
+            "    // Progressive refinement handles transient decimation instead.\n"
+            "    float coverage_scale = 1.0;\n"
+            "    ps = ps * coverage_scale;\n"
             "    if (structured_border_mode > 1.5) {\n"
             "      // HYBRID: every point grows (for the border ring on all points)\n"
             f"      float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
@@ -5122,6 +5223,63 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         return False
 
     palette = palette or _get_slot_palette(app, slot_idx)
+
+    if slot_idx == 0 and _is_main_tiled(app):
+        actors = [a for _, a in _main_tile_all_actor_items(app)]
+        if not actors:
+            return False
+        base_point_size = float(getattr(actors[0], '_naksha_base_point_size', _BASE_POINT_SIZE))
+        ctx = getattr(actors[0], '_naksha_shader_ctx', None) or ViewShaderContext(slot_idx=0)
+        ctx.force_reload()
+        ctx.load_from_palette(palette, float(border), base_point_size)
+        _set_context_border_logic_mode(app, 0, ctx)
+        if rewrite_rgb is None:
+            rewrite_rgb = str(getattr(app, 'display_mode', 'class') or 'class').lower() in ('class', 'shaded_class')
+        classification = app.data.get('classification') if isinstance(getattr(app, 'data', None), dict) else None
+        # Full-resolution and overview-LOD actors own separate VTK buffers.
+        # Keep both representations in the same PTC/class state so a camera
+        # zoom never changes which palette is visible.
+        updated_actors = 0
+        for tile_id, actor in _main_tile_all_actor_items(app):
+            actor._naksha_shader_ctx = ctx
+            if bool(rewrite_rgb) and classification is not None:
+                gi = getattr(actor, '_naksha_global_indices', None)
+                rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
+                if gi is not None and rgb_ptr is not None and _is_writable(rgb_ptr):
+                    tile_cls = classification[np.asarray(gi, dtype=np.int64)]
+                    _rewrite_rgb_from_palette(rgb_ptr, tile_cls, palette)
+                    mesh = getattr(actor, '_naksha_mesh', None)
+                    if mesh is not None:
+                        ca = mesh.GetPointData().GetArray('Classification')
+                        if ca is not None:
+                            cls_np = numpy_support.vtk_to_numpy(ca)
+                            if len(cls_np) == len(tile_cls):
+                                np.copyto(cls_np, tile_cls.astype(cls_np.dtype, copy=False))
+                                ca.Modified(); mesh.GetPointData().Modified()
+                    vtk_ca = getattr(actor, '_naksha_vtk_array', None)
+                    if vtk_ca is not None:
+                        vtk_ca.Modified()
+                    _mark_actor_dirty(actor)
+            if bool(rewrite_rgb):
+                actor._naksha_display_mode = 'class'
+            _push_uniforms_direct(actor, ctx)
+            actor._last_uniform_generation = ctx._generation
+            updated_actors += 1
+        if float(border) > 0.0:
+            app.point_border_percent = float(border)
+        if str(getattr(app, 'display_mode', 'class') or 'class').lower() == 'class':
+            app._main_tiles_mode_visible = True
+        update_main_tile_visibility(app)
+        if render:
+            # Display-Mode Apply is a committed user action. Bypass the normal
+            # interaction debounce so the PTC is visible immediately.
+            _safe_direct_render(vtk_widget)
+        print(
+            f'   ⚡ GPU Sync (Slot 0 tiled): {(time.perf_counter()-t0)*1000.0:.1f} ms '
+            f'tiles={updated_actors} full={len(getattr(app, "_main_tile_actors", {}) or {})} '
+            f'lod={len(getattr(app, "_main_tile_lod_actors", {}) or {})}'
+        )
+        return True
 
     if 1 <= slot_idx <= 4:
         if not hasattr(app, 'view_borders'):
@@ -5490,6 +5648,12 @@ def fast_palette_refresh(
 ) -> bool:
     t0 = time.perf_counter()
 
+    if _is_main_tiled(app):
+        return bool(sync_palette_to_gpu(
+            app, slot_idx=0, palette=palette or getattr(app, "class_palette", {}),
+            border=float(border_percent), render=True, rewrite_rgb=True
+        ))
+
     actor = _get_unified_actor(app)
     if actor is None:
         return False
@@ -5698,6 +5862,1441 @@ def _restore_snt_overlays(app):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2B — SPATIAL MAIN RENDER TILES
+# ─────────────────────────────────────────────────────────────────────────────
+def _main_tile_point_limit(app) -> int:
+    raw = str(os.getenv("NAKSHA_MAIN_TILE_POINTS", "")).replace(",", "").strip()
+    if raw:
+        try:
+            return max(250_000, min(10_000_000, int(raw)))
+        except Exception:
+            pass
+    try:
+        from gui.gpu_support import get_gpu_support
+        mb = int(getattr(get_gpu_support(), "gpu_memory_mb", 0) or 0)
+        if mb >= 12_000:
+            return 4_000_000
+        if mb >= 8_000:
+            return 3_000_000
+    except Exception:
+        pass
+    return 2_000_000
+
+
+
+
+def _main_tile_lod_point_limit(app) -> int:
+    """Maximum points in an overview LOD actor for one spatial tile."""
+    raw = str(os.getenv("NAKSHA_MAIN_LOD_TILE_POINTS", "")).replace(",", "").strip()
+    if raw:
+        try:
+            return max(50_000, min(1_000_000, int(raw)))
+        except Exception:
+            pass
+    try:
+        from gui.gpu_support import get_gpu_support
+        mb = int(getattr(get_gpu_support(), "gpu_memory_mb", 0) or 0)
+        if mb >= 12_000:
+            return 500_000
+        if mb >= 8_000:
+            return 300_000
+    except Exception:
+        pass
+    # GTX 1660 / 6GB class default: ~24 tiles on a 47M cloud -> ~4.8M
+    # overview points, which is far cheaper to redraw than 47M.
+    return 200_000
+
+
+def _main_render_point_budget(app) -> int:
+    """Screen-render budget; source data/classification always stays full-res."""
+    raw = str(os.getenv("NAKSHA_MAIN_RENDER_POINT_BUDGET", "")).replace(",", "").strip()
+    if raw:
+        try:
+            return max(1_000_000, min(50_000_000, int(raw)))
+        except Exception:
+            pass
+    try:
+        from gui.gpu_support import get_gpu_support
+        mb = int(getattr(get_gpu_support(), "gpu_memory_mb", 0) or 0)
+        if mb >= 12_000:
+            return 15_000_000
+        if mb >= 8_000:
+            return 10_000_000
+    except Exception:
+        pass
+    return 6_000_000
+
+
+def _main_lod_policy(app=None) -> str:
+    """Main-view LOD policy.
+
+    ``interaction`` (default) is progressive-refinement mode: overview actors
+    may be used only while the camera is actively moving.  The first settled
+    frame, and every classification/editing frame, always uses the exact full
+    tile actors.  This keeps all visible source points present at every settled
+    zoom level without giving up fluid pan/wheel interaction.
+
+    ``off`` disables point-decimating LOD entirely. ``budget`` keeps the old
+    Phase-2B behaviour for A/B benchmarking.
+    """
+    raw = str(os.getenv("NAKSHA_MAIN_LOD_POLICY", "interaction")).strip().lower()
+    if raw in ("off", "none", "full", "exact", "0", "false"):
+        return "off"
+    if raw in ("budget", "legacy", "always"):
+        return "budget"
+    return "interaction"
+
+
+def _main_camera_interacting(app) -> bool:
+    mgr = getattr(app, "gpu_render_manager", None)
+    if mgr is None:
+        return False
+    return bool(
+        getattr(mgr, "_interaction_active", False)
+        or getattr(mgr, "_pan_in_progress", False)
+    )
+
+
+def _main_classification_active(app) -> bool:
+    # ``active_classify_tool`` is the authoritative app-level lifecycle flag.
+    # Do not use ClassPicker visibility alone: it can remain alive/hidden across
+    # tool transitions and would unnecessarily force full rendering.
+    return bool(getattr(app, "active_classify_tool", None))
+
+
+def _main_visual_lod_coverage_enabled(app=None) -> bool:
+    """Legacy compatibility flag. Sprite growth is disabled by default.
+
+    Phase 2B.6 tried to hide proxy sparsity by increasing point size.  That
+    changes the visual meaning of PTC weights and is not acceptable for an
+    editing view.  Phase 2B.7 keeps the uniform for compatibility but uses
+    exact point-size semantics (scale 1.0).
+    """
+    raw = str(os.getenv("NAKSHA_MAIN_LOD_VISUAL_COVERAGE", "0")).strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _main_visual_lod_coverage_max(app=None) -> float:
+    """Maximum point-sprite growth used by overview proxy actors."""
+    raw = str(os.getenv("NAKSHA_MAIN_LOD_COVERAGE_MAX", "3.0")).strip()
+    try:
+        return float(max(1.0, min(4.0, float(raw))))
+    except Exception:
+        return 3.0
+
+
+def _build_visual_lod_indices(sidx, desc, gi, classification, limit: int):
+    """Build a spatial/class-preserving overview proxy for one render tile.
+
+    The old ``gi[::step]`` overview was cheap but could make thin/rare classes
+    disappear and left obvious holes when zoomed out.  This sampler keeps the
+    same hard point budget while improving visual continuity:
+
+      * base sample is taken from spatial-cell order (not LAS/canonical order),
+        so representatives are distributed over the tile footprint;
+      * every fine spatial cell contributes class anchors where possible, so a
+        thin line/rare class is far less likely to vanish completely;
+      * final ids are sorted canonically so sparse classification patching can
+        continue to use the existing fast ``searchsorted`` mapping.
+
+    Returns ``(lod_ids, anchor_count, coverage_scale)``.
+    """
+    src = np.asarray(gi, dtype=np.int64).ravel()
+    n = int(src.size)
+    limit = max(1, int(limit))
+    if n <= limit:
+        return src.copy(), 0, 1.0
+
+    try:
+        spatial_ids = sidx.indices_for_cell_rect(
+            desc.ix0, desc.ix1, desc.iy0, desc.iy1, sort_canonical=False
+        )
+        spatial_ids = np.asarray(spatial_ids, dtype=np.int64).ravel()
+        if spatial_ids.size != src.size:
+            spatial_ids = src
+    except Exception:
+        spatial_ids = src
+
+    # Reserve at most 25% of the proxy budget for class-preserving anchors.
+    # This is deliberately bounded so visual continuity never destroys the
+    # render-budget guarantee that made Phase 2B fast.
+    anchor_budget = max(0, min(limit // 4, 50_000))
+    anchor_parts = []
+    if anchor_budget > 0 and getattr(sidx, 'method', '') == 'grid2d':
+        try:
+            # One first-occurrence representative per class/per occupied cell.
+            # The fine grid already targets ~2k points/cell, so this is a small
+            # one-time load cost and strongly protects linear/rare features.
+            for ix in range(int(desc.ix0), int(desc.ix1) + 1):
+                for iy in range(int(desc.iy0), int(desc.iy1) + 1):
+                    cell = ix * int(sidx.ny) + iy
+                    st = int(sidx.cell_offsets[cell])
+                    en = int(sidx.cell_offsets[cell + 1])
+                    if en <= st:
+                        continue
+                    ids = np.asarray(sidx.point_order[st:en], dtype=np.int64)
+                    cls = np.asarray(classification[ids])
+                    if ids.size == 1:
+                        anchor_parts.append(ids[:1])
+                    else:
+                        # np.unique returns classes sorted; first_idx identifies
+                        # one real canonical point for every class in this cell.
+                        _u, first_idx = np.unique(cls, return_index=True)
+                        anchor_parts.append(ids[first_idx])
+        except Exception:
+            anchor_parts = []
+
+    if anchor_parts:
+        anchors = np.unique(np.concatenate(anchor_parts).astype(np.int64, copy=False))
+        if anchors.size > anchor_budget:
+            # Uniformly retain anchors across the concatenated spatial result.
+            take = np.linspace(0, anchors.size - 1, anchor_budget, dtype=np.int64)
+            anchors = anchors[take]
+    else:
+        anchors = np.empty(0, dtype=np.int64)
+
+    base_budget = max(1, limit - int(anchors.size))
+    if spatial_ids.size <= base_budget:
+        base = spatial_ids
+    else:
+        step = max(1, int(np.ceil(float(spatial_ids.size) / float(base_budget))))
+        base = spatial_ids[::step]
+        if base.size > base_budget:
+            base = base[:base_budget]
+
+    if anchors.size:
+        lod_ids = np.unique(np.concatenate((base, anchors)).astype(np.int64, copy=False))
+    else:
+        lod_ids = np.unique(np.asarray(base, dtype=np.int64))
+
+    if lod_ids.size > limit:
+        # Prefer anchors, trim only the density sample first.
+        if anchors.size and anchors.size < limit:
+            remaining = max(0, limit - int(anchors.size))
+            base_only = np.setdiff1d(lod_ids, anchors, assume_unique=True)
+            if base_only.size > remaining:
+                take = np.linspace(0, base_only.size - 1, remaining, dtype=np.int64)
+                base_only = base_only[take]
+            lod_ids = np.unique(np.concatenate((anchors, base_only)))
+        else:
+            take = np.linspace(0, lod_ids.size - 1, limit, dtype=np.int64)
+            lod_ids = lod_ids[take]
+
+    lod_ids.sort()
+    # Exact display-weight contract: overview actors never change point size.
+    # Proxy sparsity is handled by progressive refinement (full actors on every
+    # settled/editing frame), not by making the retained points artificially
+    # larger.  Keep the return value for actor/shader ABI compatibility.
+    coverage_scale = 1.0
+    return lod_ids, int(anchors.size), float(coverage_scale)
+
+
+
+_PHASE2C_BOUNDARY_SCHEMA = 1
+
+
+def _phase2c_xyz_sample_fingerprint(xyz) -> tuple:
+    try:
+        n = int(len(xyz))
+        if n <= 0:
+            return (0,)
+        ids = np.unique(np.asarray([0, n // 3, n // 2, (2 * n) // 3, n - 1], dtype=np.int64))
+        vals = np.asarray(xyz[ids, :3], dtype=np.float64).ravel()
+        return (n,) + tuple(round(float(v), 6) for v in vals)
+    except Exception:
+        return (int(len(xyz)) if xyz is not None else 0, id(xyz))
+
+
+def _phase2c_class_sample_fingerprint(classification) -> tuple:
+    try:
+        n = int(len(classification))
+        if n <= 0:
+            return (0, 0)
+        step = max(1, n // 4096)
+        sample = np.asarray(classification[::step], dtype=np.uint64)
+        return (n, int(sample.sum(dtype=np.uint64)), int(sample.size))
+    except Exception:
+        return (int(len(classification)) if classification is not None else 0, -1)
+
+
+def _phase2c_boundary_flags(xyz, classification):
+    """Warm-cache BoundaryFlag without changing its classification semantics."""
+    try:
+        from gui.point_cache import cache_dir_from_array
+        cdir = cache_dir_from_array(xyz)
+    except Exception:
+        cdir = None
+    if cdir is None:
+        return _compute_boundary_flags(xyz, classification)
+
+    import json as _json
+    from pathlib import Path as _Path
+    meta_path = _Path(cdir) / "main_boundary_flags_meta.json"
+    arr_path = _Path(cdir) / "main_boundary_flags.npy"
+    xyz_fp = _phase2c_xyz_sample_fingerprint(xyz)
+    cls_fp = _phase2c_class_sample_fingerprint(classification)
+    try:
+        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+        if (
+            int(meta.get("schema", -1)) == _PHASE2C_BOUNDARY_SCHEMA
+            and tuple(meta.get("xyz_fp") or ()) == tuple(xyz_fp)
+            and tuple(meta.get("cls_fp") or ()) == tuple(cls_fp)
+            and arr_path.is_file()
+        ):
+            cached = np.load(arr_path, mmap_mode="r", allow_pickle=False)
+            if len(cached) == len(xyz):
+                print(
+                    "PHASE2C_BOUNDARY_CACHE status=hit "
+                    f"points={len(xyz):,} mmap=1 bytes={int(cached.nbytes):,}"
+                )
+                return cached
+    except Exception:
+        pass
+
+    bf = _compute_boundary_flags(xyz, classification)
+    try:
+        # BoundaryFlag is binary. Persist uint8; each actor converts only its own
+        # tile slice to float32, cutting the persistent file to one byte/point.
+        b8 = np.asarray(bf > 0.5, dtype=np.uint8)
+        tmp = arr_path.with_suffix(".npy.tmp")
+        with open(tmp, "wb") as fh:
+            np.save(fh, b8, allow_pickle=False)
+        os.replace(tmp, arr_path)
+        meta = {
+            "schema": _PHASE2C_BOUNDARY_SCHEMA,
+            "xyz_fp": list(xyz_fp),
+            "cls_fp": list(cls_fp),
+            "dtype": "uint8",
+            "count": int(len(b8)),
+        }
+        tmpm = meta_path.with_suffix(".json.tmp")
+        tmpm.write_text(_json.dumps(meta, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmpm, meta_path)
+        print(
+            "PHASE2C_BOUNDARY_CACHE status=built "
+            f"points={len(b8):,} size_mb={b8.nbytes/(1024*1024):.1f}"
+        )
+    except Exception as exc:
+        print(f"PHASE2C_BOUNDARY_CACHE status=build_failed error={exc}")
+    return bf
+
+
+def _main_tile_mode_enabled(app, n_points: int) -> bool:
+    raw = str(os.getenv("NAKSHA_MAIN_TILED_RENDER", "1")).strip().lower()
+    return raw not in ("0", "false", "off", "no") and int(n_points) >= MAIN_TILE_MODE_THRESHOLD
+
+
+def _main_tile_actor_items(app):
+    store = getattr(app, "_main_tile_actors", None)
+    if isinstance(store, dict):
+        for tid in sorted(store):
+            actor = store.get(tid)
+            if actor is not None:
+                yield int(tid), actor
+
+
+def _main_tile_actors(app):
+    return [a for _, a in _main_tile_actor_items(app)]
+
+
+def _main_tile_lod_actor_items(app):
+    store = getattr(app, "_main_tile_lod_actors", None)
+    if isinstance(store, dict):
+        for tid in sorted(store):
+            actor = store.get(tid)
+            if actor is not None:
+                yield int(tid), actor
+
+
+def _main_tile_all_actor_items(app):
+    yield from _main_tile_actor_items(app)
+    yield from _main_tile_lod_actor_items(app)
+
+
+def _is_main_tiled(app) -> bool:
+    if not bool(getattr(app, "_main_tiled_mode", False)):
+        return False
+    descs = getattr(app, "_main_tile_descriptors", None)
+    full_store = getattr(app, "_main_tile_actors", None)
+    lod_store = getattr(app, "_main_tile_lod_actors", None)
+    if not isinstance(descs, (list, tuple)) or not descs:
+        return False
+    if not isinstance(full_store, dict):
+        full_store = {}
+    if not isinstance(lod_store, dict):
+        lod_store = {}
+    if not full_store and not lod_store:
+        return False
+
+    # A PyVista clear() can detach actors while Python references remain alive.
+    # Treat such stores as stale so class-mode restoration rebuilds cleanly.
+    try:
+        plotter = getattr(app, "vtk_widget", None)
+        actors_map = getattr(plotter, "actors", None) if plotter is not None else None
+        if isinstance(actors_map, dict) and actors_map:
+            registered = {id(a) for a in actors_map.values() if a is not None}
+            candidates = list(full_store.values()) + list(lod_store.values())
+            if candidates and not any(id(a) in registered for a in candidates if a is not None):
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _phase2c2_residency_active(app) -> bool:
+    """Return whether on-demand full-tile residency is safe right now.
+
+    Phase 2C.2 intentionally scopes eviction to ordinary Class mode.  RGB,
+    Intensity, Elevation, Depth and Line still use their proven Phase-2B code
+    paths; those modes materialize all full tiles before recoloring so this
+    storage optimization cannot change existing presentation semantics.
+    """
+    try:
+        from gui.tile_residency import residency_enabled
+        enabled = bool(residency_enabled())
+    except Exception:
+        enabled = False
+    if not enabled or bool(getattr(app, "_main_tile_residency_suspended", False)):
+        return False
+    mode = str(getattr(app, "display_mode", "class") or "class").lower().strip()
+    return mode == "class"
+
+
+def _phase2c2_descriptor_map(app):
+    return {int(d.tile_id): d for d in (getattr(app, "_main_tile_descriptors", []) or [])}
+
+
+def _phase2c2_tile_ids_for_view(app, view=None):
+    try:
+        from gui.tile_residency import tiles_intersecting
+        descs = getattr(app, "_main_tile_descriptors", []) or []
+        if view is None:
+            view = _main_view_world_xy_bounds(app)
+        return tiles_intersecting(descs, view)
+    except Exception:
+        return [int(d.tile_id) for d in (getattr(app, "_main_tile_descriptors", []) or [])]
+
+
+def _phase2c2_release_actor_object(app, actor, actor_name=None) -> None:
+    """Detach one VTK tile actor and aggressively sever NumPy/VTK refs."""
+    if actor is None:
+        return
+    plotter = getattr(app, "vtk_widget", None)
+    try:
+        if plotter is not None:
+            plotter.remove_actor(actor_name or actor, render=False)
+    except Exception:
+        try:
+            renderer = getattr(plotter, "renderer", None) if plotter is not None else None
+            if renderer is not None:
+                renderer.RemoveActor(actor)
+        except Exception:
+            pass
+    try:
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            try:
+                mapper.SetInputData(None)
+            except Exception:
+                try:
+                    mapper.SetInputConnection(None)
+                except Exception:
+                    pass
+        actor.SetMapper(None)
+    except Exception:
+        pass
+    for attr in (
+        "_naksha_rgb_ptr", "_naksha_vtk_array", "_naksha_vtk_rgb_ref",
+        "_naksha_class_vtk_ref", "_naksha_mesh", "_naksha_section_class",
+        "_naksha_section_mask", "_naksha_global_to_local_arr",
+        "_naksha_global_indices", "_naksha_boundary_vtk",
+        "_naksha_flight_vtk", "_naksha_flight_np_ref",
+    ):
+        try:
+            setattr(actor, attr, None)
+        except Exception:
+            pass
+
+
+def _phase2c2_evict_full_tile(app, tile_id: int, *, reason: str = "lru") -> bool:
+    store = getattr(app, "_main_tile_actors", None)
+    if not isinstance(store, dict):
+        return False
+    tid = int(tile_id)
+    actor = store.pop(tid, None)
+    if actor is None:
+        return False
+    name = f"{MAIN_TILE_ACTOR_PREFIX}{tid:04d}"
+    try:
+        _shader_contexts.pop(name, None)
+    except Exception:
+        pass
+    points = int(getattr(actor, "_naksha_point_count", 0) or 0)
+    was_compat = (getattr(app, "_unified_actor", None) is actor)
+    _phase2c2_release_actor_object(app, actor, name)
+    if was_compat:
+        replacement = next(iter(store.values()), None)
+        if replacement is None:
+            replacement = next(iter((getattr(app, "_main_tile_lod_actors", {}) or {}).values()), None)
+        app._unified_actor = replacement
+    try:
+        getattr(app, "_main_tile_access", {}).pop(tid, None)
+    except Exception:
+        pass
+    print(f"PHASE2C2_TILE_EVICT status=ok tile={tid} points={points:,} reason={reason}")
+    return True
+
+
+def _phase2c2_evict_to_budget(
+    app, protected_ids, *, force_soft: bool = False, reason: str = "navigation"
+) -> int:
+    """Trim non-visible full actors without causing zoom thrash.
+
+    Phase 2C.2 trimmed to the soft budget on every settled wheel/pan frame.
+    That made quick zoom-in/zoom-out gestures rebuild the exact same 1.5M-point
+    actors over and over.  Phase 2C.3 keeps a larger *hot* navigation working
+    set and only returns to the soft budget after an idle timeout or under real
+    memory pressure.
+    """
+    if not _phase2c2_residency_active(app):
+        return 0
+    store = getattr(app, "_main_tile_actors", None)
+    if not isinstance(store, dict) or not store:
+        return 0
+    try:
+        from gui.tile_residency import (
+            choose_evictions, resident_full_tile_budget,
+            resident_full_tile_hot_budget, residency_grace_seconds,
+            memory_pressure,
+        )
+        soft_budget = int(resident_full_tile_budget())
+        hot_budget = int(resident_full_tile_hot_budget(soft_budget))
+        pressure = bool(memory_pressure())
+        do_soft = bool(force_soft or pressure)
+        evict = choose_evictions(
+            store.keys(), protected_ids,
+            getattr(app, "_main_tile_access", {}) or {},
+            soft_budget,
+            hot_budget=hot_budget,
+            grace_seconds=0.0 if do_soft else float(residency_grace_seconds()),
+            force_soft=do_soft,
+        )
+    except Exception:
+        return 0
+    count = 0
+    evict_reason = "memory_pressure" if pressure else ("idle_soft_budget" if do_soft else "hot_budget")
+    for tid in evict:
+        count += int(_phase2c2_evict_full_tile(app, int(tid), reason=evict_reason))
+    app._main_tile_resident_budget = int(soft_budget)
+    app._main_tile_hot_budget = int(hot_budget)
+    if count or force_soft or pressure:
+        print(
+            "PHASE2C3_RESIDENCY_TRIM "
+            f"status=ok reason={reason} force_soft={int(bool(force_soft))} "
+            f"pressure={int(bool(pressure))} protected={len(set(int(v) for v in protected_ids))} "
+            f"resident_full={len(store)} soft_budget={soft_budget} hot_budget={hot_budget} "
+            f"evicted={count}"
+        )
+    return count
+
+
+def trim_main_tile_residency(app, *, force_soft: bool = True, reason: str = "idle") -> int:
+    """Public idle/memory-pressure trim entrypoint for GPURenderManager.
+
+    It never evicts a currently visible tile and does not render.  This lets the
+    UI keep recently-used actors hot while the operator is navigating, then
+    quietly return memory after the configured idle window.
+    """
+    if not _phase2c2_residency_active(app):
+        return 0
+    protected = _phase2c2_tile_ids_for_view(app)
+    return _phase2c2_evict_to_budget(
+        app, protected, force_soft=bool(force_soft), reason=str(reason or "idle")
+    )
+
+
+def _phase2c2_release_all_full_tiles(app, *, reason: str = "clear") -> int:
+    store = getattr(app, "_main_tile_actors", None)
+    if not isinstance(store, dict):
+        return 0
+    tids = list(store.keys())
+    count = 0
+    for tid in tids:
+        count += int(_phase2c2_evict_full_tile(app, int(tid), reason=reason))
+    return count
+
+
+def _phase2c2_release_all_lod_tiles(app, *, reason: str = "clear") -> int:
+    store = getattr(app, "_main_tile_lod_actors", None)
+    if not isinstance(store, dict):
+        return 0
+    count = 0
+    for tid, actor in list(store.items()):
+        name = f"{MAIN_TILE_LOD_ACTOR_PREFIX}{int(tid):04d}"
+        try:
+            _shader_contexts.pop(name, None)
+        except Exception:
+            pass
+        _phase2c2_release_actor_object(app, actor, name)
+        store.pop(tid, None)
+        count += 1
+    if count:
+        print(f"PHASE2C2_TILE_EVICT status=lod_clear tiles={count} reason={reason}")
+    return count
+
+
+def set_main_class_actor_visibility(app, visible: bool) -> int:
+    count = 0
+    app._main_tiles_mode_visible = bool(visible)
+    if _is_main_tiled(app):
+        for _, actor in _main_tile_all_actor_items(app):
+            try:
+                actor.SetVisibility(1 if visible else 0); count += 1
+            except Exception:
+                pass
+        if visible:
+            update_main_tile_visibility(app)
+        return count
+    actor = getattr(app, "_unified_actor", None)
+    if actor is not None:
+        try:
+            actor.SetVisibility(1 if visible else 0); count = 1
+        except Exception:
+            pass
+    return count
+
+
+def remove_main_class_actors(app, *, render: bool = False) -> int:
+    plotter = getattr(app, "vtk_widget", None)
+    if plotter is None:
+        return 0
+    removed = 0
+
+    # Phase 2C.2: release VTK/NumPy references before dropping dictionaries.
+    removed += _phase2c2_release_all_full_tiles(app, reason="remove_main")
+    removed += _phase2c2_release_all_lod_tiles(app, reason="remove_main")
+
+    for name in list((getattr(plotter, "actors", {}) or {}).keys()):
+        ns = str(name)
+        if ns == UNIFIED_ACTOR_NAME or ns == MAIN_INTERACTION_ACTOR_NAME or ns.startswith(MAIN_TILE_ACTOR_PREFIX):
+            try:
+                plotter.remove_actor(name, render=False); removed += 1
+            except Exception:
+                pass
+    app._main_tile_actors = {}
+    app._main_tile_lod_actors = {}
+    app._main_tile_descriptors = []
+    app._main_tile_descriptor_by_id = {}
+    app._main_tile_access = {}
+    app._main_tile_dirty = set()
+    app._main_tile_shader_ctx = None
+    app._main_tiled_mode = False
+    app._main_force_interaction_lod = False
+    app._main_interaction_lod_lock = None
+    app._main_tile_residency_suspended = False
+    app._unified_actor = None
+    app._main_interaction_actor = None
+    if render:
+        try:
+            plotter.render()
+        except Exception:
+            pass
+    return removed
+
+
+def _main_view_world_xy_bounds(app):
+    try:
+        plotter = getattr(app, "vtk_widget", None)
+        renderer = getattr(plotter, "renderer", None)
+        rw = getattr(plotter, "render_window", None)
+        if renderer is None or rw is None:
+            return None
+        w, h = rw.GetSize()
+        if w <= 2 or h <= 2:
+            return None
+        try:
+            cam = renderer.GetActiveCamera()
+            if cam is not None and bool(cam.GetParallelProjection()):
+                fx, fy, _fz = cam.GetFocalPoint()
+                half_h = max(float(cam.GetParallelScale()), 1e-9)
+                half_w = half_h * (float(w) / float(h))
+                mx = max(half_w * 0.08, 0.5); my = max(half_h * 0.08, 0.5)
+                return fx-half_w-mx, fx+half_w+mx, fy-half_h-my, fy+half_h+my
+        except Exception:
+            pass
+        pts = []
+        for px, py in ((0, 0), (w, 0), (0, h), (w, h)):
+            renderer.SetDisplayPoint(float(px), float(py), 0.0)
+            renderer.DisplayToWorld()
+            wp = renderer.GetWorldPoint()
+            if wp is not None and len(wp) >= 4 and abs(float(wp[3])) > 1e-12:
+                pts.append((float(wp[0]) / float(wp[3]), float(wp[1]) / float(wp[3])))
+        if len(pts) < 2:
+            return None
+        xs = [v[0] for v in pts]; ys = [v[1] for v in pts]
+        xmin, xmax = min(xs), max(xs); ymin, ymax = min(ys), max(ys)
+        mx = max((xmax - xmin) * 0.08, 0.5); my = max((ymax - ymin) * 0.08, 0.5)
+        return xmin - mx, xmax + mx, ymin - my, ymax + my
+    except Exception:
+        return None
+
+
+def update_main_tile_visibility(app, *, force_all: bool = False) -> int:
+    """Cull tiles and enforce Phase-2B.7 exact settled visibility.
+
+    Phase 2C.2 adds *full-actor residency* underneath that contract: LOD actors
+    remain resident for navigation, while full actors are materialized only for
+    the exact settled/editing viewport and a small recent LRU working set.
+    """
+    if not _is_main_tiled(app):
+        return 0
+    view = None if force_all else _main_view_world_xy_bounds(app)
+    class_mode_visible = bool(getattr(app, "_main_tiles_mode_visible", True))
+    descs = getattr(app, "_main_tile_descriptors", []) or []
+    desc_map = _phase2c2_descriptor_map(app)
+    try:
+        from gui.tile_residency import tiles_intersecting, source_point_count, touch
+        intersecting = tiles_intersecting(descs, view)
+        source_points = source_point_count(desc_map, intersecting)
+    except Exception:
+        intersecting = [int(d.tile_id) for d in descs]
+        source_points = int(sum(int(getattr(d, 'point_count', 0) or 0) for d in descs))
+        touch = None
+
+    budget = int(_main_render_point_budget(app))
+    _prev_lod = bool(getattr(app, "_main_lod_active", False))
+    force_interaction_lod = bool(getattr(app, "_main_force_interaction_lod", False))
+    interaction_lod_lock = getattr(app, "_main_interaction_lod_lock", None)
+    lod_policy = _main_lod_policy(app)
+    camera_interacting = _main_camera_interacting(app)
+    classification_active = _main_classification_active(app)
+    lod_store = getattr(app, "_main_tile_lod_actors", {}) or {}
+
+    if not class_mode_visible or not lod_store or lod_policy == "off":
+        use_lod = False
+    elif classification_active:
+        use_lod = False
+    elif interaction_lod_lock is not None:
+        use_lod = bool(interaction_lod_lock) and bool(camera_interacting)
+    elif lod_policy == "budget":
+        use_lod = bool(source_points > budget or force_interaction_lod)
+    else:
+        use_lod = bool(camera_interacting and (source_points > budget or force_interaction_lod))
+
+    # Exact settled/editing frames must have a full actor for every visible tile.
+    # During camera motion we deliberately do not materialize full actors: the
+    # resident LOD set handles navigation without growing memory behind the user.
+    built = failed = evicted = 0
+    if class_mode_visible and not use_lod:
+        if _phase2c2_residency_active(app):
+            built, failed = _phase2c2_ensure_full_tiles(app, intersecting, reason="settled_visible")
+            access = getattr(app, "_main_tile_access", None)
+            if not isinstance(access, dict):
+                access = {}; app._main_tile_access = access
+            if touch is not None:
+                try: touch(access, intersecting)
+                except Exception: pass
+            evicted = _phase2c2_evict_to_budget(app, intersecting, force_soft=False, reason="settled_navigation")
+        else:
+            # Compatibility modes are allowed to depend on all full actors.
+            if bool(getattr(app, "_main_tile_residency_suspended", False)):
+                _phase2c2_materialize_all_full_tiles(app, reason="residency_suspended")
+    else:
+        # Touch already-resident tiles under the moving viewport so the LRU keeps
+        # nearby working-set tiles instead of immediately discarding them.
+        access = getattr(app, "_main_tile_access", None)
+        if isinstance(access, dict) and touch is not None:
+            try:
+                resident = set((getattr(app, "_main_tile_actors", {}) or {}).keys())
+                touch(access, [tid for tid in intersecting if tid in resident])
+            except Exception:
+                pass
+
+    full_store = dict(_main_tile_actor_items(app))
+    lod_store = dict(_main_tile_lod_actor_items(app))
+    intersecting_set = set(int(v) for v in intersecting)
+    render_points = 0
+    visible_actors = 0
+    missing_full_visible = 0
+
+    for tid, actor in full_store.items():
+        show = bool(class_mode_visible and tid in intersecting_set and not use_lod)
+        try:
+            actor.SetVisibility(1 if show else 0)
+            if show:
+                visible_actors += 1
+                render_points += int(getattr(actor, "_naksha_point_count", 0) or 0)
+        except Exception:
+            pass
+
+    for tid, actor in lod_store.items():
+        # Normal case: LOD only while navigating.  If full actor materialization
+        # fails, show that tile's LOD as a correctness-preserving visual fallback
+        # rather than leaving a black hole; the failure is logged explicitly.
+        fallback = bool(class_mode_visible and (not use_lod) and tid in intersecting_set and tid not in full_store)
+        show = bool(class_mode_visible and tid in intersecting_set and (use_lod or fallback))
+        try:
+            actor.SetVisibility(1 if show else 0)
+            if show:
+                visible_actors += 1
+                render_points += int(getattr(actor, "_naksha_point_count", 0) or 0)
+                if fallback:
+                    missing_full_visible += 1
+        except Exception:
+            pass
+
+    app._main_visible_tile_count = len(intersecting)
+    app._main_visible_actor_count = visible_actors
+    app._main_visible_source_points = int(source_points)
+    app._main_visible_render_points = int(render_points)
+    app._main_lod_active = bool(use_lod)
+    app._main_tile_resident_count = len(full_store)
+
+    if built or evicted or failed or missing_full_visible:
+        try:
+            from gui.tile_residency import resident_full_tile_budget
+            rbudget = int(resident_full_tile_budget())
+        except Exception:
+            rbudget = len(full_store)
+        print(
+            "PHASE2C2_RESIDENCY status=update "
+            f"visible={len(intersecting)} resident_full={len(full_store)} budget={rbudget} "
+            f"hot_budget={int(getattr(app, '_main_tile_hot_budget', rbudget) or rbudget)} "
+            f"built={built} evicted={evicted} failed={failed} "
+            f"lod_fallback={missing_full_visible} use_lod={int(use_lod)}"
+        )
+
+    if class_mode_visible and (_prev_lod != bool(use_lod) or force_all):
+        print(
+            "PHASE2B_VIEW_LOD status=switch "
+            f"lod={int(bool(use_lod))} visible_tiles={len(intersecting)} "
+            f"source_points={int(source_points):,} render_points={int(render_points):,} "
+            f"budget={budget:,} visual_proxy=0 policy={lod_policy} "
+            f"transient={int(bool(use_lod and lod_policy == 'interaction'))} "
+            f"settled_exact={int(bool((not use_lod) and missing_full_visible == 0 and class_mode_visible))} "
+            f"classification_active={int(classification_active)} "
+            f"force_interaction={int(force_interaction_lod)} "
+            f"interaction_lock={-1 if interaction_lod_lock is None else int(bool(interaction_lod_lock))} "
+            f"resident_full={len(full_store)}"
+        )
+    return visible_actors
+
+
+def _patch_main_tile_actors(app, canonical_indices) -> tuple[int, int]:
+    """Patch sparse classification changes into resident full + LOD actors.
+
+    Phase 2C.2 distinguishes *non-resident* from *missing*.  Classification is
+    canonical and authoritative, so points belonging to an evicted full tile do
+    not need an immediate VTK patch; the rebuilt actor will read the latest
+    classification values when it becomes resident again.
+    """
+    ci = np.asarray(canonical_indices, dtype=np.int64).ravel()
+    if ci.size == 0 or not _is_main_tiled(app):
+        return 0, 0
+    ci = np.unique(ci)
+
+    actors = getattr(app, "_main_tile_actors", {}) or {}
+    lod_actors = getattr(app, "_main_tile_lod_actors", {}) or {}
+    descs = getattr(app, "_main_tile_descriptors", []) or []
+    sidx = getattr(app, "spatial_index", None)
+    if sidx is None or not descs:
+        return 0, 0
+
+    try:
+        per_point_tid = sidx.tile_id_array_for_indices(ci, descs)
+    except Exception:
+        # Compatibility fallback for an older SpatialIndex object.
+        per_point_tid = np.full(ci.size, -1, dtype=np.int32)
+        try:
+            for t in descs:
+                gi = sidx.indices_for_cell_rect(t.ix0, t.ix1, t.iy0, t.iy1, sort_canonical=True)
+                if gi.size == 0:
+                    continue
+                pos = np.searchsorted(gi, ci)
+                valid = pos < gi.size
+                hit = np.zeros(ci.size, dtype=bool)
+                hit[valid] = gi[pos[valid]] == ci[valid]
+                per_point_tid[hit] = int(t.tile_id)
+        except Exception:
+            pass
+
+    mapped = per_point_tid >= 0
+    mapped_count = int(np.count_nonzero(mapped))
+    mapping_missing = int(ci.size - mapped_count)
+    touched_ids = sorted(int(v) for v in np.unique(per_point_tid[mapped])) if mapped_count else []
+
+    full_tiles_patched = 0
+    full_matched = 0
+    deferred_nonresident = 0
+    lod_matched = 0
+    dirty = getattr(app, "_main_tile_dirty", None)
+    if not isinstance(dirty, set):
+        dirty = set(); app._main_tile_dirty = dirty
+
+    for tid in touched_ids:
+        subset = ci[per_point_tid == tid]
+        actor = actors.get(tid)
+        if actor is None:
+            # Canonical classification was already changed.  Mark the tile dirty
+            # for diagnostics; actor materialization always reads current data.
+            dirty.add(tid)
+            deferred_nonresident += int(subset.size)
+        else:
+            gi = getattr(actor, "_naksha_global_indices", None)
+            if gi is not None and len(gi):
+                gi_arr = np.asarray(gi, dtype=np.int64).ravel()
+                local = _map_global_changed_to_local(gi_arr, subset, assume_sorted=True)
+                if local.size:
+                    _patch_actor_memory(app, actor, local, slot_idx=0)
+                    full_tiles_patched += 1
+                    full_matched += int(local.size)
+
+        # LOD remains resident for navigation, so keep its sampled representation
+        # current even when the corresponding full tile is evicted.
+        lod_actor = lod_actors.get(tid)
+        if lod_actor is not None:
+            lgi = getattr(lod_actor, "_naksha_global_indices", None)
+            if lgi is not None and len(lgi):
+                local = _map_global_changed_to_local(lgi, subset, assume_sorted=True)
+                if local.size:
+                    _patch_actor_memory(app, lod_actor, local, slot_idx=0)
+                    lod_matched += int(local.size)
+
+    represented = full_matched + deferred_nonresident
+    # A resident actor mismatch is a genuine bug; an evicted tile is not.
+    missing = max(0, int(ci.size) - represented - mapping_missing)
+    missing += mapping_missing
+    app._phase2b_last_patch_audit = {
+        "changed": int(ci.size),
+        "full_matched": int(full_matched),
+        "deferred_nonresident": int(deferred_nonresident),
+        "lod_matched": int(lod_matched),
+        "missing": int(missing),
+        "tiles": len(touched_ids),
+        "resident_tiles_patched": int(full_tiles_patched),
+    }
+    if missing or int(getattr(app, "_phase2b_patch_audit_logs", 0)) < 30:
+        app._phase2b_patch_audit_logs = int(getattr(app, "_phase2b_patch_audit_logs", 0)) + 1
+        print(
+            "PHASE2B_PATCH_AUDIT "
+            f"changed={int(ci.size)} full_matched={int(full_matched)} "
+            f"deferred_nonresident={int(deferred_nonresident)} "
+            f"lod_matched={int(lod_matched)} missing={int(missing)} "
+            f"tiles={len(touched_ids)} resident_tiles_patched={int(full_tiles_patched)}"
+        )
+    return int(full_tiles_patched), int(full_matched + lod_matched)
+
+
+def apply_main_tiled_color_mode(app, mode: str, *, render: bool = True) -> bool:
+    """Recolor resident Main View render tiles without rebuilding geometry.
+
+    This keeps the Phase-2B spatial tiles resident for RGB / Intensity /
+    Elevation / Depth / Line display modes.  Classification remains a separate
+    sparse attribute buffer, so switching presentation never changes canonical
+    point order or LAS data.
+    """
+    if not _is_main_tiled(app):
+        return False
+    mode = str(mode or 'class').lower().strip()
+    if mode not in ('class', 'rgb', 'intensity', 'elevation', 'depth', 'line'):
+        return False
+    data = getattr(app, 'data', None)
+    if not isinstance(data, dict) or data.get('xyz') is None:
+        return False
+    xyz = data['xyz']
+
+    # Class/RGB/etc. are point presentations. Resident shading geometry may be
+    # parked for a fast return, but it must never remain drawable underneath
+    # those points. Enforce this at the authoritative tiled-mode boundary even
+    # if an earlier idempotent park call encountered stale bookkeeping.
+    try:
+        from gui.shading_display import _set_shading_actor_group_visibility
+        hidden_shading = _set_shading_actor_group_visibility(app, False)
+        if hidden_shading:
+            print(
+                "SHADING_MODE_VISIBILITY status=hidden "
+                f"mode={mode} actors={hidden_shading}"
+            )
+    except Exception as exc:
+        print(
+            "SHADING_MODE_VISIBILITY status=failed "
+            f"mode={mode} reason={type(exc).__name__}:{exc}"
+        )
+
+    # Phase 2C.2 compatibility boundary: residency/eviction is enabled only in
+    # ordinary Class mode.  Legacy RGB/Intensity/Elevation/Depth/Line paths may
+    # assume every full tile exists, so materialize them before recoloring.
+    if mode == 'class':
+        app._main_tile_residency_suspended = False
+    else:
+        app._main_tile_residency_suspended = True
+        if not _phase2c2_materialize_all_full_tiles(app, reason=f"display_mode:{mode}"):
+            print(f"PHASE2C2_RESIDENCY status=suspend_failed mode={mode}")
+            return False
+        print(
+            "PHASE2C2_RESIDENCY status=suspended "
+            f"reason=display_mode mode={mode} resident_full={len(getattr(app, '_main_tile_actors', {}) or {})}"
+        )
+
+    actors = list(_main_tile_all_actor_items(app))
+    if not actors:
+        return False
+
+    t0 = time.perf_counter()
+    app._main_tiles_mode_visible = True
+
+    # Class mode already has the authoritative LUT implementation.  Keep the
+    # same path and only batch its render with the caller.
+    if mode == 'class':
+        ok = sync_palette_to_gpu(
+            app,
+            slot_idx=0,
+            palette=getattr(app, 'class_palette', None),
+            border=float(getattr(app, 'point_border_percent', 0.0) or 0.0),
+            render=False,
+            rewrite_rgb=True,
+        )
+        update_main_tile_visibility(app)
+        if render:
+            try:
+                app.vtk_widget.render()
+            except Exception:
+                pass
+        print(
+            'PHASE2B_TILE_MODE status=ok mode=class '
+            f'tiles={len(actors)} elapsed_ms={(time.perf_counter()-t0)*1000.0:.1f}'
+        )
+        return bool(ok)
+
+    colors_full = None
+    direct_rgb = None
+    line_lut = None
+    source_ids = None
+    try:
+        if mode == 'rgb':
+            rgb = data.get('rgb')
+            if rgb is None or len(rgb) != len(xyz):
+                colors_full = np.full((len(xyz), 3), 200, dtype=np.uint8)
+            else:
+                arr = np.asarray(rgb)
+                if arr.dtype == np.uint8:
+                    direct_rgb = arr
+                else:
+                    from gui.pointcloud_display import _normalize_rgb_to_uint8
+                    colors_full = _normalize_rgb_to_uint8(arr)
+
+        elif mode == 'intensity':
+            intensity = data.get('intensity')
+            if intensity is None or len(intensity) != len(xyz):
+                colors_full = np.full((len(xyz), 3), 128, dtype=np.uint8)
+            else:
+                from gui.pointcloud_display import _microstation_intensity_rgb
+                colors_full = _microstation_intensity_rgb(
+                    intensity,
+                    low_pct=getattr(app, 'intensity_clip_low', 0.5),
+                    high_pct=getattr(app, 'intensity_clip_high', 99.8),
+                    gamma=getattr(app, 'intensity_gamma', 1.35),
+                )
+
+        elif mode == 'elevation':
+            from gui.pointcloud_display import _microstation_elevation_rgb
+            colors_full = _microstation_elevation_rgb(
+                xyz[:, 2],
+                color_ramp=getattr(app, 'elevation_color_ramp', None),
+                low_pct=getattr(app, 'elevation_clip_low', 1.0),
+                high_pct=getattr(app, 'elevation_clip_high', 99.0),
+            )
+
+        elif mode == 'depth':
+            from gui.pointcloud_display import _microstation_depth_rgb_from_camera
+            cam = app.vtk_widget.renderer.GetActiveCamera()
+            colors_full = _microstation_depth_rgb_from_camera(
+                xyz,
+                cam,
+                low_pct=getattr(app, 'depth_clip_low', 1.0),
+                high_pct=getattr(app, 'depth_clip_high', 99.0),
+                color_scheme=getattr(app, 'depth_color_scheme', 'grayscale'),
+                gamma=getattr(app, 'depth_gamma', 1.0),
+            )
+
+        elif mode == 'line':
+            source_ids = data.get('point_source_id')
+            if source_ids is None or len(source_ids) != len(xyz):
+                return False
+            source_ids = np.asarray(source_ids)
+            line_colors = dict(getattr(app, 'flight_line_colors', {}) or {})
+            ids = np.arange(65536, dtype=np.uint32)
+            line_lut = np.empty((65536, 3), dtype=np.uint8)
+            line_lut[:, 0] = ((ids * 67 + 53) & 255).astype(np.uint8)
+            line_lut[:, 1] = ((ids * 131 + 97) & 255).astype(np.uint8)
+            line_lut[:, 2] = ((ids * 193 + 181) & 255).astype(np.uint8)
+            for raw_line_id, color in line_colors.items():
+                try:
+                    lid = int(raw_line_id)
+                    if 0 <= lid <= 65535:
+                        line_lut[lid] = tuple(int(c) for c in color[:3])
+                except Exception:
+                    continue
+
+        if colors_full is not None:
+            colors_full = np.ascontiguousarray(colors_full, dtype=np.uint8)
+            if len(colors_full) != len(xyz):
+                return False
+
+        patched = 0
+        for _tid, actor in actors:
+            gi = getattr(actor, '_naksha_global_indices', None)
+            rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
+            vtk_ca = getattr(actor, '_naksha_vtk_array', None)
+            if gi is None or rgb_ptr is None or vtk_ca is None or not _is_writable(rgb_ptr):
+                continue
+            gi = np.asarray(gi, dtype=np.int64)
+            if mode == 'line':
+                local_ids = np.asarray(source_ids[gi], dtype=np.intp)
+                if local_ids.size and (local_ids.min() < 0 or local_ids.max() > 65535):
+                    return False
+                np.take(line_lut, local_ids, axis=0, out=rgb_ptr)
+            elif direct_rgb is not None:
+                np.copyto(rgb_ptr, direct_rgb[gi], casting='unsafe')
+            else:
+                np.copyto(rgb_ptr, colors_full[gi], casting='unsafe')
+            vtk_ca.Modified()
+            _mark_actor_dirty(actor)
+            actor._naksha_display_mode = mode
+            patched += 1
+
+        if patched <= 0:
+            return False
+
+        # Push class visibility/weight/border uniforms to every tile without
+        # rewriting the non-class RGB presentation.
+        sync_palette_to_gpu(
+            app,
+            slot_idx=0,
+            palette=getattr(app, 'class_palette', None),
+            border=float(getattr(app, 'point_border_percent', 0.0) or 0.0),
+            render=False,
+            rewrite_rgb=False,
+        )
+        update_main_tile_visibility(app)
+        if render:
+            try:
+                app.vtk_widget.render()
+            except Exception:
+                pass
+        print(
+            'PHASE2B_TILE_MODE status=ok '
+            f'mode={mode} tiles={patched} elapsed_ms={(time.perf_counter()-t0)*1000.0:.1f}'
+        )
+        return True
+    finally:
+        # Drop full-mode temporaries promptly; the tile RGB arrays are VTK-owned.
+        colors_full = None
+
+def _phase2c2_build_full_tile_actor(app, desc, *, reason: str = "visible"):
+    """Materialize one full-resolution Main actor from canonical mmap data.
+
+    VTK creation stays on the UI thread.  Canonical data is authoritative, so a
+    tile classified while non-resident is born with the latest class values and
+    never needs a historical replay.
+    """
+    tid = int(desc.tile_id)
+    actors = getattr(app, "_main_tile_actors", None)
+    if not isinstance(actors, dict):
+        actors = {}; app._main_tile_actors = actors
+    existing = actors.get(tid)
+    if existing is not None:
+        try:
+            from gui.tile_residency import touch
+            touch(getattr(app, "_main_tile_access", {}), [tid])
+        except Exception:
+            pass
+        return existing
+
+    t0 = time.perf_counter()
+    plotter = getattr(app, "vtk_widget", None)
+    data = getattr(app, "data", None)
+    sidx = getattr(app, "spatial_index", None)
+    if plotter is None or not isinstance(data, dict) or sidx is None:
+        return None
+    xyz = data.get("xyz"); classification = data.get("classification")
+    if xyz is None or classification is None:
+        return None
+
+    gi = sidx.indices_for_cell_rect(desc.ix0, desc.ix1, desc.iy0, desc.iy1, sort_canonical=True)
+    if gi.size == 0:
+        return None
+    palette = _get_slot_palette(app, 0) or getattr(app, "class_palette", {}) or {}
+    max_class = max(256, int(np.max(classification[gi])) + 1 if gi.size else 256)
+    color_lut = _get_lut("main_tiles").build(palette, max_class)
+    cls = classification[gi]
+    bf_full = getattr(app, "_main_boundary_flags", None)
+    if bf_full is None or len(bf_full) != len(xyz):
+        bf_full = _phase2c_boundary_flags(xyz, classification)
+        app._main_boundary_flags = bf_full
+    from gui.flight_line_filter import flight_line_visibility_mask, flight_line_visibility_signature
+    flight_full = flight_line_visibility_mask(app, len(xyz), slot=0)
+    arrays = {
+        "pts": np.ascontiguousarray(xyz[gi]),
+        "cls_f32": cls.astype(np.float32, copy=False),
+        "rgb": np.ascontiguousarray(color_lut[cls.clip(0, len(color_lut)-1).astype(np.intp)], dtype=np.uint8),
+        "bf": np.ascontiguousarray(bf_full[gi], dtype=np.float32),
+        "flight_visible": np.ascontiguousarray(flight_full[gi], dtype=np.uint8),
+    }
+    point_size = float(getattr(app, "_main_tile_point_size", _BASE_POINT_SIZE) or _BASE_POINT_SIZE)
+    border_percent = float(getattr(app, "_main_tile_border_percent", getattr(app, "point_border_percent", 0.0)) or 0.0)
+    shared_ctx = getattr(app, "_main_tile_shader_ctx", None)
+    if shared_ctx is None:
+        shared_ctx = ViewShaderContext(slot_idx=0)
+        app._main_tile_shader_ctx = shared_ctx
+    shared_ctx.load_from_palette(palette, border_percent, point_size)
+    _set_context_border_logic_mode(app, 0, shared_ctx)
+
+    name = f"{MAIN_TILE_ACTOR_PREFIX}{tid:04d}"
+    actor, _ctx, mesh, vtk_ca, vtk_rgb, vtk_cls, class_vtk, bf_vtk = _build_vtk_actor_from_arrays(
+        plotter, name, arrays, point_size, palette, border_percent, 0,
+        _attach_view_shader_context, _ensure_opengl_polydata_mapper, ViewShaderContext)
+    if actor is None:
+        return None
+    actor._naksha_shader_ctx = shared_ctx; _shader_contexts[name] = shared_ctx
+    _attach_view_shader_context(actor, shared_ctx, name)
+    _wire_actor_metadata(actor, mesh, vtk_ca, vtk_rgb, vtk_cls, class_vtk, bf_vtk, None, point_size)
+    actor._naksha_global_indices = gi
+    actor._naksha_point_count = int(gi.size)
+    actor._naksha_data_id = id(xyz)
+    actor._naksha_tile_id = tid
+    actor._naksha_tile_bounds = tuple(desc.bounds)
+    actor._naksha_main_tile = True
+    actor._naksha_display_mode = "class"
+    actor._naksha_flight_line_signature = flight_line_visibility_signature(app, 0)
+    farr = mesh.GetPointData().GetArray("FlightVisible")
+    actor._naksha_flight_vtk = farr
+    actor._naksha_flight_np_ref = numpy_support.vtk_to_numpy(farr) if farr is not None else None
+    try:
+        actor.SetVisibility(0)
+    except Exception:
+        pass
+    actors[tid] = actor
+    access = getattr(app, "_main_tile_access", None)
+    if not isinstance(access, dict):
+        access = {}; app._main_tile_access = access
+    try:
+        from gui.tile_residency import touch
+        touch(access, [tid])
+    except Exception:
+        access[tid] = time.monotonic()
+    dirty = getattr(app, "_main_tile_dirty", None)
+    if isinstance(dirty, set):
+        dirty.discard(tid)
+    if getattr(app, "_unified_actor", None) is None:
+        app._unified_actor = actor
+    print(
+        "PHASE2C2_TILE_MATERIALIZE status=ok "
+        f"tile={tid} points={int(gi.size):,} reason={reason} "
+        f"resident_full={len(actors)} build_ms={(time.perf_counter()-t0)*1000.0:.1f}"
+    )
+    return actor
+
+
+def _phase2c2_ensure_full_tiles(app, tile_ids, *, reason: str = "visible") -> tuple[int, int]:
+    desc_map = _phase2c2_descriptor_map(app)
+    store = getattr(app, "_main_tile_actors", None)
+    if not isinstance(store, dict):
+        store = {}; app._main_tile_actors = store
+    built = 0; failed = 0
+    for tid in [int(v) for v in tile_ids]:
+        if tid in store:
+            continue
+        desc = desc_map.get(tid)
+        if desc is None:
+            failed += 1; continue
+        if _phase2c2_build_full_tile_actor(app, desc, reason=reason) is None:
+            failed += 1
+        else:
+            built += 1
+    return built, failed
+
+
+def _phase2c2_materialize_all_full_tiles(app, *, reason: str = "compat_mode") -> bool:
+    descs = getattr(app, "_main_tile_descriptors", []) or []
+    ids = [int(d.tile_id) for d in descs]
+    built, failed = _phase2c2_ensure_full_tiles(app, ids, reason=reason)
+    if built or failed:
+        print(
+            "PHASE2C2_RESIDENCY status=materialize_all "
+            f"reason={reason} built={built} failed={failed} "
+            f"resident_full={len(getattr(app, '_main_tile_actors', {}) or {})}"
+        )
+    return failed == 0
+
+
+def _build_tiled_main_actors(app, palette, border_percent: float, point_size: float):
+    t0 = time.perf_counter()
+    plotter = getattr(app, "vtk_widget", None)
+    data = getattr(app, "data", None)
+    if plotter is None or not isinstance(data, dict):
+        return None
+    xyz = data.get("xyz"); classification = data.get("classification")
+    if xyz is None or classification is None or len(xyz) == 0:
+        return None
+    from gui.spatial_index import get_or_build_index
+    sidx = get_or_build_index(xyz); app.spatial_index = sidx
+    if getattr(sidx, "method", "") != "grid2d":
+        return None
+    limit = _main_tile_point_limit(app)
+    lod_limit = _main_tile_lod_point_limit(app)
+    descs = sidx.build_render_tiles(max_points=limit)
+    if len(descs) <= 1:
+        return None
+
+    # Remove stale Main point-cloud actors.  SNT/DXF/vector overlays are untouched.
+    for name in list((getattr(plotter, "actors", {}) or {}).keys()):
+        ns = str(name)
+        if ns == UNIFIED_ACTOR_NAME or ns == MAIN_INTERACTION_ACTOR_NAME or ns.startswith(MAIN_TILE_ACTOR_PREFIX) or ns.startswith("class_"):
+            try: plotter.remove_actor(name, render=False)
+            except Exception: pass
+
+    from gui.flight_line_filter import flight_line_visibility_mask, flight_line_visibility_signature
+    flight_full = flight_line_visibility_mask(app, len(xyz), slot=0)
+    bf_full = _phase2c_boundary_flags(xyz, classification)
+    app._main_boundary_flags = bf_full
+    app._main_tile_descriptors = descs
+    app._main_tile_descriptor_by_id = {int(d.tile_id): d for d in descs}
+    app._main_tile_actors = {}
+    app._main_tile_lod_actors = {}
+    app._main_tile_access = {}
+    app._main_tile_dirty = set()
+    app._main_tile_point_size = float(point_size or _BASE_POINT_SIZE)
+    app._main_tile_border_percent = float(border_percent)
+    app._main_tiled_mode = True
+    app._main_tiles_mode_visible = True
+    app._main_force_interaction_lod = False
+    app._main_interaction_lod_lock = None
+    app._main_tile_residency_suspended = False
+    app._main_global_indices = None
+    app._rgb_buffer = None
+    app._main_interaction_actor = None
+
+    shared_ctx = ViewShaderContext(slot_idx=0)
+    shared_ctx.load_from_palette(palette, border_percent, float(point_size or _BASE_POINT_SIZE))
+    _set_context_border_logic_mode(app, 0, shared_ctx)
+    app._main_tile_shader_ctx = shared_ctx
+    max_class = max(256, int(classification.max()) + 1 if len(classification) else 256)
+    color_lut = _get_lut("main_tiles").build(palette, max_class)
+
+    # LOD actors remain lightweight and resident.  They are the navigation
+    # safety net while full-resolution actors are materialized/evicted on demand.
+    lod_total = 0
+    for desc in descs:
+        gi = sidx.indices_for_cell_rect(desc.ix0, desc.ix1, desc.iy0, desc.iy1, sort_canonical=True)
+        if gi.size == 0:
+            continue
+        if int(gi.size) > int(lod_limit):
+            lod_gi, anchor_count, _coverage = _build_visual_lod_indices(
+                sidx, desc, gi, classification, int(lod_limit)
+            )
+        else:
+            lod_gi = gi.copy(); anchor_count = 0
+        if lod_gi.size == 0:
+            continue
+        lod_cls = classification[lod_gi]
+        lod_arrays = {
+            "pts": np.ascontiguousarray(xyz[lod_gi]),
+            "cls_f32": lod_cls.astype(np.float32, copy=False),
+            "rgb": np.ascontiguousarray(
+                color_lut[lod_cls.clip(0, len(color_lut)-1).astype(np.intp)], dtype=np.uint8
+            ),
+            "bf": np.ascontiguousarray(bf_full[lod_gi], dtype=np.float32),
+            "flight_visible": np.ascontiguousarray(flight_full[lod_gi], dtype=np.uint8),
+        }
+        tid = int(desc.tile_id)
+        lod_name = f"{MAIN_TILE_LOD_ACTOR_PREFIX}{tid:04d}"
+        lod_actor, _lctx, lod_mesh, lod_vtk_ca, lod_vtk_rgb, lod_vtk_cls, lod_class_vtk, lod_bf_vtk = _build_vtk_actor_from_arrays(
+            plotter, lod_name, lod_arrays, float(point_size or _BASE_POINT_SIZE), palette,
+            border_percent, 0, _attach_view_shader_context,
+            _ensure_opengl_polydata_mapper, ViewShaderContext,
+        )
+        if lod_actor is None:
+            raise RuntimeError(f"render tile LOD {tid} build failed")
+        lod_actor._naksha_shader_ctx = shared_ctx; _shader_contexts[lod_name] = shared_ctx
+        _attach_view_shader_context(lod_actor, shared_ctx, lod_name)
+        _wire_actor_metadata(
+            lod_actor, lod_mesh, lod_vtk_ca, lod_vtk_rgb, lod_vtk_cls,
+            lod_class_vtk, lod_bf_vtk, None, float(point_size or _BASE_POINT_SIZE),
+        )
+        lod_actor._naksha_global_indices = lod_gi
+        lod_actor._naksha_point_count = int(lod_gi.size)
+        lod_actor._naksha_data_id = id(xyz)
+        lod_actor._naksha_tile_id = tid
+        lod_actor._naksha_tile_bounds = tuple(desc.bounds)
+        lod_actor._naksha_main_tile = True
+        lod_actor._naksha_main_tile_lod = True
+        lod_actor._naksha_display_mode = "class"
+        lod_actor._naksha_lod_anchor_count = int(anchor_count)
+        lod_actor._naksha_lod_coverage_scale = 1.0
+        lod_actor._naksha_flight_line_signature = flight_line_visibility_signature(app, 0)
+        _push_uniforms_direct(lod_actor, shared_ctx)
+        lfarr = lod_mesh.GetPointData().GetArray("FlightVisible")
+        lod_actor._naksha_flight_vtk = lfarr
+        lod_actor._naksha_flight_np_ref = numpy_support.vtk_to_numpy(lfarr) if lfarr is not None else None
+        try: lod_actor.SetVisibility(0)
+        except Exception: pass
+        app._main_tile_lod_actors[tid] = lod_actor
+        lod_total += int(lod_gi.size)
+        print(
+            "PHASE2B6_VISUAL_LOD status=ready "
+            f"tile={tid} source={int(desc.point_count):,} proxy={int(lod_gi.size):,} "
+            f"anchors={int(anchor_count):,} coverage=1.00 exact_weight=1"
+        )
+
+    # Phase 2C.2: full actors are materialized only for the initial exact
+    # viewport.  If residency is disabled we preserve the old all-resident path.
+    try:
+        from gui.tile_residency import residency_enabled, tiles_intersecting
+        current_mode = str(getattr(app, "display_mode", "class") or "class").lower().strip()
+        residency_on = bool(residency_enabled()) and current_mode == "class"
+    except Exception:
+        residency_on = False
+    if residency_on:
+        view = _main_view_world_xy_bounds(app)
+        initial_ids = tiles_intersecting(descs, view) if view is not None else []
+        if not initial_ids and descs:
+            initial_ids = [int(descs[0].tile_id)]
+    else:
+        initial_ids = [int(d.tile_id) for d in descs]
+        app._main_tile_residency_suspended = True
+
+    _phase2c2_ensure_full_tiles(app, initial_ids, reason="initial_view")
+    if not app._main_tile_actors and descs:
+        _phase2c2_ensure_full_tiles(app, [int(descs[0].tile_id)], reason="compat_anchor")
+
+    app._unified_actor = next(iter(app._main_tile_actors.values()), None)
+    if app._unified_actor is None:
+        app._unified_actor = next(iter(app._main_tile_lod_actors.values()), None)
+
+    visible = update_main_tile_visibility(app)
+    total = int(sum(int(d.point_count) for d in descs))
+    counts = [int(d.point_count) for d in descs]
+    try:
+        from gui.tile_residency import resident_full_tile_budget
+        resident_budget = int(resident_full_tile_budget())
+    except Exception:
+        resident_budget = len(descs)
+    print(
+        "PHASE2B_TILE_BUILD status=ready "
+        f"points={total:,} tiles={len(descs)} resident_full={len(app._main_tile_actors)} "
+        f"lod_tiles={len(app._main_tile_lod_actors)} lod_points={lod_total:,} "
+        f"visible_actors={visible} tile_target={limit:,} lod_tile_target={lod_limit:,} "
+        f"render_budget={_main_render_point_budget(app):,} resident_budget={resident_budget} "
+        f"max_tile={max(counts) if counts else 0:,} "
+        f"lod_active={int(bool(getattr(app, '_main_lod_active', False)))} "
+        f"render_points={int(getattr(app, '_main_visible_render_points', 0)):,} "
+        f"build_ms={(time.perf_counter()-t0)*1000.0:.1f}"
+    )
+    return app._unified_actor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUILD UNIFIED ACTOR  (main view)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_unified_actor(
@@ -5730,6 +7329,19 @@ def build_unified_actor(
         return None
 
     palette = palette or getattr(app, "class_palette", {})
+
+    if _main_tile_mode_enabled(app, len(xyz)):
+        try:
+            tiled = _build_tiled_main_actors(app, palette, float(border_percent), float(point_size or _BASE_POINT_SIZE))
+            if tiled is not None:
+                app._unified_actor_building = False
+                _restore_snt_overlays(app)
+                return tiled
+        except Exception as exc:
+            print(f"PHASE2B_TILE_BUILD status=fallback_monolithic error={exc}")
+            app._main_tile_actors = {}
+            app._main_tile_descriptors = []
+            app._main_tiled_mode = False
 
     if UNIFIED_ACTOR_NAME in plotter.actors:
         plotter.remove_actor(UNIFIED_ACTOR_NAME, render=False)
@@ -5772,7 +7384,7 @@ def build_unified_actor(
     # and its local index is global_idx // step.
     app._main_lod_step = step
 
-    # "All off" is a valid Nakshatech-style state. Keep overlays/camera but
+    # "All off" is a valid MicroStation-style state. Keep overlays/camera but
     # remove the point-cloud actor instead of running min/max on empty arrays.
     if len(vis_xyz) == 0:
         app._main_global_indices = np.empty(0, dtype=np.int64)
@@ -5785,35 +7397,6 @@ def build_unified_actor(
             pass
         _restore_snt_overlays(app)
         print("      ℹ️ All flight lines are off — main point cloud hidden")
-        return None
-
-    # ── PERFORMANCE PHASE 1: skip the duplicate VTK LiDAR pipeline ────────
-    # When Vulkan is the visible LiDAR renderer it already holds the point
-    # cloud / classification / intensity / elevation / shaded-class / surface
-    # data in its own buffers. Everything below this point - vtkPolyData
-    # construction, numpy_to_vtk mirrors, vtkOpenGLPolyDataMapper, the
-    # per-mode GPU shader setup, the actor upload and the deferred GL warm-up
-    # - would build a SECOND copy of the same geometry that no pixel can ever
-    # see, because the opaque Vulkan surface covers the slot.
-    #
-    # Only the LiDAR path is skipped. Overlays (SNT, digitizer,
-    # measurements, text, vectors, CAD) are untouched and keep working.
-    #
-    # Everything above this point still runs on purpose: app.data validation,
-    # the flight-line filter and app._main_global_indices / _main_lod_step
-    # are CPU-side bookkeeping that the classification/brush code and the
-    # Vulkan upload both rely on, and they are cheap.
-    if _vulkan_owns_lidar(app):
-        app._unified_actor = None
-        app._main_interaction_actor = None
-        app._unified_actor_building = False   # ← clear guard
-        # The palette/brush code treats a missing actor as "not ready" and
-        # no-ops, which is exactly right: there is nothing of ours to paint.
-        try:
-            _restore_snt_overlays(app)
-        except Exception:
-            pass
-        _note_vtk_lidar_skipped(app, len(vis_xyz))
         return None
 
     cloud = pv.PolyData(vis_xyz)
@@ -6041,8 +7624,6 @@ def build_unified_actor(
             print(f"      ⚠️ Could not schedule deferred init: {_te}")
 
     elapsed = (time.perf_counter() - t0) * 1000
-    global _VTK_LIDAR_BUILT
-    _VTK_LIDAR_BUILT += 1
     print(f"   🏗️ Unified actor built: {n_pts:,} pts in {elapsed:.1f} ms")
 
     app._unified_actor_building = False   # ← clear guard
@@ -6451,6 +8032,98 @@ def section_requires_legacy_border_render(
     return has_special_order
 
 
+def _resolve_section_ordered_global_indices(
+    app,
+    view_idx: int,
+    core_pts,
+    buf_pts,
+    core_mask,
+    buf_mask,
+    n_class: int,
+):
+    """Return canonical point IDs in the exact same order as section points.
+
+    Phase 2 spatial queries return candidates grouped by spatial cell, not in
+    canonical LAS index order. Therefore ``np.flatnonzero(core_mask)`` is no
+    longer guaranteed to line up element-for-element with ``core_pts``.
+
+    New section builds store explicit ordered ``section_<v>_core_indices`` and
+    ``section_<v>_buffer_indices`` alongside the transformed point arrays.
+    Those arrays are authoritative. The old mask-derived order remains only
+    as a compatibility fallback for sections created by older code paths.
+    """
+    core_len = int(len(core_pts)) if core_pts is not None else 0
+    buf_len = int(len(buf_pts)) if buf_pts is not None else 0
+
+    def _valid(values, expected):
+        if values is None:
+            return None
+        try:
+            arr = np.asarray(values, dtype=np.int64).reshape(-1)
+        except Exception:
+            return None
+        if len(arr) != int(expected):
+            return None
+        if len(arr):
+            if int(arr.min()) < 0 or int(arr.max()) >= int(n_class):
+                return None
+        return arr
+
+    core_idx = _valid(getattr(app, f"section_{view_idx}_core_indices", None), core_len)
+    buf_idx = _valid(getattr(app, f"section_{view_idx}_buffer_indices", None), buf_len)
+
+    if core_idx is None or (buf_len and buf_idx is None):
+        combined = _valid(
+            getattr(app, f"section_{view_idx}_indices", None),
+            core_len + buf_len,
+        )
+        if combined is None:
+            combined = _valid(
+                getattr(app, f"_section_{view_idx}_global_indices", None),
+                core_len + buf_len,
+            )
+        if combined is not None:
+            core_idx = combined[:core_len]
+            buf_idx = combined[core_len:] if buf_len else np.empty(0, dtype=np.int64)
+            print(
+                f"SECTION_INDEX_ORDER view={view_idx + 1} source=combined "
+                f"aligned=1 core={core_len} buffer={buf_len}"
+            )
+            return core_idx, buf_idx
+
+    if core_idx is not None and (buf_len == 0 or buf_idx is not None):
+        if buf_idx is None:
+            buf_idx = np.empty(0, dtype=np.int64)
+        print(
+            f"SECTION_INDEX_ORDER view={view_idx + 1} source=explicit "
+            f"aligned=1 core={core_len} buffer={buf_len}"
+        )
+        return core_idx, buf_idx
+
+    cm = np.asarray(core_mask, dtype=bool).ravel() if core_mask is not None else None
+    if cm is None or cm.size != int(n_class):
+        return None, None
+    core_idx = np.flatnonzero(cm)
+    if len(core_idx) != core_len:
+        return None, None
+
+    if buf_len:
+        bm = np.asarray(buf_mask, dtype=bool).ravel() if buf_mask is not None else None
+        if bm is None or bm.size != int(n_class):
+            return None, None
+        buf_idx = np.flatnonzero(bm & ~cm)
+        if len(buf_idx) != buf_len:
+            return None, None
+    else:
+        buf_idx = np.empty(0, dtype=np.int64)
+
+    print(
+        f"SECTION_INDEX_ORDER view={view_idx + 1} source=legacy_mask "
+        f"aligned=1 core={core_len} buffer={buf_len}"
+    )
+    return core_idx.astype(np.int64, copy=False), buf_idx.astype(np.int64, copy=False)
+
+
 def build_section_legacy_border_actors(
     app,
     view_idx: int,
@@ -6482,45 +8155,24 @@ def build_section_legacy_border_actors(
     classification_full = data["classification"]
     n_class = len(classification_full)
 
-    core_mask = np.asarray(core_mask, dtype=bool).ravel()
-    if core_mask.size != n_class:
+    core_global_idx, buf_global_idx = _resolve_section_ordered_global_indices(
+        app, view_idx, core_pts, buf_pts, core_mask, buf_mask, n_class
+    )
+    if core_global_idx is None:
         print(
-            f"   ⚠️ Section {view_idx + 1}: stale core_mask "
-            f"(len={core_mask.size}, data={n_class}) - skipping refresh"
+            f"   ⚠️ Section {view_idx + 1}: unable to resolve aligned "
+            "point/class index order - skipping legacy refresh"
         )
         return False
 
-    core_global_idx = np.flatnonzero(core_mask)
-    if len(core_pts) != len(core_global_idx):
-        print(
-            f"   ⚠️ Section {view_idx + 1}: core_points/core_mask mismatch "
-            f"({len(core_pts)} vs {len(core_global_idx)}) - skipping refresh"
-        )
-        return False
+    has_buffer = (
+        buf_pts is not None
+        and len(buf_pts) > 0
+        and buf_global_idx is not None
+        and len(buf_global_idx) == len(buf_pts)
+    )
 
-    if buf_pts is not None and buf_mask is not None and len(buf_pts) > 0:
-        buf_mask = np.asarray(buf_mask, dtype=bool).ravel()
-        if buf_mask.size != n_class:
-            print(
-                f"   ⚠️ Section {view_idx + 1}: stale buffer_mask "
-                f"(len={buf_mask.size}, data={n_class}) - ignoring buffer"
-            )
-            buf_pts = None
-            buf_mask = None
-        else:
-            buf_only_mask = buf_mask & ~core_mask
-            buf_global_idx = np.flatnonzero(buf_only_mask)
-            if len(buf_pts) != len(buf_global_idx):
-                print(
-                    f"   ⚠️ Section {view_idx + 1}: buffer_points/buffer_mask mismatch "
-                    f"({len(buf_pts)} vs {len(buf_global_idx)}) - ignoring buffer"
-                )
-                buf_pts = None
-                buf_mask = None
-
-    if buf_pts is not None and buf_mask is not None and len(buf_pts) > 0:
-        buf_only_mask = buf_mask & ~core_mask
-        buf_global_idx = np.flatnonzero(buf_only_mask)
+    if has_buffer:
         all_pts = np.vstack([core_pts, buf_pts])
         all_cls = np.concatenate([
             classification_full[core_global_idx],
@@ -6719,46 +8371,23 @@ def build_section_unified_actor(
     classification_full = data['classification']
     n_class = len(classification_full)
 
-    core_mask = np.asarray(core_mask, dtype=bool).ravel()
-    if core_mask.size != n_class:
+    core_global_idx, buf_global_idx = _resolve_section_ordered_global_indices(
+        app, view_idx, core_pts, buf_pts, core_mask, buf_mask, n_class
+    )
+    if core_global_idx is None:
         print(
-            f"   ⚠️ Section {view_idx + 1}: stale core_mask "
-            f"(len={core_mask.size}, data={n_class}) - skipping refresh"
-        )
-        return None
-
-    core_global_idx = np.flatnonzero(core_mask)
-    if len(core_pts) != len(core_global_idx):
-        print(
-            f"   ⚠️ Section {view_idx + 1}: core_points/core_mask mismatch "
-            f"({len(core_pts)} vs {len(core_global_idx)}) - skipping refresh"
+            f"   ⚠️ Section {view_idx + 1}: unable to resolve aligned "
+            "point/class index order - skipping refresh"
         )
         return None
 
     all_pts_prebuilt = getattr(app, f"section_{view_idx}_points_transformed", None)
-    has_buffer = False
-    buf_global_idx = np.empty((0,), dtype=np.int64)
-    if buf_pts is not None and buf_mask is not None and len(buf_pts) > 0:
-        buf_mask = np.asarray(buf_mask, dtype=bool).ravel()
-        if buf_mask.size != n_class:
-            print(
-                f"   ⚠️ Section {view_idx + 1}: stale buffer_mask "
-                f"(len={buf_mask.size}, data={n_class}) - ignoring buffer"
-            )
-            buf_pts = None
-            buf_mask = None
-        else:
-            buf_only_mask = buf_mask & ~core_mask
-            buf_global_idx = np.flatnonzero(buf_only_mask)
-            if len(buf_pts) != len(buf_global_idx):
-                print(
-                    f"   ⚠️ Section {view_idx + 1}: buffer_points/buffer_mask mismatch "
-                    f"({len(buf_pts)} vs {len(buf_global_idx)}) - ignoring buffer"
-                )
-                buf_pts = None
-                buf_mask = None
-            else:
-                has_buffer = True
+    has_buffer = (
+        buf_pts is not None
+        and len(buf_pts) > 0
+        and buf_global_idx is not None
+        and len(buf_global_idx) == len(buf_pts)
+    )
 
     core_pts_use = core_pts
     core_idx_use = core_global_idx
@@ -7129,53 +8758,36 @@ def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: n
     return True
 
 
-def fast_partial_classify_update(app, global_changed_mask: np.ndarray):
-    """Updates ONLY the points that changed in the MAIN VIEW."""
+def fast_partial_classify_update(app, global_changed_mask=None, *, changed_indices=None, delta=None):
+    """Update only changed Main View points using sparse canonical IDs."""
+    ci = _phase1_changed_indices(app, changed_mask=global_changed_mask, changed_indices=changed_indices, delta=delta)
+    if ci.size == 0:
+        return True
+    display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+    if display_mode not in ("class", "shaded_class"):
+        return True
+    if _is_main_tiled(app):
+        try:
+            tiles, points = _patch_main_tile_actors(app, ci)
+            app._phase2b_last_tile_updates = (tiles, points)
+            return True
+        except Exception as exc:
+            print(f"⚠️ fast_partial_classify_update tiled patch failed: {exc}")
+            return False
     actor = _get_unified_actor(app)
     if actor is None:
         return False
-
     rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
     if rgb_ptr is None or not _is_writable(rgb_ptr):
         return False
-
     gi = getattr(app, '_main_global_indices', None)
-    palette = getattr(app, "class_palette", {})
-    classification = app.data["classification"]
-
-    if gi is None:
-        local_indices = np.where(global_changed_mask)[0]
-    else:
-        gi_mask = getattr(app, '_main_global_mask', None)
-        if gi_mask is None:
-            gi_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-            gi_mask[gi] = True
-            app._main_global_mask = gi_mask
-
-        changed_visible_global = np.where(global_changed_mask & gi_mask)[0]
-        if len(changed_visible_global) == 0:
-            return True
-
-        g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
-        if g_to_l_arr is None:
-            g_to_l_arr = np.full(len(app.data["xyz"]), -1, dtype=np.int32)
-            g_to_l_arr[gi] = np.arange(len(gi), dtype=np.int32)
-            actor._naksha_global_to_local_arr = g_to_l_arr
-
-        local_indices = g_to_l_arr[changed_visible_global]
-        valid_mask = local_indices != -1
-        if not np.any(valid_mask):
-            return True
-        local_indices = local_indices[valid_mask]
-
+    local_indices = ci if gi is None else _map_global_changed_to_local(gi, ci, assume_sorted=True)
+    if local_indices.size == 0:
+        return True
     try:
-        display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-        # Guard main-view RGB/class-buffer patching outside class/shaded_class modes.
-        if display_mode not in ("class", "shaded_class"):
-            return True
         _patch_actor_memory(app, actor, local_indices, slot_idx=0)
-    except Exception as e:
-        print(f"⚠️ fast_partial_classify_update patch failed: {e}")
+    except Exception as exc:
+        print(f"⚠️ fast_partial_classify_update patch failed: {exc}")
         return False
     return True
 
@@ -7184,112 +8796,81 @@ def fast_partial_classify_update(app, global_changed_mask: np.ndarray):
 # fast_classify_update — main view
 # ─────────────────────────────────────────────────────────────────────────────
 def fast_classify_update(
-    app,
-    changed_mask: np.ndarray,
-    to_class: int = None,
-    skip_render: bool = False,
-    **kwargs,
+    app, changed_mask=None, to_class: int = None, skip_render: bool = False,
+    changed_indices=None, delta=None, **kwargs,
 ) -> bool:
-    """
-    Fast main-view classification buffer patch.
+    """Sparse Main View classification buffer patch; legacy masks supported."""
+    classification = app.data.get("classification") if hasattr(app, "data") and app.data else None
+    if classification is None:
+        return False
+    ci = _phase1_changed_indices(app, changed_mask=changed_mask, changed_indices=changed_indices, delta=delta)
+    if ci.size == 0:
+        return True
+    display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+    if _is_main_tiled(app):
+        try:
+            tiles, points = _patch_main_tile_actors(app, ci)
+            app._phase2b_last_tile_updates = (tiles, points)
+            print(f"MAIN_REFRESH source=phase2b_tiled_delta changed={int(ci.size)} tiles={tiles} patched={points}")
+            if not skip_render and display_mode in ("class", "shaded_class"):
+                if display_mode == "class":
+                    update_main_tile_visibility(app)
+                try:
+                    app.vtk_widget.render(); app._gpu_sync_done = True
+                except Exception as exc:
+                    print(f"⚠️ GPU render error (fast_classify_update tiled): {exc}")
+            return True
+        except Exception as exc:
+            print(f"⚠️ fast_classify_update tiled patch failed: {exc}")
+            return False
 
-    ``to_class`` is retained for API compatibility only.  The authoritative
-    class identity for every changed point is always read from
-    ``app.data["classification"]``.  This prevents a stale changed mask from
-    repainting old points with the currently selected shortcut class.
-    """
     actor = _get_unified_actor(app)
     if actor is None:
         return False
-
-    if not isinstance(changed_mask, np.ndarray) or changed_mask.dtype != bool:
-        return False
-
-    classification = None
-    if hasattr(app, "data") and app.data:
-        classification = app.data.get("classification")
-    if classification is None or changed_mask.ndim != 1 or len(changed_mask) != len(classification):
-        return False
-
     global_indices = getattr(app, '_main_global_indices', None)
     if global_indices is not None:
-        section_changed = changed_mask[global_indices]
-        local_changed = np.flatnonzero(section_changed)
+        local_changed = _map_global_changed_to_local(global_indices, ci, assume_sorted=True)
         if local_changed.size == 0:
             return True
-        changed_global = np.asarray(global_indices, dtype=np.int64)[local_changed]
+        gi_arr = np.asarray(global_indices, dtype=np.int64).ravel()
+        changed_global = gi_arr[local_changed]
     else:
-        local_changed = np.flatnonzero(changed_mask)
-        if local_changed.size == 0:
-            return True
-        changed_global = local_changed.astype(np.int64, copy=False)
-
-    # Only update slot-0 RGB/class buffers when main view is in class/shaded_class.
-    display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+        local_changed = ci
+        changed_global = ci
     if display_mode in ("class", "shaded_class"):
         rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
         mesh = getattr(actor, '_naksha_mesh', None)
-
-        # Clamp against the live actor buffer once.  Keep global/local mappings
-        # aligned when a cropped/subset main actor is active.
-        if rgb_ptr is not None and local_changed[-1] >= len(rgb_ptr):
-            keep = local_changed < len(rgb_ptr)
-            local_changed = local_changed[keep]
-            changed_global = changed_global[keep]
+        if rgb_ptr is not None:
+            valid = (local_changed >= 0) & (local_changed < len(rgb_ptr))
+            local_changed = local_changed[valid]; changed_global = changed_global[valid]
         if local_changed.size == 0:
             return True
-
         canonical_classes = np.asarray(classification)[changed_global]
-
         if rgb_ptr is not None:
             palette = kwargs.get("palette") or getattr(app, "class_palette", {}) or _get_slot_palette(app, 0)
             max_class = max(256, int(np.max(canonical_classes, initial=0)) + 1)
             color_lut = _get_lut_array(palette, max_class)
-            safe_classes = canonical_classes.clip(0, max_class - 1).astype(np.intp, copy=False)
-            rgb_ptr[local_changed] = color_lut[safe_classes]
+            rgb_ptr[local_changed] = color_lut[canonical_classes.clip(0, max_class-1).astype(np.intp, copy=False)]
             vtk_ca = getattr(actor, "_naksha_vtk_array", None)
-            if vtk_ca is not None:
-                vtk_ca.Modified()
-
+            if vtk_ca is not None: vtk_ca.Modified()
         if mesh is not None:
             class_vtk_arr = mesh.GetPointData().GetArray("Classification")
             if class_vtk_arr is not None:
                 cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
-                valid = local_changed < len(cls_np)
-                if not np.all(valid):
-                    local_for_class = local_changed[valid]
-                    classes_for_class = canonical_classes[valid]
-                else:
-                    local_for_class = local_changed
-                    classes_for_class = canonical_classes
-                if local_for_class.size > 0:
-                    cls_np[local_for_class] = classes_for_class.astype(cls_np.dtype, copy=False)
-                    class_vtk_arr.Modified()
-                    mesh.Modified()
-
+                valid = local_changed < len(cls_np); li = local_changed[valid]; cc = canonical_classes[valid]
+                if li.size:
+                    cls_np[li] = cc.astype(cls_np.dtype, copy=False)
+                    class_vtk_arr.Modified(); mesh.GetPointData().Modified()
         _mark_actor_dirty(actor)
-
         ctx = getattr(actor, '_naksha_shader_ctx', None)
-        if ctx is not None:
-            last_gen = getattr(actor, '_last_uniform_generation', -1)
-            if ctx._generation != last_gen:
-                _push_uniforms_direct(actor, ctx)
-                actor._last_uniform_generation = ctx._generation
-
-        print(
-            f"MAIN_REFRESH source=canonical_classification_array "
-            f"changed={int(local_changed.size)}"
-        )
-
+        if ctx is not None and ctx._generation != getattr(actor, '_last_uniform_generation', -1):
+            _push_uniforms_direct(actor, ctx); actor._last_uniform_generation = ctx._generation
+        print(f"MAIN_REFRESH source=sparse_classification_delta changed={int(local_changed.size)}")
     if not skip_render and display_mode in ("class", "shaded_class"):
         try:
-            # Keep the throttled call: app.vtk_widget.render is wrapped by
-            # GPURenderManager which queues main-view renders to ~10 fps.
-            app.vtk_widget.render()
-            app._gpu_sync_done = True
-        except Exception as _e:
-            print(f"⚠️ GPU render error (fast_classify_update): {_e}")
-
+            app.vtk_widget.render(); app._gpu_sync_done = True
+        except Exception as exc:
+            print(f"⚠️ GPU render error (fast_classify_update): {exc}")
     return True
 
 
@@ -7299,10 +8880,13 @@ def fast_classify_update(
 def fast_cross_section_update(
     app,
     view_idx: int,
-    changed_mask_global: np.ndarray,
+    changed_mask_global=None,
     palette: Optional[dict] = None,
     skip_render: bool = False,
     force_visibility_refresh: bool = False,
+    *,
+    changed_indices=None,
+    delta=None,
 ) -> bool:
     t0 = time.perf_counter()
 
@@ -7397,48 +8981,19 @@ def fast_cross_section_update(
     if vtk_scalars is None:
         return False
 
-    changed_idx = None
-    cached_changed_idx = getattr(app, "_last_changed_indices", None)
-    cached_mask_ref = getattr(app, "_last_changed_mask", None)
-    can_use_sparse = (
-        isinstance(cached_changed_idx, np.ndarray)
-        and cached_changed_idx.size > 0
-        and (changed_mask_global is cached_mask_ref)
+    full_refresh_requested = (
+        changed_mask_global is None and changed_indices is None and delta is None
     )
-
-    if can_use_sparse and isinstance(changed_mask_global, np.ndarray) and changed_mask_global.dtype == bool:
-        try:
-            _probe = cached_changed_idx[
-                (cached_changed_idx >= 0) & (cached_changed_idx < len(changed_mask_global))
-            ]
-            if _probe.size == 0 or not np.all(changed_mask_global[_probe]):
-                can_use_sparse = False
-        except Exception:
-            can_use_sparse = False
-
-    if can_use_sparse:
-        g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
-        if g_to_l_arr is None or len(g_to_l_arr) != len(classification):
-            g_to_l_arr = np.full(len(classification), -1, dtype=np.int32)
-            g_to_l_arr[global_indices] = np.arange(len(global_indices), dtype=np.int32)
-            actor._naksha_global_to_local_arr = g_to_l_arr
-
-        _valid_changed = cached_changed_idx[
-            (cached_changed_idx >= 0) & (cached_changed_idx < len(g_to_l_arr))
-        ]
-        if _valid_changed.size > 0:
-            local_map = g_to_l_arr[_valid_changed]
-            keep = local_map >= 0
-            if np.any(keep):
-                changed_idx = local_map[keep]
-
-    if changed_idx is None:
-        if (changed_mask_global is not None
-                and len(changed_mask_global) >= (int(global_indices.max()) + 1 if len(global_indices) > 0 else 0)):
-            section_changed = changed_mask_global[global_indices]
-        else:
-            section_changed = np.ones(len(global_indices), dtype=bool)
-        changed_idx = np.flatnonzero(section_changed)
+    if full_refresh_requested:
+        changed_idx = np.arange(len(global_indices), dtype=np.int64)
+    else:
+        ci = _phase1_changed_indices(
+            app,
+            changed_mask=changed_mask_global,
+            changed_indices=changed_indices,
+            delta=delta,
+        )
+        changed_idx = _map_global_changed_to_local(global_indices, ci, cache_owner=actor)
 
     n_changed = int(changed_idx.size)
 
@@ -7538,68 +9093,56 @@ def fast_cross_section_update(
     return True
 
 
-def fast_undo_update(app, changed_mask: np.ndarray, **kwargs) -> bool:
+def fast_undo_update(app, changed_mask=None, *, changed_indices=None, delta=None, **kwargs) -> bool:
+    """Sparse undo/redo GPU patch across Main + section actors."""
     t0 = time.perf_counter()
     actors_updated = 0
     total_pts = 0
-
-    main_actor = _get_unified_actor(app)
-    if main_actor:
-        gi = getattr(app, '_main_global_indices', None)
-        if gi is not None:
-            local_changed = np.flatnonzero(changed_mask[gi])
-        else:
-            local_changed = np.flatnonzero(changed_mask)
-
-        if local_changed.size > 0:
-            _patch_actor_memory(app, main_actor, local_changed, slot_idx=0)
-            actors_updated += 1
-            total_pts += local_changed.size
-
-    if not (hasattr(app, 'section_vtks') and app.section_vtks):
-        elapsed = (time.perf_counter() - t0) * 1000
-        print(f"   ⚡ fast_undo_update: {total_pts:,} pts across "
-              f"{actors_updated} views [{elapsed:.1f} ms]")
-        return actors_updated > 0
-
-    sections_to_render = []
-    for view_idx, vtk_widget in app.section_vtks.items():
-        if vtk_widget is None:
-            continue
-        actor_name = f"_section_{view_idx}_unified"
-        sec_actor = vtk_widget.actors.get(actor_name)
-        if sec_actor is None:
-            continue
-        rgb_ptr = getattr(sec_actor, "_naksha_rgb_ptr", None)
-        if rgb_ptr is None or not _is_writable(rgb_ptr):
-            continue
-        gi_section = getattr(sec_actor, "_naksha_global_indices", None)
-        if gi_section is None or len(gi_section) == 0:
-            gi_section = getattr(app, f'_section_{view_idx}_global_indices', None)
-        if gi_section is None:
-            continue
-        max_gi = int(gi_section.max(initial=0))
-        if len(changed_mask) < max_gi + 1:
-            local_sec_changed = np.arange(len(gi_section), dtype=np.intp)
-        else:
-            local_sec_changed = np.flatnonzero(changed_mask[gi_section])
-        if local_sec_changed.size == 0:
-            continue
-        _patch_actor_memory(app, sec_actor, local_sec_changed, slot_idx=view_idx + 1)
-        sections_to_render.append((view_idx, vtk_widget, local_sec_changed.size))
-        actors_updated += 1
-        total_pts += local_sec_changed.size
-
-    for view_idx, vtk_widget, n_pts in sections_to_render:
+    ci = _phase1_changed_indices(app, changed_mask=changed_mask, changed_indices=changed_indices, delta=delta)
+    if ci.size == 0:
+        return False
+    if _is_main_tiled(app):
         try:
-            if _safe_widget_render(vtk_widget):
-                print(f"   ⚡ Section {view_idx+1} RGB inject: {n_pts} pts")
-        except Exception as e:
-            print(f"   ⚠️  fast_undo_update: render failed section {view_idx+1}: {e}")
-
+            tu, tp = _patch_main_tile_actors(app, ci)
+            app._phase2b_last_tile_updates = (tu, tp)
+            actors_updated += int(tu); total_pts += int(tp)
+        except Exception as exc:
+            print(f"   ⚠️ fast_undo_update tiled Main patch failed: {exc}")
+    else:
+        main_actor = _get_unified_actor(app)
+        if main_actor:
+            gi = getattr(app, '_main_global_indices', None)
+            local_changed = ci if gi is None else _map_global_changed_to_local(gi, ci, assume_sorted=True)
+            if local_changed.size:
+                _patch_actor_memory(app, main_actor, local_changed, slot_idx=0)
+                actors_updated += 1; total_pts += local_changed.size
+    if hasattr(app, 'section_vtks') and app.section_vtks:
+        sections_to_render = []
+        for view_idx, vtk_widget in app.section_vtks.items():
+            if vtk_widget is None:
+                continue
+            sec_actor = vtk_widget.actors.get(f"_section_{view_idx}_unified")
+            if sec_actor is None:
+                continue
+            gi_section = getattr(sec_actor, "_naksha_global_indices", None)
+            if gi_section is None or len(gi_section) == 0:
+                gi_section = getattr(app, f'_section_{view_idx}_global_indices', None)
+            if gi_section is None:
+                continue
+            local_sec = _map_global_changed_to_local(gi_section, ci, cache_owner=sec_actor)
+            if local_sec.size == 0:
+                continue
+            _patch_actor_memory(app, sec_actor, local_sec, slot_idx=view_idx + 1)
+            sections_to_render.append((view_idx, vtk_widget, local_sec.size))
+            actors_updated += 1; total_pts += local_sec.size
+        for view_idx, vtk_widget, n_pts in sections_to_render:
+            try:
+                if _safe_widget_render(vtk_widget):
+                    print(f"   ⚡ Section {view_idx+1} RGB inject: {n_pts} pts")
+            except Exception as exc:
+                print(f"   ⚠️ fast_undo_update: render failed section {view_idx+1}: {exc}")
     elapsed = (time.perf_counter() - t0) * 1000
-    print(f"   ⚡ fast_undo_update: {total_pts:,} pts across "
-          f"{actors_updated} views [{elapsed:.1f} ms]")
+    print(f"   ⚡ fast_undo_update: {total_pts:,} pts across {actors_updated} views [{elapsed:.1f} ms]")
     return actors_updated > 0
 
 
@@ -7736,6 +9279,8 @@ def _safe_widget_render(vtk_widget) -> bool:
 # ACTOR LOOKUP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def is_unified_actor_ready(app) -> bool:
+    if _is_main_tiled(app):
+        return any(True for _ in _main_tile_actor_items(app))
     return _get_unified_actor(app) is not None
 
 
@@ -7757,6 +9302,23 @@ def _expected_main_actor_point_count(current_n: int, app=None) -> int:
 def _get_unified_actor(app) -> Optional[object]:
     # Block all callers while build_unified_actor is running
     if getattr(app, '_unified_actor_building', False):
+        return None
+    if _is_main_tiled(app):
+        data = getattr(app, "data", None)
+        xyz = data.get("xyz") if isinstance(data, dict) else None
+        for _, actor in _main_tile_actor_items(app):
+            try:
+                if xyz is not None and getattr(actor, '_naksha_data_id', None) != id(xyz):
+                    return None
+                try:
+                    from gui.flight_line_filter import flight_line_visibility_signature
+                    if getattr(actor, '_naksha_flight_line_signature', ()) != flight_line_visibility_signature(app):
+                        fast_main_flight_line_visibility_update(app, render=False)
+                except Exception:
+                    pass
+                return actor
+            except Exception:
+                continue
         return None
     plotter = getattr(app, "vtk_widget", None)
     actor = getattr(app, "_unified_actor", None)
@@ -7852,10 +9414,16 @@ def _get_unified_actor(app) -> Optional[object]:
 
 
 def _get_all_unified_actors(app):
-    main_actor = _get_unified_actor(app)
     vtk_widget = getattr(app, "vtk_widget", None)
-    if main_actor is not None and vtk_widget is not None:
-        yield (main_actor, 0, getattr(app, "_main_global_indices", None), vtk_widget)
+    if _is_main_tiled(app) and vtk_widget is not None:
+        for _, actor in _main_tile_actor_items(app):
+            rgb = getattr(actor, "_naksha_rgb_ptr", None)
+            if rgb is not None and _is_writable(rgb):
+                yield (actor, 0, getattr(actor, "_naksha_global_indices", None), vtk_widget)
+    else:
+        main_actor = _get_unified_actor(app)
+        if main_actor is not None and vtk_widget is not None:
+            yield (main_actor, 0, getattr(app, "_main_global_indices", None), vtk_widget)
 
     if hasattr(app, "section_vtks"):
         for view_idx, widget in app.section_vtks.items():
@@ -8002,6 +9570,26 @@ def invalidate_unified_actor(app):
         "_main_global_mask",
         "_main_global_indices",
         "_rgb_buffer",
+        "_main_tile_actors",
+        "_main_tile_lod_actors",
+        "_main_tile_descriptors",
+        "_main_tiled_mode",
+        "_main_tiles_mode_visible",
+        "_main_lod_active",
+        "_main_visible_tile_count",
+        "_main_visible_actor_count",
+        "_main_visible_source_points",
+        "_main_visible_render_points",
+        "_main_boundary_flags",
+        "_main_tile_descriptor_by_id",
+        "_main_tile_access",
+        "_main_tile_dirty",
+        "_main_tile_shader_ctx",
+        "_main_tile_point_size",
+        "_main_tile_border_percent",
+        "_main_tile_resident_budget",
+        "_main_tile_resident_count",
+        "_main_tile_residency_suspended",
     ]:
         if hasattr(app, attr):
             try:
@@ -8025,8 +9613,39 @@ def fast_main_flight_line_visibility_update(app, render: bool = True) -> bool:
     helper through ``_get_unified_actor``.
     """
     t0 = time.perf_counter()
-    actor = getattr(app, "_unified_actor", None)
     plotter = getattr(app, "vtk_widget", None)
+    if _is_main_tiled(app):
+        data = getattr(app, "data", None)
+        xyz = data.get("xyz") if isinstance(data, dict) else None
+        if xyz is None:
+            return False
+        from gui.flight_line_filter import flight_line_visibility_mask, flight_line_visibility_signature
+        full_mask = flight_line_visibility_mask(app, len(xyz), slot=0)
+        visible_total = 0; total = 0; updated = 0
+        for _, tile_actor in _main_tile_all_actor_items(app):
+            gi = getattr(tile_actor, '_naksha_global_indices', None)
+            mesh = getattr(tile_actor, '_naksha_mesh', None)
+            if gi is None or mesh is None:
+                continue
+            arr = mesh.GetPointData().GetArray('FlightVisible')
+            if arr is None:
+                continue
+            vals = numpy_support.vtk_to_numpy(arr)
+            local = full_mask[np.asarray(gi, dtype=np.int64)]
+            if len(vals) != len(local):
+                continue
+            np.copyto(vals, local, casting='unsafe')
+            arr.Modified(); mesh.Modified()
+            tile_actor._naksha_flight_line_signature = flight_line_visibility_signature(app, 0)
+            tile_actor._naksha_flight_np_ref = vals; tile_actor._naksha_flight_vtk = arr
+            visible_total += int(np.count_nonzero(local)); total += int(len(local)); updated += 1
+        if render and plotter is not None:
+            update_main_tile_visibility(app)
+            try: plotter.render()
+            except Exception: pass
+        print(f"   Main tiled flight-line GPU visibility: {visible_total:,}/{total:,} pts tiles={updated} [{(time.perf_counter()-t0)*1000.0:.1f} ms]")
+        return updated > 0
+    actor = getattr(app, "_unified_actor", None)
     if actor is None and plotter is not None:
         actor = getattr(plotter, "actors", {}).get(UNIFIED_ACTOR_NAME)
     if actor is None:
@@ -8076,11 +9695,27 @@ def fast_main_flight_line_visibility_update(app, render: bool = True) -> bool:
 
 def reset_uam(app):
     """
-    Global reset for Unified Actor Manager. 
+    Global reset for Unified Actor Manager.
     Wipes all cached shader contexts, LUTs, and actor references.
     Call this when clearing a project or switching datasets.
     """
     global _shader_contexts, _lut_cache, _palette_resolve_cache
+    # Detach heavy tile actors before clearing Python registries.  This is the
+    # Phase-2C.2 memory-release boundary used by Clear / dataset switching.
+    try:
+        _phase2c2_release_all_full_tiles(app, reason="reset_uam")
+        _phase2c2_release_all_lod_tiles(app, reason="reset_uam")
+    except Exception as exc:
+        print(f"PHASE2C2_TILE_EVICT status=reset_warning error={exc}")
+    # Flight-line masks are full-dataset boolean arrays. They are cheap to
+    # regenerate and must not keep tens of megabytes alive after Clear.
+    try:
+        app._flight_line_mask_cache_by_slot = {}
+        app._flight_line_mask_cache_key = None
+        app._flight_line_mask_cache = None
+        app._flight_line_visible_count_cache = None
+    except Exception:
+        pass
     _shader_contexts.clear()
     _lut_cache.clear()
     if "_palette_resolve_cache" in globals():
@@ -8111,7 +9746,6 @@ def _ensure_opengl_polydata_mapper(actor, cloud, use_spheres=True):
         new_mapper.SetScalarVisibility(raw_mapper.GetScalarVisibility())
         actor.SetMapper(new_mapper)
         print("      ℹ️ Swapped vtkDataSetMapper → vtkOpenGLPolyDataMapper")
-
 
 def compute_point_size(weight: float, base: float = _BASE_POINT_SIZE) -> float:
     min_size = max(0.5, base * 0.1)

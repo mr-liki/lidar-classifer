@@ -448,7 +448,30 @@ def _merge_import_options(import_options=None, disabled_attrs=None):
     return merged
 
 
+_skip_import_prompt_depth = 0
+
+
+class skip_import_prompt:
+    """Context manager: loads started inside it use default import options.
+
+    Used by the Load Block/Grid shortcut so the "Read points" dialog is not
+    shown. Menu/right-click loads are unaffected.
+    """
+
+    def __enter__(self):
+        global _skip_import_prompt_depth
+        _skip_import_prompt_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _skip_import_prompt_depth
+        _skip_import_prompt_depth = max(0, _skip_import_prompt_depth - 1)
+        return False
+
+
 def prompt_lidar_import_options(filename, parent=None, disabled_attrs=None, initial_options=None):
+    if _skip_import_prompt_depth > 0:
+        return _merge_import_options(initial_options, disabled_attrs)
     dlg = LoadPointCloudDialog(
         filename,
         parent=parent,
@@ -493,7 +516,7 @@ def _extract_classification_array(las):
         if {"synthetic", "key_point", "withheld"} <= dims:
             # Legacy point formats (0-5) pack classification into one byte:
             # bits 0-4 = classification, bit5=synthetic, bit6=key_point, bit7=withheld.
-            # Reconstruct the full code the same way Nakshatech/Nakshatech write it
+            # Reconstruct the full code the same way TerraScan/MicroStation write it
             # and the same way save_pointcloud now packs it. Memory-conscious for
             # large files: stays in uint8, no int64 temporaries.
             syn = np.asarray(las.synthetic, dtype=np.uint8)
@@ -594,7 +617,7 @@ def extract_epsg_from_vlrs(las):
                     pass
     return None
 
-def _extract_crs(las):
+def _extract_crs(las, filename=None):
     crs_wkt = None
     crs_epsg = None
 
@@ -636,8 +659,27 @@ def _extract_crs(las):
         except Exception:
             pass
 
+    # LAS/LAZ workflows commonly keep projection metadata in an adjacent PRJ
+    # instead of a LAS VLR. A same-basename sidecar is authoritative for that
+    # file and is therefore a safe fallback when the header has no CRS.
+    if crs_wkt is None and filename:
+        try:
+            from pathlib import Path
+            from pyproj import CRS
+
+            prj_path = Path(filename).with_suffix(".prj")
+            if prj_path.is_file():
+                prj_text = prj_path.read_text(encoding="utf-8-sig").strip()
+                if prj_text:
+                    crs_obj = CRS.from_user_input(prj_text)
+                    crs_wkt = crs_obj.to_wkt()
+                    crs_epsg = crs_obj.to_epsg()
+                    print(f"[CRS] Extracted CRS from matching PRJ sidecar: {prj_path.name}")
+        except Exception as exc:
+            print(f"CRS not found in matching PRJ sidecar: {exc}")
+
     if crs_epsg is not None:
-        print(f"📊 Extracted EPSG: {crs_epsg} from LAZ/LAS metadata")
+        print(f"[CRS] Extracted EPSG: {crs_epsg} from LAS/LAZ metadata or sidecar")
     return crs_wkt, crs_epsg
 
 
@@ -705,6 +747,27 @@ def load_lidar_file(
             if options is None:
                 return None
 
+        # Phase 2C: warm loads use a local disk-backed canonical point store.
+        # numpy.memmap is an ndarray subclass, so every existing classification,
+        # section, save/export and shading caller continues to see the same API.
+        # COW mapping guarantees unsaved edits never mutate the persistent cache.
+        try:
+            from .point_cache import try_load_lidar_cache
+            _cached = try_load_lidar_cache(filename, options)
+        except Exception as _cache_exc:
+            print(f"PHASE2C_POINT_CACHE status=probe_failed error={_cache_exc}")
+            _cached = None
+        if _cached is not None:
+            if parent is not None:
+                parent.loaded_file = filename
+                parent.last_save_path = filename
+                try:
+                    from .save_pointcloud import load_drawings_from_las
+                    load_drawings_from_las(filename, parent)
+                except Exception as exc:
+                    print(f"Could not load drawings: {exc}")
+            return _cached
+
         las = laspy.read(filename)
 
         # Pre-allocate the XYZ output buffer and fill it column-by-column.
@@ -769,12 +832,12 @@ def load_lidar_file(
         classification = _extract_classification_array(las)
         # LAS Point Source ID is the conventional flight-line identifier.
         # Keep it aligned with xyz through import filtering so Display Mode can
-        # reproduce Nakshatech's selected-flight-lines behaviour.
+        # reproduce MicroStation's selected-flight-lines behaviour.
         point_source_id = None
         if "point_source_id" in {str(d).lower() for d in las.point_format.dimension_names}:
             point_source_id = np.asarray(las.point_source_id, dtype=np.uint16).copy()
 
-        crs_wkt, crs_epsg = _extract_crs(las)
+        crs_wkt, crs_epsg = _extract_crs(las, filename)
 
         version_str = las.header.version
         if isinstance(version_str, tuple):
@@ -803,7 +866,7 @@ def load_lidar_file(
             except Exception as exc:
                 print(f"Could not load drawings: {exc}")
 
-        return {
+        _result = {
             "xyz": xyz,
             "rgb": rgb,
             "intensity": intensity,
@@ -815,7 +878,23 @@ def load_lidar_file(
             "input_point_format": point_format_id,
             "import_options": options,
             "type": "las",
+            "_point_cache_hit": False,
         }
+
+        # Publish a local canonical cache for the next load and reopen the
+        # arrays as copy-on-write memmaps immediately.  This drops the large
+        # extracted NumPy buffers once the caller takes ownership, while all
+        # existing code keeps normal ndarray semantics.
+        try:
+            from .point_cache import store_lidar_cache
+            _mapped = store_lidar_cache(filename, options, _result, reopen_memmap=True)
+            if _mapped is not None:
+                _result = _mapped
+                _result["_point_cache_first_build"] = True
+        except Exception as _cache_exc:
+            print(f"PHASE2C_POINT_CACHE status=publish_failed error={_cache_exc}")
+
+        return _result
 
     if filename.lower().endswith(".ply"):
         pcd = o3d.io.read_point_cloud(filename)

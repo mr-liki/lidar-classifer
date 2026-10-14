@@ -1951,6 +1951,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             actor = self.digitizer._pick_actor(x, y)
             if actor:
                 for d in self._iter_pickable_drawings():
+                    if not self.digitizer.drawing_in_edit_scope(d):
+                        # Protected Cell circle / outside the active edit scope.
+                        continue
                     if d.get("actor") is actor:
                         return d
                     for key in ("start_marker", "end_marker"):

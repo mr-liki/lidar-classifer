@@ -1941,6 +1941,7 @@ class ThemeColors:
         # ── Individual icon colors: AI ───────────────────────────────
         "icon_start":                "#ff7043",
         "icon_create_block":         "#00e5ff",
+        "icon_create_cell":          "#2979ff",
     }
 
     # ── Light palette ──────────────────────────────────────────────
@@ -2120,6 +2121,7 @@ class ThemeColors:
         # ── Individual icon colors: AI ───────────────────────────────
         "icon_start":                "#f4511e",
         "icon_create_block":         "#00838f",
+        "icon_create_cell":          "#1565c0",
     }
 
     _current = "dark"

@@ -542,14 +542,13 @@ class GlobalShortcutFilter(QObject):
             print(f"   ⚠️ Surface cleanup before shading visibility enforce skipped: {_surface_cleanup_err}")
 
         try:
-            # Hide unified/main point actor.
-            from gui.unified_actor_manager import _get_unified_actor
-            unified_actor = _get_unified_actor(app)
-            if unified_actor is not None:
-                unified_actor.SetVisibility(False)
-                print("   🙈 Unified point actor hidden for ShadingMode")
+            # Hide every Main class render unit (legacy actor or Phase-2B tiles).
+            from gui.unified_actor_manager import set_main_class_actor_visibility
+            hidden = set_main_class_actor_visibility(app, False)
+            if hidden:
+                print(f"   🙈 Hidden {hidden} Main class actor(s) for ShadingMode")
         except Exception as _unified_hide_err:
-            print(f"   ⚠️ Unified actor hide for ShadingMode skipped: {_unified_hide_err}")
+            print(f"   ⚠️ Main class actor hide for ShadingMode skipped: {_unified_hide_err}")
 
         try:
             vtk_widget = getattr(app, "vtk_widget", None)
@@ -2063,28 +2062,21 @@ class GlobalShortcutFilter(QObject):
                                     f"show={info.get('show', False)}")
                         print(f"   ✅ class_palette reset complete")
 
-                        # ✅ FIX STEP 3: Remove shading mesh actor
-                        print(f"   🧹 Clearing shading actors...")
-                        if hasattr(self.app_window, '_shaded_mesh_actor') and \
-                                self.app_window._shaded_mesh_actor:
-                            try:
-                                self.app_window.vtk_widget.remove_actor(
-                                    'shaded_mesh', render=False
-                                )
-                                self.app_window._shaded_mesh_actor = None
-                                print(f"      ✅ Removed shading mesh actor")
-                            except Exception as e:
-                                print(f"      ⚠️ Could not remove shading actor: {e}")
-
-                        if hasattr(self.app_window, '_shaded_mesh_polydata'):
-                            self.app_window._shaded_mesh_polydata = None
-
+                        # STEP 1 resident shading: park the exact VTK/barycentric
+                        # render graph instead of deleting it. Returning to the
+                        # same shading preset can now be a visibility toggle.
+                        print(f"   🅿️ Parking shading actors/cache...")
                         try:
-                            from gui.shading_display import clear_shading_cache
-                            clear_shading_cache("Main View switching to DisplayMode")
-                            print(f"      ✅ Cleared shading cache")
+                            from gui.shading_display import detach_shading_before_non_shading_mode
+                            _parked = detach_shading_before_non_shading_mode(
+                                self.app_window
+                            )
+                            print(
+                                f"      ✅ Parked {_parked} shading actor(s); "
+                                "barycentric render state preserved"
+                            )
                         except Exception as e:
-                            print(f"      ⚠️ Could not clear shading cache: {e}")
+                            print(f"      ⚠️ Could not park shading state: {e}")
 
                         # ✅ FIX STEP 4: Clear shading override flag
                         self.app_window._shading_visibility_override = None
@@ -2128,11 +2120,11 @@ class GlobalShortcutFilter(QObject):
 
                         # ✅ FIX STEP 7: Ensure unified actor is visible
                         try:
-                            from gui.unified_actor_manager import _get_unified_actor
+                            from gui.unified_actor_manager import _get_unified_actor, set_main_class_actor_visibility
                             _ua = _get_unified_actor(self.app_window)
                             if _ua is not None:
-                                _ua.SetVisibility(True)
-                                print(f"      ✅ Unified actor made visible")
+                                _nvis = set_main_class_actor_visibility(self.app_window, True)
+                                print(f"      ✅ Main class render actors made visible ({_nvis})")
                             else:
                                 print(f"      ℹ️ No unified actor yet — will be built below")
                         except Exception as e:
@@ -2147,7 +2139,8 @@ class GlobalShortcutFilter(QObject):
                             print(f"      🔍 Unified actor for GPU sync: "
                                 f"{'exists' if _actor else 'None — full rebuild'}")
                             if _actor is not None:
-                                _actor.SetVisibility(True)  # ensure visible before sync
+                                from gui.unified_actor_manager import set_main_class_actor_visibility
+                                set_main_class_actor_visibility(self.app_window, True)
                                 sync_palette_to_gpu(
                                     self.app_window, 0,
                                     self.app_window.class_palette,
@@ -2512,7 +2505,8 @@ class GlobalShortcutFilter(QObject):
                                 )
                                 _actor = _get_unified_actor(self.app_window)
                                 if _actor is not None:
-                                    _actor.SetVisibility(True)
+                                    from gui.unified_actor_manager import set_main_class_actor_visibility
+                                    set_main_class_actor_visibility(self.app_window, True)
                                     self.app_window._preserve_view = True
                                     sync_palette_to_gpu(
                                         self.app_window, 0,
@@ -2982,7 +2976,10 @@ class GlobalShortcutFilter(QObject):
                     # Quality is part of shading_display's cache key. Let it
                     # restore/build the requested Fast/Normal/Slow geometry
                     # instead of discarding a valid quality-specific cache.
-                    _shading_force_rebuild = previous_display_mode != "shaded_class"
+                    # Switching from Class/RGB/etc. is NOT a geometry change.
+                    # Try exact resident restore first; normal cache/full build
+                    # remains the safety fallback for stale state.
+                    _shading_force_rebuild = False
                     update_shaded_class(
                         self.app_window,
                         azimuth=azimuth,

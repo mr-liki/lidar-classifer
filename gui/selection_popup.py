@@ -1,5 +1,5 @@
 """
-SelectionModeDialog — Nakshatech-style PowerSelector panel.
+SelectionModeDialog — MicroStation-style PowerSelector panel.
 
 UI rewrite: no fixed size, full-text buttons, and auto-positioned to
 the top-right of the parent window so it doesn't block the canvas.
@@ -319,6 +319,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         ("Block",      "block",      "▭"),
         ("Shape",      "shape",      "⬟"),
         ("Line",       "cline",      "╱"),
+        ("SNT Text",   "snt_text",   "T"),
     ]
 
     TOOL_FILTERS = [
@@ -355,6 +356,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self.setStyleSheet(_PANEL_QSS)
 
         self._method = "individual"
+        # The highlighted pick method is also its on/off state. Keep the
+        # historical default (Individual starts active), while allowing the
+        # user to click the active method again to stand selection down.
+        self._pick_enabled = True
         self._enclose_mode = "overlap"
         self._poll_generation = 0  # incremented each time move mode is armed
 
@@ -387,18 +392,21 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         method_row = QGridLayout()
         method_row.setSpacing(4)
         self._method_group = QButtonGroup(self)
-        self._method_group.setExclusive(True)
+        # An exclusive QButtonGroup cannot uncheck its current button. Enforce
+        # one-at-a-time selection in the click handler so all buttons may also
+        # be off.
+        self._method_group.setExclusive(False)
         for i, (label, key, icon) in enumerate(self.METHODS):
             btn = QPushButton(f"{icon}  {label}")
             btn.setCheckable(True)
             btn.setMinimumHeight(36)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setProperty("method_key", key)
-            if key == self._method:
+            if self._pick_enabled and key == self._method:
                 btn.setChecked(True)
             btn.setToolTip(self._tooltip_for_method(key))
             self._method_group.addButton(btn)
-            method_row.addWidget(btn, i // 4, i % 4)
+            method_row.addWidget(btn, i // len(self.METHODS), i % len(self.METHODS))
         self._method_group.buttonClicked.connect(self._on_method_button)
         root.addLayout(method_row)
 
@@ -650,6 +658,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             "block":      "Drag a rectangle to pick touched elements.",
             "shape":      "Click polygon vertices, right-click to close.",
             "cline":      "Click two points to draw a line; crossed elements pick.",
+            "snt_text":   "Drag a rectangle to select only SNT text labels for copying.",
         }.get(key, "")
 
     # ------------------------------------------------------------------
@@ -746,6 +755,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         return digitizer._element_select_tool
 
     def _activate_tool(self):
+        if not self._pick_enabled:
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -778,7 +789,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def restore_pick_interaction(self):
         """Re-arm element selection using the dialog's current method."""
-        self._activate_tool()
+        if self._pick_enabled:
+            self._activate_tool()
 
     def _on_method_button(self, btn):
         key = btn.property("method_key")
@@ -797,6 +809,25 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             self.btn_intersect.setChecked(False)
             self.lbl_count.setText(f"Selection: {self._current_selection_count()}")
             self._refresh_measurement_total()
+
+        # A second click on the active method turns picking off. Deactivation
+        # removes observers and unfinished previews, so an unhighlighted method
+        # cannot continue handling canvas input.
+        if not btn.isChecked():
+            self._pick_enabled = False
+            digitizer = getattr(self.app, "digitizer", None)
+            if digitizer is not None:
+                try:
+                    digitizer.deactivate_element_select_tool()
+                except Exception as e:
+                    print(f"Could not turn Element Selection off: {e}")
+            return
+
+        # The group is non-exclusive only to permit the all-off state above.
+        for other in self._method_group.buttons():
+            if other is not btn:
+                other.setChecked(False)
+        self._pick_enabled = True
 
         # Extend / scaling integration:
         # When switching between Individual / Block / Shape / Line,
@@ -961,6 +992,12 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             # ─────────────────────────────────────────────────────────────────
             selected = [d for d in all_drawings if d is not None]
 
+        # Never expose protected Cell circles (or drawings outside the active
+        # creation-dialog edit scope) to the Draw tab's vertex display.
+        gate = getattr(digitizer, "drawing_in_edit_scope", None)
+        if callable(gate):
+            selected = [d for d in selected if gate(d)]
+
         points = []
         for drawing in selected:
             if drawing is None or drawing.get("type") == "text":
@@ -1015,6 +1052,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     # Quick-action handlers
     # ------------------------------------------------------------------
     def _on_select_all(self):
+        tool = self._get_tool()
+        if tool is not None and getattr(tool, "_method", None) == "snt_text":
+            tool.select_all_snt_text()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1026,6 +1067,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Select All failed: {e}")
 
     def _on_deselect(self):
+        tool = self._get_tool()
+        if tool is not None and getattr(tool, "_method", None) == "snt_text":
+            tool.clear_snt_text_selection()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1042,6 +1087,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Deselect failed: {e}")
 
     def _on_invert(self):
+        tool = self._get_tool()
+        if tool is not None and getattr(tool, "_method", None) == "snt_text":
+            tool.invert_snt_text_selection()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1051,6 +1100,15 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Invert failed: {e}")
 
     def _on_delete(self):
+        tool = self._get_tool()
+        if tool is not None and getattr(tool, "_method", None) == "snt_text":
+            try:
+                self.app.statusBar().showMessage(
+                    "SNT Text selection is copy-only; labels were not deleted.", 3000
+                )
+            except Exception:
+                pass
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1106,6 +1164,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self._deactivate_intersect_if_needed()
         tool = self._get_tool()
         if tool is None or not tool.is_active():
+            return
+        if getattr(tool, "_method", None) == "snt_text":
+            tool.copy_selected_snt_text_to_clipboard()
             return
         tool.enter_copy_mode()
 

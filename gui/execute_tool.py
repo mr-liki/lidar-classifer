@@ -26,6 +26,7 @@ TOOL_MAP = {
     "Save": "save",
     "SaveAs": "save_as",
     "AttachSNT": "attach_snt",
+    "LoadBlockGrid": "load_block_grid",
 }
 
 from .shading_preset_quality import normalize_shading_preset_quality
@@ -361,6 +362,29 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     
     tool_name = TOOL_MAP.get(tool, tool.lower())
 
+    # Load Block/Grid: shortcut twin of right-click > Load Block/Grid Data.
+    # It is a one-shot action on whatever block/grid is under the cursor, so it
+    # must not tear down the active tool/dock the way a tool switch does.
+    if tool_name == "load_block_grid":
+        manager = getattr(app_window, "grid_label_manager", None)
+        loader = getattr(manager, "load_block_or_grid_under_cursor", None)
+        if callable(loader):
+            try:
+                # Shortcut loads go straight in: no "Read points" dialog.
+                from .data_loader import skip_import_prompt
+
+                with skip_import_prompt():
+                    loaded = loader()
+                if not loaded:
+                    print("Load Block/Grid: nothing under the cursor to load")
+            except Exception as e:
+                print(f"⚠️ Load Block/Grid shortcut failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("⚠️ Load Block/Grid: grid label system not available")
+        return
+
     if tool_name != "element_selection":
         deactivate_selection = getattr(app_window, "_deactivate_selection_tools", None)
         if callable(deactivate_selection):
@@ -440,6 +464,39 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             if getattr(curve_tool, "_select_mode", False) and callable(deactivate_select):
                 deactivate_select()
 
+        # A (re-armed) Cut-in-Cut placement owns the cut dock's left click, so
+        # a Left Mouse Pan could never start there. Cancel the pending
+        # placement but keep the completed cut dock open and restore its
+        # ordinary left-pan style.
+        cut_controller = getattr(app_window, "cut_section_controller", None)
+        cancel_cut_in_cut = getattr(
+            cut_controller, "cancel_persistent_cut_in_cut", None
+        )
+        if callable(cancel_cut_in_cut):
+            try:
+                cancel_cut_in_cut()
+            except Exception as e:
+                print(f"Pan: Cut-in-Cut cancel warning: {e}")
+        deactivate_cut = getattr(
+            app_window, "_deactivate_pending_cut_section_tool", None
+        )
+        if callable(deactivate_cut):
+            deactivate_cut("switching to Pan")
+        # The generic cleanup earlier in this function may already have torn
+        # down the pending placement (so the cancel above is a no-op), which
+        # leaves the cut dock without its left-pan/zoom style. Always give a
+        # completed cut dock its ordinary style back so Left Mouse Pan works.
+        unlock_cut = getattr(cut_controller, "unlock_after_classification", None)
+        if (
+            callable(unlock_cut)
+            and getattr(cut_controller, "cut_vtk", None) is not None
+            and getattr(cut_controller, "_has_valid_cut_dock", lambda: False)()
+        ):
+            try:
+                unlock_cut()
+            except Exception as e:
+                print(f"Pan: cut dock style restore warning: {e}")
+
         # Do not close completed cross/cut docks; only their active placement
         # tools are cancelled by the generic cleanup above.
         _return_focus_to_main_view(app_window)
@@ -460,19 +517,12 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             return
         
         try:
-            # ✅ ADD THIS: Clear shading actors when switching to DisplayMode
-            print(f"   🧹 Clearing shading mode actors...")
-            if hasattr(app_window, '_shaded_mesh_actor') and app_window._shaded_mesh_actor:
-                app_window.vtk_widget.remove_actor('shaded_mesh', render=False)
-                app_window._shaded_mesh_actor = None
-                print(f"      ✅ Removed shading mesh actor")
-            
-            if hasattr(app_window, '_shaded_mesh_polydata'):
-                app_window._shaded_mesh_polydata = None
-            
-            # Clear shading cache
-            from gui.shading_display import clear_shading_cache
-            clear_shading_cache("switching to DisplayMode")
+            # STEP 1 resident shading: park instead of delete. The complete
+            # barycentric actor graph stays attached/hidden for instant return.
+            print(f"   🅿️ Parking shading mode actors...")
+            from gui.shading_display import detach_shading_before_non_shading_mode
+            _parked = detach_shading_before_non_shading_mode(app_window)
+            print(f"      ✅ Parked {_parked} shading actor(s)")
             
 # ── REBASE: discard stale description/color/lvl/draw
             #            and refill from the currently loaded PTC ──
@@ -973,16 +1023,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         # ✅ Deactivate curve tool when switching display modes
         _deactivate_curve_tool_safely(app_window, f"switching to {tool} mode")
         
-        # Clear shading actors
-        if hasattr(app_window, '_shaded_mesh_actor') and app_window._shaded_mesh_actor:
-            app_window.vtk_widget.remove_actor('shaded_mesh', render=False)
-            app_window._shaded_mesh_actor = None
-        
-        if hasattr(app_window, '_shaded_mesh_polydata'):
-            app_window._shaded_mesh_polydata = None
-        
-        from gui.shading_display import clear_shading_cache
-        clear_shading_cache(f"switching to {tool} mode")
+        # Switching display modes is presentation-only. Preserve the current
+        # barycentric TIN/VTK render graph and hide it until shading is requested.
+        from gui.shading_display import detach_shading_before_non_shading_mode
+        detach_shading_before_non_shading_mode(app_window)
         
         mode_map = {
             "Depth": "depth",

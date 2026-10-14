@@ -5527,7 +5527,7 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
                 render_window.SetDesiredUpdateRate(0.0001)
             
             # ═══════════════════════════════════════════════════════════════
-            # NAKSHATECH BATCH: Group entities by (color, layer, type)
+            # MICROSTATION BATCH: Group entities by (color, layer, type)
             # Each group becomes ONE VTK actor with merged geometry
             # ═══════════════════════════════════════════════════════════════
             line_groups = defaultdict(list)      # (color_tuple, layer, width, style) → [entity, ...]

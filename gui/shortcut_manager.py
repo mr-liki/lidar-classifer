@@ -38,6 +38,7 @@ TOOLS = [
     "MeasureLine", "MeasurePath", "ClearMeasurements", "CrossSectionMeasure",
     "Pan",
     "Save", "SaveAs",
+    "LoadBlockGrid",
 ]
 
 SIMPLE_SHORTCUT_TOOLS = (
@@ -46,6 +47,7 @@ SIMPLE_SHORTCUT_TOOLS = (
     "MeasureLine", "MeasurePath", "ClearMeasurements", "CrossSectionMeasure",
     "Pan",
     "Save", "SaveAs",
+    "LoadBlockGrid",
 )
 
 DISPLAY_VISIBILITY_TOOLS = ("Depth", "RGB", "Intensity", "Elevation", "Line")
@@ -5770,11 +5772,29 @@ class ShortcutManager(QWidget):
                 "color: #cccccc; font-size: 13px; background: transparent; border: none;"
             )
             _lbl.setGeometry(_splash.rect())
-            # Position near the Config button or center of screen
-            screen = QApplication.primaryScreen().geometry()
+            # Center the splash on the screen the MAIN WINDOW lives on — not
+            # QApplication.primaryScreen(), which is the OS default monitor.
+            # On a two-monitor setup that default is often the other screen,
+            # so the popup used to appear away from the project window.
+            target_screen = None
+            if app_window is not None:
+                try:
+                    target_screen = app_window.screen()
+                except Exception:
+                    target_screen = None
+                if target_screen is None:
+                    try:
+                        target_screen = QApplication.screenAt(
+                            app_window.frameGeometry().center()
+                        )
+                    except Exception:
+                        target_screen = None
+            if target_screen is None:
+                target_screen = QApplication.primaryScreen()
+            screen = target_screen.availableGeometry()
             _splash.move(
-                screen.width() // 2 - 130,
-                screen.height() // 2 - 30
+                screen.center().x() - _splash.width() // 2,
+                screen.center().y() - _splash.height() // 2
             )
             _splash.show()
             QApplication.processEvents()  # force the splash to paint
