@@ -4386,17 +4386,35 @@ class EditClassDialog(InputPopupMixin, QDialog):
                 refreshed = False
                 if current_slot == 0:
                     # Main View Path
-                    border = float(getattr(app, 'point_border_percent', 0.0) or 0.0)
-                    refreshed = _uam_fast_refresh(app, palette, border)
-                    if not refreshed and app is not None:
-                        print("âš ï¸ Main View GPU poke unavailable - forcing rebuild")
-                        update_class_mode(app, force_refresh=True)
-                        refreshed = True
+                    if getattr(app, '_lnt_main_view', None) is not None:
+                        # Native main view: the weight table is a uniform push on
+                        # the live renderer (nkv_set_class_weights), never a VTK
+                        # rebuild. _push_applied_palette reads app.class_palette,
+                        # which step 5 above just updated for slot 0.
+                        refreshed = app._lnt_main_view._push_applied_palette()
+                    else:
+                        border = float(getattr(app, 'point_border_percent', 0.0) or 0.0)
+                        refreshed = _uam_fast_refresh(app, palette, border)
+                        if not refreshed and app is not None:
+                            print("â ï¸ Main View GPU poke unavailable - forcing rebuild")
+                            update_class_mode(app, force_refresh=True)
+                            refreshed = True
                 else:
                     # Cross-Section Path
-                    view_idx = current_slot - 1
-                    border = float(self.parent_dialog.view_borders.get(current_slot, 0.0))
-                    refreshed = _uam_refresh_section(app, view_idx, palette, border)
+                    native_sections = getattr(app, '_native_sections', None)
+                    if (native_sections is not None
+                            and current_slot in getattr(native_sections, 'views', {})):
+                        # Native section view: per-view uniform push (color,
+                        # visibility AND the per-class weight table), strictly on
+                        # this view - synced sibling views must not change.
+                        section_view = native_sections.views[current_slot]
+                        section_view.apply_palette(
+                            palette, getattr(section_view, 'mode', 'class'), sync=False)
+                        refreshed = True
+                    else:
+                        view_idx = current_slot - 1
+                        border = float(self.parent_dialog.view_borders.get(current_slot, 0.0))
+                        refreshed = _uam_refresh_section(app, view_idx, palette, border)
 
                 # Mark slot as explicitly weight-applied
                 if not hasattr(app, '_slot_weights_applied'):

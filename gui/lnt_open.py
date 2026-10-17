@@ -540,6 +540,11 @@ class LntMainView(QObject):
             import numpy as np
             packed = np.full((256, 4), 128, dtype=np.uint8)
             packed[:, 3] = 1
+            # Per-class point weights (Display Mode "Weight" column). Native
+            # form of the VTK weight_lut: gl_PointSize = base pixel size *
+            # clamp(weight, 0.1, 12.0). Uniform-only in the engine, so raising a
+            # weight never re-uploads a point.
+            weights = np.ones(256, dtype=np.float32)
             weight = float(getattr(self.app, "class_weight", 1.0) or 1.0)
             for code, entry in self.app.class_palette.items():
                 code = int(code)
@@ -548,12 +553,22 @@ class LntMainView(QObject):
                         np.asarray(entry.get("color", (128, 128, 128)),
                                    dtype=np.float64) * weight, 0, 255).astype(np.uint8)
                     packed[code, 3] = int(bool(entry.get("show", True)))
+                    try:
+                        raw = float(entry.get("weight", 1.0))
+                    except (TypeError, ValueError):
+                        raw = 1.0
+                    weights[code] = np.float32(max(0.1, min(raw, 12.0)))
             # Only the CLASS palette comes from the Display dialog. The elevation and
             # intensity ramps are generated on the GPU by apply_shading(); the VTK-side
             # tables built by build_point_luts() must not overwrite them.
             ok = (self.native is not None and
                   self.native.set_classification_lut(packed))
             if ok:
+                pushed = (hasattr(self.native, "set_class_weights")
+                          and self.native.set_class_weights(weights))
+                if not pushed:
+                    print("[LNT] per-class weights not pushed (engine DLL "
+                          "predates lnt_view_set_class_weights)")
                 self._palette_baseline = self.app.class_palette
                 self.ptc_applied = True
                 self._refresh_point_statistics()

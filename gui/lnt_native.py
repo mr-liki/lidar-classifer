@@ -89,6 +89,9 @@ def lib():
     if hasattr(d, "lnt_view_set_classification_lut"):
         d.lnt_view_set_classification_lut.argtypes = [c_void_p, c_void_p]
         d.lnt_view_set_classification_lut.restype = c_int
+    if hasattr(d, "lnt_view_set_class_weights"):   # per-class point sizes (Weight column)
+        d.lnt_view_set_class_weights.argtypes = [c_void_p, c_void_p]
+        d.lnt_view_set_class_weights.restype = c_int
     if hasattr(d, "lnt_view_set_2d"):
         d.lnt_view_set_2d.argtypes = [c_void_p, c_int]
     if hasattr(d, "lnt_view_set_view"):
@@ -257,6 +260,21 @@ class NativeView:
         if table.shape != (256, 4):
             raise ValueError("classification LUT must have shape (256, 4)")
         return bool(lib().lnt_view_set_classification_lut(
+            c_void_p(self.h), c_void_p(table.ctypes.data)))
+
+    def set_class_weights(self, weights):
+        """Upload a 256-float per-class point-size weight table (1.0 = neutral).
+
+        Native form of the VTK weight_lut: gl_PointSize scales with the weight,
+        per view. Uniform-only in the engine, so this never re-uploads a point.
+        False when the DLL predates lnt_view_set_class_weights."""
+        if not (self._ok() and hasattr(lib(), "lnt_view_set_class_weights")):
+            return False
+        import numpy as np
+        table = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
+        if table.size != 256:
+            raise ValueError("class weights must have 256 entries")
+        return bool(lib().lnt_view_set_class_weights(
             c_void_p(self.h), c_void_p(table.ctypes.data)))
 
     def set_2d(self, on):

@@ -47,6 +47,18 @@ class NativeAttachmentHandle:
     def Modified(self):
         self._layer.refresh()
 
+    def dispose(self):
+        """VTK-compatible teardown used by attachment removal sweeps.
+
+        SNT/DXF removal treats every cached "actor" uniformly, but native
+        handles have no VTK renderer to remove them from. The layer has
+        already dropped the document when this is called, so severing the
+        handle's own references is all that is left - which also stops a
+        stale row cache from keeping the geometry alive.
+        """
+        self._visible = False
+        self._document = None
+
 
 class NativeAttachmentLayer:
     def __init__(self, app, view=None):

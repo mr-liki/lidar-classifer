@@ -175,6 +175,7 @@ void main() {
     // above the hardware limit still rasterises, never to inflate.
     float deviceMax = max(pc.view.w, 1.0);
     int mode = int(pc.shading.x + 0.5);
+    int classId = int(inClassU * 255.0 + 0.5) & 255;
 
     if (mode == MODE_SHADED_CLASS_INSTANT) {
         // SPLAT sizing (this mode only - every other mode keeps the fixed
@@ -191,6 +192,18 @@ void main() {
         float footprintPx = pc.size.x * pc.view.x / max(gl_Position.w, 1e-4);
         pixels = clamp(footprintPx, pc.size.y, pc.size.z);
     }
+
+    // ---- per-class point weight (Display Mode "Weight" column) ------------
+    // VTK parity: the legacy view sizes every point through its per-view
+    // weight_lut - gl_PointSize = max(1.0, base * weight) - in EVERY display
+    // mode, so raising a class's weight grows only that class's points.
+    // The native engine folds the nkv_set_class_weights table into the
+    // elevation LUT's ALPHA (a channel no shader reads), which is why this
+    // line needs no FrameUbo layout change and no extra binding: weight 1.0
+    // is the neutral default, 0.1..12.0 matches the UI's own clamp.
+    float classWeight = clamp(ubo.elevationLut[classId].a, 0.1, 12.0);
+    pixels *= classWeight;
+
     gl_PointSize = clamp(pixels, 1.0, min(deviceMax, 64.0));
     v_point_px = gl_PointSize;
 
@@ -200,7 +213,6 @@ void main() {
     if (mode == MODE_NEUTRAL) {
         rgb = vec3(128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0);
     } else if (mode == MODE_CLASSIFICATION || mode == MODE_SHADED_CLASS_INSTANT) {
-        int classId = int(inClassU * 255.0 + 0.5) & 255;
         rgb = ubo.classPalette[classId].rgb;
         // Class visibility rides in the palette's alpha (nkv_set_class_visibility,
         // a 256-byte LUT upload) and is forwarded into vColor.a, which

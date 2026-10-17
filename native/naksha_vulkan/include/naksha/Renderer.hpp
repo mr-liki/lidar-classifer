@@ -302,6 +302,16 @@ public:
     void SetClassVisibility(const uint8_t* visible256);
     uint64_t GetClassVisibilityUpdateCount() const { return classVisibilityUpdates_; }
 
+    // Per-class point-size weights: 256 floats, 1.0 = neutral. Larger weight
+    // draws that class's points larger, mirroring the VTK weight_lut semantics
+    // of the Display Mode "Weight" column (gl_PointSize = base * weight).
+    // Folded into the elevation LUT's alpha inside UpdateFrameUbo - a channel
+    // no shader reads - so neither the FrameUbo layout nor any shader's
+    // declared block changes and a weight edit can never re-upload a point.
+    // Returns the number of times a weight table has been replaced.
+    void SetClassWeights(const float* weights256);
+    uint64_t GetClassWeightUpdateCount() const { return classWeightUpdates_; }
+
     // ---- Offscreen diagnostic capture (Part 6: real pixel comparison) ----
     // Fully self-contained: does NOT touch the swapchain, the per-frame
     // BeginFrame/EndFrame path, or any state the normal render loop relies
@@ -438,6 +448,13 @@ private:
     // re-shows a class the user unchecked (StoreLut always writes alpha = 1).
     uint8_t classVisible_[256];
     uint64_t classVisibilityUpdates_ = 0;
+
+    // Per-class point-size weights folded into lutElevation_'s alpha (a channel
+    // no shader reads; see SetClassWeights). Kept separately from the LUTs for
+    // the same reason as classVisible_: a LUT upload writes alpha = 1 through
+    // StoreLut, so folding must be re-applied every frame, not at upload time.
+    float classWeights_[256];
+    uint64_t classWeightUpdates_ = 0;
 
     VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;

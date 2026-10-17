@@ -550,6 +550,25 @@ NKV_API uint64_t nkv_get_class_visibility_update_count(NkvHandle handle) {
     return inst->renderer.GetClassVisibilityUpdateCount();
 }
 
+/* Per-class point-size weights (see the header). Uniform-only: the table is
+ * stored on the renderer and folded into the frame UBO; no point buffer is
+ * touched, which is exactly what nkv_get_point_position_upload_count proves. */
+NKV_API int nkv_set_class_weights(NkvHandle handle, const float* weights256) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) { SetError("invalid handle"); return 0; }
+    if (!weights256) { SetError("weights256 is NULL"); return 0; }
+    inst->renderer.SetClassWeights(weights256);
+    return 1;
+}
+
+NKV_API uint64_t nkv_get_class_weight_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    return inst->renderer.GetClassWeightUpdateCount();
+}
+
 NKV_API int nkv_set_point_size(NkvHandle handle, float pixels) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);

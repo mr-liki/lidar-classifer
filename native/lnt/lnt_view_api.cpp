@@ -1136,6 +1136,15 @@ __declspec(dllexport) int lnt_view_set_classification_lut(void* h, const uint8_t
     v->surface_ids.clear();
     return 1;
 }
+// Per-class point-size weights: 256 floats, 1.0 = neutral (see the Display
+// Mode "Weight" column). Uniform-only - the engine folds the table into the
+// frame UBO, so this never re-uploads a point or rebuilds the surface. Returns
+// 0 only when the view handle is bad or the engine DLL predates the export.
+__declspec(dllexport) int lnt_view_set_class_weights(void* h, const float* weights256) {
+    View* v = static_cast<View*>(h);
+    if(!v || !weights256) return 0;
+    return v->eng.set_class_weights(weights256) ? 1 : 0;
+}
 __declspec(dllexport) void lnt_view_set_mode(void* h, int mode) {
     if (View* v = static_cast<View*>(h)) {
         // Point presentation modes (including native view-space Depth) must

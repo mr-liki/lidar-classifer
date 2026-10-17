@@ -291,6 +291,12 @@ public:
     bool set_point_luts(const uint8_t* class_rgb, const uint8_t* elevation_rgb,
                         const uint8_t* intensity_rgb);
     bool set_classification_lut(const PackedClassColor lut[256]);
+    // Per-class point-size weights: 256 floats, 1.0 = neutral, larger = bigger
+    // points (the VTK weight_lut semantics of the Display Mode "Weight" column).
+    // Uniform-only: the engine folds the table into the frame UBO, so no point
+    // buffer is touched or re-uploaded. False when the engine DLL predates
+    // nkv_set_class_weights.
+    bool set_class_weights(const float* weights256);
     // Cross-section clip volume: up to kMaxClipPlanes planes (A,B,C,D) in WORLD
     // coordinates, normal pointing into the KEPT side. The GPU discards every point
     // on the negative side in the vertex stage - no CPU buffer is touched, so the
@@ -422,6 +428,7 @@ private:
         int          (*set_classification_lut)(uint64_t, const uint8_t*) = nullptr;
         int          (*set_clip_volume)(uint64_t, const float*, uint32_t) = nullptr;
         int          (*set_class_visibility)(uint64_t, const uint8_t*) = nullptr;
+        int          (*set_class_weights)(uint64_t, const float*) = nullptr;
         int          (*set_render_origin)(uint64_t, double, double, double) = nullptr;
         int          (*resize)(uint64_t, uint32_t, uint32_t) = nullptr;
         int          (*render)(uint64_t) = nullptr;
@@ -590,6 +597,8 @@ inline bool VulkanEngine::resolve_all(std::string& err) {
       resolve(api_.set_classification_lut, "nkv_set_classification_lut", optional_error); }
     { std::string optional_error;
       resolve(api_.set_class_visibility, "nkv_set_class_visibility", optional_error); }
+    { std::string optional_error;     // absent in an engine DLL built before per-class weights
+      resolve(api_.set_class_weights, "nkv_set_class_weights", optional_error); }
     { std::string optional_error;     // absent in an engine DLL built before shading modes
       resolve(api_.set_shading_mode, "nkv_set_shading_mode", optional_error); }
     { std::string optional_error;
@@ -1038,6 +1047,10 @@ inline bool VulkanEngine::set_classification_lut(const PackedClassColor lut[256]
     }
     return api_.set_point_luts(handle_, rgb, nullptr, nullptr) != 0 &&
            api_.set_class_visibility(handle_, visible) != 0;
+}
+inline bool VulkanEngine::set_class_weights(const float* weights256) {
+    if (handle_ == 0 || api_.set_class_weights == nullptr) return false;
+    return api_.set_class_weights(handle_, weights256) != 0;
 }
 inline bool VulkanEngine::set_camera_ortho(double cx, double cy, double cz, double dx,
                                            double dy, double dz, double parallel_scale,
