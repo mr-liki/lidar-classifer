@@ -252,13 +252,18 @@ class PluginManager:
             status_str = "SUCCESS" if ok else "ERROR"
             print(f"[{status_str}] Plugin: {msg}")
 
-    def install_plugin_from_zip(self, zip_path: Path) -> Tuple[bool, str]:
+    def install_plugin_from_zip(self, zip_path: Path, progress=None) -> Tuple[bool, str]:
         """
         Installs a plugin from a ZIP archive.
         Supports QGIS-style installations: scans for manifest.json, unloads any existing
         version of the same plugin, cleans up old directories, and unzips & loads it.
+
+        progress(percent, text), when given, is called at every stage (and per
+        extracted file) so a caller can show the install as it happens.
         """
+        report = progress or (lambda percent, text: None)
         try:
+            report(2, "Checking the ZIP package…")
             if not zip_path.exists():
                 return False, f"ZIP file does not exist: {zip_path}"
                 
@@ -277,6 +282,7 @@ class PluginManager:
                     return False, "Invalid plugin zip structure: manifest.json not found."
 
                 # 2. Read and parse manifest.json
+                report(8, "Reading manifest.json…")
                 try:
                     manifest_content = zf.read(manifest_in_zip).decode("utf-8-sig")
                     manifest = json.loads(manifest_content)
@@ -293,6 +299,7 @@ class PluginManager:
 
                 # 4. Check if already loaded, unload if necessary
                 if plugin_name in self.loaded_plugins:
+                    report(12, f"Unloading the installed '{plugin_name}'…")
                     ok, msg = self.unload_plugin(
                         plugin_name, rebuild_ribbon=False
                     )
@@ -305,6 +312,7 @@ class PluginManager:
 
                 # If destination directory already exists, attempt to remove it
                 if dest_dir.exists():
+                    report(16, "Removing the previous version…")
                     try:
                         shutil.rmtree(dest_dir)
                     except Exception as e:
@@ -313,23 +321,33 @@ class PluginManager:
                 # 5. Extract to temporary folder first
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_path = Path(tmpdir)
-                    zf.extractall(tmp_path)
+                    members = zf.infolist()
+                    total_bytes = max(1, sum(m.file_size for m in members))
+                    done_bytes = 0
+                    for index, member in enumerate(members, 1):
+                        zf.extract(member, tmp_path)
+                        done_bytes += member.file_size
+                        report(20 + 55 * done_bytes / total_bytes,
+                               f"Extracting files… {index}/{len(members)}")
 
                     # Find the folder containing the manifest.json
                     manifest_abs = tmp_path / manifest_in_zip
                     plugin_root_src = manifest_abs.parent
 
                     # Copy contents to final destination
+                    report(78, "Copying the plugin into place…")
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(plugin_root_src, dest_dir, dirs_exist_ok=True)
 
                 # 6. Load the installed plugin immediately
+                report(86, f"Loading '{plugin_name}'…")
                 ok, msg = self.load_plugin(manifest, dest_dir)
                 if not ok:
                     return False, f"Installed successfully but failed to load: {msg}"
 
                 # Retain the original package outside the live plugin directory.
                 # Reinstall can then perform the same clean extraction again.
+                report(95, "Keeping the package for Reinstall…")
                 cache_path = self._cached_archive_path(plugin_name)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 if zip_path.resolve() != cache_path.resolve():
@@ -337,16 +355,17 @@ class PluginManager:
                     shutil.copy2(zip_path, temp_cache)
                     temp_cache.replace(cache_path)
 
+                report(100, f"'{plugin_name}' installed.")
                 return True, f"Plugin '{plugin_name}' successfully installed and loaded."
 
         except Exception as e:
             return False, f"Plugin installation failed: {e}"
 
-    def reinstall_plugin(self, name):
+    def reinstall_plugin(self, name, progress=None):
         """Re-extract a ZIP install, or cleanly reload a bundled plugin."""
         cached_archive = self._cached_archive_path(name)
         if cached_archive.exists():
-            return self.install_plugin_from_zip(cached_archive)
+            return self.install_plugin_from_zip(cached_archive, progress=progress)
 
         plugin_info = self.loaded_plugins.get(name)
         manifest = plugin_info.get("manifest") if plugin_info else None

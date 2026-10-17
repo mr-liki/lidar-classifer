@@ -3926,6 +3926,17 @@ class MeasurementRibbon(QWidget):
         button drives the tool through."""
         try:
             main_window = self.window()
+            # Native .lnt session: the section windows are Vulkan canvases the
+            # VTK tool's observers never see, so XS arms the native Line there.
+            from gui.native_shortcuts import native_section_measure
+            if native_section_measure(main_window, bool(checked)):
+                if hasattr(main_window, "statusBar"):
+                    main_window.statusBar().showMessage(
+                        "📏 Cross-section measurement enabled — click two points in a cross-section view"
+                        if checked else "📏 Cross-section measurement disabled",
+                        4000 if checked else 2000,
+                    )
+                return
             tool = getattr(main_window, "cross_section_measurement_tool", None)
             if tool is None:
                 return
@@ -13323,7 +13334,13 @@ class AIRibbon(QWidget):
                 app = getattr(self.parent(), 'app', None)
             if app is None:
                 app = self.parent().parent().parent()
-            
+
+            # Native .lnt session: AI runs on the source points, mapped onto the
+            # .lnt, and writes its classes back natively (gui/lnt_ai_bridge.py).
+            from gui.lnt_ai_bridge import start_lnt_ai
+            if start_lnt_ai(app):
+                return
+
             # Check if LAZ file is loaded
             if not hasattr(app, 'data') or app.data is None:
                 QMessageBox.warning(

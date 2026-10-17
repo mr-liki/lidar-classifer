@@ -7,7 +7,6 @@ same original dataset point across every open view that contains it.
 
 from PySide6.QtCore import QObject
 import numpy as np
-import vtk
 
 
 class _TargetRingOverlay:
@@ -19,6 +18,7 @@ class _TargetRingOverlay:
     TICK_LENGTH_PX = 5.0
 
     def __init__(self, vtk_widget, world_point):
+        import vtk  # Legacy viewport only; native targeting never constructs this.
         self.vtk_widget = vtk_widget
         self.renderer = getattr(vtk_widget, "renderer", None)
         self.render_window = vtk_widget.GetRenderWindow() if vtk_widget is not None else None
@@ -177,6 +177,14 @@ class PointSyncTool(QObject):
         self._deactivate_conflicting_tools()
 
         self.active = True
+        from gui.native_vector_overlay import snt_viewport_active
+        if (getattr(self.app, '_lnt_main_view', None) is not None
+                or snt_viewport_active(self.app)):
+            from gui.native_point_target import NativePointTarget
+            self._native_target = NativePointTarget(self)
+            self._native_target.start()
+            self._sync_footer_button_state(True)
+            return
         print("🎯 Point sync tool ACTIVATED")
         self._sync_shared_canvas_cursor(True)
 
@@ -205,6 +213,13 @@ class PointSyncTool(QObject):
             return
 
         self.active = False
+        native = getattr(self, '_native_target', None)
+        if native is not None:
+            native.stop()
+            self._native_target = None
+            self.selected_global_index = None
+            self._sync_footer_button_state(False)
+            return
         print("🎯 Point sync tool DEACTIVATED")
         self._sync_shared_canvas_cursor(False)
 
@@ -267,6 +282,8 @@ class PointSyncTool(QObject):
                     pass
 
     def activate_for_section(self, section_vtk_widget, view_index):
+        if getattr(self, '_native_target', None) is not None:
+            return
         """Attach the tool to one cross-section view."""
         if section_vtk_widget is None:
             return
@@ -316,6 +333,8 @@ class PointSyncTool(QObject):
             self.deactivate_for_section(view_index)
 
     def activate_for_cut_view(self, cut_vtk_widget):
+        if getattr(self, '_native_target', None) is not None:
+            return
         """Attach the tool to the dedicated cut view."""
         if cut_vtk_widget is None:
             return
@@ -359,6 +378,13 @@ class PointSyncTool(QObject):
 
     def clear_highlights(self):
         """Remove synced highlight overlays from every view."""
+        native = getattr(self, '_native_target', None)
+        if native is not None:
+            native.stop()
+            self.selected_global_index = None
+            if self.active:
+                native.start()
+            return
         for overlay in list(self._overlays.values()):
             try:
                 overlay.remove()
@@ -378,6 +404,9 @@ class PointSyncTool(QObject):
 
     def highlight_global_point(self, global_index):
         """Highlight one global dataset point everywhere it is visible."""
+        native = getattr(self, '_native_target', None)
+        if native is not None:
+            return native.highlight(global_index)
         xyz = self._get_dataset_xyz()
         if xyz is None:
             return False

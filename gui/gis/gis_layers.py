@@ -725,27 +725,20 @@ ROW_HEIGHT = 40  # fixed list-row height (prevents label overlap)
 
 
 def _occ_colors():
-    """Return the fixed light GIS palette, isolated from the application theme."""
+    """Use the main application's active palette for the Layers sidebar."""
+    from gui.theme_manager import ThemeColors as c
     return {
-        "panel": "#e9edf2",
-        "surface": "#ffffff",
-        "card_hover": "#e7f1f8",
-        "btn": "#edf1f4",
-        "btn_hover": "#dceaf5",
-        "text": "#1d2730",
-        "muted": "#6c7c88",
-        "secondary": "#455661",
-        "border": "#9ba9b5",
-        "accent": "#397aa8",
-        "accent_hover": "#2f6d98",
-        "danger": "#c43b3b",
-        "danger_hover": "#a92f2f",
-        "on_accent": "#ffffff",
-        "raster": "#1971c2",
-        "vector": "#2f9e44",
-        "sel": "#b8daf4",
-        "is_light": True,
+        "panel": c.get("bg_secondary"), "surface": c.get("bg_input"),
+        "card_hover": c.get("bg_button_hover"), "btn": c.get("bg_button"),
+        "btn_hover": c.get("bg_button_hover"), "text": c.get("text_primary"),
+        "muted": c.get("text_muted"), "secondary": c.get("text_secondary"),
+        "border": c.get("border_light"), "accent": c.get("accent"),
+        "accent_hover": c.get("accent_hover"), "danger": c.get("danger"),
+        "danger_hover": c.get("danger_hover"), "on_accent": c.get("text_on_active"),
+        "raster": c.get("icon_vectors"), "vector": c.get("icon_view"),
+        "sel": c.get("dialog_selection"), "is_light": c.is_light(),
     }
+
 
 # Preferred UI font (professional, falls back gracefully across platforms).
 _UI_FONT = '"Segoe UI", "Inter", "Roboto", Arial, sans-serif'
@@ -1344,6 +1337,7 @@ class GisLayersDock:
         def _tool(name, tip, size=16):
             b = QToolButton()
             b.setObjectName("occTool")
+            b.setProperty("gisIcon", name)
             b.setIcon(gicons.icon(name, cols["text"], size))
             b.setIconSize(QSize(size, size))
             b.setFixedSize(QSize(26, 24))
@@ -1373,7 +1367,7 @@ class GisLayersDock:
         filter_box.setObjectName("occFilter")
         filter_box.setPlaceholderText("Filter layers…")
         filter_box.setClearButtonEnabled(True)
-        filter_box.addAction(gicons.icon("search", cols["muted"], 14),
+        filter_action = filter_box.addAction(gicons.icon("search", cols["muted"], 14),
                              QLineEdit.LeadingPosition)
         filter_box.hide()
         v.addWidget(filter_box)
@@ -2602,6 +2596,30 @@ class GisLayersDock:
         tb_table.clicked.connect(_do_open_table)
         tb_domains.clicked.connect(_do_open_domains)
 
+        def refresh_theme():
+            cols.clear()
+            cols.update(_occ_colors())
+            apply_gis_dock_style(panel)
+            for button in panel.findChildren(QToolButton):
+                name = button.property("gisIcon")
+                if name:
+                    button.setIcon(gicons.icon(name, cols["text"], button.iconSize().width()))
+            filter_action.setIcon(gicons.icon("search", cols["muted"], 14))
+            from PySide6.QtWidgets import QTreeWidgetItemIterator
+            blocked = layer_list.blockSignals(True)
+            try:
+                items = QTreeWidgetItemIterator(layer_list)
+                while items.value():
+                    item = items.value()
+                    item.setForeground(0, QColor(cols["text"]))
+                    item.setForeground(1, QColor(cols["muted"]))
+                    items += 1
+            finally:
+                layer_list.blockSignals(blocked)
+            _sync_table_btn()
+
+        panel.refresh_theme = refresh_theme
+        refresh_theme()
         refresh()
         return panel
 

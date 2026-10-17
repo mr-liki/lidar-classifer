@@ -550,6 +550,9 @@ class AIFenceRunDialog(QDialog):
         return True
 
     def _get_drawings(self):
+        from gui.lnt_ai_bridge import active_bridge, native_fence_drawings
+        if active_bridge(self.app) is not None:
+            return native_fence_drawings(self.app)   # .lnt session: Draw tab's native drawings
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return []
@@ -826,6 +829,15 @@ class AIFenceRunDialog(QDialog):
         if not coords or len(coords) < 2:
             return None
 
+        from gui.lnt_ai_bridge import active_bridge
+        if active_bridge(self.app) is not None:
+            # .lnt session: a native overlay shape, never a VTK actor.
+            from PySide6.QtGui import QColor
+            return {"native_highlight": True,
+                    "coords": [(float(p[0]), float(p[1])) for p in coords],
+                    "color": QColor.fromRgbF(*[float(c) for c in color[:3]]).name(),
+                    "width": max(1, int(round(width)))}
+
         try:
             import vtk
 
@@ -909,6 +921,8 @@ class AIFenceRunDialog(QDialog):
         return getattr(self.app, "renderer", None)
 
     def _add_actor(self, actor):
+        if isinstance(actor, dict) and actor.get("native_highlight"):
+            return                       # painted from _hover_actor/_selected_actors in _render
         ren = self._get_overlay_renderer()
         if ren is None or actor is None:
             return
@@ -918,7 +932,7 @@ class AIFenceRunDialog(QDialog):
             pass
 
     def _remove_actor(self, actor):
-        if actor is None:
+        if actor is None or (isinstance(actor, dict) and actor.get("native_highlight")):
             return
 
         ren = self._get_overlay_renderer()
@@ -945,6 +959,13 @@ class AIFenceRunDialog(QDialog):
         self._render()
 
     def _render(self):
+        from gui.lnt_ai_bridge import active_bridge, show_native_highlights
+        if active_bridge(self.app) is not None:
+            shapes = list(self._selected_actors)
+            if self._hover_actor is not None:
+                shapes.append(self._hover_actor)
+            show_native_highlights(self.app, shapes)
+            return
         try:
             if hasattr(self.app, "vtk_widget"):
                 if hasattr(self.app.vtk_widget, "render"):
@@ -3446,6 +3467,16 @@ class AIClassificationDialog(QDialog):
                 "fence_mode": self.target_indices is not None,
                 "selected_fence_count": int(self.selected_fence_count or 0),
             }
+            from gui.lnt_ai_bridge import active_bridge
+            bridge = active_bridge(self.app)
+            if bridge is not None:
+                # .lnt identities of the changed points: native undo/redo
+                # (native_shortcuts.native_classification_history) rewrites them.
+                node, local = bridge.identity(changed_mask)
+                undo_step.update({"lnt_node": node, "lnt_local": local,
+                                  "lnt_path": bridge.view.lnt_path})
+                for key in ("mask",):
+                    undo_step.pop(key, None)     # a 15M-entry bool mask is not needed natively
 
             if hasattr(self.app, "undo_stack"):
                 self.app.undo_stack.append(undo_step)
@@ -3591,6 +3622,24 @@ class AIClassificationDialog(QDialog):
         Always emit classification_finished so cross-section, cut-section,
         stats, and any cached section buffers refresh after AI.
         """
+        from gui.lnt_ai_bridge import active_bridge
+        bridge = active_bridge(self.app)
+        if bridge is not None:
+            # .lnt session: write the AI result into the .lnt natively (main view,
+            # sections, class counts follow); the VTK refresh/sync must not run
+            # on this full-cloud dataset.
+            try:
+                bridge.commit()
+            except Exception as e:
+                print(f"AI finish .lnt write-back failed: {e}")
+                QMessageBox.critical(self, "AI Classification", str(e))
+            try:
+                from gui.point_count_widget import refresh_point_statistics
+                refresh_point_statistics(self.app)
+            except Exception:
+                pass
+            return
+
         self._auto_apply_active_ptc_palette()
 
         try:

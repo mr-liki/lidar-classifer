@@ -564,6 +564,9 @@ class NativeSections:
         dock.show()
         canvas.start()
         self._apply_theme_background(canvas)
+        if slot != CUT_SLOT and getattr(self.app, '_native_xs_active', False):
+            from gui.native_shortcuts import arm_section_measure
+            arm_section_measure(canvas, True)     # XS is on: new views measure too
         return canvas
 
     @staticmethod

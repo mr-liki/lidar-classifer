@@ -14,11 +14,10 @@ WHY THIS EXISTS
     (~one draw call per layer/colour group, no per-frame CPU cost). Layer and
     file visibility become DRAW-RANGE toggles, never re-uploads.
 
-WHAT STAYS ON THE QT OVERLAY
-    TEXT. Labels are not uploaded and there is no font atlas in the engine -
-    each label remains a (points, {'type': 'text', ...}) record on the Qt
-    overlay, exactly as before. So this module replaces the *linework* path and
-    leaves the label path alone.
+LABELS
+    World-sized CAD text is flattened into glyph contours at attachment time
+    and uploaded alongside the linework. Both use the same Vulkan camera and
+    presentation frame. Text without an authored height uses the Qt overlay.
 
 WHAT IS *NOT* CHANGED
     The entity dicts stay the source of truth for picking, digitizing, saving
@@ -438,27 +437,28 @@ class _MvpScreenMapping:
             return None
         return sx, sy
 
-    def projection_snapshot(self):
+    def projection_snapshot(self, world_z=None):
         """One immutable frame projection shared by every label in a paint."""
         backend = self._backend()
         frames = getattr(backend, 'render_count', None)
         size = self._size()
-        token = (frames, size) if isinstance(frames, int) else None
+        token = (frames, size, world_z) if isinstance(frames, int) else None
         if token is not None and token == getattr(self, '_snapshot_token', None):
             return self._snapshot_value
         mvp, origin = self._mvp_and_origin()
         w, h = size
         if mvp is None or not w or not h:
             return None
-        key = (mvp.tobytes(), origin.tobytes(), w, h)
+        key = (mvp.tobytes(), origin.tobytes(), w, h, world_z)
+        rz = 0.0 if world_z is None else float(world_z) - origin[2]
         def project(x, y):
             # Plan-view labels lie on the render-origin plane.
             rx, ry = float(x) - origin[0], float(y) - origin[1]
-            cw = mvp[3, 0] * rx + mvp[3, 1] * ry + mvp[3, 3]
+            cw = mvp[3, 0] * rx + mvp[3, 1] * ry + mvp[3, 2] * rz + mvp[3, 3]
             if not np.isfinite(cw) or abs(cw) < 1e-12:
                 return -1.e9, -1.e9
-            return ((mvp[0, 0] * rx + mvp[0, 1] * ry + mvp[0, 3]) / cw * .5 + .5) * w, \
-                   ((mvp[1, 0] * rx + mvp[1, 1] * ry + mvp[1, 3]) / cw * .5 + .5) * h
+            return ((mvp[0, 0] * rx + mvp[0, 1] * ry + mvp[0, 2] * rz + mvp[0, 3]) / cw * .5 + .5) * w, \
+                   ((mvp[1, 0] * rx + mvp[1, 1] * ry + mvp[1, 2] * rz + mvp[1, 3]) / cw * .5 + .5) * h
         value = key, project
         if token is not None:
             self._snapshot_token, self._snapshot_value = token, value
@@ -785,11 +785,53 @@ class VectorLayerHandle(NativeAttachmentHandle):
                    default=0)
 
 
+def _cloud_z_bounds(app):
+    """Full-file bounds, independent of the currently streamed point LOD."""
+    view = getattr(app, "_lnt_main_view", None)
+    if view is not None and getattr(view, "native", None) is not None:
+        cached = getattr(view, "_snt_cloud_z_bounds", None)
+        if cached is not None:
+            return cached
+        try:
+            import struct
+            from gui.lnt_class_counts import read_directory
+            with open(view.lnt_path, "rb") as stream:
+                header = struct.unpack("<4sHHQ6d", stream.read(64))
+            _, entries = read_directory(view.lnt_path)
+            leaves = entries[(entries["children_mask"] == 0) & (entries["point_count"] > 0)]
+            if not len(leaves):
+                return None
+            # The file header is a cubic octree envelope, often hundreds of
+            # metres taller than the terrain. Populated leaf boxes give a tight,
+            # conservative ceiling without decoding every source point or
+            # trusting the root LOD sample (which can miss the tallest points).
+            centres = leaves["center"][:, 2].astype(np.float64) + header[6]
+            half = leaves["half_size"].astype(np.float64)
+            bounds = float(np.min(centres - half)), float(np.max(centres + half))
+            if np.all(np.isfinite(bounds)) and bounds[1] >= bounds[0]:
+                view._snt_cloud_z_bounds = bounds
+                return bounds
+        except (OSError, AttributeError, ValueError, KeyError, struct.error):
+            return None
+        return None
+    data = getattr(app, "data", None)
+    if data is not None and "xyz" in data and len(data["xyz"]):
+        bounds = getattr(app, "data_bounds", None)
+        if bounds is not None and len(bounds) >= 6:
+            z0, z1 = float(bounds[4]), float(bounds[5])
+        else:
+            z = np.asarray(data["xyz"])[:, 2]
+            z0, z1 = float(np.nanmin(z)), float(np.nanmax(z))
+        if np.isfinite(z0) and np.isfinite(z1) and z1 >= z0:
+            return z0, z1
+    return None
+
+
 class NativeVectorLayer(NativeAttachmentLayer):
     """NativeAttachmentLayer whose polyline geometry lives in the GPU arena.
 
-    `documents[key]['groups']` still carries only the Qt-overlay records - which
-    now means the TEXT records - and `documents[key]['gpu']` carries the
+    `documents[key]['groups']` carries fallback Qt text records, and
+    `documents[key]['gpu']` carries the linework and world-sized glyphs in
     arena-resident chunks per layer. Everything else (refresh, remove,
     remove_file, shutdown) is inherited.
     """
@@ -815,6 +857,10 @@ class NativeVectorLayer(NativeAttachmentLayer):
         actor_cache handling is unchanged.
         """
         gpu_groups = prepared_groups if prepared_groups is not None else group_entities(entities)
+        # World-sized CAD labels must share the linework's Vulkan camera frame.
+        # A separate transparent window can present an older frame during pan.
+        from gui.native_label_layout import native_text_entities
+        glyph_entities = []
         text_grouped: Dict[str, List] = {}
         for entity in entities or ():
             try:
@@ -822,11 +868,23 @@ class NativeVectorLayer(NativeAttachmentLayer):
                     continue
             except Exception:
                 continue
+            glyphs = native_text_entities(entity)
+            if glyphs is not None:
+                glyph_entities.extend(glyphs)
+                continue
             record = _entity_record(entity)
             if record is None:
                 continue
+            position = entity.get("position") or ()
+            record[1]["source_z"] = float(position[2]) if len(position) > 2 else 0.0
             text_grouped.setdefault(
                 str(entity.get("layer", "0") or "0"), []).append(record)
+
+        if glyph_entities:
+            # Copy the prepared map: it may also be retained by the attachment.
+            gpu_groups = {layer: list(chunks) for layer, chunks in gpu_groups.items()}
+            for layer, chunks in group_entities(glyph_entities).items():
+                gpu_groups.setdefault(layer, []).extend(chunks)
 
         key = (str(kind).lower(), str(Path(name)))
 
@@ -863,9 +921,8 @@ class NativeVectorLayer(NativeAttachmentLayer):
             # draw instead of showing a canvas with nothing on it.
             return None
 
-        document = {"groups": text_grouped, "handles": {}, "gpu": {}}
-        for layer_name, chunks in gpu_groups.items():
-            document["gpu"][layer_name] = self._upload_chunks(chunks)
+        document = {"kind": key[0], "groups": text_grouped, "handles": {}, "gpu": gpu_groups}
+        self._upload_document(document)
 
         layer_names = set(text_grouped) | set(gpu_groups)
         document["handles"] = {
@@ -946,29 +1003,54 @@ class NativeVectorLayer(NativeAttachmentLayer):
             # (Re)allocated: nothing resident survives, so rebuild from scratch.
             self._v_used = 0
             self._i_used = 0
-            for document in self.documents.values():
-                rebuilt = {}
-                for layer_name, chunks in (document.get("gpu") or {}).items():
-                    rebuilt[layer_name] = self._upload_chunks(
-                        [{k: c[k] for k in ("xyz", "rgb", "indices", "v_count",
-                                            "i_count", "lineweight")}
-                         for c in chunks])
-                document["gpu"] = rebuilt
+            for key, document in self.documents.items():
+                document.setdefault("kind", key[0])
+                self._upload_document(document)
                 for layer_name, handle in document["handles"].items():
-                    handle.chunks = rebuilt.get(layer_name, [])
+                    handle.chunks = document["gpu"].get(layer_name, [])
         return True
 
-    def _upload_chunks(self, chunks) -> List[Dict]:
+    def _upload_document(self, document):
+        offset = 0.0
+        cloud = _cloud_z_bounds(self.app) if document.get("kind") == "snt" else None
+        if cloud is not None:
+            lows = []
+            for chunks in document.get("gpu", {}).values():
+                for chunk in chunks:
+                    z = chunk["xyz"][:, 2]
+                    finite = z[np.isfinite(z)]
+                    if finite.size:
+                        lows.append(float(finite.min()))
+            for records in document.get("groups", {}).values():
+                lows.extend(float(data.get("source_z", 0.0)) for _, data in records)
+            if lows:
+                z0, z1 = cloud
+                target = z1 + max((z1 - z0) * 0.5, 50.0)
+                offset = max(0.0, target - min(lows))
+        document["z_offset"] = offset
+        document["gpu"] = {name: self._upload_chunks(chunks, offset)
+                           for name, chunks in document.get("gpu", {}).items()}
+        for records in document.get("groups", {}).values():
+            for _, data in records:
+                if document.get("kind") == "snt":
+                    data["world_z"] = float(data.get("source_z", 0.0)) + offset
+
+    def _upload_chunks(self, chunks, z_offset=0.0) -> List[Dict]:
         resident: List[Dict] = []
         for chunk in chunks:
             v_first, i_first = self._v_used, self._i_used
             indices = chunk["indices"].copy()
             live = indices != RESTART_INDEX
             indices[live] += np.uint32(v_first)
+            # Keep authored world coordinates for rebinding, picking and saving.
+            xyz = chunk["xyz"]
+            if z_offset:
+                xyz = xyz.copy()
+                xyz[:, 2] += z_offset
             ok = False
             try:
                 ok = bool(self._backend.vector_upload_strip(
-                    v_first, chunk["v_count"], chunk["xyz"], chunk["rgb"],
+                    v_first, chunk["v_count"], xyz, chunk["rgb"],
                     i_first, chunk["i_count"], indices))
             except Exception:
                 ok = False

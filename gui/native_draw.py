@@ -319,9 +319,45 @@ class NativeDraw:
             self.tool = None
         self._paint()
 
+    def _sync_block_vectors(self):
+        """Keep authored blocks in the same camera frame as attached linework."""
+        blocks = [d for d in self.drawings if d.get('source') == 'block_creation']
+        resident = getattr(self, '_block_vector_layer', None)
+        name = '__native_created_blocks__'
+        if not blocks:
+            if resident is not None:
+                resident.remove('drawing', name)
+            self._block_vector_layer = None
+            self._block_vector_signature = None
+            return False
+        from gui.native_vector_overlay import vector_layer_for
+        layer = vector_layer_for(self.app)
+        if layer is None:
+            return False
+        entities = []
+        for drawing in blocks:
+            color = drawing.get('color', (0, 179, 255))
+            if isinstance(color, str):
+                from PySide6.QtGui import QColor
+                color = QColor(color).getRgb()[:3]
+            entities.append({'type': 'polyline', 'layer': 'Created blocks',
+                             'points': drawing.get('coords', []), 'color': tuple(color),
+                             '_lineweight': max(0, (int(drawing.get('width', 3)) - 1) * 2)})
+        signature = (id(layer), tuple((tuple(tuple(p) for p in e['points']),
+                                      e['color'], e['_lineweight']) for e in entities))
+        if signature != getattr(self, '_block_vector_signature', None):
+            if layer.put_entities('drawing', name, entities) is None:
+                return False
+            self._block_vector_layer = layer
+            self._block_vector_signature = signature
+        return True
+
     def _paint(self):
+        gpu_blocks = self._sync_block_vectors()
         shapes = []
         for i, drawing in enumerate(self.drawings):
+            if gpu_blocks and drawing.get('source') == 'block_creation':
+                continue
             data = self._style(drawing.get('type'))
             data.update(drawing)
             data['selected'] = i == self.selected
@@ -338,14 +374,32 @@ class NativeDraw:
         self.overlay.set_shapes(shapes)
 
     def shutdown(self):
+        layer = getattr(self, '_block_vector_layer', None)
+        if layer is not None:
+            layer.remove('drawing', '__native_created_blocks__')
         self.cancel()
         self.overlay._timer.stop()
         self.overlay.close()
 
 
-def get_native_draw(app, create=False):
+def native_plan_view(app, allow_snt=False):
+    """The native 2D plan view: the open .lnt's, or - with allow_snt - the promoted
+    Vulkan viewport of an SNT-only session (engine MVP mapping, no point stream)."""
     view = getattr(app, '_lnt_main_view', None)
-    if view is None or getattr(view, 'native', None) is None or not getattr(view, 'mode_2d', False):
+    if view is not None and getattr(view, 'native', None) is not None:
+        return view if getattr(view, 'mode_2d', False) else None
+    if allow_snt:
+        from gui.native_vector_overlay import _view_for, snt_viewport_active
+        if snt_viewport_active(app):
+            view = _view_for(app)
+            if view is not None and getattr(getattr(view, 'owner', None), 'vulkan_widget', None) is not None:
+                return view
+    return None
+
+
+def get_native_draw(app, create=False, allow_snt=False):
+    view = native_plan_view(app, allow_snt)
+    if view is None:
         return None
     draw = getattr(view, 'drawing', None)
     if draw is None and create:
