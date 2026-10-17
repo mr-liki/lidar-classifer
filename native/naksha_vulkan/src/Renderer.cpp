@@ -46,6 +46,9 @@ bool Renderer::Initialize(const RendererConfig& cfg) {
     FillDefaultLut(lutIntensity_, 2);
     // Every class starts visible; nkv_set_class_visibility replaces this.
     std::memset(classVisible_, 1, sizeof(classVisible_));
+    // Neutral weight: every class draws at the pixel size the UI selected until
+    // nkv_set_class_weights replaces the table.
+    for (uint32_t i = 0; i < 256; ++i) classWeights_[i] = 1.0f;
     maxFramesInFlight_ = std::max<uint32_t>(cfg.maxFramesInFlight, 1u);
     enableGpuTimestamps_ = cfg.enableGpuTimestamps;
 
@@ -941,6 +944,22 @@ void Renderer::SetClassVisibility(const uint8_t* visible256) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-class point-size weights - 256 floats (see Renderer.hpp). Stored CPU-side
+// and folded into the elevation LUT's alpha by UpdateFrameUbo every frame, so
+// this never touches a point buffer and never disturbs the FrameUbo layout.
+// ---------------------------------------------------------------------------
+void Renderer::SetClassWeights(const float* weights256) {
+    if (!weights256) return;
+    for (uint32_t i = 0; i < 256; ++i) {
+        const float w = weights256[i];
+        // A NaN/Inf (bad caller) would propagate into gl_PointSize; degrade it
+        // to the neutral value instead of poisoning the vertex stage.
+        classWeights_[i] = std::isfinite(w) ? w : 1.0f;
+    }
+    classWeightUpdates_++;
+}
+
+// ---------------------------------------------------------------------------
 // Instant Shaded Class pass
 // ---------------------------------------------------------------------------
 
@@ -1533,6 +1552,12 @@ void Renderer::UpdateFrameUbo(uint32_t slot) {
     std::memcpy(ubo.classPalette, lutClass_, sizeof(ubo.classPalette));
     std::memcpy(ubo.elevationLut, lutElevation_, sizeof(ubo.elevationLut));
     std::memcpy(ubo.intensityLut, lutIntensity_, sizeof(ubo.intensityLut));
+    // Per-class point weights ride in the elevation LUT's alpha - a channel no
+    // shader reads (every consumer samples elevationLut[i].rgb). Written AFTER
+    // the memcpys so a LUT upload that rewrote alpha = 1 (StoreLut) can never
+    // clear them, and so the write order can never matter.
+    for (uint32_t i = 0; i < 256; ++i)
+        ubo.elevationLut[i * 4 + 3] = classWeights_[i];
     std::memcpy(ubo.clipPlanes, clipPlanes_, sizeof(ubo.clipPlanes));
     ubo.clipInfo[0] = clipCount_;
     std::memcpy(frameUboBuffers_[slot].mappedData, &ubo, sizeof(ubo));

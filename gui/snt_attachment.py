@@ -25287,14 +25287,38 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         try:
             filename = str(item.snt_path.name)
             try:
+                full_path = str(item.snt_path.resolve())
+            except Exception:
+                full_path = str(item.snt_path)
+            # Snapshot the row's direct actor references BEFORE the canvas
+            # cleanup runs. On the VTK path they are the only guaranteed live
+            # refs when the app-level stores were already popped (or were never
+            # populated because the attach failed midway), so they must reach
+            # _remove_from_vtk instead of being discarded by a cache clear.
+            cached_actors = []
+            try:
+                for actors in (getattr(item, "actor_cache", None) or {}).values():
+                    cached_actors.extend(list(actors or []))
+            except Exception:
+                cached_actors = []
+            try:
                 item.cleanup()
             except Exception:
                 pass
             self.snt_items.remove(item)
             self.file_list_layout.removeWidget(item)
-            if hasattr(item, 'actor_cache'):
-                item.actor_cache.clear()
-            self._remove_from_vtk(filename)
+            self._remove_from_vtk(
+                filename, full_path=full_path, cached_actors=cached_actors)
+            # Drop the row-local refs only AFTER the canvas cleanup has used
+            # them, so restore_snt_actors() can never resurrect this file.
+            try:
+                item.actor_cache = {}
+            except Exception:
+                pass
+            try:
+                item.attachment = None
+            except Exception:
+                pass
             try:
                 item.remove_requested.disconnect()
             except Exception:
@@ -25305,16 +25329,17 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         except Exception as exc:
             print(f"[warn] Error in _remove_item: {exc}")
 
-    def _remove_from_vtk(self, filename: str):
+    def _remove_from_vtk(self, filename: str, full_path: Optional[str] = None,
+                         cached_actors: Optional[List] = None):
         try:
             target = os.path.basename(str(filename or ""))
             target_lower = target.lower()
-            from gui.native_attachments import is_native_main, layer_for
-            native_mode = is_native_main(self.app)
-            if native_mode:
-                native_layer = layer_for(self.app)
-                if native_layer is not None:
-                    native_layer.remove_file('snt', target)
+            target_key = self._path_key(full_path) if full_path else ""
+            print(
+                f"[SNT remove] canvas cleanup target='{target}' "
+                f"full_path='{full_path or ''}' key='{target_key}' "
+                f"cached_actors={len(list(cached_actors or []))}"
+            )
 
             def _norm_name(value) -> str:
                 if not value:
@@ -25333,14 +25358,56 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     return str(value).strip().lower()
 
             def _matches_record(record) -> bool:
+                """Resolved-path identity first, basename only as a fallback.
+
+                Attachments carry both the basename ('filename') and the
+                resolved source path ('full_path'); matching the path keeps a
+                same-named file in another folder attached. The basename
+                fallback stays for records (or legacy callers) with no path.
+                """
                 if not isinstance(record, dict):
                     return False
                 record_name = _norm_name(record.get("filename"))
                 record_full = _norm_path(record.get("full_path"))
+                if target_key:
+                    if record_full:
+                        return record_full == target_key
+                    return bool(target_lower and record_name == target_lower)
                 return bool(
-                    (target_lower and record_name == target_lower)
-                    or (target_lower and record_full and os.path.basename(record_full) == target_lower)
+                    target_lower
+                    and (
+                        record_name == target_lower
+                        or (record_full and os.path.basename(record_full) == target_lower)
+                    )
                 )
+
+            def _store_matches(value) -> bool:
+                """Same identity rule for stores keyed by 'snt_filename'."""
+                if not value:
+                    return False
+                if target_key and _norm_path(value) == target_key:
+                    return True
+                return bool(target_lower and _norm_name(value) == target_lower)
+
+            # Native / GPU linework is NOT VTK: it lives in the attachment
+            # layer documents (Qt-overlay labels) and, on the vector layer, in
+            # the engine's vector arena. The VTK sweeps below cannot touch
+            # either, so drop the file from every layer that may own it BEFORE
+            # any renderer work. layer_for() is deliberately not used here: an
+            # SNT attach registers on '_native_vector_layer' (render_linework)
+            # or '_native_attachment_layer' (render_entities), while layer_for()
+            # only ever returns the latter - which is why the X button used to
+            # leave GPU linework on the canvas.
+            native_layers = []
+            for attr in ("_native_vector_layer", "_native_attachment_layer"):
+                layer = getattr(self.app, attr, None)
+                if layer is not None and layer not in native_layers:
+                    native_layers.append(layer)
+            for layer in native_layers:
+                try:
+                    layer.remove_file('snt', target)
+                except Exception as exc:
+                    print(f"  [warn] native attachment layer remove_file failed: {exc}")
 
             # Collect the layer names that belong to the SNT file being removed,
             # BEFORE its attachment metadata is dropped below. Used to also take
@@ -25360,8 +25427,6 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             renderer = None
             try:
                 if (
-                    not native_mode
-                    and
                     hasattr(self.app, "vtk_widget")
                     and self.app.vtk_widget is not None
                     and hasattr(self.app.vtk_widget, "renderer")
@@ -25372,8 +25437,6 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
 
             extra_renderers = []
             try:
-                if native_mode:
-                    raise RuntimeError('native attachment mode')
                 digitizer = getattr(self.app, "digitizer", None)
                 for extra in (
                     getattr(digitizer, "overlay_renderer", None),
@@ -25385,6 +25448,36 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 pass
 
             removed_actor_ids = set()
+
+            # 0) Remove this row's own cached actors first (snapshotted by
+            #    _remove_item before it cleared the cache). This is the direct
+            #    actor handle the DWG path relies on, and it still works when
+            #    the app-level stores below have already lost the entry.
+            for actor in list(cached_actors or []):
+                try:
+                    removed_actor_ids.add(id(actor))
+                    for vtk_renderer in [renderer] + extra_renderers:
+                        if vtk_renderer is None:
+                            continue
+                        try:
+                            vtk_renderer.RemoveActor(actor)
+                        except Exception:
+                            pass
+                        try:
+                            vtk_renderer.RemoveActor2D(actor)
+                        except Exception:
+                            pass
+                        try:
+                            vtk_renderer.RemoveViewProp(actor)
+                        except Exception:
+                            pass
+                    if hasattr(actor, "dispose"):
+                        try:
+                            actor.dispose()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             # 1) Remove real SNT/DXF actors matching the removed SNT filename
             for store_name in ["snt_actors", "dxf_actors"]:
@@ -25510,12 +25603,12 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 if hasattr(self.app, "snt_block_polygons"):
                     self.app.snt_block_polygons = [
                         poly for poly in getattr(self.app, "snt_block_polygons", [])
-                        if _norm_name(poly.get("snt_filename", "")) != target_lower
+                        if not _store_matches(poly.get("snt_filename", ""))
                     ]
                 if hasattr(self.app, "snt_grid_tiles"):
                     self.app.snt_grid_tiles = [
                         tile for tile in self.app.snt_grid_tiles
-                        if _norm_name(tile.get("snt_filename", "")) != target_lower
+                        if not _store_matches(tile.get("snt_filename", ""))
                     ]
             except Exception:
                 pass
@@ -25582,7 +25675,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                         if not isinstance(d, dict):
                             return False
                         sf = d.get("snt_file")
-                        if sf and os.path.basename(str(sf)) == target:
+                        if sf and os.path.basename(str(sf)).lower() == target_lower:
                             return True
                         return str(d.get("layer", "")) in removed_layers
                     doomed = [
@@ -25607,33 +25700,59 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             except Exception as exc:
                 print(f"  [warn] digitizer drawing cleanup after SNT remove failed: {exc}")
 
-            # 9) Render once at end
-            for vtk_renderer in all_renderers:
-                try:
-                    vtk_renderer.Modified()
-                except Exception:
-                    pass
-            if renderer is not None:
-                try:
-                    rw = self.app.vtk_widget.GetRenderWindow()
-                    if rw is not None:
-                        rw.Render()
-                except Exception:
-                    pass
-
-            # Reconcile only after all SNT actors/metadata have been removed.
-            # Existing spatial actors are already in the current canvas CRS,
-            # so attachment removal must never select a replacement CRS.
-            try:
-                from gui.crs_manager import reconcile_canvas_crs_after_content_change
-                reconcile_canvas_crs_after_content_change(
-                    self.app, reason="SNT attachment removed"
-                )
-            except Exception as _crs_clean_err:
-                print(f"  [warn] CRS cleanup after SNT remove failed: {_crs_clean_err}")
+            # 9) Repaint once at the end - VTK canvas AND the native/GPU
+            #    viewport. Clear All suspends this so N removals paint once.
+            if not getattr(self, "_suspend_snt_removal_render", False):
+                self._finalize_snt_removal_render(all_renderers)
 
         except Exception as exc:
             print(f"  [warn] _remove_from_vtk failed: {exc}")
+
+    def _finalize_snt_removal_render(self, all_renderers=None) -> None:
+        """One repaint for every canvas an SNT removal touched (VTK + native).
+
+        The native/GPU linework is drawn by the engine rather than VTK, so a
+        Render() on the VTK widget alone cannot clear it: the vector layers are
+        refreshed (Qt labels + GPU draw ranges) and the render backend is asked
+        to present a fresh frame. The CRS reconcile runs at the very end, after
+        every actor and metadata store has already been removed.
+        """
+        for vtk_renderer in all_renderers or []:
+            try:
+                vtk_renderer.Modified()
+            except Exception:
+                pass
+        for attr in ("_native_vector_layer", "_native_attachment_layer"):
+            layer = getattr(self.app, attr, None)
+            if layer is None:
+                continue
+            try:
+                layer.refresh()
+            except Exception as exc:
+                print(f"  [warn] native layer refresh after SNT remove failed: {exc}")
+        try:
+            owner = getattr(self.app, "render_backend", None)
+            request = getattr(owner, "request_render", None)
+            if callable(request):
+                request()
+        except Exception:
+            pass
+        try:
+            rw = self.app.vtk_widget.GetRenderWindow()
+            if rw is not None:
+                rw.Render()
+        except Exception:
+            pass
+        # Reconcile only after all SNT actors/metadata have been removed.
+        # Existing spatial actors are already in the current canvas CRS,
+        # so attachment removal must never select a replacement CRS.
+        try:
+            from gui.crs_manager import reconcile_canvas_crs_after_content_change
+            reconcile_canvas_crs_after_content_change(
+                self.app, reason="SNT attachment removed"
+            )
+        except Exception as _crs_clean_err:
+            print(f"  [warn] CRS cleanup after SNT remove failed: {_crs_clean_err}")
 
     def _clear_all(self):
         if self._load_worker is not None and self._load_worker.isRunning():
@@ -25649,16 +25768,24 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         # SBM rows are torn down through their OWN removal helpers. This
         # prevents any cross-pipeline state (actor_cache, _sbm_dialog, etc.)
         # from leaking between the two pipelines.
-        for sbm in list(self._iter_sbm_file_items()):
-            try:
-                self._remove_sbm_item(sbm)
-            except Exception:
-                pass
-        for snt in list(self._iter_snt_file_items()):
-            try:
-                self._remove_item(snt)
-            except Exception:
-                pass
+        #
+        # Per-file repaints are suspended so the whole batch ends in ONE
+        # Render() (plus one native refresh and one CRS reconcile).
+        self._suspend_snt_removal_render = True
+        try:
+            for sbm in list(self._iter_sbm_file_items()):
+                try:
+                    self._remove_sbm_item(sbm)
+                except Exception:
+                    pass
+            for snt in list(self._iter_snt_file_items()):
+                try:
+                    self._remove_item(snt)
+                except Exception:
+                    pass
+        finally:
+            self._suspend_snt_removal_render = False
+        self._finalize_snt_removal_render()
         self._update_file_count()
         import gc
         gc.collect()

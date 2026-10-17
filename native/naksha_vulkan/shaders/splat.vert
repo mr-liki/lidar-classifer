@@ -81,12 +81,21 @@ void main() {
     // former / px-per-world-unit for the latter, so one expression covers both.
     float footprintPx = pc.size.x * pc.view.x / max(gl_Position.w, 1e-4);
     float pixels = clamp(footprintPx, pc.size.y, pc.size.z);
+
+    int mode = int(pc.shading.x + 0.5);
+    int classId = int(inClassU * 255.0 + 0.5) & 255;
+
+    // Per-class point weight (Display Mode "Weight" column), same source and
+    // semantics as point.vert: the nkv_set_class_weights table rides in the
+    // elevation LUT's alpha, 1.0 = neutral. VTK's weight_lut applies in the
+    // Shaded Class mode too, so the splat must honour it as well.
+    float classWeight = clamp(ubo.elevationLut[classId].a, 0.1, 12.0);
+    pixels *= classWeight;
+
     float deviceMax = max(pc.view.w, 1.0);
     gl_PointSize = clamp(pixels, 1.0, min(deviceMax, 64.0));
     v_point_px = gl_PointSize;
 
-    int mode = int(pc.shading.x + 0.5);
-    int classId = int(inClassU * 255.0 + 0.5) & 255;
     vec3 rgb = ubo.classPalette[classId].rgb;
     // Intensity modulation is off (pc.size.w == 0) on this mode: Shaded Class
     // colours with the palette and lights it, matching the legacy TIN.

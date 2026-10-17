@@ -257,19 +257,31 @@ class SectionCanvas(QWidget):
             self.fit(sync=False)
         self._dirty = True
 
-    def apply_palette(self, palette, mode='class', sync=True):
+    def apply_palette(self, palette, mode='class', sync=False):
         self.palette, self.mode = dict(palette or {}), mode
         if not self.backend._handle:
             return
         colors = np.full((256, 3), 128, dtype=np.uint8)
         visible = np.ones(256, dtype=np.uint8)
+        # Per-class point weights (Display Mode "Weight" column). Mirrors the
+        # VTK weight_lut: gl_PointSize = the view's fixed pixel size * weight.
+        # Strictly per-view: this pushes to THIS view's renderer only, so
+        # growing a class's points here never touches a synced sibling view.
+        weights = np.ones(256, dtype=np.float32)
         for code, rule in (palette or {}).items():
             code = int(code)
             if 0 <= code < 256:
                 colors[code] = rule.get('color', (128, 128, 128))
                 visible[code] = bool(rule.get('show', True))
+                try:
+                    raw = float(rule.get('weight', 1.0))
+                except (TypeError, ValueError):
+                    raw = 1.0
+                weights[code] = np.float32(max(0.1, min(raw, 12.0)))
         self.backend.set_point_luts(class_rgb=colors)
         self.backend.set_class_visibility(visible)
+        if hasattr(self.backend, 'set_class_weights'):
+            self.backend.set_class_weights(weights)
         modes = {'rgb': 0, 'class': 1, 'intensity': 2, 'elevation': 3,
                  'shaded_class': 4, 'depth': 6}
         # Sections are projected point views. Native instant lighting shades
@@ -728,13 +740,10 @@ class NativeSections:
                     if not data:
                         continue
                     target = self.ensure_dock(peer)
-                if display:
-                    target.palette = {code: dict(rule) for code, rule in source.palette.items()}
-                    target.mode = source.mode
-                    target.shading_parameters = source.shading_parameters
-                    palettes = getattr(self.app, 'view_palettes', None)
-                    if palettes is not None:
-                        palettes[peer] = {code: dict(rule) for code, rule in target.palette.items()}
+                # Palette and display mode are per-view: a Display Mode Apply
+                # targets ONLY the view selected in the dialog. Sync mirrors
+                # section data and camera, never display state, so a peer keeps
+                # its own class colors/visibility whether linked or not.
                 if data or target.axis != source.axis:
                     target.classifier.cancel()
                     target.set_points(source.local, source.indices, source.axis, fit=False,
@@ -823,8 +832,10 @@ class NativeSections:
         if mode in ('surface', 'line'):
             raise ValueError('Native section views support Class, Shaded Class, Depth, Intensity, RGB and Elevation')
         self._pending_display[slot] = (dict(palette), mode)
+        # Display Mode Apply is strictly per-view: never mirror the palette or
+        # the color mode into synced peers (sync carries data and camera only).
         if slot in self.views:
-            self.views[slot].apply_palette(palette, mode)
+            self.views[slot].apply_palette(palette, mode, sync=False)
         return True
 
     def cancel_cross(self):

@@ -1065,6 +1065,15 @@ class VulkanRenderBackend(RenderBackend):
         if hasattr(dll, "nkv_get_class_visibility_update_count"):
             dll.nkv_get_class_visibility_update_count.restype = ctypes.c_uint64
             dll.nkv_get_class_visibility_update_count.argtypes = [ctypes.c_uint64]
+        # Per-class point weights (Display Mode "Weight" column). Additive like
+        # every optional entry point: an older DLL lacks them, getattr returns
+        # None and the caller degrades to "unsupported" instead of raising.
+        if hasattr(dll, "nkv_set_class_weights"):
+            dll.nkv_set_class_weights.restype = ctypes.c_int
+            dll.nkv_set_class_weights.argtypes = [ctypes.c_uint64, ctypes.c_void_p]
+        if hasattr(dll, "nkv_get_class_weight_update_count"):
+            dll.nkv_get_class_weight_update_count.restype = ctypes.c_uint64
+            dll.nkv_get_class_weight_update_count.argtypes = [ctypes.c_uint64]
         if hasattr(dll, "nkv_get_instant_shaded_frame_count"):
             dll.nkv_get_instant_shaded_frame_count.restype = ctypes.c_uint64
             dll.nkv_get_instant_shaded_frame_count.argtypes = [ctypes.c_uint64]
@@ -2110,6 +2119,31 @@ class VulkanRenderBackend(RenderBackend):
 
     def get_class_visibility_update_count(self) -> int:
         value = self._nkv("nkv_get_class_visibility_update_count",
+                          ctypes.c_uint64(self._handle))
+        return int(value) if value is not None else 0
+
+    def set_class_weights(self, weights) -> bool:
+        """Upload the 256-entry per-class point-size weight table (1.0 = neutral).
+
+        Native form of the VTK weight_lut the Display Mode "Weight" column
+        edits: gl_PointSize = fixed pixel size * clamp(weight, 0.1, 12.0), so
+        raising one class's weight grows only that class's points. Uniform-only
+        by contract - the table is folded into the frame UBO (elevation LUT
+        alpha), so this never re-uploads a point: get_point_position_upload_count
+        must stay put, and get_class_weight_update_count moves instead. This is
+        also what makes a weight edit strictly per-view: each view has its own
+        renderer handle and therefore its own weight table.
+        """
+        arr = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
+        if arr.size != 256:
+            raise ValueError(f"weights must have 256 entries, got {arr.size}")
+        value = self._nkv("nkv_set_class_weights",
+                          ctypes.c_uint64(self._handle),
+                          ctypes.c_void_p(arr.ctypes.data))
+        return bool(value) if value is not None else False
+
+    def get_class_weight_update_count(self) -> int:
+        value = self._nkv("nkv_get_class_weight_update_count",
                           ctypes.c_uint64(self._handle))
         return int(value) if value is not None else 0
 

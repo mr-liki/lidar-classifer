@@ -209,6 +209,20 @@ NKV_API int nkv_set_instant_normal_source(NkvHandle handle, int screen_space);
 
 NKV_API int nkv_set_class_visibility(NkvHandle handle, const uint8_t* visible256);
 
+/* Per-class point-size weights: 256 floats, 1.0 = neutral, larger = bigger
+ * points. This is the native form of the VTK weight_lut the Display Mode
+ * "Weight" column edits (gl_PointSize = fixed pixel size * weight, clamped to
+ * 0.1..12.0), so raising a class's weight in one view grows only that class's
+ * points in that view. The table is folded into the frame UBO every frame -
+ * uniform-only by contract: it never re-uploads or re-allocates a point buffer
+ * (nkv_get_point_position_upload_count must NOT move across this call), and it
+ * never changes the FrameUbo layout, so every shader that declares only a
+ * prefix of the block is unaffected. Absent in engine DLLs built before it;
+ * the caller degrades to "unsupported" (returns 0). Pairs with
+ * nkv_get_class_weight_update_count. */
+NKV_API int nkv_set_class_weights(NkvHandle handle, const float* weights256);
+NKV_API uint64_t nkv_get_class_weight_update_count(NkvHandle handle);
+
 /* ---- Shading modes (MicroStation-style presentation) --------------------------
  * One call switches the whole presentation: display mode, colour ramp, the elevation
  * and intensity ranges, the light and the Eye-Dome Lighting strength. It changes
