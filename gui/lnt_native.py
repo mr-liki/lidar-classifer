@@ -10,13 +10,15 @@ from ctypes import (POINTER, Structure, c_char_p, c_double, c_float, c_int,
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Viewer API in main_shading.dll; GPU Shading uses the compact Vulkan engine below.
-LNT_DLL = os.path.join(_LNT_DIR, "main_shading.dll")
+# Use the camera-preset build. Keeping a distinct deployed filename also lets a
+# corrected renderer be installed while an older main_shading.dll is still
+# mapped by a running Windows process.
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
-_UPDATED_VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan_surface_only.dll")
-VULKAN_DLL = (_UPDATED_VULKAN_DLL if os.path.isfile(_UPDATED_VULKAN_DLL)
-              else os.path.join(_VULKAN_DIR, "naksha_vulkan.dll"))
+# Main and section renderers share the same engine module/device pool.
+VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
 
-MODE_CLASS, MODE_INTENSITY, MODE_ELEVATION, MODE_NEUTRAL = 1, 2, 3, 5
+MODE_CLASS, MODE_INTENSITY, MODE_ELEVATION, MODE_NEUTRAL, MODE_DEPTH = 1, 2, 3, 5, 6
 
 # Presentation modes of lnt_view_set_shading (LNTShadingModes.h). NOT the engine's
 # MODE_* numbers above: these are the shading API's own enumeration.
@@ -76,6 +78,9 @@ def lib():
         getattr(d, n).argtypes = [c_void_p, c_double]
     d.lnt_view_set_mode.argtypes = [c_void_p, c_int]
     d.lnt_view_reset.argtypes = [c_void_p]
+    if hasattr(d, "lnt_view_renderer_handle"):    # the view's own nkv renderer (vector overlay)
+        d.lnt_view_renderer_handle.argtypes = [c_void_p]
+        d.lnt_view_renderer_handle.restype = c_uint64
     if hasattr(d, "lnt_view_plan_view"):          # absent in older builds of the DLL
         d.lnt_view_plan_view.argtypes = [c_void_p]
     if hasattr(d, "lnt_view_set_luts"):
@@ -86,15 +91,24 @@ def lib():
         d.lnt_view_set_classification_lut.restype = c_int
     if hasattr(d, "lnt_view_set_2d"):
         d.lnt_view_set_2d.argtypes = [c_void_p, c_int]
+    if hasattr(d, "lnt_view_set_view"):
+        d.lnt_view_set_view.argtypes = [c_void_p, c_int]
     if hasattr(d, "lnt_query_aabb"):             # section tools: point query + class write-back
         d.lnt_query_aabb.argtypes = [c_void_p, c_void_p, c_void_p, c_uint64, c_char_p, c_int]
         d.lnt_query_aabb.restype = ctypes.c_int64
         d.lnt_query_fetch.argtypes = [c_void_p] * 7
         d.lnt_query_fetch.restype = c_int
+    if hasattr(d, "lnt_query_stroke"):           # brush stroke: only the swept records
+        d.lnt_query_stroke.argtypes = [c_void_p, c_void_p, c_uint64, ctypes.c_double, c_int, c_uint64,
+                                       c_char_p, c_int]
+        d.lnt_query_stroke.restype = ctypes.c_int64
         d.lnt_query_release.argtypes = [c_void_p]
         d.lnt_set_classes.argtypes = [c_void_p, c_void_p, c_void_p, c_void_p, c_uint64,
                                       c_char_p, c_int]
         d.lnt_set_classes.restype = c_int
+    if hasattr(d, "lnt_preview_classes"):        # instant class display before the write
+        d.lnt_preview_classes.argtypes = [c_void_p] * 6 + [c_uint64, c_void_p]
+        d.lnt_preview_classes.restype = c_int
         d.lnt_view_screen_to_world.argtypes = [c_void_p, c_double, c_double, c_void_p]
         d.lnt_view_screen_to_world.restype = c_int
         d.lnt_view_world_to_screen.argtypes = [c_void_p, c_double, c_double, c_void_p]
@@ -179,8 +193,8 @@ class NativeView:
 
     def __init__(self, hwnd, width, height, lnt_path, budget_mb=512, sse=8.0):
         """Create the dedicated LNT renderer on `hwnd` (a Qt widget's native window).
-        The engine allows ONE renderer per process, so the host must have shut its
-        own renderer down first (see LntMainView)."""
+        Main and section views share the engine's Vulkan device; each HWND
+        has its own renderer handle."""
         err = create_string_buffer(512)
         self.h = lib().lnt_view_open_on_window(c_void_p(int(hwnd)), int(width), int(height),
                                                os.fsencode(lnt_path), os.fsencode(VULKAN_DLL),
@@ -194,6 +208,14 @@ class NativeView:
         if self.h:
             lib().lnt_view_close(c_void_p(self.h))
             self.h = None
+
+    def renderer_handle(self):
+        """The nkv renderer handle this view draws with (0 if unavailable). Same
+        naksha_vulkan.dll module as the app backend, so nkv_* calls accept it."""
+        fn = getattr(lib(), "lnt_view_renderer_handle", None)
+        if not self.h or fn is None:
+            return 0
+        return int(fn(c_void_p(self.h)) or 0)
 
     def _ok(self):
         return bool(self.h)
@@ -247,6 +269,15 @@ class NativeView:
         if self._ok() and hasattr(lib(), "lnt_view_plan_view"):
             lib().lnt_view_plan_view(c_void_p(self.h))
 
+    def set_view(self, preset):
+        """Native camera preset: 3d/top/front/side; never calls VTK."""
+        values = {'3d': 0, 'top': 1, 'front': 2, 'side': 3}
+        value = values.get(str(preset).lower())
+        if value is None or not (self._ok() and hasattr(lib(), "lnt_view_set_view")):
+            return False
+        lib().lnt_view_set_view(c_void_p(self.h), value)
+        return True
+
     # ---- section tools -----------------------------------------------------------
     def has_section_api(self):
         return self._ok() and hasattr(lib(), "lnt_query_aabb")
@@ -266,6 +297,27 @@ class NativeView:
         err = create_string_buffer(256)
         a, b = (c_double * 3)(*[float(v) for v in mn]), (c_double * 3)(*[float(v) for v in mx])
         n = lib().lnt_query_aabb(c_void_p(self.h), a, b, int(max_points), err, 256)
+        return self._fetch_query(n, err)
+
+    def has_stroke_query(self):
+        return self._ok() and hasattr(lib(), "lnt_query_stroke")
+
+    def query_stroke(self, path, radius, square, max_points=0):
+        """Every leaf point a plan-view brush stroke covers: the round (or square) brush of
+        `radius` swept along the XY `path`. Same result layout as query_points()."""
+        import numpy as np
+        self.last_error = ""
+        if not self.has_stroke_query():
+            self.last_error = "this lnt_view DLL has no stroke query (rebuild native/lnt)"
+            return None
+        path = np.ascontiguousarray(np.asarray(path, dtype=np.float64).reshape(-1, 2))
+        err = create_string_buffer(256)
+        n = lib().lnt_query_stroke(c_void_p(self.h), c_void_p(path.ctypes.data), len(path),
+                                   float(radius), int(bool(square)), int(max_points), err, 256)
+        return self._fetch_query(n, err)
+
+    def _fetch_query(self, n, err):
+        import numpy as np
         if n < 0:
             self.last_error = err.value.decode("utf-8", "replace") or (
                 "too many points in the section" if n == -2 else "query failed")
@@ -306,13 +358,40 @@ class NativeView:
             return False
         if len(node) == 0:
             return True
+        # Live class histogram (gui/lnt_class_counts.py): old bytes before, delta after.
+        counts = getattr(self, "class_counts", None)
+        token = counts.before_write(node, local, cls) if counts is not None else None
         err = create_string_buffer(256)
         ok = lib().lnt_set_classes(c_void_p(self.h), c_void_p(node.ctypes.data),
                                    c_void_p(local.ctypes.data), c_void_p(cls.ctypes.data),
                                    len(node), err, 256)
         if not ok:
             self.last_error = err.value.decode("utf-8", "replace") or "write failed"
+        if counts is not None:
+            counts.after_write(token, bool(ok))
         return bool(ok)
+
+    def preview_classes(self, node, local, xyz, old_class, new_class):
+        """Show class edits at once, before set_classes() writes them: the resident surface
+        tiles are recoloured in place (no re-meshing) and point tiles re-uploaded. Returns
+        (tiles, vertices, coverage, rebuilt) or None when the DLL predates it."""
+        import numpy as np
+        if not (self._ok() and hasattr(lib(), "lnt_preview_classes")):
+            return None
+        node = np.ascontiguousarray(node, dtype=np.uint32)
+        local = np.ascontiguousarray(local, dtype=np.uint32)
+        xyz = np.ascontiguousarray(xyz, dtype=np.float64)
+        old_class = np.ascontiguousarray(old_class, dtype=np.uint8)
+        new_class = np.ascontiguousarray(new_class, dtype=np.uint8)
+        n = len(node)
+        if not (len(local) == len(old_class) == len(new_class) == n and xyz.shape == (n, 3)):
+            raise ValueError("preview_classes: array length mismatch")
+        stats = (ctypes.c_uint32 * 4)()
+        ok = lib().lnt_preview_classes(c_void_p(self.h), c_void_p(node.ctypes.data),
+                                       c_void_p(local.ctypes.data), c_void_p(xyz.ctypes.data),
+                                       c_void_p(old_class.ctypes.data), c_void_p(new_class.ctypes.data),
+                                       n, stats)
+        return tuple(stats) if ok else None
 
     def screen_to_world(self, px, py):
         """Device-pixel window position -> world (x, y, z); None in 3D orbit mode."""

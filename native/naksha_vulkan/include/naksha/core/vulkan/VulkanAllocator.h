@@ -72,6 +72,7 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     Stats stats_ = {};
+    unsigned references_ = 0;
 };
 
 inline void GPUBuffer::InvalidateMapped() {

@@ -1,18 +1,48 @@
 #include "naksha/core/vulkan/VulkanDevice.h"
 #include <set>
 #include <vector>
+#include <map>
+#include <mutex>
 
 namespace naksha {
 namespace vulkan {
+namespace {
+struct SharedDevice {
+    VkDevice device = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkQueue graphics, present, compute, transfer;
+    VkPhysicalDeviceFeatures features;
+    QueueFamilyIndices families;
+    unsigned references;
+};
+std::mutex deviceMutex;
+std::map<VkInstance, SharedDevice> sharedDevices;
+}
 
 VulkanDevice::~VulkanDevice() { Shutdown(); }
 
 bool VulkanDevice::Initialize(VkInstance instance, VkSurfaceKHR surface,
                                const VulkanDeviceConfig& config) {
+    std::lock_guard<std::mutex> lock(deviceMutex);
+    if (device_) return true;
     physicalDevice_.Choose(instance, surface);
     if (physicalDevice_.GetDevice() == VK_NULL_HANDLE) return false;
 
     auto indices = physicalDevice_.GetQueueFamilies();
+    auto found = sharedDevices.find(instance);
+    if (found != sharedDevices.end()) {
+        auto& shared = found->second;
+        if (shared.physical != physicalDevice_.GetDevice() ||
+            shared.families.graphicsFamily != indices.graphicsFamily ||
+            shared.families.presentFamily != indices.presentFamily) return false;
+        device_ = shared.device;
+        graphicsQueue_ = shared.graphics; presentQueue_ = shared.present;
+        computeQueue_ = shared.compute; transferQueue_ = shared.transfer;
+        enabledFeatures_ = shared.features;
+        ++shared.references;
+        volkLoadDevice(device_);
+        return true;
+    }
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
     std::set<uint32_t> uniqueFamilies = {
         static_cast<uint32_t>(indices.graphicsFamily),
@@ -136,11 +166,24 @@ bool VulkanDevice::Initialize(VkInstance instance, VkSurfaceKHR surface,
     else
         transferQueue_ = graphicsQueue_;
 
+    sharedDevices.emplace(instance, SharedDevice{device_, physicalDevice_.GetDevice(),
+        graphicsQueue_, presentQueue_, computeQueue_, transferQueue_,
+        enabledFeatures_, indices, 1});
     return true;
 }
 
 void VulkanDevice::Shutdown() {
+    std::lock_guard<std::mutex> lock(deviceMutex);
     if (device_) {
+        for (auto it = sharedDevices.begin(); it != sharedDevices.end(); ++it) {
+            if (it->second.device != device_) continue;
+            if (--it->second.references != 0) {
+                device_ = VK_NULL_HANDLE;
+                return;
+            }
+            sharedDevices.erase(it);
+            break;
+        }
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
     }

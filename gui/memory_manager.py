@@ -17,6 +17,9 @@ except Exception:  # pragma: no cover - optional at runtime
 
 
 MAX_UNDO_STEPS = 20
+# Classification tools (VTK, native .lnt, AI, conversions) share app.undo_stack /
+# app.redo_stack: at most this many undos and redos are kept, oldest dropped first.
+MAX_CLASSIFY_UNDO_STEPS = 10
 GC_INTERVAL_MS = 30_000
 RAM_CHECK_MS = 30_000
 RAM_WARN_PERCENT = 80
@@ -116,8 +119,11 @@ def _free_undo_entry(entry: dict) -> None:
             del arr
 
 
-def trim_undo_stack(app, max_steps: int = MAX_UNDO_STEPS) -> None:
+def trim_undo_stack(app, max_steps: int | None = None) -> None:
     """Trim undo/redo stacks and free arrays from dropped entries."""
+    if max_steps is None:
+        max_steps = MAX_CLASSIFY_UNDO_STEPS
+    max_steps = min(int(max_steps), MAX_CLASSIFY_UNDO_STEPS)
     undo = getattr(app, "undo_stack", None)
     if not isinstance(undo, list):
         return
@@ -166,7 +172,9 @@ def _recommended_undo_steps(app, ram_pct: float) -> int:
     elif ram_pct >= 70:
         steps = min(steps, 10)
 
-    return max(4, int(steps))
+    # Classification undo/redo is capped at MAX_CLASSIFY_UNDO_STEPS: oldest steps
+    # are dropped first, so the user can undo/redo at most that many steps.
+    return max(4, min(int(steps), MAX_CLASSIFY_UNDO_STEPS))
 
 
 def current_recommended_undo_steps(app) -> int:
@@ -483,6 +491,24 @@ class MemoryLeakGuard(QObject):
     def force_gc(self) -> None:
         self._run_gc(verbose=True)
 
+    def _collection_generation(self, app, ram_pct, verbose=False):
+        """Avoid walking an unchanged million-entity SNT graph every 30 s."""
+        layer = getattr(app, '_native_vector_layer', None)
+        large_snt = getattr(layer, '_v_used', 0) >= 100_000
+        if verbose or ram_pct >= 85 or not large_snt:
+            return 2
+        now = time.monotonic()
+        last = getattr(self, '_last_snt_full_gc', None)
+        if last is None:
+            self._last_snt_full_gc = now
+            return 1
+        if now - last >= 300:
+            self._last_snt_full_gc = now
+            return 2
+        # Refcount cleanup and young-generation collection continue normally.
+        # Explicit cleanup and RAM-pressure collection still run immediately.
+        return 1
+
     def _run_gc(self, verbose: bool = False) -> None:
         try:
             app = self.app
@@ -521,7 +547,8 @@ class MemoryLeakGuard(QObject):
             cleanup_stale_actors(app)
 
 
-            freed = gc.collect(generation=2)
+            generation = self._collection_generation(app, ram_pct, verbose)
+            freed = gc.collect(generation=generation)
             self._last_gc_freed = freed
 
             if verbose or freed > 0:

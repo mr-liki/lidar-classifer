@@ -73,7 +73,7 @@ public:
     // timestamp pair around the copy batch, waits for completion, reads back
     // the timestamps. cpuPrepMs/stageMs are caller-measured CPU phases.
     UploadStats Execute(const std::vector<CopyRegion>& regions,
-                        double cpuPrepMs, double stageMs);
+                        double cpuPrepMs, double stageMs, bool overwriteInUse = false);
 
     VkDeviceSize GetStagingCapacity() const { return staging_.size; }
     uint64_t GetTotalUploadedBytes() const { return totalUploadedBytes_; }

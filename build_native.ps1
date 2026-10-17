@@ -65,3 +65,19 @@ foreach ($spv in 'surface.vert.spv', 'surface.frag.spv', 'point.vert.spv', 'poin
         Write-Host "[build] WARNING: $spv missing next to the DLL (the app loads .spv from the DLL directory)" -ForegroundColor Yellow
     }
 }
+
+# Record which native sources this DLL was built from. main.py's startup
+# self-check uses that stamp (plus the DLL's export surface) instead of
+# mtimes: a checkout, restore or backup copy re-stamps every file it writes,
+# which made a matching build look stale and blocked startup.
+$stampPy = Join-Path $root 'write_native_build_stamp.py'
+if (Test-Path $stampPy) {
+    $py = Join-Path $root 'venv\Scripts\python.exe'
+    if (-not (Test-Path $py)) { $py = 'py' }
+    & $py $stampPy
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[build] WARNING: build stamp not written (exit=$LASTEXITCODE)" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[build] NOTE: write_native_build_stamp.py missing - startup self-check will verify the export surface only" -ForegroundColor Yellow
+}

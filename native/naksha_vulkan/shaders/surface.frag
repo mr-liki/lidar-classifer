@@ -55,6 +55,7 @@ layout(push_constant) uniform PushConstant {
     vec4 lightDirAmbient;
     vec4 elevRangeMode;  // x=zMin, y=zMax, z=mode, w=base light elevation (modes 4/5)
     vec4 shadeParamsA;   // x=azimuthDeg, y=sharpnessRaw, z=ambient, w=ambient floor
+    vec4 elevationColor; // enabled, world zMin, world zMax, ramp
     vec4 shadeParamsB;   // x=keyIntensity, y=fillIntensity, z=debugStage, w=colorMode
 } pc;
 
@@ -219,6 +220,18 @@ void main() {
         if (!mixedFace) albedo = unpackUnorm4x8(crispCol[i0]).rgb;
     }
 #endif
+
+    // Surface retains the class-based pure/mixed face decision and lighting.
+    // Only albedo changes: elevation is evaluated at the interpolated world Z.
+    if (pc.elevationColor.x > 0.5) {
+        float t = clamp((vLocalPos.z + ubo.origin.z - pc.elevationColor.y) /
+                        max(pc.elevationColor.z - pc.elevationColor.y, 1e-6), 0.0, 1.0);
+        int ramp = int(pc.elevationColor.w + 0.5);
+        if (ramp == 1) albedo = clamp(abs(mod((1.0-t)*4.0 + vec3(0,4,2), 6.0)-3.0)-1.0, 0.0, 1.0);
+        else if (ramp == 2) albedo = vec3(t, 0.0, 1.0-t);
+        else if (ramp == 3) albedo = mix(vec3(0.1,0.5,0.1), vec3(0.9,0.8,0.5), t);
+        else albedo = vec3(t);
+    }
 
     if (mode == 3) {              // colours already fully baked by the CPU
         outColor = vec4(present(albedo), 1.0);

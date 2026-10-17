@@ -142,7 +142,7 @@ def validate_palette_isolation(view_palettes, cut_section_palette=None,
 
 def sync_palette_to_gpu_safe(app, slot, palette, reason=""):
     """Wrapper around ``_uam_sync`` with slot/palette assertions and logging."""
-    assert slot in range(6), f"Invalid palette slot: {slot}"
+    assert slot in range(10), f"Invalid palette slot: {slot}"
     assert palette is not None, f"Missing palette for slot {slot}"
 
     visible = [cls for cls, cfg in palette.items() if cfg.get("show", True)]
@@ -940,7 +940,7 @@ class DisplayModeDialog(QDialog):
         self.setMinimumSize(420, 400)
         self.current_ptc_path = None
         ##
-        self.view_borders = {i: 0 for i in range(6)}
+        self.view_borders = {i: 0 for i in range(10)}
         ##
         # Display Mode is a normal non-modal NakshaAI utility window.
         # It must NEVER be globally always-on-top: clicking the main NakshaAI
@@ -1082,6 +1082,9 @@ class DisplayModeDialog(QDialog):
             "View 1", "View 2", "View 3", "View 4",
         ])
         self.slot_box.currentIndexChanged.connect(self.on_slot_changed)
+        if getattr(parent, '_lnt_main_view', None) is not None:
+            from gui.native_sections import NativeSections
+            NativeSections.configure_display_dialog(self)
         self.slot_box.currentIndexChanged.connect(self.on_view_selection_changed)
         controls_layout.addWidget(self.slot_box, stretch=2)
 
@@ -1299,7 +1302,6 @@ class DisplayModeDialog(QDialog):
 
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
-        bottom.addStretch()
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setObjectName("displayApplyBtn")
         self.close_btn = QPushButton("Close")
@@ -1310,11 +1312,13 @@ class DisplayModeDialog(QDialog):
         self.close_btn.setAutoDefault(False)
         self.close_btn.setDefault(False)
         self.close_btn.setFocusPolicy(Qt.NoFocus)
+        # Border controls on the left; only Apply / Close stay on the right.
         bottom.addWidget(self.border_label)
         bottom.addWidget(self.border_minus_btn)
         bottom.addWidget(self.border_value_display)
         bottom.addWidget(self.border_plus_btn)
         bottom.addWidget(self.border_setting_btn)
+        bottom.addStretch()
         bottom.addSpacing(8)
         bottom.addWidget(self.apply_btn)
         bottom.addWidget(self.close_btn)
@@ -1337,14 +1341,14 @@ class DisplayModeDialog(QDialog):
             if isinstance(getattr(self, "slot_shows", None), dict) else {}
 
         self.current_slot      = 0
-        self.slot_shows        = {i: {} for i in range(6)}
+        self.slot_shows        = {i: {} for i in range(10)}
         app_modes = getattr(parent, "_naksha_border_logic_modes", None)
         self.view_border_modes = {
             i: int(app_modes.get(i, 1)) if isinstance(app_modes, dict) else 1
-            for i in range(6)
+            for i in range(10)
         }   # 0=Per-Point, 1=Structured, 2=Hybrid
         self.point_border_percent = 0
-        self.view_palettes     = {i: {} for i in range(6)}
+        self.view_palettes     = {i: {} for i in range(10)}
 
         # Rehydrate restored entries into the fixed slot range.
         for slot_idx, show_map in existing_slot_shows.items():
@@ -1352,7 +1356,7 @@ class DisplayModeDialog(QDialog):
                 si = int(slot_idx)
             except Exception:
                 continue
-            if 0 <= si <= 5 and isinstance(show_map, dict):
+            if 0 <= si <= 9 and isinstance(show_map, dict):
                 self.slot_shows[si] = {
                     int(code): bool(val) for code, val in show_map.items()
                 }
@@ -1362,7 +1366,7 @@ class DisplayModeDialog(QDialog):
                 si = int(slot_idx)
             except Exception:
                 continue
-            if 0 <= si <= 5 and isinstance(palette_map, dict):
+            if 0 <= si <= 9 and isinstance(palette_map, dict):
                 normalized = {}
                 for code, info in palette_map.items():
                     try:
@@ -1458,7 +1462,7 @@ class DisplayModeDialog(QDialog):
                 "weight":      weight
             }
 
-        for view_idx in range(6):
+        for view_idx in range(10):
             if view_idx not in self.view_palettes:
                 self.view_palettes[view_idx] = {}
             if view_idx not in self.slot_shows:
@@ -1537,6 +1541,14 @@ class DisplayModeDialog(QDialog):
     def _sync_color_mode_state(self) -> None:
         """Keep mode controls visible and bind Speed independently to Shading/Surface."""
         try:
+            native_section = (self.current_slot > 0 and
+                              getattr(self._get_app_window(), '_lnt_main_view', None) is not None)
+            for mode in (6, 7):
+                item = self.color_mode.model().item(mode)
+                if item is not None:
+                    item.setEnabled(not native_section)
+            if native_section and self.color_mode.currentIndex() in (6, 7):
+                self.color_mode.setCurrentIndex(0)
             if not hasattr(self, "color_mode") or self.color_mode is None:
                 return
 
@@ -1550,12 +1562,12 @@ class DisplayModeDialog(QDialog):
                     self._surface_quality_value = current_value
 
             self.color_mode.setVisible(True)
-            # Cross-sections (slots 1-4) support Class/Depth/Intensity/RGB/
+            # Cross-sections (slots 1-8) support Class/Shaded/Depth/Intensity/RGB/
             # Elevation; Main View (slot 0) supports everything; Cut Section
-            # (slot 5) stays classification-only, unchanged.
-            self.color_mode.setEnabled(self.current_slot in (0, 1, 2, 3, 4))
+            # (slot 9) supports the same six point modes, unchanged.
+            self.color_mode.setEnabled(getattr(self._get_app_window(), "_lnt_main_view", None) is not None or self.current_slot in range(0, 10))
             mode_idx = int(self.color_mode.currentIndex())
-            mesh_speed_visible = self.current_slot in (0, 1, 2, 3, 4) and mode_idx in (1, 6)
+            mesh_speed_visible = self.current_slot in range(0, 10) and mode_idx in (1, 6)
 
             if hasattr(self, "shading_quality_label"):
                 self.shading_quality_label.setVisible(mesh_speed_visible)
@@ -1586,15 +1598,17 @@ class DisplayModeDialog(QDialog):
             self._quality_mode_context = mode_idx
 
             # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
-            # Surface(6) / Line(7) are wired up for cross-section views (View 1-4).
-            # Cut Section (slot 5) keeps its original classification-only restriction.
+            # Surface(6) / Line(7) are wired up for cross-section views (View 1-8).
+            # Native cut (slot 9) supports the six point modes; only the legacy
+            # VTK cut (slot 5) keeps its classification-only restriction.
             _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
-            if self.current_slot == 5 and self.color_mode.currentIndex() != 0:
+            legacy_cut_only = (self.current_slot == 5 and getattr(self._get_app_window(), "_lnt_main_view", None) is None)
+            if legacy_cut_only and self.color_mode.currentIndex() != 0:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
                 self.color_mode.blockSignals(False)
             elif (
-                1 <= self.current_slot <= 4
+                1 <= self.current_slot <= 9
                 and self.color_mode.currentIndex() not in _SECTION_ALLOWED_MODES
             ):
                 self.color_mode.blockSignals(True)
@@ -1662,13 +1676,13 @@ class DisplayModeDialog(QDialog):
     def _save_border_mode(self, slot_idx: int) -> None:
         """Save the current border type selection for this slot."""
         if not hasattr(self, 'view_border_modes'):
-            self.view_border_modes = {i: 1 for i in range(6)}
+            self.view_border_modes = {i: 1 for i in range(10)}
         self.view_border_modes[slot_idx] = int(self.get_border_mode())
 
     def _load_border_mode(self, slot_idx: int) -> None:
         """Restore the border type selection for this slot (no GPU push)."""
         if not hasattr(self, 'view_border_modes'):
-            self.view_border_modes = {i: 1 for i in range(6)}
+            self.view_border_modes = {i: 1 for i in range(10)}
         mode_val = self.view_border_modes.get(slot_idx, 1)
         self._select_border_mode(mode_val, push_gpu=False)
 
@@ -1952,7 +1966,7 @@ class DisplayModeDialog(QDialog):
         restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
             self.color_mode.setEnabled(True)
-        elif 1 <= idx <= 4:
+        elif 1 <= idx <= 4 or (1 <= idx <= 9 and getattr(self._get_app_window(), "_lnt_main_view", None) is not None):
             if restore_idx not in _SECTION_ALLOWED_MODES:
                 restore_idx = 0
             self.color_mode.setEnabled(True)
@@ -2251,7 +2265,7 @@ class DisplayModeDialog(QDialog):
                     baseline_palettes = app.view_palettes
                 else:
                     baseline_palettes = self.view_palettes or {}
-                for _slot in range(6):
+                for _slot in range(10):
                     slot_pal = (baseline_palettes or {}).get(_slot, {})
                     if isinstance(slot_pal, dict):
                         previous_view_palettes[_slot] = clone_palette(slot_pal)
@@ -2260,9 +2274,9 @@ class DisplayModeDialog(QDialog):
 
             # âœ… FIX: Clear view_palettes before rebuilding to prevent stale classes 
             # from previous PTC files from bleeding into the new one.
-            self.view_palettes = {i: {} for i in range(6)}
+            self.view_palettes = {i: {} for i in range(10)}
             
-            for view_idx in range(6):
+            for view_idx in range(10):
                 for code, info in master_palette.items():
                     existing = previous_view_palettes.get(view_idx, {}).get(code)
 
@@ -2972,8 +2986,8 @@ class DisplayModeDialog(QDialog):
         Call this when a project is cleared to prevent stale classes from persisting.
         """
         self.table.setRowCount(0)
-        self.view_palettes = {i: {} for i in range(6)}
-        self.slot_shows = {i: {} for i in range(6)}
+        self.view_palettes = {i: {} for i in range(10)}
+        self.slot_shows = {i: {} for i in range(10)}
         self.current_ptc_path = None
         self._class_mode_vis_slot0 = None
         print("   âœ… DisplayModeDialog state reset")
@@ -3049,7 +3063,7 @@ class DisplayModeDialog(QDialog):
         if not isinstance(vb, dict):
             vb = {}
         norm = {}
-        for i in range(6):
+        for i in range(10):
             raw = vb.get(i, vb.get(str(i), 0))
             try:
                 norm[i] = float(raw or 0)
@@ -3183,7 +3197,7 @@ class DisplayModeDialog(QDialog):
             self._surface_quality_value = quality_mode
             app.surface_quality = quality_mode
         if not hasattr(self, 'view_palettes'):
-            self.view_palettes = {i: {} for i in range(6)}
+            self.view_palettes = {i: {} for i in range(10)}
         self.view_palettes[self.current_slot] = clone_palette(class_map)
         self._save_slot_checkboxes(self.current_slot)
 
@@ -3201,7 +3215,7 @@ class DisplayModeDialog(QDialog):
             # already existed in a slot, so a class added to the PTC vanished
             # from Cross/Cut palettes and later from shortcut rebases.
             master_codes = set(class_map)
-            for other_slot in range(1, 6):
+            for other_slot in range(1, 10):
                 for target_palettes in (self.view_palettes, app.view_palettes):
                     existing = target_palettes.get(other_slot)
                     if not existing:
@@ -3274,7 +3288,15 @@ class DisplayModeDialog(QDialog):
 
         fast_path_handled = False
 
-        if self.current_slot == 0 and getattr(app, '_lnt_main_view', None) is not None:
+        if self.current_slot in range(1, 10) and getattr(app, '_native_sections', None) is not None:
+            native_modes = {0: "class", 1: "shaded_class", 2: "depth",
+                            3: "intensity", 4: "rgb", 5: "elevation",
+                            6: "class", 7: "class"}
+            app._native_sections.apply(self.current_slot, class_map,
+                                       native_modes.get(idx, "class"))
+            fast_path_handled = True
+
+        elif self.current_slot == 0 and getattr(app, '_lnt_main_view', None) is not None:
             # Native files own their records; app.data is intentionally None.
             # Apply the small palette, then change presentation without VTK actors.
             native_view = app._lnt_main_view
@@ -4099,7 +4121,7 @@ class DisplayModeDialog(QDialog):
         app = self._get_app_window()
         if app:
             if not hasattr(app, 'view_borders'):
-                app.view_borders = {i: 0 for i in range(6)}
+                app.view_borders = {i: 0 for i in range(10)}
             app.view_borders[self.current_slot] = new_border
             self._push_border_to_gpu(app, self.current_slot, new_border)
         self.border_changed.emit(self.current_slot, float(new_border), int(self.get_border_mode()))
@@ -4112,7 +4134,7 @@ class DisplayModeDialog(QDialog):
         app = self._get_app_window()
         if app:
             if not hasattr(app, 'view_borders'):
-                app.view_borders = {i: 0 for i in range(6)}
+                app.view_borders = {i: 0 for i in range(10)}
             app.view_borders[self.current_slot] = new_border
             self._push_border_to_gpu(app, self.current_slot, new_border)
         self.border_changed.emit(self.current_slot, float(new_border), int(self.get_border_mode()))
@@ -4156,14 +4178,14 @@ class DisplayModeDialog(QDialog):
         pass
     def update_border_display(self):
         if not hasattr(self, 'view_borders') or self.view_borders is None:
-            self.view_borders = {i: 0 for i in range(6)}
+            self.view_borders = {i: 0 for i in range(10)}
         value = self.view_borders.get(self.current_slot, 0)
         self.border_label.setText("Border")
         self.border_value_display.setText(f"{int(value)}%")
 
     def load_view_border(self, view_idx):
         if not hasattr(self, 'view_borders'):
-            self.view_borders = {i: 0 for i in range(6)}
+            self.view_borders = {i: 0 for i in range(10)}
         border_value = self.view_borders.get(view_idx, 0)
         self.border_label.setText("Border")
         self.border_value_display.setText(f"{int(border_value)}%")
@@ -4319,7 +4341,7 @@ class EditClassDialog(InputPopupMixin, QDialog):
 
             # 5. Synchronize Palettes in Memory
             if not hasattr(self.parent_dialog, 'view_palettes'):
-                self.parent_dialog.view_palettes = {i: {} for i in range(6)}
+                self.parent_dialog.view_palettes = {i: {} for i in range(10)}
             
             if current_slot in self.parent_dialog.view_palettes:
                 if code in self.parent_dialog.view_palettes[current_slot]:

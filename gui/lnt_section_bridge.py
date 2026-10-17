@@ -20,8 +20,8 @@ supplies exactly that, from the .lnt FILE, for the REGION a section needs:
                       native view (a translucent tool window, because a Qt widget cannot be
                       composited over a native Vulkan child window).
 
-The section DOCKS keep their existing widgets: the engine allows one renderer per process,
-and it is the main viewport's. What changed is where the points come from.
+Native section docks are implemented in gui.native_sections. They share the
+main viewport's Vulkan device and retain these source identities for edits.
 """
 from __future__ import annotations
 
@@ -33,7 +33,57 @@ from PySide6.QtWidgets import QWidget
 # Largest number of points the section store may hold. A section is a corridor, not the
 # cloud: this bounds memory (about 45 bytes per point) and refuses a runaway region.
 MAX_STORE_POINTS = 30_000_000
+
+try:
+    from numba import njit as _njit
+except Exception:  # noqa: BLE001
+    _njit = None
+
+if _njit is not None:
+    @_njit(cache=True, nogil=True)
+    def _merge_searchsorted(haystack, needles):
+        # np.searchsorted(haystack, needles) (side='left') for SORTED needles:
+        # one linear merge instead of a binary search per needle.
+        out = np.empty(needles.shape[0], dtype=np.int64)
+        j, n = 0, haystack.shape[0]
+        for i in range(needles.shape[0]):
+            v = needles[i]
+            while j < n and haystack[j] < v:
+                j += 1
+            out[i] = j
+        return out
+
+
+    @_njit(cache=True, nogil=True)
+    def _merge_rows(haystack, positions, needles):
+        # Store row of each SORTED needle key, -1 when the store lacks it.
+        out = np.empty(needles.shape[0], dtype=np.int64)
+        j, n = 0, haystack.shape[0]
+        for i in range(needles.shape[0]):
+            v = needles[i]
+            while j < n and haystack[j] < v:
+                j += 1
+            out[i] = positions[j] if j < n and haystack[j] == v else -1
+        return out
+
+
+def _store_rows(haystack, positions, needles, needles_sorted):
+    if _njit is not None and needles_sorted and len(needles) > 4096:
+        return _merge_rows(haystack, positions, needles)
+    rows = np.full(len(needles), -1, dtype=np.int64)
+    at = np.searchsorted(haystack, needles)
+    hit = at < len(haystack)
+    hit[hit] = haystack[at[hit]] == needles[hit]
+    rows[hit] = positions[at[hit]]
+    return rows
+
+
+def _sorted_positions(haystack, needles, needles_sorted):
+    if _njit is not None and needles_sorted and len(needles) > 4096:
+        return _merge_searchsorted(haystack, needles)
+    return np.searchsorted(haystack, needles)
 FLUSH_INTERVAL_MS = 400
+SHOW_WRITE_DELAY_MS = 30     # after show(): write once the recoloured frame is presented
 
 
 def active_view(app):
@@ -58,11 +108,18 @@ def get_store(app):
     return store
 
 
-def release(app):
-    """Flush pending edits and give app.data back. Safe to call at any time."""
+def release(app, flush_pending=True):
+    """Flush pending edits (unless discarded) and give app.data back. Safe anytime."""
+    native_sections = getattr(app, '_native_sections', None)
+    if native_sections is not None:
+        native_sections.close()
+        app._native_sections = None
     store = getattr(app, "_lnt_section_store", None)
     if store is not None:
-        store.release()
+        try:
+            store.release(flush_pending=flush_pending)
+        except TypeError:
+            store.release()
         app._lnt_section_store = None
     v = getattr(app, "_lnt_main_view", None)
     overlay = getattr(v, "section_overlay", None) if v is not None else None
@@ -80,6 +137,13 @@ class LntSectionStore:
         self.node = np.empty(0, dtype=np.uint32)
         self.local = np.empty(0, dtype=np.uint32)
         self._synced = np.empty(0, dtype=np.uint8)       # classes as last written to the file
+        self.rgb8 = np.empty((0, 3), dtype=np.uint8)     # file colours as uploaded to section views
+        self.generation = 0                              # bumps whenever flush finds class edits
+        # keys kept sorted (with their store positions) so a query is matched
+        # against the store in O(m log n), not an np.isin over the whole store
+        self._node_rows = {}                             # leaf node -> (local -> store row)
+        self._buffers = {}                               # column name -> backing array with spare rows
+        self.last_region_indices = np.empty(0, dtype=np.int64)  # store rows of the last query box
         self.data = {
             "xyz": np.empty((0, 3), dtype=np.float64),
             "classification": np.empty(0, dtype=np.uint8),
@@ -101,39 +165,106 @@ class LntSectionStore:
     def __len__(self):
         return int(self.keys.shape[0])
 
+    def _append(self, name, cur, new):
+        """cur + new as one array. When cur is the head of this column's backing buffer
+        the new rows are written into its spare capacity (no copy of the existing rows);
+        otherwise (first use, full, or cur replaced elsewhere) a buffer with 50 % headroom
+        is allocated."""
+        n0, n1 = cur.shape[0], cur.shape[0] + new.shape[0]
+        buf = self._buffers.get(name)
+        if (buf is None or cur.base is not buf or buf.shape[0] < n1 or buf.dtype != cur.dtype
+                or (n0 and cur.ctypes.data != buf.ctypes.data)):
+            dtype = cur.dtype if n0 else new.dtype
+            buf = np.empty((max(n1, n0 + n0 // 2, 4096),) + new.shape[1:], dtype=dtype)
+            buf[:n0] = cur
+            self._buffers[name] = buf
+        buf[n0:n1] = new
+        return buf[:n1]
+
     # ---- loading a region ----------------------------------------------------------
     def ensure_region(self, mn, mx):
         """Make sure every point inside the world box [mn, mx] is in app.data.
         Returns True on success; on failure last_error says why."""
         self.last_error = ""
+        self.last_region_indices = np.empty(0, dtype=np.int64)
         remaining = MAX_STORE_POINTS - len(self)
         res = self.view.native.query_points(mn, mx, max_points=max(remaining, 1) + len(self))
+        return self._ingest(res)
+
+    def ensure_stroke(self, path, radius, square):
+        """Make sure every point a plan-view brush stroke covers is in app.data; on success
+        last_region_indices holds exactly those store rows (no bounding-box surplus)."""
+        self.last_error = ""
+        self.last_region_indices = np.empty(0, dtype=np.int64)
+        remaining = MAX_STORE_POINTS - len(self)
+        res = self.view.native.query_stroke(path, radius, square,
+                                            max_points=max(remaining, 1) + len(self))
+        return self._ingest(res)
+
+    def _ingest(self, res):
         if res is None:
             self.last_error = self.view.native.last_error or "the section query failed"
             return False
         n = int(res["xyz"].shape[0])
         if n == 0:
             return True
-        k = (res["node"].astype(np.uint64) << np.uint64(32)) | res["local"].astype(np.uint64)
-        fresh = ~np.isin(k, self.keys) if len(self) else np.ones(n, dtype=bool)
-        m = int(fresh.sum())
+        node, local = res["node"], res["local"]
+        base = len(self)
+        # Store rows by identity: one row table per leaf node (local -> row, -1 = absent),
+        # so matching costs O(query) however large the store has grown. The queries
+        # return records grouped node by node.
+        cuts = np.flatnonzero(node[1:] != node[:-1]) + 1
+        bounds = np.concatenate(([0], cuts, [n]))
+        rows = np.empty(n, dtype=np.int64)
+        tables = self._node_rows
+        for s0, s1 in zip(bounds[:-1], bounds[1:]):
+            loc = local[s0:s1]
+            tbl = tables.get(int(node[s0]))
+            if tbl is None:
+                rows[s0:s1] = -1
+            else:
+                inside = loc < tbl.shape[0]
+                part = np.full(s1 - s0, -1, dtype=np.int64)
+                part[inside] = tbl[loc[inside]]
+                rows[s0:s1] = part
+        fresh = rows < 0
+        m = int(np.count_nonzero(fresh))
         if m == 0:
+            self.last_region_indices = rows
             return True
-        if len(self) + m > MAX_STORE_POINTS:
-            self.last_error = (f"the section holds {len(self) + m:,} points (limit "
+        if base + m > MAX_STORE_POINTS:
+            self.last_error = (f"the section holds {base + m:,} points (limit "
                                f"{MAX_STORE_POINTS:,}) - use a narrower section or clear the sections")
             return False
-        # Points already held keep their (possibly edited, not yet flushed) classes.
-        cls = np.asarray(self.data["classification"], dtype=np.uint8)
+        take = (lambda a: a) if m == n else (lambda a: a[fresh])
         d = self.data
-        d["xyz"] = np.concatenate([d["xyz"], res["xyz"][fresh]])
-        d["classification"] = np.concatenate([cls, res["classification"][fresh]])
-        d["intensity"] = np.concatenate([d["intensity"], res["intensity"][fresh].astype(np.float32)])
-        d["rgb"] = np.concatenate([d["rgb"], res["rgb"][fresh].astype(np.float32) / 255.0])
-        self.keys = np.concatenate([self.keys, k[fresh]])
-        self.node = np.concatenate([self.node, res["node"][fresh]])
-        self.local = np.concatenate([self.local, res["local"][fresh]])
-        self._synced = np.concatenate([self._synced, res["classification"][fresh]])
+        cls_new = np.asarray(take(res["classification"]), dtype=np.uint8)
+        rgb8 = take(res["rgb"])
+        # Points already held keep their (possibly edited, not yet flushed) classes.
+        # Columns grow into spare capacity: only the new rows are written.
+        d["xyz"] = self._append("xyz", d["xyz"], take(res["xyz"]))
+        d["classification"] = self._append("classification", np.asarray(d["classification"], dtype=np.uint8), cls_new)
+        d["intensity"] = self._append("intensity", d["intensity"], take(res["intensity"]).astype(np.float32))
+        self.rgb8 = self._append("rgb8", self.rgb8, rgb8)
+        d["rgb"] = self._append("rgb", d["rgb"], np.multiply(rgb8, np.float32(1.0 / 255.0), dtype=np.float32))
+        new_node, new_local = take(node), take(local)
+        self.keys = self._append("keys", self.keys,
+                                 (new_node.astype(np.uint64) << np.uint64(32)) | new_local.astype(np.uint64))
+        self.node = self._append("node", self.node, new_node)
+        self.local = self._append("local", self.local, new_local)
+        self._synced = self._append("synced", self._synced, cls_new)
+        rows[fresh] = np.arange(base, base + m, dtype=np.int64)
+        for s0, s1 in zip(bounds[:-1], bounds[1:]):
+            nd, loc = int(node[s0]), local[s0:s1]
+            tbl = tables.get(nd)
+            need = int(loc.max()) + 1
+            if tbl is None or tbl.shape[0] < need:
+                grown = np.full(max(need, 2 * (0 if tbl is None else tbl.shape[0])), -1, dtype=np.int64)
+                if tbl is not None:
+                    grown[:tbl.shape[0]] = tbl
+                tables[nd] = tbl = grown
+            tbl[loc] = rows[s0:s1]
+        self.last_region_indices = rows
         return True
 
     def ensure_for_section(self, P1, P2, half_width, buffer):
@@ -146,11 +277,34 @@ class LntSectionStore:
             return True
         d = v / length
         perp = np.array([-d[1], d[0]])
-        mx_ = half_width * abs(perp[0]) + (length + buffer) * abs(d[0])
-        my_ = half_width * abs(perp[1]) + (length + buffer) * abs(d[1])
-        lo = (min(p1[0], p2[0]) - mx_, min(p1[1], p2[1]) - my_, -1.0e12)
-        hi = (max(p1[0], p2[0]) + mx_, max(p1[1], p2[1]) + my_, 1.0e12)
+        corners = np.array([p1-buffer*d-half_width*perp,
+                            p1-buffer*d+half_width*perp,
+                            p2+buffer*d-half_width*perp,
+                            p2+buffer*d+half_width*perp])
+        # Expand by one ULP so query rounding cannot lose boundary records.
+        low = np.nextafter(corners.min(axis=0), -np.inf)
+        high = np.nextafter(corners.max(axis=0), np.inf)
+        lo = (low[0], low[1], -1.0e12)
+        hi = (high[0], high[1], 1.0e12)
         return self.ensure_region(lo, hi)
+
+    # ---- showing edits at once ------------------------------------------------------
+    def show(self, indices, old_classes):
+        """Display class edits of these store rows in the main view now (surface tiles are
+        recoloured in place, nothing re-meshed) and present a frame; the file write
+        follows right after, off the gesture's critical path. Returns the native patch
+        statistics (tiles, vertices, coverage, rebuilt) or None."""
+        idx = np.asarray(indices, dtype=np.int64)
+        nv = getattr(self.view, "native", None)
+        if idx.size == 0 or nv is None:
+            return None
+        stats = nv.preview_classes(self.node[idx], self.local[idx], self.data["xyz"][idx],
+                                   old_classes, np.asarray(self.data["classification"])[idx])
+        if stats is not None:
+            self._preview_pending = True
+            nv.frame(0.0)                                # present the recoloured view now
+        QTimer.singleShot(SHOW_WRITE_DELAY_MS, self.flush)
+        return stats
 
     # ---- writing edits back --------------------------------------------------------
     def flush(self):
@@ -164,13 +318,20 @@ class LntSectionStore:
             cur = cur.astype(np.uint8, copy=False)
             changed = np.flatnonzero(cur != self._synced)
             if changed.size == 0:
+                if getattr(self, '_preview_pending', False):
+                    # Undo can restore the on-disk classes before the delayed write.
+                    # Complete that preview transaction too, without rewriting points.
+                    if self.view.native.set_classes(self.node[:0], self.local[:0], cur[:0]):
+                        self._preview_pending = False
                 return 0
+            self.generation += 1
             ok = self.view.native.set_classes(self.node[changed], self.local[changed], cur[changed])
             if not ok:
                 self.last_error = self.view.native.last_error
                 print(f"[LNT-SECTION] could not write {changed.size:,} class edits: {self.last_error}")
                 return 0
             self._synced[changed] = cur[changed]
+            self._preview_pending = False
             self.writes += int(changed.size)
             print(f"[LNT-SECTION] wrote {changed.size:,} class edits into the .lnt file")
             return int(changed.size)
@@ -178,12 +339,103 @@ class LntSectionStore:
             print(f"[LNT-SECTION] flush failed: {exc}")
             return 0
 
-    def release(self):
+    def discard_unflushed_edits(self, stop_timer=True):
+        """Revert on-screen classes to disk state and drop the pending queue.
+
+        Clear / Clear Data call this when the user picks "Don't Save": writes
+        that already reached the .lnt are written back to their pre-edit
+        classes (replayed from the undo history, newest first), while edits
+        that never flushed are simply forgotten in memory. Returns the number
+        of store rows reverted in memory.
+        """
+        reverted = 0
+        try:
+            if stop_timer:
+                try:
+                    self._timer.stop()
+                except Exception:
+                    pass
+            self._preview_pending = False
+            data = self.data
+            if not isinstance(data, dict):
+                return 0
+            cur = np.asarray(data.get("classification", None))
+            if cur.size == 0:
+                return 0
+            try:
+                history = list(getattr(self.app, "undo_stack", None) or [])
+            except Exception:
+                history = []
+            pending_writes = {}
+            # Newest-first replay: each older entry overwrites newer ones in
+            # memory, so after the loop cur[] holds the TRUE original classes.
+            for entry in reversed(history):
+                try:
+                    if not isinstance(entry, dict):
+                        continue
+                    idx = np.asarray(entry.get("indices", None), dtype=np.int64).ravel()
+                    old = np.asarray(entry.get("old_classes", None), dtype=np.uint8).ravel()
+                    if idx.size == 0 or old.shape[0] != idx.shape[0]:
+                        continue
+                    valid = (idx >= 0) & (idx < cur.shape[0])
+                    if not np.any(valid):
+                        continue
+                    idx = idx[valid]
+                    old = old[valid]
+                    cur[idx] = old
+                    reverted += int(idx.shape[0])
+                except Exception:
+                    continue
+            # Write back the final reverted classes for every row that is
+            # still dirty on disk (covers flushed AND never-flushed edits in
+            # one pass; overlapping entries converge to the true original).
+            try:
+                synced = np.asarray(self._synced)
+                if synced.shape[0] == cur.shape[0]:
+                    rows = np.flatnonzero(cur != synced)
+                else:
+                    rows = np.arange(cur.shape[0], dtype=np.int64)
+            except Exception:
+                rows = np.arange(cur.shape[0], dtype=np.int64)
+            if rows.size:
+                try:
+                    nodes = np.asarray(self.node)[rows].astype(np.uint64, copy=False)
+                    locals_ = np.asarray(self.local)[rows].astype(np.uint64, copy=False)
+                    for _n, _l, _c in zip(nodes.tolist(), locals_.tolist(), cur[rows].tolist()):
+                        pending_writes[(int(_n), int(_l))] = int(_c)
+                except Exception:
+                    pass
+            if pending_writes:
+                try:
+                    pairs = list(pending_writes.items())
+                    n2 = np.asarray([k[0] for k, _v in pairs], dtype=np.uint32)
+                    l2 = np.asarray([k[1] for k, _v in pairs], dtype=np.uint32)
+                    c2 = np.asarray([_v for _k, _v in pairs], dtype=np.uint8)
+                    nv = getattr(self.view, "native", None)
+                    if nv is not None and n2.size:
+                        if nv.set_classes(n2, l2, c2):
+                            print(f"[LNT-SECTION] reverted {n2.size:,} class edits on Don't Save")
+                        else:
+                            print(f"[LNT-SECTION] revert failed: {getattr(nv, 'last_error', '')}")
+                except Exception as exc:
+                    print(f"[LNT-SECTION] revert write-back failed: {exc}")
+            try:
+                self._synced = np.asarray(cur, dtype=np.uint8).copy()
+            except Exception:
+                pass
+            self._preview_pending = False
+            self._discarded = True
+        except Exception as exc:                          # noqa: BLE001 - never break clear
+            print(f"[LNT-SECTION] discard_unflushed_edits failed: {exc}")
+        return int(reverted)
+
+    def release(self, flush_pending=True):
         try:
             self._timer.stop()
         except Exception:                                 # noqa: BLE001
             pass
-        self.flush()
+        if flush_pending and not getattr(self, "_discarded", False):
+            self.flush()
         if self.app.data is self.data:
             self.app.data = self._saved_data
 
@@ -207,6 +459,13 @@ class LntSectionOverlay(QWidget):
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
         self._last = None
+        # Freshness for finished boxes: a box belongs to the dataset revision
+        # that produced it. _tick compares against the live LNT revision and
+        # drops boxes from a previous file, so opening a new cloud can never
+        # leave old magenta rectangles hanging over the fresh data (the extra
+        # boxes floating outside the cloud in the report).
+        self._section_rev = {}
+        self._lnt_rev = None
 
     def _widget(self):
         return getattr(self.view.owner, "vulkan_widget", None)
@@ -226,10 +485,12 @@ class LntSectionOverlay(QWidget):
 
     def set_section(self, view_idx, corners):
         self.sections[int(view_idx)] = [(float(c[0]), float(c[1])) for c in corners]
+        self._section_rev[int(view_idx)] = self._lnt_rev
         self.update()
 
     def clear_sections(self):
         self.sections.clear()
+        self._section_rev.clear()
         self.update()
 
     def _tick(self):
@@ -239,11 +500,30 @@ class LntSectionOverlay(QWidget):
             return
         if not self.isVisible():
             self.show()
-        rect = QRect(w.mapToGlobal(QPoint(0, 0)), w.size())
-        if self.geometry() != rect:
-            self.setGeometry(rect)
+        # Drop boxes drawn for a previous .lnt before re-framing: the native
+        # view object is rebuilt per file, so its identity is the revision.
+        rev = id(self.view.native)
+        if self._lnt_rev != rev:
+            self._lnt_rev = rev
+            if self.sections:
+                self.sections.clear()
+                self._section_rev.clear()
+                self.preview = None
+                self.update()
+        # The overlay is a top-level tool window painted in widget-LOCAL
+        # logical pixels (paintEvent draws the QPolygonF in local coords), so
+        # frame it from the Vulkan widget's own size — never from its global
+        # top-left. Offsetting by the global origin double-counts the position
+        # (global pos + local coords) and shifts every preview box down-right
+        # away from the cursor, exactly the offset boxes in the report.
+        if self.size() != w.size():
+            self.resize(w.size())
+        top_left = w.mapToGlobal(QPoint(0, 0))
+        if self.pos() != top_left:
+            self.move(top_left)
         nv = self.view.native
-        state = (rect.x(), rect.y(), rect.width(), rect.height(), self.view.mode_2d,
+        pos = self.pos()
+        state = (pos.x(), pos.y(), self.width(), self.height(), self.view.mode_2d,
                  tuple(nv.world_to_screen(0.0, 0.0) or ()), tuple(nv.world_to_screen(1.0, 1.0) or ()))
         if state != self._last:
             self._last = state
@@ -262,11 +542,18 @@ class LntSectionOverlay(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
+        app = self.view.app
+        color = QColor.fromRgbF(*getattr(app, 'cross_line_color', (1., 0., 1.)))
+        width = max(1, int(getattr(app, 'cross_line_width', 3)))
+        style = {'solid': Qt.SolidLine, 'dashed': Qt.DashLine,
+                 'dotted': Qt.DotLine, 'dash-dot': Qt.DashDotLine,
+                 'dash-dot-dot': Qt.DashDotDotLine}.get(
+                     getattr(app, 'cross_line_style', 'solid'), Qt.SolidLine)
         for idx, corners in self.sections.items():
             pts = [self._to_qt(c) for c in corners]
             if any(q is None for q in pts):
                 continue
-            p.setPen(QPen(QColor(255, 0, 255), 2))
+            p.setPen(QPen(color, width, style))
             p.drawPolygon(QPolygonF(pts))
             p.setPen(QPen(QColor(255, 255, 0), 2))
             mid_a = QPointF((pts[0].x() + pts[3].x()) / 2, (pts[0].y() + pts[3].y()) / 2)
@@ -277,10 +564,16 @@ class LntSectionOverlay(QWidget):
             kind, pts_w = self.preview
             pts = [self._to_qt(c) for c in pts_w]
             if all(q is not None for q in pts):
-                pen = QPen(QColor(255, 0, 255), 2, Qt.DashLine)
+                pen = QPen(color, width, style)
                 p.setPen(pen)
                 if kind == "rect":
                     p.drawPolygon(QPolygonF(pts))
+                    # Same yellow centreline as a finished section, so the
+                    # live corridor's orientation reads while dragging.
+                    p.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
+                    mid_a = QPointF((pts[0].x() + pts[3].x()) / 2, (pts[0].y() + pts[3].y()) / 2)
+                    mid_b = QPointF((pts[1].x() + pts[2].x()) / 2, (pts[1].y() + pts[2].y()) / 2)
+                    p.drawLine(mid_a, mid_b)
                 else:
                     p.drawPolyline(QPolygonF(pts))
         p.end()
@@ -363,6 +656,18 @@ class LntCrossPicker:
             except Exception as exc:                      # noqa: BLE001
                 print(f"[LNT-SECTION] clear() failed: {exc}")
             self.P1, self.slice_state = pt, 1
+            # A fresh gesture for this target view replaces its old finished
+            # box: otherwise the previous corridor stays on screen next to the
+            # live rubber band and the user cannot tell which box is being
+            # drawn (the skewed/offset boxes in the report).
+            try:
+                ov = self._overlay()
+                idx = getattr(sc, "active_view", None)
+                if ov is not None and idx is not None and int(idx) in ov.sections:
+                    del ov.sections[int(idx)]
+                    ov.update()
+            except Exception:  # noqa: BLE001
+                pass
         elif self.slice_state == 1:
             if np.linalg.norm(pt[:2] - self.P1[:2]) < 1e-6:
                 return True
@@ -405,7 +710,12 @@ class LntCrossPicker:
         self.slice_state = 0
         ov = self._overlay()
         if ov is not None:
+            # The rubber band only shows the area while it is being picked:
+            # once the section is taken nothing stays on the main view.
+            # Repaint now so it is gone before the section is computed.
             ov.clear_preview()
+            ov.clear_sections()
+            ov.repaint()
         if hw < 1e-3:
             self.app.statusBar().showMessage("Section width is zero: click farther from the line", 4000)
             return
@@ -415,11 +725,7 @@ class LntCrossPicker:
             view_idx = getattr(sc, "active_view", None)
             if view_idx is None:
                 view_idx = 0
-            if ov is not None:
-                c = self._corners(P1, P2, hw)
-                if c is not None:
-                    ov.set_section(view_idx, c)
-            if hasattr(self.app, "_on_section_updated"):
+            if getattr(self.app, '_native_sections', None) is None and hasattr(self.app, "_on_section_updated"):
                 self.app._on_section_updated(view_idx)
         except Exception as exc:                          # noqa: BLE001
             import traceback

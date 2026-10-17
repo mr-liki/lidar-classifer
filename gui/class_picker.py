@@ -322,7 +322,8 @@ class ClassPicker(QWidget):
  
         self.setWindowFlags(
             Qt.Window |
-            Qt.WindowMinimizeButtonHint |
+            Qt.CustomizeWindowHint |
+            Qt.WindowTitleHint |
             Qt.WindowCloseButtonHint
         )
         self.setWindowModality(Qt.NonModal)

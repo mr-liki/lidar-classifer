@@ -346,6 +346,11 @@ public:
     uint32_t UploadTiles(TileUploadDesc* tiles, uint32_t count, std::string* error);
     uint32_t EvictTiles(const uint64_t* keys, uint32_t count);
     bool SetTilePalette(const uint8_t* lutRgb, float coverageShade, std::string* error);
+    // Point class edits on one resident tile: rewrites only the listed vertex/coverage
+    // colours (tile-local indices) from the current palette. Geometry is unchanged.
+    bool PatchTileClasses(uint64_t key, const uint32_t* vertexIndex, const uint8_t* vertexClass,
+                          uint32_t vertexCount, const uint32_t* coverageIndex,
+                          const uint8_t* coverageClass, uint32_t coverageCount, std::string* error);
     bool SetTileDrawList(const TileDrawItem* items, uint32_t count);
     void GetTileStats(uint64_t* out, uint32_t count) const;
 
@@ -367,6 +372,10 @@ public:
     // Push-constant only - never touches a GPU buffer.
     void SetShadingParityParams(int colorMode, int debugStage,
                                 float ambientFloor, float baseLightElevationDeg);
+    void SetElevationColor(bool on, float z0, float z1, float ramp) {
+        elevationColor_[0] = on ? 1.0f : 0.0f;
+        elevationColor_[1] = z0; elevationColor_[2] = z1; elevationColor_[3] = ramp;
+    }
     uint64_t GetParityParamUpdateCount() const { return parityParamUpdates_; }
 
     uint64_t GetShadeParamUpdateCount() const { return shadeParamUpdates_; }
@@ -392,10 +401,12 @@ private:
         // Crisp-hybrid Shaded Class params (mode 4/5 only; unused by 0-3).
         float shadeParamsA[4];      // x = azimuthDeg, y = sharpnessRaw(0-999),
                                     // z = ambient, w = ambient floor
+        float elevationColor[4];  // enabled, world zMin, world zMax, ramp
         float shadeParamsB[4];      // x = keyIntensity, y = fillIntensity,
                                     // z = debug stage, w = colour mode
     };
 
+    float elevationColor_[4]{};
     GPUBuffer positions_;
     GPUBuffer normals_;
     GPUBuffer colors_;
@@ -437,6 +448,7 @@ private:
     float tileShade_ = 1.0f;
     uint64_t tileDrawnTiles_ = 0, tileDrawnFaces_ = 0, tileDrawnCoverage_ = 0, tileDraws_ = 0;
     uint64_t tileUploads_ = 0, tileUploadBytes_ = 0, tileEvictions_ = 0, tileRecolors_ = 0;
+    uint64_t tileClassPatches_ = 0;
 
     // Compact crisp mesh (UploadCrispIndexedMesh) and its pipeline.
     void RecordCrispIndexed(VkCommandBuffer cmd, uint32_t frameSlot);

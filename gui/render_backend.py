@@ -1167,6 +1167,38 @@ class VulkanRenderBackend(RenderBackend):
                 getattr(dll, _fn).argtypes = _argtypes
             except Exception:
                 pass
+        # Vector overlay (SNT / CAD linework). Additive: a DLL built before this
+        # pass lacks every symbol, and the caller then keeps linework on the Qt
+        # overlay (gui/native_vector_overlay.py checks vector_available()).
+        for _fn, _restype, _argtypes in (
+            ("nkv_vector_available", ctypes.c_int, [ctypes.c_uint64]),
+            ("nkv_vector_reserve", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]),
+            ("nkv_vector_upload_strip", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p,
+              ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p]),
+            ("nkv_vector_set_draw_ranges", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+              ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32]),
+            ("nkv_vector_set_draw_ranges_ex", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+              ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_float),
+              ctypes.c_uint32]),
+            ("nkv_vector_clear_draw_ranges", ctypes.c_int, [ctypes.c_uint64]),
+            ("nkv_get_line_width_range", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.POINTER(ctypes.c_float),
+              ctypes.POINTER(ctypes.c_float)]),
+            ("nkv_vector_set_line_width", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.c_float]),
+            ("nkv_vector_clear", ctypes.c_int, [ctypes.c_uint64]),
+            ("nkv_vector_get_stats", ctypes.c_int,
+             [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]),
+        ):
+            try:
+                getattr(dll, _fn).restype = _restype
+                getattr(dll, _fn).argtypes = _argtypes
+            except Exception:
+                pass
         # Phase 2 GPU-memory accounting: measured surface counts, so the
         # per-buffer breakdown is read from the renderer rather than
         # estimated from an assumed vertex stride.
@@ -2203,6 +2235,14 @@ class VulkanRenderBackend(RenderBackend):
             ctypes.c_double(aspect),
             ctypes.c_double(float(near_clip)), ctypes.c_double(float(far_clip))))
 
+    def set_camera_view_up(self, x, y, z) -> bool:
+        if not self._handle or not hasattr(self._dll, 'nkv_set_camera_view_up'):
+            return False
+        function = self._dll.nkv_set_camera_view_up
+        function.argtypes = [ctypes.c_uint64, ctypes.c_double, ctypes.c_double, ctypes.c_double]
+        function.restype = ctypes.c_int
+        return bool(function(self._handle, x, y, z))
+
     def set_camera_perspective_mode(self) -> bool:
         """Leave orthographic (3D orbit mode)."""
         if not self._handle:
@@ -2302,6 +2342,13 @@ class VulkanRenderBackend(RenderBackend):
                     if _owner is not None:
                         _owner.note_frame((_now - _prev) * 1000.0, _cpu_ms)
                 self._last_present_perf = _now
+                # Labels must follow this presented camera immediately, rather
+                # than lagging behind geometry on an independent 33 ms timer.
+                for overlay in tuple(getattr(self, '_frame_overlays', ())):
+                    try:
+                        overlay._follow(immediate=True)
+                    except (RuntimeError, ReferenceError):
+                        pass  # a Qt overlay may have been closed during a frame
             elif code == 1:
                 self.skip_count += 1
             else:
@@ -2329,6 +2376,233 @@ class VulkanRenderBackend(RenderBackend):
             return bool(ok)
         except Exception:
             return False
+
+    # -- vector overlay (SNT / CAD linework) ----------------------------------
+    def supports_vector_overlay(self) -> bool:
+        """True when the loaded DLL can draw the vector overlay at all.
+
+        A DLL without the symbols, or one whose vector.vert/frag.spv were missing
+        at create time, reports False - and the caller keeps linework on the Qt
+        overlay. There is deliberately no partial state: either the pass was
+        built or the whole thing stays on the CPU path.
+        """
+        if not self._handle or self._dll is None:
+            return False
+        if getattr(self._dll, "nkv_vector_upload_strip", None) is None:
+            return False
+        try:
+            return bool(self._dll.nkv_vector_available(ctypes.c_uint64(self._handle)))
+        except Exception:
+            return False
+
+    def vector_reserve(self, capacity_vertices: int, capacity_indices: int) -> int:
+        """0 = failed, 1 = ready, 2 = (re)allocated (earlier strips are invalid)."""
+        if not self._handle or self._dll is None:
+            return 0
+        try:
+            return int(self._dll.nkv_vector_reserve(
+                ctypes.c_uint64(self._handle),
+                ctypes.c_uint64(int(capacity_vertices)),
+                ctypes.c_uint64(int(capacity_indices))))
+        except Exception:
+            return 0
+
+    def vector_upload_strip(self, v_first: int, v_count: int, xyz, rgb,
+                            i_first: int, i_count: int, indices) -> bool:
+        """Writes strips that SHARE the arena.
+
+        xyz is WORLD float64 (N,3); rgb is uint8 (N,3); indices is uint32 with
+        0xFFFFFFFF separators between the strips in this group. Vertex and index
+        ranges upload independently, so a later group's indices never rewrite an
+        earlier group's vertices.
+        """
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            x = None if xyz is None else np.ascontiguousarray(
+                np.asarray(xyz, dtype=np.float64).reshape(-1, 3))
+            c = None if rgb is None else np.ascontiguousarray(
+                np.asarray(rgb, dtype=np.uint8).reshape(-1, 3))
+            idx = None if indices is None else np.ascontiguousarray(
+                np.asarray(indices, dtype=np.uint32).reshape(-1))
+            ok = self._dll.nkv_vector_upload_strip(
+                ctypes.c_uint64(self._handle),
+                ctypes.c_uint64(int(v_first)), ctypes.c_uint64(int(v_count)),
+                None if x is None else ctypes.c_void_p(x.ctypes.data),
+                None if c is None else ctypes.c_void_p(c.ctypes.data),
+                ctypes.c_uint64(int(i_first)), ctypes.c_uint64(int(i_count)),
+                None if idx is None else ctypes.c_void_p(idx.ctypes.data))
+            return bool(ok)
+        except Exception:
+            return False
+
+    def vector_set_draw_ranges(self, index_firsts, index_counts,
+                               widths_px=None) -> bool:
+        """The visible index windows - one draw call each, never an upload.
+
+        `widths_px` is an optional per-range pixel width (None -> the engine's
+        global nkv_vector_set_line_width value). Line width is dynamic state, so
+        a per-LAYER-GROUP width is one extra command per group and still never a
+        buffer touch or a pipeline rebuild. Older DLLs without the _ex entry
+        point fall back to the widthless call, ignoring widths_px.
+        """
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            f = np.ascontiguousarray(np.asarray(index_firsts, dtype=np.uint32))
+            c = np.ascontiguousarray(np.asarray(index_counts, dtype=np.uint32))
+            if f.size != c.size:
+                return False
+            n = ctypes.c_uint32(int(f.size))
+            ex = getattr(self._dll, "nkv_vector_set_draw_ranges_ex", None)
+            if widths_px is not None and ex is not None:
+                w = np.ascontiguousarray(np.asarray(widths_px, dtype=np.float32))
+                if w.size != f.size:
+                    w = None
+            else:
+                w = None
+            if w is not None:
+                return bool(ex(
+                    ctypes.c_uint64(self._handle),
+                    f.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                    c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                    w.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n))
+            return bool(self._dll.nkv_vector_set_draw_ranges(
+                ctypes.c_uint64(self._handle),
+                f.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                c.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), n))
+        except Exception:
+            return False
+
+    def get_line_width_range(self):
+        """(min, max) of VkPhysicalDeviceLimits.lineWidthRange, or None.
+
+        The Phase-0 probe: max > 1 means this GPU can draw thick lines in core
+        Vulkan (dynamic line width), max == 1 means every stroke is 1 px and a
+        thicker line needs CPU ribbon tessellation instead. None means the DLL
+        predates the probe.
+        """
+        if not self._handle or self._dll is None:
+            return None
+        fn = getattr(self._dll, "nkv_get_line_width_range", None)
+        if fn is None:
+            return None
+        try:
+            lo = ctypes.c_float(0.0)
+            hi = ctypes.c_float(0.0)
+            if not fn(ctypes.c_uint64(self._handle), ctypes.byref(lo),
+                      ctypes.byref(hi)):
+                return None
+            return (float(lo.value), float(hi.value))
+        except Exception:
+            return None
+
+    def vector_clear_draw_ranges(self) -> bool:
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            return bool(self._dll.nkv_vector_clear_draw_ranges(
+                ctypes.c_uint64(self._handle)))
+        except Exception:
+            return False
+
+    def vector_set_line_width(self, pixels: float) -> bool:
+        """Dynamic line width in pixels (dynamic state - no pipeline rebuild)."""
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            return bool(self._dll.nkv_vector_set_line_width(
+                ctypes.c_uint64(self._handle), ctypes.c_float(float(pixels))))
+        except Exception:
+            return False
+
+    def vector_clear(self) -> bool:
+        """Drops the vector arenas and ranges, keeping the renderer alive."""
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            return bool(self._dll.nkv_vector_clear(ctypes.c_uint64(self._handle)))
+        except Exception:
+            return False
+
+    def get_render_origin_xyz(self):
+        """(ox, oy, oz) every vertex buffer is shifted by, or (0, 0, 0)."""
+        if not self._handle or self._dll is None:
+            return (0.0, 0.0, 0.0)
+        try:
+            fn = getattr(self._dll, "nkv_get_render_origin", None)
+            if fn is None:
+                return (0.0, 0.0, 0.0)
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_double)]
+            out = (ctypes.c_double * 3)()
+            if not fn(ctypes.c_uint64(self._handle), out):
+                return (0.0, 0.0, 0.0)
+            return (float(out[0]), float(out[1]), float(out[2]))
+        except Exception:
+            return (0.0, 0.0, 0.0)
+
+    def set_render_origin(self, x: float, y: float, z: float) -> bool:
+        """Pins the floating render origin; render space = world - origin.
+
+        Only valid while the geometry buffers are still empty: changing the
+        origin re-interprets every resident vertex, so a caller must pin it
+        BEFORE the first upload and never afterwards.
+        """
+        if not self._handle or self._dll is None:
+            return False
+        try:
+            return bool(self._dll.nkv_set_render_origin(
+                ctypes.c_uint64(self._handle),
+                ctypes.c_double(float(x)), ctypes.c_double(float(y)),
+                ctypes.c_double(float(z))))
+        except Exception:
+            return False
+
+    def get_last_mvp(self):
+        """The 4x4 MVP of the most recently drawn frame, or None.
+
+        GLSL stores mat4 column-major (element (row r, col c) is at d[c*4 + r]),
+        so the returned array is already transposed into matrix form: clip =
+        M @ [x, y, z, 1]. Input points are RENDER space (world - origin, see
+        get_render_origin), because that is what the vertex shader multiplies.
+
+        None when the DLL predates the accessor or when no frame has been drawn
+        yet (the engine then reports an all-zero matrix).
+        """
+        if not self._handle or self._dll is None:
+            return None
+        fn = getattr(self._dll, "nkv_get_last_mvp", None)
+        if fn is None:
+            return None
+        try:
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+            buf = (ctypes.c_float * 16)()
+            if not fn(ctypes.c_uint64(self._handle), buf):
+                return None
+            m = np.asarray(buf, dtype=np.float64)
+            if not np.all(np.isfinite(m)) or float(np.max(np.abs(m))) < 1e-9:
+                return None
+            return m.reshape(4, 4).T
+        except Exception:
+            return None
+
+    def vector_stats(self) -> dict:
+        """upload count / drawn indices + draw calls (last frame) / resident
+        bytes / capacities / range count. Empty dict when unsupported."""
+        keys = ("uploads", "drawn_indices", "draw_calls", "resident_bytes",
+                "vertex_capacity", "index_capacity", "range_count")
+        if not self._handle or self._dll is None:
+            return {}
+        try:
+            out = (ctypes.c_uint64 * len(keys))()
+            if not self._dll.nkv_vector_get_stats(
+                    ctypes.c_uint64(self._handle), out, ctypes.c_uint32(len(keys))):
+                return {}
+            return {name: int(out[i]) for i, name in enumerate(keys)}
+        except Exception:
+            return {}
 
     # -- stable-offset arena residency ----------------------------------------
     def supports_point_arena(self) -> bool:
@@ -3246,6 +3520,14 @@ class _VulkanSurfaceWidget(_QWidget):
     def __init__(self, parent, owner: "AppRenderBackendOwner"):
         super().__init__(parent)
         self._owner = owner
+        # Vulkan owns this HWND's pixels. Qt's backing store must never erase
+        # them when a menu, dialog, or focus change repaints the parent window.
+        self.setAttribute(Qt.WA_NativeWindow)
+        self.setAttribute(Qt.WA_PaintOnScreen)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAutoFillBackground(False)
+        self._presenting_exposure = False
         # Direct manipulation. The Vulkan widget IS the visible viewport now,
         # so it has to own navigation itself - the VTK interactor underneath
         # receives no input while hidden. Gestures update the shared
@@ -3254,6 +3536,27 @@ class _VulkanSurfaceWidget(_QWidget):
         # both viewports (and VTK-based capture/parity scripts) stay in step.
         self._last_pos = None
         self._panning = False
+        self._right_press_pos = None
+        self._right_dragged = False
+
+    _CLICK_SLOP_PX = 4.0
+
+    def paintEngine(self):
+        return None
+
+    def paintEvent(self, event):
+        # Exposure is a redraw request, not a geometry upload or camera change.
+        # No animation timer: a static attached SNT remains idle between events.
+        owner = self._owner
+        backend = getattr(owner, 'vulkan_backend', None)
+        if (self._presenting_exposure or not getattr(owner, 'active', False)
+                or backend is None or not self.isVisible()):
+            return
+        self._presenting_exposure = True
+        try:
+            backend.request_render()
+        finally:
+            self._presenting_exposure = False
 
     def _rig(self):
         rig = getattr(self._owner, "_camera_rig", None)
@@ -3269,6 +3572,11 @@ class _VulkanSurfaceWidget(_QWidget):
         except Exception:
             pass
         self._last_pos = self._event_pos(event)
+        # Right press is a click candidate (grid/block context menu) until the
+        # cursor travels past _CLICK_SLOP_PX; see mouseReleaseEvent.
+        self._right_press_pos = (
+            self._last_pos if event.button() == Qt.MouseButton.RightButton else None)
+        self._right_dragged = False
         self._panning = event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton
             and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -3282,6 +3590,14 @@ class _VulkanSurfaceWidget(_QWidget):
         dx, dy = pos.x() - last.x(), pos.y() - last.y()
         if abs(dx) < 0.01 and abs(dy) < 0.01:
             return
+        press = getattr(self, "_right_press_pos", None)
+        if press is not None and not self._right_dragged:
+            if (abs(pos.x() - press.x()) <= self._CLICK_SLOP_PX
+                    and abs(pos.y() - press.y()) <= self._CLICK_SLOP_PX):
+                # Hand jitter inside a right-click must not orbit the view.
+                self._last_pos = last
+                return
+            self._right_dragged = True
         rig = self._rig()
         if rig is None:
             return
@@ -3311,9 +3627,25 @@ class _VulkanSurfaceWidget(_QWidget):
         self._owner._note_surface_interaction(True)
 
     def mouseReleaseEvent(self, event):
+        press = getattr(self, "_right_press_pos", None)
+        is_right_click = (
+            press is not None
+            and event.button() == Qt.MouseButton.RightButton
+            and not getattr(self, "_right_dragged", False)
+        )
         self._last_pos = None
         self._panning = False
+        self._right_press_pos = None
+        self._right_dragged = False
         event.accept()
+        if is_right_click and self._owner is not None:
+            pos = self._event_pos(event)
+            x, y = float(pos.x()), float(pos.y())
+            w, h = max(1, self.width()), max(1, self.height())
+            # Defer one event-loop turn so the release finishes before a menu
+            # opens its own loop.
+            QTimer.singleShot(
+                0, lambda: self._owner.dispatch_surface_right_click(x, y, w, h))
 
     def wheelEvent(self, event):
         # Zoom has exactly ONE owner: the VTK main camera.
@@ -3334,7 +3666,17 @@ class _VulkanSurfaceWidget(_QWidget):
                 # This surface is the SINGLE physical wheel receiver when it is
                 # the visible main viewport, so it must not be debounced against
                 # a phantom second sender.
-                _ok = self._owner.apply_surface_wheel(notches)
+                display_position = None
+                try:
+                    from gui.zoom_navigation import qt_position_to_vtk_display
+                    render_size = self._owner._vtk_widget.GetRenderWindow().GetSize()
+                    pos = self._event_pos(event)
+                    display_position = qt_position_to_vtk_display(
+                        pos.x(), pos.y(), self.width(), self.height(), *render_size)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+                _ok = self._owner.apply_surface_wheel(
+                    notches, display_position=display_position)
                 _af = self._owner._camera_parallel_scale()
                 if os.environ.get("NAKSHA_DEV_CAMERA_TRACE", "").strip() not in (
                         "", "0", "false", "False"):
@@ -3397,10 +3739,14 @@ class _GeometryMirror(_QObject):
 
     def eventFilter(self, obj, event):
         try:
-            if event.type() in (_QEvent.Resize, _QEvent.Move):
+            if event.type() in (_QEvent.Resize, _QEvent.Move, _QEvent.LayoutRequest):
                 geom = self._sources[0].geometry()
                 if self._target.geometry() != geom:
                     self._target.setGeometry(geom)
+            if event.type() in (_QEvent.Show, _QEvent.ZOrderChange):
+                owner = getattr(self._target, '_owner', None)
+                if getattr(owner, '_viewport_installed', False) and self._sources[0].isVisible():
+                    self._target.raise_()
         except Exception:
             pass
         return False
@@ -6536,6 +6882,43 @@ class AppRenderBackendOwner:
         return bool(self.active and self.vulkan_backend is not None
                     and self._viewport_installed)
 
+    def surface_to_world(self, x: float, y: float, w: float, h: float):
+        """World XY under a surface-widget position (Qt pixels, origin top-left)
+        from the canonical MainCamera2D - native, no VTK picking. Returns
+        (world_xy, units_per_surface_pixel) or None outside a 2D plan view."""
+        if not self.owns_main_camera():
+            return None
+        mc = self.main_camera
+        if not mc.valid:
+            self.sync_main_camera_from_vtk("seed_before_right_click")
+        if not mc.valid or w <= 0 or h <= 0:
+            return None
+        # Map widget pixels onto the camera's viewport (device pixels may
+        # differ from widget pixels under DPI scaling), flipping Y to the
+        # bottom-left origin display_to_world expects.
+        vx = float(x) / float(w) * mc.viewport_width
+        vy = (1.0 - float(y) / float(h)) * mc.viewport_height
+        upp = mc.world_height / float(h)
+        return mc.display_to_world(vx, vy), upp
+
+    def dispatch_surface_right_click(self, x: float, y: float, w: float, h: float) -> bool:
+        """A right-click (no drag) on the Vulkan main viewport. The VTK
+        interactor never sees it, so route it to the grid/block context menu
+        natively. Returns True when a menu was shown."""
+        try:
+            hit = self.surface_to_world(x, y, w, h)
+            if hit is None:
+                return False
+            world_xy, upp = hit
+            mgr = getattr(self._app, "grid_label_manager", None)
+            handler = getattr(mgr, "on_native_right_click", None)
+            if handler is None:
+                return False
+            return bool(handler(world_xy, upp))
+        except Exception:
+            self._log.exception("surface right-click dispatch failed (ignored)")
+            return False
+
     def main_vtk_adoption_blocked(self) -> bool:
         """NAKSHA_DISABLE_MAIN_VTK_CAMERA=1: the VTK main camera must NOT feed
         MainCamera2D / Vulkan (validation switch for VTK independence)."""
@@ -6657,37 +7040,24 @@ class AppRenderBackendOwner:
         return True
 
     # -- single camera owner -------------------------------------------------
-    def apply_surface_wheel(self, notches: float) -> bool:
-        """Apply ONE wheel notch from the Vulkan surface, through the owner.
-
-        The surface does NOT own a pose: it no longer dollies the rig and no
-        longer invents its own zoom factor. It normalises its raw notches and
-        hands them to the single main-view zoom owner, which applies exactly
-        one absolute 1.10**steps mutation and then pushes once (PART 2/8/12).
-
-        3D (Shift+P) is routed to `apply_3d_wheel`, the canonical rig owner.
-        That routing is the fix for dead 3D zoom: `apply_zoom_steps` refuses in
-        3D by design, so before this the notch was consumed by two handlers that
-        both declined to mutate anything. The 2D branch below is unchanged.
-        """
+    def apply_surface_wheel(self, notches: float, *, display_position=None) -> bool:
+        """Route native-surface notches through the current main wheel owner."""
         if not notches or not (self.active and self.vulkan_backend is not None):
             return False
         try:
             if bool(getattr(self._app, "is_3d_mode", False)):
                 return self.apply_3d_wheel(float(notches))
-            from gui.zoom_navigation import apply_zoom_steps
-            changed = bool(apply_zoom_steps(self._app, float(notches),
-                                            label="vulkan_surface",
-                                            debounce=False))
+            if not math.isfinite(float(notches)):
+                return False
+            # Qt's main-view filter uses raw angle units (120 per notch).
+            # Use the same controller for this surface so bounds, cursor
+            # anchoring, history, and the zoom speed match the visible app.
+            changed = bool(self._app._handle_fast_main_wheel(
+                float(notches) * 120.0, display_position=display_position))
             if changed:
-                # apply_zoom_steps mutates only the canonical camera, and the
-                # VTK ModifiedEvent observer is deliberately suppressed during
-                # that transaction, so NOTHING pushed the new scale to the
-                # native renderer: the wheel changed the camera but the
-                # viewport stayed at the old scale until the next pan/resize
-                # (live trace: vtk 86.13 vs native 94.74 after a notch). Push
-                # exactly once, here, after the transaction has closed;
-                # resync_camera() de-duplicates by camera signature.
+                # The VTK camera is the input to native camera adoption.
+                # Signature deduplication avoids an extra push if its observer
+                # already mirrored the controller's change.
                 self.resync_camera(present=True)
             return changed
         except Exception:

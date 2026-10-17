@@ -37,6 +37,11 @@ struct DeviceReport {
     uint64_t minUniformBufferOffsetAlignment = 0;
     uint64_t nonCoherentAtomSize = 0;
     float maxPointSize = 0.0f;           // limits.pointSizeRange[1]
+    // limits.lineWidthRange. Dynamic line width (the vector overlay) may ONLY
+    // be set inside this range, and above 1.0 only with wideLines enabled, so
+    // the pass clamps to it instead of assuming the T400's [1, 64].
+    float minLineWidth = 1.0f;
+    float maxLineWidth = 1.0f;
     // Features SUPPORTED by the device (what the renderer is allowed to use):
     VkBool32 fillModeNonSolid = VK_FALSE;
     VkBool32 largePoints = VK_FALSE;

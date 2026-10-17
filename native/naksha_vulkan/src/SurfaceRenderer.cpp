@@ -125,7 +125,7 @@ bool SurfaceRenderer::Initialize(Renderer& renderer) {
         indexedVs_ = renderer.Shaders().LoadSPIRV(renderer.cfg_.shaderDirectory + "/surface_indexed.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
         indexedFs_ = renderer.Shaders().LoadSPIRV(renderer.cfg_.shaderDirectory + "/surface_indexed.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
         cellLayout_ = renderer.Descriptors().CreateLayout({{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT}});
-        VkPushConstantRange indexedPush{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t)};
+        VkPushConstantRange indexedPush{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
         indexedLayout_ = renderer.Pipelines().CreatePipelineLayout({renderer.GetFrameSetLayout(), cellLayout_}, {indexedPush});
         PipelineConfig indexed = pipelineCfg_;
         indexed.rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
@@ -1036,6 +1036,8 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
                 (shadingMode_ == ShadingMode::Wireframe ? indexedWireframePipeline_ : indexedPipeline_));
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, indexedLayout_, 0, 2, sets, 0, nullptr);
             }
+            PushConstants indexedPc{}; FillCrispPushConstants(indexedPc);
+            vkCmdPushConstants(cmd, indexedLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(indexedPc), &indexedPc);
             uint64_t submitted = 0;
             for (uint32_t index : active_->visibleTiles[lod]) {
                 const auto& tile = mesh.tiles[index]; uint32_t firstTriangle = tile.firstIndex / 3;
@@ -1048,6 +1050,9 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
                 VkBuffer coverageBuffers[]={active_->coveragePositions.buffer,active_->coverageColors.buffer};
                 VkDeviceSize offsets[]={0,0};
                 vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,coveragePipeline_);
+                PushConstants coveragePc{};
+                FillCrispPushConstants(coveragePc);
+                vkCmdPushConstants(cmd,indexedLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(coveragePc),&coveragePc);
                 vkCmdBindVertexBuffers(cmd,0,2,coverageBuffers,offsets);
                 vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,indexedLayout_,0,1,sets,0,nullptr);
                 vkCmdDraw(cmd,uint32_t(active_->coverageCount),1,0,0);
@@ -1085,6 +1090,7 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
         pc.shadeParamsA[1] = crispSharpnessRaw_;
         pc.shadeParamsA[2] = crispAmbient_;
         pc.shadeParamsA[3] = parityAmbientFloor_;
+        std::copy(elevationColor_, elevationColor_ + 4, pc.elevationColor);
         pc.shadeParamsB[0] = crispKeyIntensity_;
         pc.shadeParamsB[1] = crispFillIntensity_;
         pc.shadeParamsB[2] = static_cast<float>(parityDebugStage_);
@@ -1161,6 +1167,7 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     pc.shadeParamsA[1] = crispSharpnessRaw_;
     pc.shadeParamsA[2] = crispAmbient_;
     pc.shadeParamsA[3] = parityAmbientFloor_;         // < 0 -> shader default
+    std::copy(elevationColor_, elevationColor_ + 4, pc.elevationColor);
     pc.shadeParamsB[0] = crispKeyIntensity_;
     pc.shadeParamsB[1] = crispFillIntensity_;
     pc.shadeParamsB[2] = static_cast<float>(parityDebugStage_);
@@ -1464,6 +1471,7 @@ void SurfaceRenderer::FillCrispPushConstants(PushConstants& pc) const {
     pc.shadeParamsA[1] = crispSharpnessRaw_;
     pc.shadeParamsA[2] = crispAmbient_;
     pc.shadeParamsA[3] = parityAmbientFloor_;
+    std::copy(elevationColor_, elevationColor_ + 4, pc.elevationColor);
     pc.shadeParamsB[0] = crispKeyIntensity_;
     pc.shadeParamsB[1] = crispFillIntensity_;
     pc.shadeParamsB[2] = static_cast<float>(parityDebugStage_);
@@ -1515,6 +1523,9 @@ void SurfaceRenderer::RecordCrispIndexed(VkCommandBuffer cmd, uint32_t frameSlot
     if (crispCoverageCount_ && coveragePipeline_ != VK_NULL_HANDLE) {
         VkBuffer cbs[] = {crispCovPositions_.buffer, crispCovColors_.buffer};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePipeline_);
+        PushConstants coveragePc{};
+        FillCrispPushConstants(coveragePc);
+        vkCmdPushConstants(cmd, indexedLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(coveragePc), &coveragePc);
         vkCmdBindVertexBuffers(cmd, 0, 2, cbs, offsets);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, indexedLayout_, 0, 1, sets, 0, nullptr);
         vkCmdDraw(cmd, static_cast<uint32_t>(crispCoverageCount_), 1, 0, 0);
@@ -1770,7 +1781,6 @@ bool SurfaceRenderer::SetTilePalette(const uint8_t* lut, float shade, std::strin
     VkDeviceSize total = 0;
     for (const auto& kv : tileSlots_) total += (kv.second.vcount + kv.second.ccount) * 4;
     if (!total) return true;
-    renderer_->WaitIdle();            // colours are read by frames in flight
     uint8_t* st = renderer_->GetUploadContext().Stage(total);
     if (!st) { if (error) *error = "surface tile staging failed"; return false; }
     std::vector<CopyRegion> regions;
@@ -1796,6 +1806,67 @@ bool SurfaceRenderer::SetTilePalette(const uint8_t* lut, float shade, std::strin
     }
     renderer_->GetUploadContext().Execute(regions, 0.0, 0.0);
     ++tileRecolors_;
+    return true;
+}
+
+bool SurfaceRenderer::PatchTileClasses(uint64_t key, const uint32_t* vi, const uint8_t* vc, uint32_t nv,
+                                       const uint32_t* ci, const uint8_t* cc, uint32_t nc, std::string* error) {
+    auto fail = [&](const char* why) { if (error) *error = why; return false; };
+    if (!tilesActive_) return fail("surface tile arena not configured");
+    auto it = tileSlots_.find(key);
+    if (it == tileSlots_.end()) return fail("surface tile is not resident");
+    TileSlot& s = it->second;
+    if ((nv && (!vi || !vc)) || (nc && (!ci || !cc))) return fail("invalid tile class patch arrays");
+    for (uint32_t i = 0; i < nv; ++i) if (vi[i] >= s.vcount) return fail("tile vertex index out of range");
+    for (uint32_t i = 0; i < nc; ++i) if (ci[i] >= s.ccount) return fail("tile coverage index out of range");
+    for (uint32_t i = 0; i < nv; ++i) s.cls[vi[i]] = vc[i];
+    for (uint32_t i = 0; i < nc; ++i) s.covCls[ci[i]] = cc[i];
+    // One copy per contiguous run of changed entries (sorted, de-duplicated).
+    auto runs = [](const uint32_t* idx, uint32_t n) {
+        if (!n) return std::vector<std::pair<uint32_t, uint32_t>>{};
+        std::vector<uint32_t> v(idx, idx + n);
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        std::vector<std::pair<uint32_t, uint32_t>> r;          // (first, count)
+        for (uint32_t x : v) {
+            if (!r.empty() && r.back().first + r.back().second == x) ++r.back().second;
+            else r.push_back({x, 1});
+        }
+        return r;
+    };
+    const auto vr = runs(vi, nv), cr = runs(ci, nc);
+    VkDeviceSize total = 0;
+    for (const auto& r : vr) total += VkDeviceSize(r.second) * 4;
+    for (const auto& r : cr) total += VkDeviceSize(r.second) * 4;
+    if (!total) return true;
+    renderer_->WaitIdle();            // colours are read by frames in flight
+    uint8_t* st = renderer_->GetUploadContext().Stage(total);
+    if (!st) return fail("surface tile staging failed");
+    std::vector<CopyRegion> regions;
+    regions.reserve(vr.size() + cr.size());
+    VkDeviceSize cursor = 0;
+    for (const auto& r : vr) {
+        for (uint32_t i = 0; i < r.second; ++i) {
+            const uint8_t c = s.cls[r.first + i];
+            uint8_t* o = st + cursor + i * 4;
+            o[0] = tileLut_[c * 3]; o[1] = tileLut_[c * 3 + 1]; o[2] = tileLut_[c * 3 + 2]; o[3] = 255;
+        }
+        regions.push_back({tileColors_.buffer, (s.vbase + r.first) * 4, cursor, VkDeviceSize(r.second) * 4});
+        cursor += VkDeviceSize(r.second) * 4;
+    }
+    for (const auto& r : cr) {
+        for (uint32_t i = 0; i < r.second; ++i) {
+            const uint8_t c = s.covCls[r.first + i];
+            uint8_t* o = st + cursor + i * 4;
+            for (int k = 0; k < 3; ++k)
+                o[k] = uint8_t(std::min(255.0f, std::max(0.0f, float(tileLut_[c * 3 + k]) * tileShade_ + 0.5f)));
+            o[3] = 255;
+        }
+        regions.push_back({tileCovColors_.buffer, (s.cbase + r.first) * 4, cursor, VkDeviceSize(r.second) * 4});
+        cursor += VkDeviceSize(r.second) * 4;
+    }
+    renderer_->GetUploadContext().Execute(regions, 0.0, 0.0, true);
+    ++tileClassPatches_;
     return true;
 }
 
@@ -1875,6 +1946,9 @@ void SurfaceRenderer::RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot) {
         VkDescriptorSet frame = renderer_->GetFrameDescriptorSet();
         VkBuffer cbs[] = {tileCovPositions_.buffer, tileCovColors_.buffer};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, coveragePipeline_);
+        PushConstants coveragePc{};
+        FillCrispPushConstants(coveragePc);
+        vkCmdPushConstants(cmd, indexedLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(coveragePc), &coveragePc);
         vkCmdBindVertexBuffers(cmd, 0, 2, cbs, offsets);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, indexedLayout_, 0, 1, &frame, 0, nullptr);
         for (const auto& r : coverage) {

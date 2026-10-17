@@ -2283,27 +2283,21 @@ def show_export_dialog(app):
     layout.addWidget(gpkg_radio)
     layout.addWidget(tiff_radio)
     layout.addWidget(snt_radio)
-    # Buttons
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-    )
+    # Buttons (OK only — the dialog is dismissed with the title-bar X or Esc)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok)
     ok_btn = buttons.button(QDialogButtonBox.Ok)
-    cancel_btn = buttons.button(QDialogButtonBox.Cancel)
     if ok_btn:
+        ok_btn.setText("Export")
         ok_btn.setObjectName("primaryBtn")
         ok_btn.setAutoDefault(False)
         ok_btn.setDefault(False)
         ok_btn.setFocusPolicy(Qt.NoFocus)
-    if cancel_btn:
-        cancel_btn.setAutoDefault(False)
-        cancel_btn.setDefault(False)
-        cancel_btn.setFocusPolicy(Qt.NoFocus)
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
-    
+
     dialog.setLayout(layout)
-    
+
     if dialog.exec() == QDialog.Accepted:
         # Get base filename from current file
         if hasattr(app, 'last_save_path') and app.last_save_path:

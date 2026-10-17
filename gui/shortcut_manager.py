@@ -9,7 +9,6 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect
 from PySide6.QtWidgets import QFrame, QAbstractItemView
 from PySide6.QtCore import Signal, Qt, QSettings, QEvent
 from PySide6.QtGui import QColor, QAction, QActionGroup
-from torch import layout
 
 from .class_picker import ClassPicker, resolve_class_catalog
 from .theme_manager import get_dialog_stylesheet
@@ -68,6 +67,15 @@ def decode_classes(text):
         return data.get("from"), data.get("to")
     except Exception:
         return None, None
+
+
+def shortcut_row_sort_key(modifier, key):
+    order = {'alt': 0, 'alt+shift': 1, 'ctrl': 2, 'ctrl+alt': 3,
+             'ctrl+alt+shift': 4, 'ctrl+shift': 5, 'none': 6, 'shift': 7}
+    modifier, key = str(modifier).strip().lower(), str(key).strip().upper()
+    rank = ((0, int(key[1:]), '') if key.startswith('F') and key[1:].isdigit()
+            else (2, 0, 'SPACE') if key == 'SPACE' else (1, 0, key))
+    return order.get(modifier, 99), rank
 
 
 def shortcut_search_matches(search_text, modifier="", key="", tool="", classes=""):
@@ -428,7 +436,7 @@ def summarize_display_like_preset(preset: dict, prefix: str = "Preset") -> str:
         visible = sum(1 for c in view_classes.values() if c.get("show"))
         weights = [float(c.get("weight", 1.0)) for c in view_classes.values()]
         view_name = (["Main", "V1", "V2", "V3", "V4", "Cut"][view_idx]
-                     if view_idx < 6 else f"V{view_idx}")
+                     if view_idx < 5 else ('Cut' if view_idx == 9 else f"V{view_idx}"))
         if weights:
             unique_weights = sorted(set(weights))
             weight_info = (f"W={unique_weights[0]:.1f}" if len(unique_weights) == 1
@@ -957,7 +965,8 @@ def encode_sync_preset(payload: dict) -> str:
                 "mode":   int(r.get("mode", 0)),
                 "source": int(r.get("source", 1)),
             })
-        return json.dumps({"__type__": "sync_views_preset", "rows": rows})
+        return json.dumps({"__type__": "sync_views_preset", "rows": rows,
+                           "version": payload.get('version', 1)})
     except Exception as e:
         print(f"❌ encode_sync_preset error: {e}")
         return json.dumps({"__type__": "sync_views_preset", "rows": []})
@@ -976,7 +985,7 @@ def decode_sync_preset(text) -> dict | None:
                 "mode":   int(r.get("mode", 0)),
                 "source": int(r.get("source", 1)),
             })
-        return {"rows": rows}
+        return {"rows": rows, "version": data.get('version', 1)}
     except Exception as e:
         print(f"❌ decode_sync_preset error: {e}")
         return None
@@ -995,7 +1004,7 @@ def _sync_preset_summary(preset: dict) -> str:
 class SyncViewsPicker(QDialog):
     """Modal dialog to configure a Sync Views preset for a shortcut."""
 
-    NUM_VIEWS = 5
+    NUM_VIEWS = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1013,7 +1022,7 @@ class SyncViewsPicker(QDialog):
 
         info = QLabel(
             "Configure which views should sync when this shortcut is pressed.\n"
-            "\"View A: Match → View B\" means View B will follow View A's camera."
+            "\"View A: Match → View B\" means View A will match View B. Linked views move together."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #aaaaaa; font-style: italic; font-size: 11px;")
@@ -1081,10 +1090,19 @@ class SyncViewsPicker(QDialog):
                 "mode":   r["mode"].currentIndex(),
                 "source": r["source"].currentData() or 1,
             })
-        return {"rows": rows}
+        return {"rows": rows, "version": 2}
 
     def set_preset(self, preset: dict):
         rows_data = {r["view"]: r for r in preset.get("rows", [])}
+        if preset.get('version', 1) < 2:
+            # Older presets placed the source on the left; preserve their links.
+            rows_data = {v: {'view': v, 'mode': 0, 'source': 1}
+                         for v in range(1, self.NUM_VIEWS+1)}
+            for old in preset.get('rows', []):
+                if old.get('mode', 0) == 1:
+                    target = int(old.get('source', 1))
+                    if 1 <= target <= self.NUM_VIEWS:
+                        rows_data[target] = {'view': target, 'mode': 1, 'source': old['view']}
         for r in self._rows:
             v = r["view_num"]
             if v not in rows_data:
@@ -1469,7 +1487,7 @@ class ClassVisibilityPicker(QDialog):
             current_slot = int(getattr(dialog, "current_slot", 0) or 0)
             candidates.extend(
                 dialog_palettes.get(slot_idx)
-                for slot_idx in dict.fromkeys((current_slot, 0, 1, 2, 3, 4, 5))
+                for slot_idx in dict.fromkeys((current_slot, *range(10)))
             )
 
         app_palette = getattr(self.app_window, "class_palette", {}) or {}
@@ -1477,7 +1495,7 @@ class ClassVisibilityPicker(QDialog):
 
         app_palettes = getattr(self.app_window, "view_palettes", None)
         if isinstance(app_palettes, dict):
-            candidates.extend(app_palettes.get(slot_idx) for slot_idx in range(6))
+            candidates.extend(app_palettes.get(slot_idx) for slot_idx in range(10))
 
         primary = next(
             (palette for palette in candidates if isinstance(palette, dict) and palette),
@@ -1909,9 +1927,7 @@ class ClassVisibilityPicker(QDialog):
         self.view_selector = QComboBox()
         self.view_selector.setMinimumWidth(130)
         self.view_selector.addItems([
-            "Main View", "View 1", "View 2",
-            "View 3", "View 4",
-        ])
+            "Main View"] + [f'View {i}' for i in range(1, 9)] + ['Cut Section'])
         self.view_selector.setCurrentIndex(0)
         self.view_selector.currentIndexChanged.connect(self._on_view_selector_changed)
         controls_row.addWidget(self.view_selector)
@@ -2694,8 +2710,7 @@ class ClassVisibilityPicker(QDialog):
                     if code in self.view_configs[new_index]:
                         spin.setValue(self.view_configs[new_index][code].get("weight", 1.0))
 
-        view_name = (["Main View", "View 1", "View 2", "View 3", "View 4"]
-                     [new_index] if new_index < 5 else f"View {new_index}")
+        view_name = 'Main View' if new_index == 0 else ('Cut Section' if new_index == 9 else f'View {new_index}')
         print(f"   ✅ Repopulated classes for {view_name}")
         # Re-seed border from display_mode for the newly selected view
         self._seed_border_from_display_mode()
@@ -3053,7 +3068,7 @@ class ShortcutManager(QWidget):
         shortcut preset stored in the table cell is the authoritative source for
         the saved display-mode label and per-view class configuration.
         """
-        _VIEW_NAMES = ["Main", "View 1", "View 2", "View 3", "View 4", "Cut"]
+        _VIEW_NAMES = ['Main'] + [f'View {i}' for i in range(1, 9)] + ['Cut']
         _MODE_LABELS = {
             "class": "By Classification",
             "shaded_class": "Shaded Classification",
@@ -3163,6 +3178,18 @@ class ShortcutManager(QWidget):
             return
 
         def _focus_once():
+            native_view = getattr(app, '_lnt_main_view', None)
+            if native_view is not None and getattr(native_view, 'native', None) is not None:
+                from gui.native_shortcuts import main_widget
+                sections = getattr(app, '_native_sections', None)
+                slot = getattr(app, '_native_shortcut_target', 0)
+                canvas = sections.views.get(slot) if sections is not None else None
+                widget = canvas if canvas is not None and canvas.isVisible() else main_widget(app)
+                if widget is not None:
+                    widget.window().raise_()
+                    widget.window().activateWindow()
+                    widget.setFocus(Qt.ActiveWindowFocusReason)
+                return
             try:
                 app.raise_()
             except Exception:
@@ -3701,6 +3728,10 @@ class ShortcutManager(QWidget):
                 tool      = entry.get("tool", "AboveLine")
                 mod       = modifier.lower()
                 key_upper = key.upper()
+
+                if ShortcutManager._PREDEFINED_SHORTCUTS.get((mod, key_upper)):
+                    print(f"      Skipped reserved shortcut {mod}+{key_upper}")
+                    continue
 
                 if tool == "LineMode":
                     preset_payload = line_mode_to_display_visibility_preset(
@@ -5483,6 +5514,14 @@ class ShortcutManager(QWidget):
                     mod   = mod_combo.currentText().lower()
                     key   = key_combo.currentText().upper()
                     combo = (mod, key)
+                    predefined_desc = self._is_predefined_shortcut(mod, key)
+                    if predefined_desc:
+                        QMessageBox.critical(
+                            self, "Cannot Apply",
+                            f"{mod.title()}+{key} is a preserved predefined shortcut "
+                            f"for {predefined_desc}. Please choose another combination."
+                        )
+                        return
                     if combo in seen_keys:
                         QMessageBox.critical(
                             self, "Cannot Apply",
@@ -5757,56 +5796,11 @@ class ShortcutManager(QWidget):
                 needs_new = True
 
         if needs_new:
-            # Show a lightweight loading splash while the heavy constructor runs
-            from PySide6.QtWidgets import QLabel, QWidget, QApplication
-            from PySide6.QtGui import QFont
-            _splash = QWidget(None, Qt.SplashScreen | Qt.FramelessWindowHint)
-            _splash.setAttribute(Qt.WA_ShowWithoutActivating)
-            _splash.setFixedSize(260, 60)
-            _splash.setStyleSheet(
-                "background-color: #1e1e2e; border: 1px solid #444; border-radius: 8px;"
-            )
-            _lbl = QLabel("Loading shortcuts...", _splash)
-            _lbl.setAlignment(Qt.AlignCenter)
-            _lbl.setStyleSheet(
-                "color: #cccccc; font-size: 13px; background: transparent; border: none;"
-            )
-            _lbl.setGeometry(_splash.rect())
-            # Center the splash on the screen the MAIN WINDOW lives on — not
-            # QApplication.primaryScreen(), which is the OS default monitor.
-            # On a two-monitor setup that default is often the other screen,
-            # so the popup used to appear away from the project window.
-            target_screen = None
-            if app_window is not None:
-                try:
-                    target_screen = app_window.screen()
-                except Exception:
-                    target_screen = None
-                if target_screen is None:
-                    try:
-                        target_screen = QApplication.screenAt(
-                            app_window.frameGeometry().center()
-                        )
-                    except Exception:
-                        target_screen = None
-            if target_screen is None:
-                target_screen = QApplication.primaryScreen()
-            screen = target_screen.availableGeometry()
-            _splash.move(
-                screen.center().x() - _splash.width() // 2,
-                screen.center().y() - _splash.height() // 2
-            )
-            _splash.show()
-            QApplication.processEvents()  # force the splash to paint
-
             inst = ShortcutManager(app_window)
             ShortcutManager.instance = inst
 
-            _splash.close()
-
-        # Restore from minimized/taskbar state if needed
-        inst.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        inst.setWindowFlag(Qt.Tool, False)
+        # Flags are established in the constructor. Changing them here recreates
+        # the native window and delays both first-open and subsequent opens.
         if inst.isMinimized():
             inst.setWindowState(inst.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
         elif not inst.isVisible():
@@ -5859,6 +5853,10 @@ class ShortcutManager(QWidget):
                         continue
                     mod       = modifier.lower()
                     key_upper = key.upper()
+
+                    if self._is_predefined_shortcut(mod, key_upper):
+                        print(f"   Skipped reserved shortcut {mod}+{key_upper}")
+                        continue
 
                     if tool == "DisplayMode":
                         preset_payload = entry.get("display_preset")
@@ -5940,6 +5938,14 @@ class ShortcutManager(QWidget):
             print("   ⚠️  view_palettes / class_palette NOT touched — will apply on keypress only")
 
             # ── Rebuild table UI ──────────────────────────────────────
+            # Sort the records before creating widgets; avoid destroying and
+            # rebuilding every combo box just to put the rows in order.
+            shortcuts_list = [entry for entry in shortcuts_list if not self._is_predefined_shortcut(
+                str(entry.get('modifier', 'alt')), str(entry.get('key', 'F1'))
+            )]
+            shortcuts_list = sorted(shortcuts_list, key=lambda entry: shortcut_row_sort_key(
+                entry.get('modifier', 'alt'), entry.get('key', 'F1')))
+            self.table.setUpdatesEnabled(False)
             self._is_loading_shortcuts = True
             self._selected_rows.clear()
             try:
@@ -6088,9 +6094,9 @@ class ShortcutManager(QWidget):
 
             finally:
                 self._is_loading_shortcuts = False
+                self.table.setUpdatesEnabled(True)
 
             if self.table.rowCount() > 0:
-                self._sort_table_by_modifier()
                 self._set_current_row(0)
             print(f"✅ Table rebuilt with {self.table.rowCount()} rows")
 

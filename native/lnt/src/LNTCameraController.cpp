@@ -34,7 +34,22 @@ void LntCameraController::set_lens(double fov_y_deg, double near_clip, double fa
 
 void LntCameraController::set_ortho2d(bool on) {
     ortho2d_ = on;
+    view_preset_ = on ? 1 : 0;
     if (on) { yaw_ = 0.0; pitch_ = 0.0; }
+}
+
+void LntCameraController::set_view_preset(int preset) {
+    view_preset_ = std::max(0, std::min(3, preset));
+    ortho2d_ = view_preset_ == 1;
+    if (view_preset_ == 1) { yaw_ = 0.0; pitch_ = 0.0; }
+    else if (view_preset_ == 2) { yaw_ = 3.14159265358979323846; pitch_ = 0.0; }
+    else if (view_preset_ == 3) { yaw_ = 1.57079632679489661923; pitch_ = 0.0; }
+    else if (view_preset_ == 0) {
+        // 3D always opens at a useful tilted isometric angle. Reset even when
+        // coming from perspective Front/Side so their level pitch is not kept.
+        yaw_ = 0.78539816339744830962;
+        pitch_ = 0.61086523819801535192; // 35 degrees
+    }
 }
 
 void LntCameraController::orbit(float delta_yaw, float delta_pitch) {
@@ -47,16 +62,25 @@ void LntCameraController::orbit(float delta_yaw, float delta_pitch) {
 void LntCameraController::eye(double out[3]) const {
     const double cp = std::cos(pitch_);
     out[0] = target_[0] + dist_ * cp * std::sin(yaw_);
-    out[1] = target_[1] + dist_ * std::sin(pitch_);
-    out[2] = target_[2] + dist_ * cp * std::cos(yaw_);
+    out[1] = target_[1] + dist_ * cp * std::cos(yaw_);
+    out[2] = target_[2] + dist_ * std::sin(pitch_);
 }
 
 void LntCameraController::pan(float delta_x, float delta_y) {
+    if (view_preset_ == 1) { // top: screen X/Y = world X/Y
+        target_[0] += delta_x; target_[1] += delta_y; return;
+    }
+    if (view_preset_ == 2) { // front: screen X/Y = world X/Z
+        target_[0] += delta_x; target_[2] += delta_y; return;
+    }
+    if (view_preset_ == 3) { // side: screen X/Y = world Y/Z
+        target_[1] += delta_x; target_[2] += delta_y; return;
+    }
     // View basis from the angles directly (no matrix needed): forward points
     // eye -> target, right = forward x up, camera-up = right x forward.
     const double cp = std::cos(pitch_), sp = std::sin(pitch_);
-    const double fx = -cp * std::sin(yaw_), fy = -sp, fz = -cp * std::cos(yaw_);
-    double rx = fy * 0.0 - fz * 1.0, ry = fz * 0.0 - fx * 0.0, rz = fx * 1.0 - fy * 0.0;
+    const double fx = -cp * std::sin(yaw_), fy = -cp * std::cos(yaw_), fz = -sp;
+    double rx = fy, ry = -fx, rz = 0.0; // forward x world-up (0,0,1)
     const double rl = std::sqrt(rx * rx + ry * ry + rz * rz);   // > 0: pitch < 90 deg
     rx /= rl; ry /= rl; rz /= rl;
     const double ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
@@ -85,7 +109,9 @@ void LntCameraController::set_sse_threshold(double px) {
 bool LntCameraController::apply_to(LNTCamera& cam, const double origin[3], double aspect,
                                    uint32_t screen_height_px) const {
     for (int i = 0; i < 3; ++i) { cam.target[i] = target_[i]; cam.origin[i] = origin[i]; }
-    cam.up[0] = 0.0; cam.up[1] = 1.0; cam.up[2] = 0.0;
+    cam.up[0] = 0.0;
+    cam.up[1] = view_preset_ == 1 ? 1.0 : 0.0;
+    cam.up[2] = view_preset_ == 1 ? 0.0 : 1.0;
     cam.fov_y_deg = fov_;
     cam.near_clip = near_;
     cam.far_clip = far_;
@@ -98,9 +124,10 @@ bool LntCameraController::apply_to(LNTCamera& cam, const double origin[3], doubl
         const double tn = std::tan(fov_ * 3.14159265358979323846 / 360.0);
         cam.ortho_half_height = std::max(dist_ * tn, 1e-6);
         const double standoff = 0.5 * (near_ + far_);
-        cam.eye[0] = target_[0];
-        cam.eye[1] = target_[1];
-        cam.eye[2] = target_[2] + standoff;
+        cam.eye[0] = target_[0]; cam.eye[1] = target_[1]; cam.eye[2] = target_[2];
+        if (view_preset_ == 2) cam.eye[1] -= standoff;
+        else if (view_preset_ == 3) cam.eye[0] += standoff;
+        else cam.eye[2] += standoff;
     } else {
         eye(cam.eye);
     }

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <atomic>
 #include <future>
@@ -159,6 +160,7 @@ struct View {
     bool has_surface_light = false;
     // Surface feature: the same lit mesh as Shading, coloured by elevation.
     bool surface_elev = false;
+    bool surface_gpu_elev = false;
     uint32_t surface_ramp = uint32_t(LNTColorRamp::Hue);
     double surface_z0 = 0.0, surface_z1 = 1.0;
     PackedClassColor class_lut[256]{};
@@ -175,7 +177,7 @@ struct View {
     // ---- viewport-LOD surface (LNTSurfaceLod.h) ----
     // The compact crisp multi-class Shading path draws persistent, independently
     // resident surface tiles chosen per frame from the camera; the cut-based builder
-    // below remains for the other surface paths (one visible class, elevation colour,
+    // below remains for the other surface paths (one visible class, legacy elevation colour,
     // engines without the tile arena).
     std::unique_ptr<surface_lod::Manager> lod;
     bool lod_failed = false;                 // arena or archive unusable this session
@@ -200,7 +202,7 @@ struct View {
     }
     // The tiled path serves exactly the compact crisp, class-coloured, multi-class case.
     bool lod_eligible() {
-        if (lod_failed || surface_elev) return false;
+        if (lod_failed || (surface_elev && !surface_gpu_elev)) return false;
         if (surface_lod::env_value("NAKSHA_LNT_SURFACE_LOD") == "0") return false;
         if (!eng.has_surface_tiles() || !eng.has_compact_shaded_class_surface()) return false;
         return visible_root_classes() >= 2;
@@ -232,6 +234,43 @@ struct View {
             lod_shade = shade;
             lod->set_palette(lut, shade);
         }
+    }
+
+    // Shows class edits at once: surface tiles are recoloured in place (LNTSurfaceLod.h)
+    // and resident point tiles of the edited nodes are re-uploaded from their patched
+    // records. `pending` = not in the file yet. Returns the surface patch statistics.
+    surface_lod::Manager::PatchResult show_class_edits(const std::vector<surface_lod::ClassEdit>& edits,
+                                                       bool pending) {
+        surface_lod::Manager::PatchResult r;
+        if (edits.empty()) return r;
+        if (lod) {
+            uint8_t visible[256];
+            for (int i = 0; i < 256; ++i) visible[i] = class_lut[i].visible;
+            r = lod->patch_classes(edits, visible, &eng, pending);
+            if (r.rebuilt) lod_changed = true;
+        }
+        std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint8_t>>> by_node;
+        for (const auto& e : edits) by_node[e.node].push_back({e.local, e.cls});
+        // An uploaded point tile keeps its positions and stays drawn: only the class
+        // bytes of the edited run are rewritten in place on the GPU. Re-uploading the
+        // whole tile instead dropped it from the draw (a sparse ancestor stood in) until
+        // the upload budget brought it back - the whole node visibly refreshed.
+        const std::vector<LNTNodeEntry>& ns = rd.nodes();
+        std::vector<uint8_t> span;
+        for (const auto& kv : by_node) {
+            if (kv.first >= ns.size()) continue;
+            const uint64_t id = ns[kv.first].node_id;
+            uint32_t span_first = 0;
+            if (!cache.patch_classes(id, kv.second, &span, &span_first) || span.empty()) continue;
+            LntTile* t = scene.tile_mut(id);
+            if (!t || !t->uploaded) continue;              // uploaded later from the patched records
+            if (uint64_t(span_first) + span.size() > t->count ||
+                !eng.upload_point_tile(uint64_t(t->first) + span_first, span.size(), nullptr,
+                                       span.data(), nullptr, nullptr))
+                t->uploaded = false;
+        }
+        frame_sig_valid = false;          // redraw now, not after the idle debounce
+        return r;
     }
 
     // ---- point query / edit state (section tools) ----
@@ -339,7 +378,7 @@ struct View {
             params.elevation_deg = std::asin(std::clamp(lz, -1.0, 1.0)) *
                                    180.0 / 3.14159265358979323846;
         }
-        if (surface_elev) {
+        if (surface_elev && !surface_gpu_elev) {
             params.color_source = SurfaceColor::Elevation;
             params.ramp = LNTColorRamp(surface_ramp);
             params.z_min = surface_z0;
@@ -355,7 +394,7 @@ struct View {
             params.ambient = surface_shading.ambient;
         }
         params.single_elevation_deg = surface_single_elevation;
-        params.compact_crisp = !surface_elev && eng.has_compact_shaded_class_surface();
+        params.compact_crisp = (!surface_elev || surface_gpu_elev) && eng.has_compact_shaded_class_surface();
         return params;
     }
 
@@ -768,9 +807,9 @@ struct View {
         // Shaded Classification (the class-coloured Shading mode) goes through the engine's
         // crisp-hybrid path whenever the engine has it: the engine reproduces
         // gui/shading_display.py's model in-shader, so the .lnt view and the VTK view agree.
-        // The elevation-coloured Surface mode keeps the legacy ramp path.
+        // Surface uses the same crisp mesh; the shader supplies elevation albedo.
         bool crisp = false;
-        if (!surface_elev && job.class_count >= 2 && eng.has_shaded_class_surface() &&
+        if ((!surface_elev || surface_gpu_elev) && job.class_count >= 2 && eng.has_shaded_class_surface() &&
             !job.mesh.vertex_class.empty())
             crisp = upload_crisp_surface(job.mesh, revision);
         surface_shading_upload = crisp;
@@ -829,6 +868,33 @@ struct View {
         ctl.set_ortho2d(true);                     // 2D plan view, orthographic
         ctl.set_distance(std::max(side, 1.0) * 1.3);
         ctl.set_sse_threshold(init_sse);
+    }
+
+    void set_view_preset(int preset) {
+        ctl.set_view_preset(preset);
+        if (preset == 0) return;                    // Keep the current 3D orbit framing.
+
+        // Fit the plane actually visible in this orthographic view. Reusing the
+        // plan-view distance makes a shallow cloud almost disappear in Front/Side:
+        // its small Z extent is framed inside the much larger XY dataset extent.
+        const int horizontal_axis = preset == 3 ? 1 : 0; // Top/Front: X; Side: Y
+        const int vertical_axis = preset == 1 ? 1 : 2;   // Top: Y; Front/Side: Z
+        const double projected_width = std::max(env.extent(horizontal_axis), 1e-6);
+        const double projected_height = std::max(env.extent(vertical_axis), 1e-6);
+        const double aspect = std::max(double(w) / double(std::max(h, 1u)), 1e-6);
+        const double half_height = 0.55 * std::max(projected_height, projected_width / aspect);
+        constexpr double tan_half_fov = 0.4142135623730950488; // tan(45 degrees / 2)
+
+        ctl.set_target(env.mid(0), env.mid(1), env.mid(2));
+        double distance = half_height / tan_half_fov;
+        if (preset == 2 || preset == 3) {
+            // Perspective Front/Side: put the eye beyond the near face of the
+            // cloud, then leave a small depth margin. These are real 3D cameras,
+            // differing only in their viewing direction.
+            const int depth_axis = preset == 2 ? 1 : 0;
+            distance += 0.55 * std::max(env.extent(depth_axis), 1e-6);
+        }
+        ctl.set_distance(std::max(distance, 1.0));
     }
 };
 
@@ -1061,13 +1127,24 @@ __declspec(dllexport) int lnt_view_set_classification_lut(void* h, const uint8_t
         reinterpret_cast<const lnt::PackedClassColor*>(rgba1024))) return 0;
     std::memcpy(v->class_lut, rgba1024, sizeof(v->class_lut));
     v->class_lut_uploaded=true;
+    if (v->surface_elev) {
+        v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() >= 2;
+        v->eng.set_surface_elevation_color(v->surface_gpu_elev, v->surface_z0, v->surface_z1, v->surface_ramp);
+    }
     ++v->surface_gen; // discard any job built with the previous palette/visibility
     v->node_cache_gen = v->surface_gen; // samples and cached class sets are palette independent
     v->surface_ids.clear();
     return 1;
 }
 __declspec(dllexport) void lnt_view_set_mode(void* h, int mode) {
-    if (View* v = static_cast<View*>(h)) v->eng.set_display_mode(mode);
+    if (View* v = static_cast<View*>(h)) {
+        // Point presentation modes (including native view-space Depth) must
+        // take ownership back from a previously selected surface/shading mesh.
+        v->surface_requested = false;
+        v->surface_urgent = false;
+        v->eng.show_surface(false);
+        v->eng.set_display_mode(mode);
+    }
 }
 // Back to a top-down plan view (X right, Y up) keeping the current target and
 // distance: what the 2D mode uses when the user switches back from 3D orbit.
@@ -1077,6 +1154,10 @@ __declspec(dllexport) void lnt_view_plan_view(void* h) {
 // 1 = 2D plan (orthographic, orbit locked; the default), 0 = 3D perspective orbit.
 __declspec(dllexport) void lnt_view_set_2d(void* h, int on) {
     if (View* v = static_cast<View*>(h)) v->ctl.set_ortho2d(on != 0);
+}
+// Native camera presets: 0 perspective 3D, 1 top, 2 front, 3 side.
+__declspec(dllexport) void lnt_view_set_view(void* h, int preset) {
+    if (View* v = static_cast<View*>(h)) v->set_view_preset(preset);
 }
 __declspec(dllexport) void lnt_view_reset(void* h) {
     if (View* v = static_cast<View*>(h)) v->reset();
@@ -1091,7 +1172,7 @@ __declspec(dllexport) int lnt_view_set_shading(void* h, const ShadingUniforms* c
     if (!v || !config || !v->eng.set_shading_mode(*config)) return 0;
     const bool request_surface = config->display_mode == uint32_t(LNTDisplayMode::NormalShading);
     const bool needs_new_surface = request_surface &&
-        (!v->has_surface_light || v->surface_elev ||
+        (!v->has_surface_light || (v->surface_elev && !v->surface_gpu_elev) ||
          std::memcmp(v->last_surface_light,config->light_direction,sizeof(v->last_surface_light))!=0);
     v->shading = *config;
     v->surface_requested = request_surface;
@@ -1103,6 +1184,7 @@ __declspec(dllexport) int lnt_view_set_shading(void* h, const ShadingUniforms* c
         // first full-detail surface has been built and uploaded.
         if (!v->eng.show_surface(true)) return 0;
         v->surface_elev = false;                   // Shading mode: class colours
+        v->eng.set_surface_elevation_color(false, 0.0, 1.0, 0);
         std::memcpy(v->last_surface_light,config->light_direction,sizeof(v->last_surface_light));
         v->has_surface_light=true;
         if (needs_new_surface) {
@@ -1126,10 +1208,15 @@ __declspec(dllexport) int lnt_view_set_surface_elevation(void* h, int on, uint32
     View* v = static_cast<View*>(h);
     if (!v || !v->surface_requested || ramp > 3) return 0;
     v->surface_elev = on != 0;
-    if (v->surface_job_running) v->surface_cancel->store(true);
     v->surface_ramp = ramp;
     v->surface_z0 = z0;
     v->surface_z1 = z1 > z0 ? z1 : z0 + 1.0;
+    // The single-class Shading path bakes its flat hillshade into cell colours;
+    // retain that same path for Surface too. Multi-class uses the shared tile arena.
+    v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() >= 2;
+    v->eng.set_surface_elevation_color(v->surface_elev && v->surface_gpu_elev, z0, v->surface_z1, ramp);
+    if (v->surface_gpu_elev) return 1;
+    if (v->surface_job_running) v->surface_cancel->store(true);
     ++v->surface_gen;
     v->node_cache_gen=v->surface_gen; // elevation ramp does not change source records
     v->surface_ids.clear();
@@ -1211,6 +1298,17 @@ __declspec(dllexport) int64_t lnt_query_aabb(void* h, const double* mn, const do
     if (n < 0) set_err(err, err_cap, e);
     return n;
 }
+// Collects every leaf point a plan-view brush stroke covers (path: n XY pairs; round or
+// square brush of radius r swept along it). Same return values as lnt_query_aabb.
+__declspec(dllexport) int64_t lnt_query_stroke(void* h, const double* path, uint64_t n, double radius,
+                                               int square, uint64_t max_points, char* err, int err_cap) {
+    View* v = static_cast<View*>(h);
+    if (!v || (n && !path)) { set_err(err, err_cap, "bad arguments"); return -1; }
+    std::string e;
+    const int64_t c = section_query_stroke(v->rd, path, n, radius, square != 0, v->hits, e, max_points);
+    if (c < 0) set_err(err, err_cap, e);
+    return c;
+}
 __declspec(dllexport) int lnt_query_fetch(void* h, double* xyz, uint8_t* cls, uint8_t* inten,
                                           uint8_t* rgb, uint32_t* node_idx, uint32_t* local_idx) {
     View* v = static_cast<View*>(h);
@@ -1228,30 +1326,85 @@ __declspec(dllexport) int lnt_set_classes(void* h, const uint32_t* node_idx,
     View* v = static_cast<View*>(h);
     if (!v || (n && (!node_idx || !local_idx || !new_class))) { set_err(err, err_cap, "bad arguments"); return 0; }
     std::vector<uint32_t> touched;
+    std::vector<SectionRecordEdit> records;
     std::string e;
     try {
+        const auto write_start = std::chrono::steady_clock::now();
         if (!section_set_classes(v->rd, v->sec_idx, &v->cache.read_mutex(), node_idx, local_idx,
-                                 new_class, n, touched, e)) {
+                                 new_class, n, touched, e, nullptr, &records)) {
             set_err(err, err_cap, e);
             return 0;
         }
-        const std::vector<LNTNodeEntry>& ns = v->rd.nodes();
-        std::vector<RawPoint> pts;
-        for (uint32_t ni : touched) {
-            if (!v->rd.read_node_points(ns[ni], pts)) continue;
-            v->cache.refresh_node(ns[ni].node_id, pts);
-            // Mark the tile stale: the streamer's normal path re-uploads it from the
-            // (patched) cache. Rewriting in place here would, in a bounded arena, hand
-            // the tile a fresh slot while the draw list still names the old one.
-            if (LntTile* t = v->scene.tile_mut(ns[ni].node_id)) t->uploaded = false;
+        const auto written = std::chrono::steady_clock::now();
+        struct Trace {
+            std::chrono::steady_clock::time_point a, b;
+            size_t n;
+            ~Trace() {
+                if (std::getenv("NAKSHA_TRACE_BRUSH"))
+                    std::fprintf(stderr, "[BRUSH] write %.3f ms, show %.3f ms, %zu records\n",
+                        std::chrono::duration<double, std::milli>(b-a).count(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-b).count(), n);
+            }
+        } trace{write_start, written, records.size()};
+        // Every rewritten record (leaves and LOD copies) recolours its resident surface
+        // vertices and point tiles in place; nothing is re-meshed unless a class's
+        // visibility changed. Already previewed leaf edits are a no-op here.
+        std::vector<surface_lod::ClassEdit> edits;
+        edits.reserve(records.size());
+        for (const auto& r : records) edits.push_back({r.node, r.local, r.x, r.y, r.z, r.cls, r.old_cls});
+        v->show_class_edits(edits, false);
+        if (v->lod) v->lod->end_edit();
+        // The cut-based surface (one visible class, elevation colour) caches meshes with
+        // baked colours: those are rebuilt.
+        v->node_cache = std::make_shared<View::NodeMeshCache>();
+        if (!v->lod_mode_last) {
+            ++v->surface_gen;
+            v->node_cache_gen = v->surface_gen;
+            v->surface_ids.clear();
         }
-        if (v->lod) v->lod->invalidate_source();
-        ++v->surface_gen;
-        v->node_cache=std::make_shared<View::NodeMeshCache>();
-        v->node_cache_gen=v->surface_gen;
-        v->surface_ids.clear();
     } catch (const std::exception& ex) {
         set_err(err, err_cap, ex.what());
+        return 0;
+    }
+    return 1;
+}
+
+// Shows class edits immediately, before they are written (lnt_set_classes writes them
+// later): resident surface tiles are recoloured in place and point tiles re-uploaded.
+// xyz are the records' positions as lnt_query_fetch returned them; old_class is the
+// class currently shown. out_stats (optional, 4 values): tiles patched, vertices,
+// coverage points, tiles rebuilt.
+__declspec(dllexport) int lnt_preview_classes(void* h, const uint32_t* node_idx, const uint32_t* local_idx,
+                                              const double* xyz, const uint8_t* old_class,
+                                              const uint8_t* new_class, uint64_t n, uint32_t* out_stats) {
+    View* v = static_cast<View*>(h);
+    if (!v || (n && (!node_idx || !local_idx || !xyz || !old_class || !new_class))) return 0;
+    try {
+        const auto preview_start = std::chrono::steady_clock::now();
+        const std::vector<LNTNodeEntry>& ns = v->rd.nodes();
+        std::vector<surface_lod::ClassEdit> edits;
+        // A coarse surface uses ancestor copies, whose quantized coordinates differ
+        // from leaf XYZ. Resolve the same verified record identities as write-back,
+        // without opening the file for writing, so coarse tiles also change now.
+        std::vector<uint32_t> touched;
+        std::vector<SectionRecordEdit> records;
+        std::string error;
+        if (!section_set_classes(v->rd, v->sec_idx, &v->cache.read_mutex(), node_idx, local_idx,
+                new_class, n, touched, error, nullptr, &records, true, old_class)) return 0;
+        edits.reserve(records.size());
+        for (const auto& e : records)
+            edits.push_back({e.node, e.local, e.x, e.y, e.z, e.cls, e.old_cls});
+        const auto resolve_end = std::chrono::steady_clock::now();
+        const auto r = v->show_class_edits(edits, true);
+        if (std::getenv("NAKSHA_TRACE_BRUSH")) {
+            const auto end = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[BRUSH] resolve %.3f ms, patch %.3f ms, %zu records\n",
+                std::chrono::duration<double, std::milli>(resolve_end-preview_start).count(),
+                std::chrono::duration<double, std::milli>(end-resolve_end).count(), records.size());
+        }
+        if (out_stats) { out_stats[0] = r.tiles; out_stats[1] = r.vertices; out_stats[2] = r.coverage; out_stats[3] = r.rebuilt; }
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[LNT] class preview failed: %s\n", ex.what());
         return 0;
     }
     return 1;

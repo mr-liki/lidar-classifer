@@ -905,6 +905,11 @@ class SectionController:
 
     def _get_active_vtk(self):
         """Return the VTK widget for the currently active view."""
+        # Native LNT sections own Vulkan canvases, including while their target
+        # has no dock yet. Never route legacy cleanup/render work to sec_vtk.
+        native_view = getattr(self.app, '_lnt_main_view', None)
+        if native_view is not None and getattr(native_view, 'native', None) is not None:
+            return None
         if not hasattr(self, 'active_view'):
             self.active_view = 0
         
@@ -1789,6 +1794,10 @@ class SectionController:
 
 
     def finalize_section(self, P1, P2):
+                from gui.native_sections import manager
+                native_sections = manager(self.app)
+                if native_sections is not None:
+                    return native_sections.finalize(P1, P2, self.half_width)
                 """
                 ✅ NAKSHATECH METHOD:
                 - Width = ONLY what user dragged (half_width)
@@ -4034,6 +4043,11 @@ class SectionController:
     # ✅ ADD THESE TWO NEW METHODS HERE:
 
     def set_cross_view_mode(self, mode):
+        from gui.native_sections import manager
+        native_sections = manager(self.app, create=False)
+        if native_sections is not None:
+            self.app.cross_view_mode = mode
+            return native_sections.change_axis(self.active_view+1, 0 if mode == 'front' else 1)
         """
         Set view mode and trigger immediate refresh if changed.
         ✅ FIXED: Automatically refreshes the cross-section when switching views.

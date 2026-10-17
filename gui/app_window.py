@@ -164,22 +164,9 @@ class MainWheelZoomEventFilter(QObject):
             # Physical middle is always pan, irrespective of which
             # configurable primary pan button is selected.
             return Qt.MiddleButton
-        if pressed_button == Qt.LeftButton:
-            # Shift+Left is reserved for the native 3D rotate/orbit gesture
-            # (works fine when the panning-button setting is "scroll",
-            # since that setting never claims Left at all) -- with "Left
-            # Mouse Button" or "Tap-Tap" panning, every Left press was
-            # claimed for pan unconditionally, including Shift+Left, so
-            # that gesture stopped reaching whatever handles it as soon as
-            # a Left-based panning-button setting was chosen. Let it
-            # through here regardless of the panning-button setting.
-            if modifiers & Qt.ShiftModifier:
-                return None
-            pb = getattr(app, "panning_button", "scroll")
-            if pb in ("left", "tap") or getattr(
-                app, "_left_pan_shortcut_active", False
-            ):
-                return Qt.LeftButton
+        # Main-view 2D navigation deliberately never converts a left press
+        # into pan. This also neutralizes old saved "left"/"tap" preferences
+        # and the historical left-pan shortcut without stealing tool clicks.
         return None
 
     def _finish_tap_session(self, app):
@@ -730,7 +717,25 @@ class StableFooterStatusBar(QStatusBar):
 
         super().addPermanentWidget(self._footer_host, 1)
         self._refresh_message_label()
+        # The groups are placed by hand, so a child whose text grows (e.g.
+        # "Total Points: 0" -> "Total Points: 14,925,100") would stay clipped
+        # at its old width. A changed size hint posts LayoutRequest to its
+        # group; re-place the groups once per event-loop turn when that happens.
+        self._relayout_pending = False
+        for group in (self._left_widget, self._center_widget, self._right_widget):
+            group.installEventFilter(self)
         QTimer.singleShot(0, self._layout_footer_widgets)
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.LayoutRequest and not self._relayout_pending
+                and obj in (self._left_widget, self._center_widget, self._right_widget)):
+            self._relayout_pending = True
+            QTimer.singleShot(0, self._relayout_now)
+        return super().eventFilter(obj, event)
+
+    def _relayout_now(self):
+        self._relayout_pending = False
+        self._layout_footer_widgets()
 
     def addWidget(self, widget, stretch=0):
         if widget is None:
@@ -1460,6 +1465,15 @@ class NakshaApp(QMainWindow):
             print("⚠️ VTK widget not ready - will retry")
             QTimer.singleShot(1000, self._install_vtk_filter)
 
+        # Load and activate saved definitions immediately. Previously the
+        # filter started with only hard-coded entries until the user manually
+        # ran the shortcut reload command after every software launch.
+        try:
+            ShortcutManager.apply_shortcuts_from_settings(self)
+            print("Saved shortcuts active at startup")
+        except Exception as shortcut_startup_error:
+            print(f"Shortcut startup activation failed: {shortcut_startup_error}")
+
         print("🔍 ALL SHORTCUTS:", {k: v['tool'] for k, v in self.shortcuts.items()})
               
         if not hasattr(self, 'brush_radius'):
@@ -1815,7 +1829,7 @@ class NakshaApp(QMainWindow):
         self._last_changed_mask = None
         self._last_changed_indices = None
         self.classification_revision = 0
-        self._max_undo_steps = 30  # Global cap for classification undo/redo
+        self._max_undo_steps = 10  # Global cap for classification undo/redo (max 10 undos/redos)
         # Aliases — point to the SAME list objects (never reassign, always use .clear())
         self.undostack = self.undo_stack
         self.redostack = self.redo_stack
@@ -1872,7 +1886,12 @@ class NakshaApp(QMainWindow):
         if not hasattr(self, "total_points_label"):
             return
 
-        if total_points is None:
+        # A streamed .lnt owns the full cloud: app.data is empty or only the
+        # section bridge's partial subset, so the file's record count wins.
+        lnt_total = getattr(getattr(self, "_lnt_main_view", None), "total_points", None)
+        if lnt_total is not None:
+            total_points = int(lnt_total)
+        elif total_points is None:
             total_points = 0
             data = getattr(self, "data", None)
             xyz = data.get("xyz") if isinstance(data, dict) else None
@@ -1979,6 +1998,11 @@ class NakshaApp(QMainWindow):
 
         from gui.snt_attachment import show_snt_attachment_dialog
         dlg = show_snt_attachment_dialog(self)
+        try:
+            from gui.menu_sidebar_system import _track_snt_dialog_visibility
+            _track_snt_dialog_visibility(self, dlg)
+        except Exception:
+            pass
 
         QTimer.singleShot(
             300,
@@ -2548,6 +2572,32 @@ class NakshaApp(QMainWindow):
 
     def _cancel_cross_section_tool_only(self):
         """Deactivate cross-section drawing tool but keep cross-section windows/views intact."""
+        # Native (.lnt) path first: the armed LntCrossPicker lives on the LNT
+        # view, not in cross_interactor. Detach it and clear its preview so Esc
+        # (from any focus) cannot leave the tool half-armed.
+        try:
+            _v = getattr(self, "_lnt_main_view", None)
+            _p = getattr(_v, "picker", None) if _v is not None else None
+            if _p is not None:
+                try:
+                    if hasattr(_p, "cleanup"):
+                        _p.cleanup()
+                    elif hasattr(_p, "cancel"):
+                        _p.cancel()
+                except Exception:
+                    pass
+                try:
+                    if getattr(_v, "picker", None) is _p:
+                        _v.picker = None
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "cross_interactor", None) is _p:
+                        self.cross_interactor = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if getattr(self, "cross_interactor", None) is not None:
                 try:
@@ -2606,6 +2656,12 @@ class NakshaApp(QMainWindow):
             self.set_cross_cursor_active(False, "cross_section")
         except TypeError:
             self.set_cross_cursor_active(False)
+        except Exception:
+            pass
+
+        try:
+            from gui.native_sections import _set_cross_ribbon_checked as _native_cross_checked
+            _native_cross_checked(self, False)
         except Exception:
             pass
 
@@ -3393,8 +3449,7 @@ class NakshaApp(QMainWindow):
         if not hasattr(self, "_global_settings_dialog") or self._global_settings_dialog is None:
             self._global_settings_dialog = GlobalSettingsDialog(self, self)
 
-        self._global_settings_dialog.refresh_theme()
-        self._global_settings_dialog.refresh_summaries()
+        # showEvent owns refresh; repeating it here reloads every control twice.
         self._global_settings_dialog.show()
         self._global_settings_dialog.raise_()
         self._global_settings_dialog.activateWindow()
@@ -4578,6 +4633,10 @@ class NakshaApp(QMainWindow):
         - Opens next available view (2, 3, 4) if views already exist
         - Shows message if all 4 views are open
         """
+        from gui.native_sections import manager
+        native_sections = manager(self)
+        if native_sections is not None:
+            return native_sections.open_next()
         from PySide6.QtWidgets import QMessageBox
         
         # Restrict to top view only
@@ -4681,6 +4740,11 @@ class NakshaApp(QMainWindow):
         return disabled
 
     def enable_cross_section_mode(self):   #Added by bala
+        from gui.native_sections import manager
+        native_sections = manager(self)
+        if native_sections is not None:
+            return native_sections.select_view()
+        self._deactivate_pending_cut_section_tool('switching to cross-section')
         # Check if we're in top view (for main viewer)
         if getattr(self, "current_view", None) != "top":
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
@@ -4921,6 +4985,10 @@ class NakshaApp(QMainWindow):
         - enable_cross_section_mode() (manual dialog selection)
         - open_next_cross_section_view() (auto-increment shortcut)
         """
+        from gui.native_sections import manager
+        native_sections = manager(self)
+        if native_sections is not None:
+            return native_sections.open(view_index)
         from PySide6.QtWidgets import QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton
         from pyvistaqt import QtInteractor
         from .cross_section.interactor_slice import CrossSectionInteractor
@@ -5541,6 +5609,9 @@ class NakshaApp(QMainWindow):
         Syncs section geometry to matched views and mirrors the source view's
         camera/zoom when sync is active.
         """
+        native_sections = getattr(self, '_native_sections', None)
+        if native_sections is not None:
+            return native_sections.sync_from(view_idx+1, data=True, display=True)
         # view, do not bounce another sync cycle back out from it.
         is_a_source = any(src == view_idx for src in self.view_sync_map.values())
         if not is_a_source and getattr(self, '_sync_count', 0) > 0:
@@ -5564,6 +5635,9 @@ class NakshaApp(QMainWindow):
 
     def _get_synced_view_targets(self, view_idx: int):
         """Return every view currently linked to view_idx."""
+        native_sections = getattr(self, '_native_sections', None)
+        if native_sections is not None:
+            return {slot-1 for slot in native_sections.linked_slots(view_idx+1)}
         targets = set()
         if not hasattr(self, 'view_sync_map') or not self.view_sync_map:
             return targets
@@ -5599,6 +5673,9 @@ class NakshaApp(QMainWindow):
         ✅ BIDIRECTIONAL: Works with bidirectional sync
         ✅ SYNCS: Points, masks, indices, and source camera/zoom
         """
+        native_sections = getattr(self, '_native_sections', None)
+        if native_sections is not None:
+            return native_sections.sync_from(source_idx+1, data=True, display=True)
         import numpy as np
         
         # Re-entrancy guard
@@ -5798,6 +5875,10 @@ class NakshaApp(QMainWindow):
         ✅ REAL-TIME: Immediate synchronization
         ✅ SYNCS: Both camera AND section data
         """
+        from gui.native_sections import manager
+        native_sections = manager(self)
+        if native_sections is not None:
+            return native_sections.set_view_sync(target_view_num, source_view_num)
         target_idx = target_view_num - 1
 
         self._init_camera_sync_state()
@@ -5953,6 +6034,9 @@ class NakshaApp(QMainWindow):
         """
         Sync camera bidirectionally.
         """
+        native_sections = getattr(self, '_native_sections', None)
+        if native_sections is not None:
+            return native_sections.sync_from(source_idx+1)
         self._sync_count = getattr(self, '_sync_count', 0) + 1
         
         try:
@@ -6007,6 +6091,9 @@ class NakshaApp(QMainWindow):
 
     def _sync_camera_immediate(self, source_idx: int):
         """Initial camera sync."""
+        native_sections = getattr(self, '_native_sections', None)
+        if native_sections is not None:
+            return native_sections.sync_from(source_idx+1)
         if getattr(self, '_sync_count', 0) > 0:
             return
         
@@ -6371,6 +6458,10 @@ class NakshaApp(QMainWindow):
         Enable cut section mode.
         Cut section draws on the CROSS-SECTION window, NOT the main view.
         """
+        from gui.native_sections import manager
+        native_sections = manager(self)
+        if native_sections is not None:
+            return native_sections.arm_cut(False)
         # Check if we're in top view (for main viewer)
         if getattr(self, "current_view", None) != "top":
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
@@ -6383,6 +6474,7 @@ class NakshaApp(QMainWindow):
 
         # ✅ Do NOT touch the main interactor - cut section works on cross-section window!
         # Just activate the cut section controller
+        self.deactivate_cross_section_tool()
         self.cut_section_controller.activate()
         self.cut_section_mode_on = True
         self.set_cross_cursor_active(True, "cut_section")
@@ -9585,6 +9677,12 @@ class NakshaApp(QMainWindow):
 
             self.view_palettes[target_view] = normalized_palette
 
+            native_sections = getattr(self, '_native_sections', None)
+            if native_sections is not None and 1 <= target_view <= 9:
+                return native_sections.apply(target_view, normalized_palette,
+                    {0: 'class', 1: 'shaded_class', 2: 'depth', 3: 'intensity',
+                     4: 'rgb', 5: 'elevation', 6: 'surface', 7: 'line'}.get(color_mode, 'class'))
+
             # ============================================================
             # CASE A: MAIN VIEW (View 0) - ULTRA OPTIMIZED
             # ============================================================
@@ -9595,7 +9693,9 @@ class NakshaApp(QMainWindow):
                 native_view = getattr(self, "_lnt_main_view", None)
                 if native_view is not None:
                     native_view._push_applied_palette()
-                    native_view.set_app_display_mode("class" if color_mode == 0 else "shaded_class")
+                    native_view.set_app_display_mode({0: 'class', 1: 'shaded_class',
+                        2: 'depth', 3: 'intensity', 4: 'rgb', 5: 'elevation',
+                        6: 'surface', 7: 'line'}.get(color_mode, 'class'))
                     return
             # ADD AFTER:
                 # ── Keep dialog.view_palettes[0] in sync so DisplayMode preset shortcuts
@@ -10198,6 +10298,13 @@ class NakshaApp(QMainWindow):
                 hasattr(self, "cut_section_controller")
                 and self.cut_section_controller.cut_points is not None
             )
+            # Native (.lnt) section canvases classify on their own (they read
+            # active_classify_tool / from / to on each event); no VTK attach.
+            _native_sections = getattr(self, "_native_sections", None)
+            if _native_sections is not None:
+                has_cross_section = has_cross_section or any(
+                    len(view.indices) for view in _native_sections.views.values())
+                has_cut_section = False
    
             # Tools that ONLY make sense in cross-section views
             section_only_tools = {"above_line", "below_line", "parallel_line"}
@@ -10214,8 +10321,21 @@ class NakshaApp(QMainWindow):
                 self.active_classify_tool = None
                 QMessageBox.warning(self, "Cross Section Required", "Open a Cross Section view to use this tool.")
                 return
-   
-            if self.data is None:
+
+            # Native .lnt main view: its records live in the file, not app.data,
+            # and it classifies through the native plan-view classifier (no VTK).
+            _lnt_view = getattr(self, "_lnt_main_view", None)
+            if getattr(_lnt_view, "native", None) is None:
+                _lnt_view = None
+            if _lnt_view is not None and do_main:
+                from gui.native_main_classify import ensure_classifier
+                if ensure_classifier(_lnt_view) is None and not has_cross_section:
+                    self.active_classify_tool = None
+                    QMessageBox.warning(self, "Top View Required",
+                                        "Classification in the main view needs the 2D plan view.")
+                    return
+
+            if self.data is None and _lnt_view is None:
                 QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
                 return
    
@@ -10262,6 +10382,15 @@ class NakshaApp(QMainWindow):
             
                 print("✅ ClassPicker is now visible and active")
    
+            if _lnt_view is not None:
+                # Native canvases read active_classify_tool / from / to on every
+                # event: nothing to attach, no VTK interactor or brush index.
+                self.active_classify_target = "main"
+                _widget = getattr(getattr(_lnt_view, "owner", None), "vulkan_widget", None)
+                if _widget is not None and do_main:
+                    _widget.setFocus()
+                return
+
             # ✅ CRITICAL: Keep focus on main view
             if hasattr(self, 'vtk_widget'):
                 self.vtk_widget.setFocus()
@@ -10271,7 +10400,7 @@ class NakshaApp(QMainWindow):
                     self.cut_section_controller.activate_classification_mode()
                     # don't return — fall through to also attach sections + main
  
-                if do_sections:
+                if do_sections and _native_sections is None:
                     self.attach_classification_to_all_section_views()
  
                 if do_main:
@@ -11282,6 +11411,9 @@ class NakshaApp(QMainWindow):
 
     def undo_classification(self):
         """Undo classification using sparse canonical indices (Phase 1)."""
+        from gui.native_shortcuts import native_classification_history
+        if native_classification_history(self):
+            return True
         import numpy as np
         from gui.classification_delta import (
             make_delta,
@@ -11372,7 +11504,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 30))
+            max_steps = int(getattr(self, '_max_undo_steps', 10))
         while len(self.redo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.redo_stack.pop(0))
@@ -11530,6 +11662,9 @@ class NakshaApp(QMainWindow):
 
     def redo_classification(self):
         """Redo classification using sparse canonical indices (Phase 1)."""
+        from gui.native_shortcuts import native_classification_history
+        if native_classification_history(self, redo=True):
+            return True
         import numpy as np
         from gui.classification_delta import (
             make_delta,
@@ -11603,7 +11738,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 30))
+            max_steps = int(getattr(self, '_max_undo_steps', 10))
         while len(self.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.undo_stack.pop(0))
@@ -14893,6 +15028,16 @@ class NakshaApp(QMainWindow):
                     except Exception:
                         pass
 
+                # An LNT main view is owned by the native Vulkan renderer.
+                # Route its draw gestures to the native overlay before the
+                # legacy digitizer installs any VTK observers or actors.
+                from gui.native_draw import activate_native_draw
+                if activate_native_draw(self, tool_name):
+                    self.digitizer.active_tool = None
+                    self.digitizer.enabled = False
+                    self.statusBar().showMessage(f'Native Vulkan Draw: {tool_name}', 3000)
+                    return
+
                 if hasattr(self, "digitizer"):
                     self.digitizer.enabled = True
                     print("✅ Digitizer enabled for drawing")
@@ -14916,9 +15061,15 @@ class NakshaApp(QMainWindow):
                 self.digitizer.set_tool(tool_name)
 
             draw_ribbon.draw_tool_selected.connect(on_draw_tool_selected)
-            draw_ribbon.clear_requested.connect(
-                lambda: self.digitizer.clear_drawings(record_undo=True, preserve_committed=True)
-            )
+            def clear_drawings():
+                from gui.native_draw import get_native_draw
+                native = get_native_draw(self)
+                if native is not None:
+                    native.clear()
+                    self.statusBar().showMessage('Native drawings cleared', 2500)
+                    return
+                self.digitizer.clear_drawings(record_undo=True, preserve_committed=True)
+            draw_ribbon.clear_requested.connect(clear_drawings)
             if hasattr(draw_ribbon, "curve_tool_selected"):
                 draw_ribbon.curve_tool_selected.connect(self.on_curve_button_clicked)
 
@@ -15059,6 +15210,24 @@ class NakshaApp(QMainWindow):
 
     def handle_view_change(self, mode):
         """Handle view mode changes from visual panel or sidebar"""
+
+        # An active LNT main view owns its camera entirely in native Vulkan.
+        # Route every View-ribbon preset there and stop before any VTK camera,
+        # actor or interactor code below is touched.
+        native_view = getattr(self, '_lnt_main_view', None)
+        if native_view is not None and getattr(native_view, 'native', None) is not None:
+            mode = str(mode or '').lower()
+            if mode in ('top', 'front', 'side', '3d'):
+                if native_view.native.set_view(mode):
+                    native_view.mode_2d = mode == 'top'
+                    self._main_view_3d_user_enabled = mode in ('front', 'side', '3d')
+                    self.is_3d_mode = mode in ('front', 'side', '3d')
+                    self.current_view = mode
+                    self.statusBar().showMessage(f'{mode.upper()} View (Native Vulkan)', 3000)
+                    return True
+                self.statusBar().showMessage(
+                    'Native view presets require the updated LNT renderer', 4000)
+                return False
 
         # This signal comes from a direct ribbon/sidebar action. Grant 3D only
         # for that action and revoke it for every orthographic view.
@@ -16637,6 +16806,22 @@ class NakshaApp(QMainWindow):
         Activate measurement tool with proper coordination.
         ✅ FIXED: Proper cleanup and priority handling
         """
+        # Native LNT/Vulkan viewport first: the overlay tool
+        # (gui/native_measure.py) paints the line/path over the Vulkan child
+        # window, where the VTK MeasurementTool's observers never see a click.
+        # Falls through only when no native viewport owns the view - then the
+        # VTK tool is the right one, and any native gesture stands down.
+        from gui.native_shortcuts import (cancel_native_measurements,
+                                          execute_native_shortcut)
+        if execute_native_shortcut(self, tool_name):
+            _mt = getattr(self, "measurement_tool", None)
+            if _mt is not None and getattr(_mt, "active", False):
+                try:
+                    _mt.deactivate()
+                except Exception as _e:
+                    print(f"⚠️ Legacy measurement deactivate failed: {_e}")
+            return
+        cancel_native_measurements(self)
         self._deactivate_pending_cut_section_tool("switching to measurement")
 
         # ✅ MUTUAL EXCLUSION: deactivate any active classification tool so its
@@ -16703,6 +16888,9 @@ class NakshaApp(QMainWindow):
 
     def clear_all_measurements(self):
         """Clear all measurement lines and labels — main view AND cross-section."""
+        # Native LNT/Vulkan overlays keep their own list (no tool switch).
+        from gui.native_shortcuts import clear_native_measurements
+        clear_native_measurements(self)
         if hasattr(self, 'measurement_tool'):
             self.measurement_tool.clear_all_measurements()
         cs_measure = getattr(self, 'cross_section_measurement_tool', None)
@@ -19307,6 +19495,14 @@ class NakshaApp(QMainWindow):
                 print(f"🔮 Curve tool '{tool_name}' activated")
  
     def on_curve_button_clicked(self):
+        from gui.native_draw import activate_native_draw
+        if activate_native_draw(self, 'curve'):
+            self._draw_curve_context_active = False
+            if hasattr(self, 'digitizer'):
+                self.digitizer.active_tool = None
+                self.digitizer.enabled = False
+            self.statusBar().showMessage('Native Vulkan Curve: click points; right-click to finish', 4000)
+            return
         """Activate the curve drawing tool"""
         # Curve is activated through its own dedicated path rather than
         # digitizer.set_tool() (which every other draw tool - SmartLine,

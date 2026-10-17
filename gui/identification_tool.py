@@ -1,9 +1,11 @@
+"""
+Identification Tool for NakshaAI (native Vulkan; VTK-free).
 
+Gestures arrive through the native input filter (see gui/native_identify.py).
+This module keeps the shared, renderer-agnostic logic: index-based identify,
+ribbon/statistics updates, class metadata, nearest-point search.
 """
-Identification Tool for NakshaAI
-Allows clicking on points to identify their class and properties
-✅ FIXED: Highlights identified class in Point Statistics widget
-"""
+from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 import numpy as np
@@ -16,81 +18,69 @@ except Exception:
 
 
 class IdentificationTool(QObject):
-    """Tool for identifying point properties on click"""
-    
+    """Tool for identifying point properties on click (native Vulkan)."""
+
     point_identified = Signal(int, str, tuple)  # class_code, class_name, (x, y, z)
-    
+
     def __init__(self, app):
         super().__init__()
         self.app = app
         self.active = False
+        # Compat: the native path never creates pickers/observers.
         self.picker = None
         self._click_observer = None
         self._section_observers = {}
-        print("✅ IdentificationTool initialized")
-    
+        print("IdentificationTool initialized (native)")
+
     def activate(self):
-        """Activate identification mode for main view and all open section views"""
+        """Activate identification mode (native Vulkan; no VTK observers)."""
         if self.active:
-            print("⚠️ Identification tool already active")
+            print("Identification tool already active")
             return
-        
         self.active = True
-        print("🔍 Identification tool ACTIVATED")
-        
-        # Activate for main view
-        if hasattr(self.app, 'vtk_widget'):
-            try:
-                vtk_interactor = self.app.vtk_widget.interactor
-                
-                if self.picker is None:
-                    import vtk
-                    self.picker = vtk.vtkPointPicker()
-                    self.picker.SetTolerance(0.005)
-                
-                # ✅ FIX: Use LOWER priority so Cross Section interactor runs first
-                # Cross Section uses default priority (0.0), we use -1.0 to run AFTER it
-                self._click_observer = vtk_interactor.AddObserver(
-                    "LeftButtonPressEvent",
-                    self._on_left_click,
-                    -1.0  # Lower priority = runs after other tools
-                )
-                
-                print(f"   ✅ Main view observer attached with LOW priority (ID: {self._click_observer})")
-                
-            except Exception as e:
-                print(f"   ⚠️ Failed to attach main observer: {e}")
-        
-        # Activate for all open cross-section views
-        if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
-            for view_index, vtk_widget in self.app.section_vtks.items():
-                self.activate_for_section(vtk_widget, view_index)
+        print("Identification tool ACTIVATED (native)")
 
     def deactivate(self):
-        """Deactivate identification mode for all views"""
+        """Deactivate identification mode."""
         if not self.active:
             return
-        
         self.active = False
-        print("🔍 Identification tool DEACTIVATED")
-        
-        # Deactivate main view
-        if self._click_observer is not None and hasattr(self.app, 'vtk_widget'):
-            try:
-                vtk_interactor = self.app.vtk_widget.interactor
-                vtk_interactor.RemoveObserver(self._click_observer)
-                print(f"   ✅ Main view observer removed")
-            except Exception as e:
-                print(f"   ⚠️ Failed to remove main observer: {e}")
-            
-            self._click_observer = None
-        
-        # Deactivate all section views
+        print("Identification tool DEACTIVATED")
         self.deactivate_all_sections()
-        
-        # ✅ NEW: Clear highlight when deactivating
         self.clear_highlight()
-    
+
+    def _on_left_click(self, obj, event):
+        """Retired VTK entry point. Native clicks arrive via NativeIdentify."""
+        return None
+
+    def activate_for_section(self, section_widget, view_index):
+        """Retired VTK entry point (native canvases own their gestures)."""
+        return None
+
+    def deactivate_for_section(self, view_index):
+        """Retired VTK entry point."""
+        return None
+
+    def deactivate_all_sections(self):
+        """Retired VTK entry point."""
+        try:
+            self._section_observers = {}
+        except Exception:
+            pass
+        return None
+
+    def _on_section_click(self, obj, event, section_widget, view_index):
+        """Retired VTK entry point."""
+        return None
+
+    def _get_section_xyz(self, view_index):
+        """Retired VTK helper (native reads the section store instead)."""
+        return None
+
+    def _get_original_index(self, view_index, section_local_idx):
+        """Retired VTK helper."""
+        return None
+
     def _cut_section_is_taking(self):
         """
         Return True if a cut section is currently being placed/taken (consuming
@@ -109,97 +99,6 @@ class IdentificationTool(QObject):
             return True
         return False
 
-    def _on_left_click(self, obj, event):
-        """
-        Handle left click to identify point.
-
-        ✅ FIX: Check if Cross Section tool is active and skip if it is
-        """
-        if not self.active:
-            return
-        
-        # ✅ CRITICAL FIX: Don't interfere with Cross Section tool
-        if hasattr(self.app, 'cross_interactor') and self.app.cross_interactor:
-            # Check if Cross Section is currently active (drawing rectangle)
-            if hasattr(self.app, 'cross_action') and self.app.cross_action:
-                if self.app.cross_action.isChecked():
-                    print("🚫 Cross Section active - skipping identification")
-                    return
-
-        # ✅ CRITICAL FIX: Don't interfere while a Cut Section is being taken
-        if self._cut_section_is_taking():
-            print("🚫 Cut Section being taken - skipping identification")
-            return
-        
-        try:
-            # Get click position
-            vtk_interactor = self.app.vtk_widget.interactor
-            click_pos = vtk_interactor.GetEventPosition()
-            
-            print(f"🔍 Click at screen position: {click_pos}")
-            
-            # Get renderer
-            renderer = self.app.vtk_widget.renderer
-            
-            # Use cell picker instead of point picker
-            import vtk
-            picker = vtk.vtkCellPicker()
-            picker.SetTolerance(0.01)  # Increased tolerance for better picking
-            
-            # Pick at the click location
-            success = picker.Pick(click_pos[0], click_pos[1], 0, renderer)
-            
-            if success:
-                # Get the picked 3D position
-                picked_pos = picker.GetPickPosition()
-                
-                print(f"   ✅ Picked 3D position: {picked_pos}")
-                
-                # Find the closest point in the actual point cloud data
-                if hasattr(self.app, 'data') and self.app.data is not None:
-                    xyz = self.app.data.get('xyz')
-                    classification = self.app.data.get('classification')
-                    
-                    if xyz is not None and classification is not None:
-                        # Find closest point to picked position
-                        picked_array = np.asarray(picked_pos, dtype=float)
-                        closest_idx, closest_dist = self._nearest_global_index(picked_array, xyz, view_index=0)
-                        if closest_idx is None or closest_dist is None:
-                            print("   ⚠️ Failed to resolve nearest point")
-                            return
-                        
-                        print(f"   📍 Closest point index: {closest_idx} (distance: {closest_dist:.3f})")
-                        
-                        # Only accept if reasonably close (within 1 unit)
-                        if closest_dist < 1.0:
-                            class_code = int(classification[closest_idx])
-                            class_name = self.get_class_name(class_code)
-                            actual_pos = tuple(xyz[closest_idx])
-                            
-                            print(f"   🏷️ Class: {class_code} ({class_name})")
-                            
-                            # ✅ NEW: Highlight in Point Statistics widget
-                            self.highlight_class(class_code)
-                            
-                            # Update ribbon display
-                            self._update_ribbon_info(class_code, class_name, actual_pos, point_index=closest_idx)
-
-                            # Emit signal
-                            self.point_identified.emit(class_code, class_name, actual_pos)
-                        else:
-                            print(f"   ⚠️ Closest point too far away ({closest_dist:.3f} units)")
-                    else:
-                        print("   ⚠️ No xyz or classification data")
-                else:
-                    print("   ⚠️ No point cloud data loaded")
-            else:
-                print("   ⚠️ Pick failed - no geometry at click location")
-                    
-        except Exception as e:
-            print(f"   ❌ Error in click handler: {e}")
-            import traceback
-            traceback.print_exc()
-    
     def identify_point_index(self, point_index):
         """
         Identify an already-known global point index using the same backend as
@@ -373,7 +272,7 @@ class IdentificationTool(QObject):
 
         except Exception as e:
             print(f"   ⚠️ Failed to update ribbon: {e}")
-    
+
     def highlight_class(self, class_code):
         """
         ✅ NEW: Highlight a class in the Point Statistics widget.
@@ -414,7 +313,7 @@ class IdentificationTool(QObject):
             print(f"   ⚠️ Failed to highlight class: {e}")
             import traceback
             traceback.print_exc()
-    
+
     def _apply_highlight_style(self, widget, class_code):
         """Apply a highlight animation/style to a widget."""
         try:
@@ -451,7 +350,7 @@ class IdentificationTool(QObject):
             
         except Exception as e:
             print(f"   ⚠️ Failed to apply highlight animation: {e}")
-    
+
     def clear_highlight(self):
         """Clear all highlights from the Point Statistics widget."""
         if not hasattr(self.app, 'point_count_widget') or not self.app.point_count_widget:
@@ -472,7 +371,6 @@ class IdentificationTool(QObject):
             lbl.setTextFormat(Qt.PlainText)
             lbl.setStyleSheet("")
 
-    
     def get_class_color(self, class_code):
         """
         Get the RGB color for a classification code from the app's class palette.
@@ -512,7 +410,7 @@ class IdentificationTool(QObject):
         
         # Fallback to default gray
         return (160, 160, 160)
-    
+
     def get_class_name(self, class_code):
         """
         Get the name for a classification code from the app's class palette.
@@ -543,265 +441,6 @@ class IdentificationTool(QObject):
                         return view_palette[class_code].get('description', f"Class {class_code}")
         
         return f"Class {class_code}"
-    
-    def activate_for_section(self, section_vtk_widget, view_index):
-        """
-        Activate identification for a specific cross-section view.
-        
-        Args:
-            section_vtk_widget: The QtInteractor widget for the section view
-            view_index: Index of the section view (0-3)
-        """
-        if not hasattr(self, '_section_observers'):
-            self._section_observers = {}
-        
-        # Don't re-attach if already active for this view
-        if view_index in self._section_observers:
-            print(f"⚠️ Identification already active for section view {view_index + 1}")
-            return
-        
-        print(f"🔍 Activating identification for Cross Section View {view_index + 1}")
-        
-        try:
-            vtk_interactor = section_vtk_widget.interactor
-            
-            # Add observer for left click (lower priority for section views too)
-            observer_id = vtk_interactor.AddObserver(
-                "LeftButtonPressEvent",
-                lambda obj, event: self._on_section_click(obj, event, section_vtk_widget, view_index),
-                -1.0  # Lower priority
-            )
-            
-            self._section_observers[view_index] = {
-                'observer_id': observer_id,
-                'vtk_widget': section_vtk_widget
-            }
-            
-            print(f"   ✅ Section click observer attached (ID: {observer_id})")
-            
-        except Exception as e:
-            print(f"   ⚠️ Failed to attach section observer: {e}")
-
-    def deactivate_for_section(self, view_index):
-        """Deactivate identification for a specific cross-section view."""
-        if not hasattr(self, '_section_observers'):
-            return
-        
-        if view_index not in self._section_observers:
-            return
-        
-        try:
-            info = self._section_observers[view_index]
-            vtk_interactor = info['vtk_widget'].interactor
-            vtk_interactor.RemoveObserver(info['observer_id'])
-            
-            del self._section_observers[view_index]
-            print(f"   ✅ Section observer removed for view {view_index + 1}")
-            
-        except Exception as e:
-            print(f"   ⚠️ Failed to remove section observer: {e}")
-
-    def deactivate_all_sections(self):
-        """Deactivate identification for all cross-section views."""
-        if not hasattr(self, '_section_observers'):
-            return
-        
-        for view_index in list(self._section_observers.keys()):
-            self.deactivate_for_section(view_index)
-
-    def _on_section_click(self, obj, event, section_vtk_widget, view_index):
-        """Handle left click in cross-section view to identify point"""
-        if not self.active:
-            return
-
-        # ✅ CRITICAL FIX: Don't interfere while a Cut Section is being taken.
-        # The cut placement observer is attached to the very same cross-section
-        # view, so both handlers otherwise run on every click and the point
-        # target "glitches" / fights with the cut tool during placement.
-        if self._cut_section_is_taking():
-            print(f"🚫 Cut Section being taken (view {view_index + 1}) - skipping identification")
-            return
-
-        # ✅ CRITICAL FIX: Don't interfere with the active Cross Section tool
-        # (e.g. section-locate clicks) in the section view either.
-        if hasattr(self.app, 'cross_interactor') and self.app.cross_interactor:
-            if hasattr(self.app, 'cross_action') and self.app.cross_action:
-                if self.app.cross_action.isChecked():
-                    print(f"🚫 Cross Section active (view {view_index + 1}) - skipping identification")
-                    return
-
-        try:
-
-            # Get click position
-            vtk_interactor = section_vtk_widget.interactor
-            click_pos = vtk_interactor.GetEventPosition()
-            
-            print(f"🔍 Section View {view_index + 1} - Click at: {click_pos}")
-            
-            # Get renderer
-            renderer = section_vtk_widget.renderer
-            
-            # Use cell picker
-            import vtk
-            picker = vtk.vtkCellPicker()
-            picker.SetTolerance(0.01)
-            
-            # Pick at the click location
-            success = picker.Pick(click_pos[0], click_pos[1], 0, renderer)
-            
-            if success:
-                # Get the picked 3D position
-                picked_pos = picker.GetPickPosition()
-                
-                print(f"   ✅ Picked 3D position: {picked_pos}")
-                
-                # Get section data for this view
-                section_xyz = self._get_section_xyz(view_index)
-                
-                if section_xyz is not None and len(section_xyz) > 0:
-                    # Find closest point in section data
-                    picked_array = np.array(picked_pos)
-                    distances = np.linalg.norm(section_xyz - picked_array, axis=1)
-                    
-                    # Sort indices of distances in ascending order
-                    sorted_indices = np.argsort(distances)
-                    
-                    closest_idx = None
-                    closest_dist = None
-                    original_idx = None
-                    class_code = None
-                    
-                    # Look for the first closest point that is in a visible class
-                    for local_idx in sorted_indices:
-                        dist = distances[local_idx]
-                        if dist >= 2.0:  # Larger tolerance for section views
-                            break  # Since sorted, all subsequent distances are >= 2.0
-                        
-                        # Resolve original index
-                        # Prefer explicit section index mapping
-                        sec_indices = getattr(self.app, f"section_{view_index}_indices", None)
-                        orig_idx = None
-                        if sec_indices is not None:
-                            try:
-                                if local_idx < len(sec_indices):
-                                    orig_idx = int(sec_indices[local_idx])
-                            except Exception:
-                                orig_idx = None
-
-                        # Fallback to legacy core/buffer mask mapping
-                        if orig_idx is None:
-                            orig_idx = self._get_original_index(view_index, local_idx)
-                            
-                        if orig_idx is not None:
-                            classification = self.app.data.get('classification')
-                            if classification is not None and 0 <= orig_idx < len(classification):
-                                c_code = int(classification[orig_idx])
-                                # Check if this class is visible in this section view (slot_idx = view_index + 1)
-                                if self._is_class_visible(c_code, view_index=view_index + 1):
-                                    closest_idx = local_idx
-                                    closest_dist = dist
-                                    original_idx = orig_idx
-                                    class_code = c_code
-                                    break
-                    
-                    if closest_idx is not None and original_idx is not None and class_code is not None:
-                        class_name = self.get_class_name(class_code)
-                        actual_pos = tuple(section_xyz[closest_idx])
-                        
-                        print(f"   🏷️ Class: {class_code} ({class_name})")
-                        
-                        # ✅ Highlight in Point Statistics widget
-                        self.highlight_class(class_code)
-
-                        # Update ribbon display
-                        self._update_ribbon_info(class_code, class_name, actual_pos, point_index=original_idx)
-
-                        # Emit signal
-                        self.point_identified.emit(class_code, class_name, actual_pos)
-                    else:
-                        print("   ⚠️ No visible point identified in range or failed to map index")
-                else:
-                    print("   ⚠️ No section data available")
-            else:
-                print("   ⚠️ Pick failed - no geometry at click location")
-                    
-        except Exception as e:
-            print(f"   ❌ Error in section click handler: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _get_section_xyz(self, view_index):
-        """Get XYZ coordinates for a section view."""
-        try:
-            # Preferred source: transformed section points aligned with section_indices.
-            transformed = getattr(self.app, f"section_{view_index}_points_transformed", None)
-            if transformed is not None and len(transformed) > 0:
-                return transformed
-
-            # Try to get from stored section data
-            core_pts = getattr(self.app, f'section_{view_index}_core_points', None)
-            buf_pts = getattr(self.app, f'section_{view_index}_buffer_points', None)
-            
-            if core_pts is not None:
-                if buf_pts is not None:
-                    return np.vstack([core_pts, buf_pts])
-                return core_pts
-            
-            return None
-            
-        except Exception as e:
-            print(f"   ⚠️ Error getting section XYZ: {e}")
-            return None
-
-    def _get_original_index(self, view_index, section_local_idx):
-        """
-        Convert local section index to original dataset index.
-        
-        Args:
-            view_index: Section view index (0-3)
-            section_local_idx: Index within the section point array
-        
-        Returns:
-            Original index in app.data, or None if not found
-        """
-        try:
-            # Phase 2 sections preserve an explicit canonical-ID vector in the
-            # exact same order as the rendered/transformed point array. Use it
-            # first; rebuilding IDs from boolean masks sorts by LAS index and
-            # can map a clicked point to the wrong source point.
-            ordered = getattr(self.app, f'_section_{view_index}_global_indices', None)
-            if ordered is None:
-                ordered = getattr(self.app, f'section_{view_index}_indices', None)
-            if ordered is not None:
-                ordered = np.asarray(ordered, dtype=np.int64).reshape(-1)
-                if 0 <= int(section_local_idx) < len(ordered):
-                    return int(ordered[int(section_local_idx)])
-
-            # Legacy compatibility fallback for sections created by older code.
-            core_mask = getattr(self.app, f'section_{view_index}_core_mask', None)
-            buffer_mask = getattr(self.app, f'section_{view_index}_buffer_mask', None)
-            if core_mask is None:
-                return None
-
-            core_pts = getattr(self.app, f'section_{view_index}_core_points', None)
-            num_core = len(core_pts) if core_pts is not None else 0
-
-            if section_local_idx < num_core:
-                core_indices = np.where(core_mask)[0]
-                if section_local_idx < len(core_indices):
-                    return core_indices[section_local_idx]
-            elif buffer_mask is not None:
-                buffer_local_idx = section_local_idx - num_core
-                buffer_only = buffer_mask & ~core_mask
-                buffer_indices = np.where(buffer_only)[0]
-                if buffer_local_idx < len(buffer_indices):
-                    return buffer_indices[buffer_local_idx]
-
-            return None
-            
-        except Exception as e:
-            print(f"   ⚠️ Error mapping section index: {e}")
-            return None
 
     def _is_class_visible(self, class_code, view_index=0):
         """Check if a classification code is visible in the given view/slot."""
@@ -880,7 +519,7 @@ class IdentificationTool(QObject):
         except Exception as e:
             print(f"   ⚠️ Numpy nearest query failed: {e}")
             return None, None
-        
+
     def get_class_lvl(self, class_code):
         """
         Get the Level (Lvl) for a classification code from Display Mode table.

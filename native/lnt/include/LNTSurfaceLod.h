@@ -39,6 +39,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -212,6 +213,17 @@ private:
 };
 
 // ---------------------------------------------------------------------------------
+// A class edit of one stored record (a leaf record or one of its LOD copies): the chunk
+// and index it lives at, its exact decoded position (bit-for-bit what the point reader
+// and the tile vertices hold), and the class before / after.
+// ---------------------------------------------------------------------------------
+struct ClassEdit {
+    uint32_t node = 0, local = 0;
+    double x = 0.0, y = 0.0, z = 0.0;
+    uint8_t cls = 0, old_cls = 0;
+};
+
+// ---------------------------------------------------------------------------------
 // Decoded node records, shared by the build workers (LRU by bytes).
 // ---------------------------------------------------------------------------------
 class NodePoints {
@@ -248,6 +260,9 @@ public:
         for (const RawPoint& p : raw) v->push_back({p.x, p.y, p.z, p.classification, p.r, p.g, p.b, p.intensity});
         std::lock_guard<std::mutex> lk(mu_);
         if (generation != gen_) return nullptr;
+        auto ov = overrides_.find(idx);                   // edits not yet in the file
+        if (ov != overrides_.end())
+            for (const auto& e : ov->second) if (e.first < v->size()) (*v)[e.first].cls = e.second;
         const uint64_t b = v->size() * sizeof(SurfacePoint);
         while (bytes_ + b > budget_ && !map_.empty()) {
             auto victim = map_.begin();
@@ -260,10 +275,32 @@ public:
         return v;
     }
     uint64_t bytes() const { std::lock_guard<std::mutex> lk(mu_); return bytes_; }
+    // Class edits: cached records are patched copy-on-write (a worker holding the old
+    // vector keeps it) and the cache moves to `generation`. With `pending` the edits
+    // are also applied to records read later, until clear_overrides() (the file holds
+    // them by then).
+    void apply_edits(uint64_t generation, const std::vector<ClassEdit>& edits, bool pending) {
+        std::lock_guard<std::mutex> lk(mu_);
+        gen_ = generation;
+        std::unordered_map<uint32_t, std::vector<const ClassEdit*>> by_node;
+        for (const auto& e : edits) by_node[e.node].push_back(&e);
+        for (const auto& kv : by_node) {
+            if (pending) for (const ClassEdit* e : kv.second) overrides_[kv.first][e->local] = e->cls;
+            auto it = map_.find(kv.first);
+            if (it == map_.end()) continue;
+            auto copy = it->second.ptr.use_count() == 1
+                ? std::const_pointer_cast<std::vector<SurfacePoint>>(it->second.ptr)
+                : std::make_shared<std::vector<SurfacePoint>>(*it->second.ptr);
+            for (const ClassEdit* e : kv.second) if (e->local < copy->size()) (*copy)[e->local].cls = e->cls;
+            it->second.ptr = copy;
+        }
+    }
+    void clear_overrides() { std::lock_guard<std::mutex> lk(mu_); overrides_.clear(); }
 private:
     struct Entry { Ptr ptr; uint64_t tick = 0, bytes = 0; };
     mutable std::mutex mu_;
     std::unordered_map<uint32_t, Entry> map_;
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint8_t>> overrides_;
     uint64_t budget_, bytes_ = 0, tick_ = 0, gen_ = 0;
 };
 
@@ -822,6 +859,184 @@ public:
         drop_tiles(true);
     }
 
+    // Class edits of stored records, shown without re-meshing: every resident tile vertex
+    // or coverage point made from an edited record is recoloured in place (its CPU tile
+    // copy-on-write, its GPU colours by a sparse upload), because a class change moves no
+    // point and the compact mesh depends on classes only through their visibility. An
+    // edit that hides or reveals a point (old/new class visibility differs) changes the
+    // triangles: only the tiles around it are rebuilt. Work in flight is discarded and
+    // the archive is re-keyed, as for any source change. `pending` = the edits are not in
+    // the file yet: records read later get them too, until end_edit().
+    struct PatchResult { uint32_t tiles = 0, vertices = 0, coverage = 0, rebuilt = 0; };
+    PatchResult patch_classes(const std::vector<ClassEdit>& edits, const uint8_t* class_visible,
+                              VulkanEngine* eng, bool pending) {
+        PatchResult r;
+        if (edits.empty()) return r;
+        edits_pending_ = pending;
+        uint64_t gen;
+        {
+            std::lock_guard<std::mutex> lk(q_mu_);
+            gen = ++source_gen_;
+            queue_.clear();
+        }
+        points_->apply_edits(gen, edits, pending);
+        {
+            std::lock_guard<std::mutex> lk(a_mu_);
+            arch_ = surface_archive::State{};
+            slot_entries_.clear();
+            source_known_ = false;
+            trusted_ = false;
+        }
+        struct PosKey {
+            uint64_t a, b, c;
+            bool operator==(const PosKey& o) const { return a == o.a && b == o.b && c == o.c; }
+        };
+        struct PosHash {
+            size_t operator()(const PosKey& k) const {
+                uint64_t h = k.a * 0x9E3779B97F4A7C15ull;
+                h ^= k.b + 0x632BE59BD9B4E019ull + (h << 6) + (h >> 2);
+                h ^= k.c + 0x85EBCA77C2B2AE63ull + (h << 6) + (h >> 2);
+                return size_t(h);
+            }
+        };
+        auto key_of = [](double x, double y, double z) {
+            PosKey k;
+            std::memcpy(&k.a, &x, 8); std::memcpy(&k.b, &y, 8); std::memcpy(&k.c, &z, 8);
+            return k;
+        };
+        // Keep only edits that can affect a currently resident CPU surface.
+        // A wide selection can contain millions of leaf/LOD records while the
+        // rendered surface represents only a few hundred thousand vertices.
+        // Hashing every edit made refresh cost scale with source-point count.
+        std::unordered_set<PosKey, PosHash> resident_positions;
+        size_t resident_count = 0;
+        for (const auto& c : cpu_)
+            resident_count += c.second.tile->vertex_class.size() + c.second.tile->coverage_class.size();
+        const bool filter_resident = resident_count && edits.size() > resident_count * 2;
+        if (filter_resident) {
+            resident_positions.reserve(resident_count * 2);
+            for (const auto& c : cpu_) {
+                const TileData& t = *c.second.tile;
+                for (size_t i = 0; i < t.vertex_class.size(); ++i)
+                    resident_positions.insert(key_of(t.positions[i * 3], t.positions[i * 3 + 1], t.positions[i * 3 + 2]));
+                for (size_t i = 0; i < t.coverage_class.size(); ++i)
+                    resident_positions.insert(key_of(t.coverage_positions[i * 3], t.coverage_positions[i * 3 + 1],
+                                                     t.coverage_positions[i * 3 + 2]));
+            }
+        }
+        std::unordered_map<PosKey, uint8_t, PosHash> recolour;
+        std::vector<std::pair<double, double>> reshape;           // visibility changes
+        double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+        bool recolour_requested = false;
+        recolour.reserve((filter_resident ? std::min(edits.size(), resident_count) : edits.size()) * 2);
+        for (const auto& e : edits) {
+            const bool was = class_visible[e.old_cls] != 0, now = class_visible[e.cls] != 0;
+            if (was != now) { reshape.push_back({e.x, e.y}); continue; }
+            if (!now) continue;                                   // hidden before and after
+            recolour_requested = true;
+            lo[0] = std::min(lo[0], e.x); lo[1] = std::min(lo[1], e.y);
+            hi[0] = std::max(hi[0], e.x); hi[1] = std::max(hi[1], e.y);
+            const PosKey pos = key_of(e.x, e.y, e.z);
+            if (!filter_resident || resident_positions.find(pos) != resident_positions.end()) recolour[pos] = e.cls;
+        }
+        // A tile's vertices lie in its cell or (halo / fringe) its eight neighbours.
+        auto reach = [&](uint64_t k, double mn[2], double mx[2]) {
+            qt_.cell_xy(k, mn, mx);
+            for (int a = 0; a < 2; ++a) { const double w = mx[a] - mn[a]; mn[a] -= w; mx[a] += w; }
+        };
+        std::unordered_set<uint64_t> keys;
+        for (const auto& g : gpu_) keys.insert(g.first);
+        for (const auto& c : cpu_) keys.insert(c.first);
+        std::vector<uint64_t> rebuild;
+        std::vector<uint32_t> vi, ci;
+        std::vector<uint8_t> vc, cc;
+        for (uint64_t k : keys) {
+            double mn[2], mx[2];
+            reach(k, mn, mx);
+            bool redo = false;
+            for (const auto& p : reshape)
+                if (p.first >= mn[0] && p.first <= mx[0] && p.second >= mn[1] && p.second <= mx[1]) { redo = true; break; }
+            if (!redo && (!recolour_requested || hi[0] < mn[0] || lo[0] > mx[0] || hi[1] < mn[1] || lo[1] > mx[1]))
+                continue;
+            auto cit = cpu_.find(k);
+            if (!redo && cit == cpu_.end()) redo = true;          // no copy to find the vertices in
+            if (redo) { rebuild.push_back(k); continue; }
+            const TileData& t = *cit->second.tile;
+            vi.clear(); vc.clear(); ci.clear(); cc.clear();
+            auto scan = [&](const std::vector<double>& pos, const std::vector<uint8_t>& cls,
+                            std::vector<uint32_t>& idx, std::vector<uint8_t>& out) {
+                for (size_t i = 0; i < cls.size(); ++i) {
+                    const double x = pos[i * 3], y = pos[i * 3 + 1];
+                    if (x < lo[0] || x > hi[0] || y < lo[1] || y > hi[1]) continue;
+                    auto it = recolour.find(key_of(x, y, pos[i * 3 + 2]));
+                    if (it != recolour.end() && it->second != cls[i]) { idx.push_back(uint32_t(i)); out.push_back(it->second); }
+                }
+            };
+            scan(t.positions, t.vertex_class, vi, vc);
+            scan(t.coverage_positions, t.coverage_class, ci, cc);
+            if (vi.empty() && ci.empty()) continue;
+            auto copy = cit->second.tile.use_count() == 1
+                ? std::const_pointer_cast<TileData>(cit->second.tile)
+                : std::make_shared<TileData>(t);
+            for (size_t i = 0; i < vi.size(); ++i) copy->vertex_class[vi[i]] = vc[i];
+            for (size_t i = 0; i < ci.size(); ++i) copy->coverage_class[ci[i]] = cc[i];
+            cit->second.tile = copy;
+            auto git = gpu_.find(k);
+            if (git != gpu_.end() && !git->second.empty) {
+                if (!eng || !eng->surface_tiles_patch_classes(k, vi, vc, ci, cc)) { rebuild.push_back(k); continue; }
+            }
+            ++r.tiles;
+            r.vertices += uint32_t(vi.size());
+            r.coverage += uint32_t(ci.size());
+        }
+        if (!rebuild.empty()) {
+            std::vector<uint64_t> evict;
+            for (uint64_t k : rebuild) {
+                auto git = gpu_.find(k);
+                if (git != gpu_.end()) {
+                    if (!git->second.empty) {
+                        evict.push_back(k);
+                        gpu_vertices_ -= git->second.vertices; gpu_faces_ -= git->second.faces;
+                        gpu_coverage_ -= git->second.coverage;
+                    }
+                    gpu_.erase(git);
+                    gpu_bounds_.erase(k);
+                }
+                auto cit = cpu_.find(k);
+                if (cit != cpu_.end()) { cpu_bytes_ -= cit->second.tile->bytes(); cpu_.erase(cit); }
+                failed_.erase(k);
+            }
+            if (eng && !evict.empty()) eng->surface_tiles_evict(evict);
+            last_draw_.clear();
+            r.rebuilt = uint32_t(rebuild.size());
+        }
+        // The archive is re-keyed by the edit: the resident tiles (patched or untouched,
+        // all current) are re-encoded and committed by the writer, off this thread, so a
+        // reopen loads them instead of triangulating again.
+        {
+            std::lock_guard<std::mutex> lk(w_mu_);
+            pending_.clear();
+            pending_bytes_ = 0;
+            if (!pending && config.persist && !w_disabled_) {
+                if (reencode_.empty()) pending_since_ = std::chrono::steady_clock::now();
+                for (const auto& c : cpu_) reencode_[c.first] = {c.second.tile, gen};
+            }
+        }
+        w_cv_.notify_all();
+        return r;
+    }
+    // The edited records are in the file now: later reads see them without help.
+    void end_edit() {
+        points_->clear_overrides();
+        edits_pending_ = false;
+        std::lock_guard<std::mutex> lk(w_mu_);
+        if (config.persist && !w_disabled_) {
+            if (reencode_.empty()) pending_since_ = std::chrono::steady_clock::now();
+            for (const auto& c : cpu_) reencode_[c.first] = {c.second.tile, source_gen_.load()};
+            w_cv_.notify_all();
+        }
+    }
+
     // Leaving the LOD path (another surface took the engine): GPU residency is gone.
     void deactivate(VulkanEngine& eng) {
         if (gpu_configured_) eng.surface_tiles_release();
@@ -955,7 +1170,8 @@ public:
         std::unique_lock<std::mutex> lk(w_mu_);
         w_flush_ = true;
         w_cv_.notify_all();
-        w_done_cv_.wait_for(lk, std::chrono::seconds(60), [&] { return pending_.empty() || w_disabled_ || w_stop_; });
+        w_done_cv_.wait_for(lk, std::chrono::seconds(60), [&] {
+            return (pending_.empty() && reencode_.empty() && !writer_busy_) || w_disabled_ || w_stop_; });
         w_flush_ = false;
     }
 
@@ -1097,7 +1313,7 @@ private:
                         surface_archive::PendingRecord rec;
                         encode_tile(*tile, snap->settings, qt_, codec, rec);
                         std::lock_guard<std::mutex> lk(w_mu_);
-                        if (sgen == source_gen_.load() && !w_disabled_) {
+                        if (sgen == source_gen_.load() && !w_disabled_ && !edits_pending_) {
                             pending_bytes_ += rec.stored.size();
                             if (pending_.empty()) pending_since_ = std::chrono::steady_clock::now();
                             pending_.push_back({std::move(rec), sgen});
@@ -1122,9 +1338,15 @@ private:
 
     // ---- writer: batches built tiles into archive commits --------------------
     struct PendingItem { surface_archive::PendingRecord rec; uint64_t source_gen; };
+    // Resident tiles to re-encode and commit after a class edit (w_mu_), latest per key.
+    std::unordered_map<uint64_t, std::pair<std::shared_ptr<const TileData>, uint64_t>> reencode_;
+    bool writer_busy_ = false; // guarded by w_mu_; flush includes encoding/commit work
+    std::atomic<bool> edits_pending_{false}; // previews never persist uncommitted colours
     void writer_main() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         auto retry_at = std::chrono::steady_clock::time_point{};
+        embedded_surface::MeshCodec codec;
+        std::unordered_map<uint64_t, std::pair<std::shared_ptr<const TileData>, uint64_t>> reencode;
         for (;;) {
             std::vector<PendingItem> batch;
             {
@@ -1133,18 +1355,35 @@ private:
                     return w_stop_ || w_flush_ || pending_bytes_ >= (16ull << 20);
                 });
                 const auto now = std::chrono::steady_clock::now();
-                const bool due = !pending_.empty() &&
+                const bool due = (!pending_.empty() || !reencode_.empty()) &&
                     (w_stop_ || w_flush_ || pending_bytes_ >= (16ull << 20) || now - pending_since_ >= std::chrono::seconds(2));
-                if (w_disabled_) { pending_.clear(); pending_bytes_ = 0; w_done_cv_.notify_all(); }
+                if (w_disabled_) { pending_.clear(); reencode_.clear(); pending_bytes_ = 0; w_done_cv_.notify_all(); }
                 if (!due || (now < retry_at && !w_stop_ && !w_flush_)) {
                     if (w_stop_) { w_done_cv_.notify_all(); return; }
                     continue;
                 }
                 batch.swap(pending_);
                 pending_bytes_ = 0;
+                reencode.swap(reencode_);
+                writer_busy_ = true;
+            }
+            if (!reencode.empty()) {
+                Digest settings;
+                {
+                    std::lock_guard<std::mutex> lk(a_mu_);
+                    settings = settings_;
+                }
+                for (const auto& kv : reencode) {
+                    if (kv.second.second != source_gen_.load()) continue;     // edited again
+                    surface_archive::PendingRecord rec;
+                    if (encode_tile(*kv.second.first, settings, qt_, codec, rec))
+                        batch.push_back({std::move(rec), kv.second.second});
+                }
+                reencode.clear();
             }
             const bool ok = commit_batch(batch);
             std::lock_guard<std::mutex> lk(w_mu_);
+            writer_busy_ = false;
             if (!ok && !w_disabled_ && !batch.empty()) {
                 // Transient failure (lock held elsewhere): keep the tiles, retry later.
                 for (auto& b : batch) { pending_bytes_ += b.rec.stored.size(); pending_.push_back(std::move(b)); }
@@ -1159,6 +1398,7 @@ private:
     }
 
     bool commit_batch(std::vector<PendingItem>& batch) {
+        if (edits_pending_) { batch.clear(); return true; }
         const uint64_t gen = source_gen_.load();
         std::vector<surface_archive::PendingRecord> recs;
         for (auto& b : batch) if (b.source_gen == gen) recs.push_back(std::move(b.rec));
@@ -1456,7 +1696,7 @@ private:
     // CPU eviction: least recently used decoded tiles not waiting for an upload.
     void evict_cpu() {
         if (cpu_bytes_ <= config.cpu_bytes) return;
-        std::unordered_set<uint64_t> pending;
+        std::unordered_set<uint64_t> pending(drawn_.begin(), drawn_.end());   // drawn: class edits patch them
         for (const auto& w : wanted_) if (!gpu_.count(w.second)) pending.insert(w.second);
         std::vector<std::pair<uint64_t, uint64_t>> lru;
         for (const auto& c : cpu_) if (!pending.count(c.first)) lru.push_back({c.second.last_frame, c.first});

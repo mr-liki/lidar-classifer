@@ -301,6 +301,40 @@ public:
         }
     }
 
+    // Class edits on one node's records: applied in place when it is resident (returns
+    // true: its tile must be re-uploaded); a node being loaded is re-read afterwards.
+    // `span` (optional) receives the classes of records [*span_first, +span.size()): the
+    // smallest run covering every record whose class actually changed (empty: none did),
+    // so the caller can rewrite just those bytes of the uploaded tile.
+    inline bool patch_classes(uint64_t id, const std::vector<std::pair<uint32_t, uint8_t>>& edits,
+                              std::vector<uint8_t>* span = nullptr, uint32_t* span_first = nullptr) {
+        std::lock_guard<std::mutex> lock(mu_);
+        Entry* e = find(id);
+        if (e == nullptr) return false;
+        if (e->state == int(LntResidency::Resident)) {
+            uint32_t lo = UINT32_MAX, hi = 0;
+            for (const auto& ed : edits) {
+                if (ed.first >= e->points.size()) continue;
+                uint8_t& c = e->points[ed.first].classification;
+                if (c == ed.second) continue;
+                c = ed.second;
+                lo = std::min(lo, ed.first);
+                hi = std::max(hi, ed.first);
+            }
+            if (span) {
+                span->clear();
+                if (lo <= hi) {
+                    span->resize(size_t(hi - lo) + 1);
+                    for (uint32_t i = lo; i <= hi; ++i) (*span)[i - lo] = e->points[i].classification;
+                }
+                if (span_first) *span_first = lo <= hi ? lo : 0;
+            }
+            return true;
+        }
+        if (e->state == int(LntResidency::Loading)) stale_.insert(id);
+        return false;
+    }
+
     // Held (shared) by every loader across a file read. An editor takes it EXCLUSIVELY
     // while it rewrites a chunk so a read can never observe half of the write.
     inline std::shared_mutex& read_mutex() { return read_mu_; }

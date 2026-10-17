@@ -6183,7 +6183,7 @@ class GridLabelManager:
         if not root_path.exists():
             return None
         try:
-            for ext in ("*.laz", "*.las"):
+            for ext in ("*.laz", "*.las", "*.lnt"):
                 for fp in root_path.rglob(ext):
                     if fp.stem.strip().upper() in wanted:
                         return fp
@@ -6847,7 +6847,7 @@ class GridLabelManager:
             self.app,
             f"Select LAZ/LAS file for grid {grid_name}",
             folder_str,
-            "LiDAR Files (*.laz *.las);;All Files (*.*)",
+            "LiDAR Files (*.laz *.las *.lnt);;All Files (*.*)",
         )
 
         if not file_path:
@@ -7322,7 +7322,7 @@ class GridLabelManager:
         except Exception:
             pass
 
-    def _block_polygon_hit_click(self, obj, clickPos, renderer) -> bool:
+    def _block_polygon_hit_click(self, obj, clickPos, renderer, world_xy=None) -> bool:
         """
         Global block-polygon priority check.
 
@@ -7406,10 +7406,15 @@ class GridLabelManager:
             return False
 
         try:
-            coord = vtk.vtkCoordinate()
-            coord.SetCoordinateSystemToDisplay()
-            coord.SetValue(float(clickPos[0]), float(clickPos[1]), 0.0)
-            wx, wy, _ = coord.GetComputedWorldValue(renderer)
+            if world_xy is not None:
+                # Native Vulkan viewport: world XY already resolved from
+                # MainCamera2D, no VTK coordinate transform involved.
+                wx, wy = float(world_xy[0]), float(world_xy[1])
+            else:
+                coord = vtk.vtkCoordinate()
+                coord.SetCoordinateSystemToDisplay()
+                coord.SetValue(float(clickPos[0]), float(clickPos[1]), 0.0)
+                wx, wy, _ = coord.GetComputedWorldValue(renderer)
             print(f"[block-click] world XY = ({wx:.2f}, {wy:.2f}), "
                   f"testing {len(block_polygons)} BL polygons")
 
@@ -7781,6 +7786,73 @@ class GridLabelManager:
             snt_filename=snt_filename,
             alt_names=self._get_alt_names_for_grid(grid_name),
         )
+        return True
+
+    def _native_grid_label_near(self, world_xy, units_per_pixel, radius_px=20.0):
+        """Nearest grid label within `radius_px` of a world XY, measured in
+        screen pixels of the native plan camera. Reads only label positions;
+        no VTK picker or coordinate transform."""
+        if units_per_pixel <= 0.0:
+            return None
+        radius_w2 = (radius_px * units_per_pixel) ** 2
+        best_actor, best_d2 = None, None
+        seen = set()
+        for store_name in ("dxf_actors", "snt_actors"):
+            for data in getattr(self.app, store_name, None) or []:
+                if not isinstance(data, dict):
+                    continue
+                for prop in data.get("actors", []) or []:
+                    if id(prop) in seen or not getattr(prop, "is_grid_label", False):
+                        continue
+                    seen.add(id(prop))
+                    try:
+                        px, py = prop.GetPosition()[:2]
+                    except Exception:
+                        continue
+                    d2 = (float(px) - world_xy[0]) ** 2 + (float(py) - world_xy[1]) ** 2
+                    if d2 <= radius_w2 and (best_d2 is None or d2 < best_d2):
+                        best_actor, best_d2 = prop, d2
+        return best_actor
+
+    def on_native_right_click(self, world_xy, units_per_pixel) -> bool:
+        """Right-click on the native Vulkan main viewport (plan view).
+
+        The Vulkan surface owns all mouse input, so the VTK RightButtonPress
+        observer (on_right_click) never fires there. This is its native twin:
+        the caller resolves the click's world XY from MainCamera2D and the
+        block / grid-label menus are shown from pure geometry. Returns True
+        when a menu was shown.
+        """
+        if getattr(self.app, "_shutdown_in_progress", False):
+            return False
+        try:
+            digitizer = getattr(self.app, "digitizer", None)
+            if digitizer is not None and (
+                str(getattr(digitizer, "active_tool", "") or "").lower().strip() == "movevertex"
+                or getattr(digitizer, "moving_vertex_data", None) is not None
+            ):
+                return False
+        except Exception:
+            pass
+        if self._is_tool_operation_in_progress():
+            return False
+
+        print(f"[native-right-click] world XY = ({world_xy[0]:.2f}, {world_xy[1]:.2f})")
+        if self._block_polygon_hit_click(None, None, None, world_xy=world_xy):
+            return True
+
+        actor = self._native_grid_label_near(world_xy, units_per_pixel)
+        if actor is None:
+            return False
+        grid_name = getattr(actor, "grid_name", "")
+        if not grid_name:
+            return False
+        snt_filename = (
+            getattr(actor, "_naksha_snt_filename", None)
+            or getattr(actor, "snt_filename", None)
+            or self._infer_snt_filename_for_grid(grid_name)
+        )
+        self.show_grid_label_menu(grid_name, snt_filename=snt_filename, actor=actor)
         return True
 
     def on_right_click(self, obj, event):
@@ -8471,12 +8543,19 @@ class GridLabelManager:
         all_files = list(las_folder_path.glob("*.laz")) + list(las_folder_path.glob("*.las"))
         
         print(f"   Total files in folder: {len(all_files)}")
-        
-        if not all_files:
-            return None
 
         grid_name_clean = strip_lidar_extension(grid_name)
-        best = find_matching_lidar_file(all_files, grid_name_clean)
+        best = find_matching_lidar_file(all_files, grid_name_clean) if all_files else None
+
+        if best is None:
+            # A folder may hold only the native .lnt (source moved/deleted).
+            # Searched separately so X.laz + X.lnt never read as ambiguous.
+            lnt_files = list(las_folder_path.glob("*.lnt"))
+            if lnt_files:
+                best = find_matching_lidar_file(lnt_files, grid_name_clean)
+                if best is not None:
+                    print(f"   ✅ EXACT GRID MATCH FOUND (.lnt): {best.name}")
+                    return best
 
         if best is None:
             print(
@@ -8575,6 +8654,24 @@ class GridLabelManager:
 
         return unique_patterns    
     
+    def _load_las_file_native(self, las_file, grid_name):
+        """Load a block through the native .lnt pipeline - the same call
+        File > Open makes for a single .las/.laz/.lnt (gui.lnt_open.open_with_lnt):
+        build `<source>.lnt` once, then stream it into the Vulkan viewport. The
+        point records stay in the native file, so no grid index list is kept.
+        Returns False only for formats that pipeline does not open."""
+        from gui.lnt_open import LNT_SUFFIXES, open_with_lnt
+
+        las_file = Path(las_file)
+        if las_file.suffix.lower() not in LNT_SUFFIXES:
+            return False
+        self.loaded_grids.clear()
+        self.grid_aliases.clear()
+        self.app._lnt_block_grid_name = grid_name
+        print(f"[block-load] '{grid_name}' -> native .lnt open: {las_file}")
+        open_with_lnt(self.app, str(las_file))
+        return True
+
     def _load_las_file(self, las_file, grid_name):
         """
         Load LAZ/LAS file using the EXACT same path as menu bar loading.
@@ -8592,6 +8689,9 @@ class GridLabelManager:
         print(f"   Grid: {grid_name}")
         print(f"   File: {las_file.name}")
         print(f"{'='*70}")
+
+        if self._load_las_file_native(las_file, grid_name):
+            return
 
         def _reset_interaction_state():
             """Clear stale zoom/pan state before or after a grid swap."""

@@ -35,6 +35,12 @@ void Camera::SetPerspectiveMode() {
     core_.SetPerspective(fovYDegrees_, aspectRatio_, nearClip_, farClip_);
 }
 
+void Camera::SetViewUpWorld(double x, double y, double z) {
+    const double length = std::sqrt(x*x+y*y+z*z);
+    if (!std::isfinite(length) || length < 1e-12) return;
+    up_[0] = x/length; up_[1] = y/length; up_[2] = z/length;
+}
+
 void Camera::SetOrthographicWorld(const double centre[3], const double viewDir[3],
                                   double parallelScale, double aspect,
                                   double nearClip, double farClip) {

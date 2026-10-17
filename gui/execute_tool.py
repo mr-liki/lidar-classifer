@@ -356,6 +356,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     ✅ FIXED: Properly deactivates curve/measurement tools when switching contexts
     ✅ NEW: ``key_label`` is prepended to status-bar feedback so the user sees the exact pressed key.
     """
+    from gui.native_shortcuts import execute_native_shortcut
+    if execute_native_shortcut(app_window, tool, from_cls, to_cls, preset, key_label):
+        return
     _kp = f"[{key_label}] " if key_label else ""
     
     print(f"🔧 execute_tool called: tool={tool}, from_cls={from_cls}, to_cls={to_cls}, preset={preset is not None}")
@@ -731,6 +734,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             existing = dict(getattr(app_window, "view_sync_map", {}) or {})
             desired  = {}
             sources_no_sync = set()
+            target_rows = preset.get('version', 1) >= 2
 
             for r in rows:
                 source_view_num = int(r.get("view", 1))
@@ -745,18 +749,30 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 target_idx      = target_view_num - 1
                 if target_idx == source_idx:
                     continue
-                desired[target_idx] = source_idx
+                if target_rows:
+                    desired[source_idx] = target_idx
+                else:
+                    desired[target_idx] = source_idx
 
             # Clear mappings no longer wanted
-            for target_idx, src_idx in existing.items():
-                if target_idx in desired and desired[target_idx] != src_idx:
-                    app_window.set_view_sync(target_idx + 1, None)
-                elif target_idx not in desired and src_idx in sources_no_sync:
-                    app_window.set_view_sync(target_idx + 1, None)
+            native_sections = getattr(app_window, '_native_sections', None)
+            if native_sections is not None:
+                mapping = dict(existing)
+                for target_idx, src_idx in existing.items():
+                    if target_idx not in desired and (target_idx if target_rows else src_idx) in sources_no_sync:
+                        mapping.pop(target_idx, None)
+                mapping.update(desired)
+                native_sections.apply_sync_map(mapping)
+            else:
+                for target_idx, src_idx in existing.items():
+                    if target_idx in desired and desired[target_idx] != src_idx:
+                        app_window.set_view_sync(target_idx + 1, None)
+                    elif target_idx not in desired and (target_idx if target_rows else src_idx) in sources_no_sync:
+                        app_window.set_view_sync(target_idx + 1, None)
 
-            # Apply new mappings
-            for target_idx, source_idx in desired.items():
-                app_window.set_view_sync(target_idx + 1, source_idx + 1)
+                # Apply new mappings
+                for target_idx, source_idx in desired.items():
+                    app_window.set_view_sync(target_idx + 1, source_idx + 1)
 
             if hasattr(app_window, "statusBar"):
                 if desired:
@@ -861,7 +877,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             import traceback
             traceback.print_exc()
 
-    if tool_name in ("measure_line", "measure_path"):
+    if tool_name in ("measure_line", "measure_path", "measure_grid_area", "measure_block_area"):
         print(f"📏 Activating measurement shortcut: {tool_name}")
 
         # ✅ Deactivate curve tool when switching to measurement
@@ -936,7 +952,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         print("📎 Opening Attach SNT dialog via shortcut")
         try:
             from .snt_attachment import show_snt_attachment_dialog
+            from .menu_sidebar_system import _track_snt_dialog_visibility
             app_window.snt_dialog = show_snt_attachment_dialog(app_window)
+            _track_snt_dialog_visibility(app_window, app_window.snt_dialog)
         except Exception as e:
             print(f"⚠️ Attach SNT shortcut failed: {e}")
             import traceback

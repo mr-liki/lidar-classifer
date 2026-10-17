@@ -108,8 +108,9 @@ class UltraFastClassifier:
         if hasattr(self.app, 'redo_stack'):
             self.app.redo_stack.clear()
 
-        # Limit stack size (keep last 30 operations to save memory)
-        if len(self.app.undo_stack) > 30:
+        # Limit stack size (keep last MAX_CLASSIFY_UNDO_STEPS operations to save memory)
+        from gui.memory_manager import MAX_CLASSIFY_UNDO_STEPS
+        if len(self.app.undo_stack) > MAX_CLASSIFY_UNDO_STEPS:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.app.undo_stack.pop(0))
     

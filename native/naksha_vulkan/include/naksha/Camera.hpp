@@ -39,6 +39,7 @@ public:
     double GetParallelScale() const { return parallelScale_; }
     // Switch back to the perspective path (3D orbit mode).
     void SetPerspectiveMode();
+    void SetViewUpWorld(double x, double y, double z);
 
     // Authoritative world-space view state (metres, float64).
     void SetLookAtWorld(const double eye[3], const double target[3]);

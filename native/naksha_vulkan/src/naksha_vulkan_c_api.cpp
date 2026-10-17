@@ -1,10 +1,9 @@
 // naksha_vulkan_c_api.cpp - implementation of the narrow C ABI declared in
 // include/naksha/naksha_vulkan_c_api.h. See that header for the contract.
 //
-// Single-instance design: this phase's app has exactly one main viewport,
-// so one process-wide NakshaVulkanInstance is sufficient. The handle is
-// still a real value (not just "1") so a future multi-instance version
-// does not need an ABI break.
+// Viewport handles own independent rendering state and swapchains, while
+// sharing the Vulkan instance/device/allocator. C ABI calls serialize GPU
+// queue access and Volk dispatch selection across main and section views.
 
 #include "naksha/naksha_vulkan_c_api.h"
 
@@ -17,10 +16,12 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "naksha/Renderer.hpp"
 #include "naksha/PointCloudRenderer.hpp"
 #include "naksha/SurfaceRenderer.hpp"
+#include "naksha/VectorOverlayRenderer.hpp"
 #include "naksha/Camera.hpp"
 
 namespace {
@@ -72,9 +73,12 @@ std::string ThisDllDirectory() {
 namespace {
 
 struct Instance {
+    void* hwnd = nullptr;
     Renderer renderer;
     PointCloudRenderer pointCloud;
     SurfaceRenderer surface;
+    // SNT/CAD linework drawn after the opaque passes (see VectorOverlayRenderer).
+    VectorOverlayRenderer vector;
     int streamingSurface = -1; // -1 retains the legacy point+mesh behavior
     uint64_t lastPointDraws = 0, lastIndexedDraws = 0;
     bool ready = false;
@@ -88,9 +92,8 @@ std::mutex gMutex;
 // (nkv_get_device_vram_budget) cannot drift away from the surface budget. If the
 // margin is ever tuned, it is tuned HERE and both paths follow.
 constexpr double kVramBudgetFraction = 0.70;
-std::unique_ptr<Instance> gInstance;
+std::unordered_map<NkvHandle, std::unique_ptr<Instance>> gInstances;
 NkvHandle gNextHandle = 1;
-NkvHandle gActiveHandle = 0;
 std::string gLastError;
 
 void SetError(const char* msg) {
@@ -98,13 +101,31 @@ void SetError(const char* msg) {
 }
 
 Instance* Resolve(NkvHandle h) {
-    if (h == 0 || h != gActiveHandle || !gInstance) return nullptr;
-    return gInstance.get();
+    auto found = gInstances.find(h);
+    if (found == gInstances.end()) return nullptr;
+    auto* inst = found->second.get();
+    // Volk uses process-global dispatch pointers. All C API GPU operations
+    // hold gMutex; select this viewport's instance/device before using them.
+    // Reload only on a switch: each volkLoad* re-resolves hundreds of entry
+    // points (~3 ms), and every API call - even a camera setter - lands here,
+    // so an unconditional reload made one section-view pan frame cost ~9 ms
+    // of pure dispatch loading. volk records what is loaded, including loads
+    // done elsewhere (VulkanDevice/VulkanInstance init), so the check is exact.
+    // An instance load also rewrites the device-level pointers, so it forces
+    // the device load after it.
+    auto& ctx = inst->renderer.GetContext();
+    const bool instance_switched = volkGetLoadedInstance() != ctx.GetInstance();
+    if (instance_switched)
+        volkLoadInstance(ctx.GetInstance());
+    if (instance_switched || volkGetLoadedDevice() != ctx.GetDevice())
+        volkLoadDevice(ctx.GetDevice());
+    return inst;
 }
 
 } // namespace
 
 NKV_API int nkv_is_available(void) {
+    std::lock_guard<std::mutex> lock(gMutex);
     // Cheapest possible probe: try to load the Vulkan loader via volk and
     // create a throwaway VkInstance. Never touches gInstance/gActiveHandle.
     //
@@ -150,16 +171,18 @@ NKV_API int nkv_is_available(void) {
 NKV_API NkvHandle nkv_create_renderer(void* hwnd, uint32_t width, uint32_t height,
                                        int enable_validation) {
     std::lock_guard<std::mutex> lock(gMutex);
-    if (gInstance) {
-        SetError("a renderer already exists in this process; call "
-                  "nkv_destroy_renderer first");
-        return 0;
+    for (const auto& entry : gInstances) {
+        if (entry.second->hwnd == hwnd) {
+            SetError("a renderer already owns this window");
+            return 0;
+        }
     }
     if (hwnd == nullptr) {
         SetError("hwnd is null");
         return 0;
     }
     auto inst = std::make_unique<Instance>();
+    inst->hwnd = hwnd;
     RendererConfig cfg;
     cfg.nativeWindowHandle = hwnd;
     cfg.width = width > 0 ? width : 1;
@@ -183,6 +206,13 @@ NKV_API NkvHandle nkv_create_renderer(void* hwnd, uint32_t width, uint32_t heigh
             inst->renderer.Shutdown();
             return 0;
         }
+        // Non-fatal: a missing vector.vert/frag.spv must not stop the point and
+        // surface paths from working. When it fails the Python side sees
+        // nkv_vector_available()==0 and keeps the Qt overlay for linework.
+        if (!inst->vector.Initialize(inst->renderer)) {
+            fprintf(stderr, "[naksha_vulkan] vector overlay unavailable - "
+                            "vector linework stays on the Qt overlay\n");
+        }
     } catch (const std::exception& e) {
         SetError(e.what());
         return 0;
@@ -192,24 +222,33 @@ NKV_API NkvHandle nkv_create_renderer(void* hwnd, uint32_t width, uint32_t heigh
     }
     inst->ready = true;
     inst->deviceNameCache = inst->renderer.GetContext().GetReport().deviceName;
-    gInstance = std::move(inst);
-    gActiveHandle = gNextHandle++;
-    return gActiveHandle;
+    const auto handle = gNextHandle++;
+    gInstances.emplace(handle, std::move(inst));
+    return handle;
 }
 
 NKV_API void nkv_destroy_renderer(NkvHandle handle) {
     std::lock_guard<std::mutex> lock(gMutex);
-    if (!gInstance || handle != gActiveHandle) return;
+    auto* inst = Resolve(handle);
+    if (!inst) return;
     try {
-        gInstance->renderer.WaitIdle();
-        gInstance->surface.Shutdown();
-        gInstance->pointCloud.Shutdown();
-        gInstance->renderer.Shutdown();
+        inst->renderer.WaitIdle();
+        inst->vector.Shutdown();
+        inst->surface.Shutdown();
+        inst->pointCloud.Shutdown();
+        inst->renderer.Shutdown();
     } catch (...) {
         // Never let shutdown throw across the C boundary.
     }
-    gInstance.reset();
-    gActiveHandle = 0;
+    gInstances.erase(handle);
+}
+
+NKV_API int nkv_set_camera_view_up(NkvHandle handle, double x, double y, double z) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    auto* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->renderer.GetCamera().SetViewUpWorld(x, y, z);
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -303,6 +342,7 @@ NKV_API int nkv_set_point_cloud(NkvHandle handle,
 }
 
 NKV_API int nkv_set_display_mode(NkvHandle handle, int mode /* NkvDisplayMode */) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     // point.vert branches on this value (pc.shading.x): NKV_DISPLAY_RGB reads the
@@ -331,6 +371,7 @@ NKV_API int nkv_set_instant_shading_parameters(NkvHandle handle,
 }
 
 NKV_API int nkv_set_instant_normal_radius(NkvHandle handle, int radius_texels) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->renderer.SetInstantNormalRadius(radius_texels);
@@ -338,12 +379,14 @@ NKV_API int nkv_set_instant_normal_radius(NkvHandle handle, int radius_texels) {
 }
 
 NKV_API uint64_t nkv_get_instant_shaded_frame_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.GetInstantFrameCount();
 }
 
 NKV_API int nkv_get_instant_shaded_available(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.IsInstantShadedAvailable() ? 1 : 0;
@@ -362,24 +405,28 @@ NKV_API int nkv_set_point_normals(NkvHandle handle, const uint8_t* packed,
 }
 
 NKV_API uint64_t nkv_get_point_normal_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return static_cast<uint64_t>(inst->pointCloud.GetNormalCount());
 }
 
 NKV_API uint64_t nkv_get_point_normal_bytes(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return static_cast<uint64_t>(inst->pointCloud.GetNormalBytes());
 }
 
 NKV_API uint64_t nkv_get_point_normal_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetNormalUploadCount();
 }
 
 NKV_API int nkv_set_instant_normal_source(NkvHandle handle, int screen_space) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->renderer.SetInstantNormalSource(screen_space);
@@ -497,12 +544,14 @@ NKV_API int nkv_set_class_visibility(NkvHandle handle, const uint8_t* visible256
 }
 
 NKV_API uint64_t nkv_get_class_visibility_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.GetClassVisibilityUpdateCount();
 }
 
 NKV_API int nkv_set_point_size(NkvHandle handle, float pixels) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->pointCloud.SetPointSize(pixels);
@@ -591,6 +640,7 @@ NKV_API int nkv_set_point_luts(NkvHandle handle,
 /* Proof that an intensity channel really reached the GPU (0 when the dataset
  * had none or the upload failed). */
 NKV_API uint64_t nkv_get_point_intensity_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetIntensityUploadCount();
@@ -644,18 +694,21 @@ NKV_API int nkv_set_point_attributes(NkvHandle handle,
 }
 
 NKV_API uint64_t nkv_get_point_classification_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetClassificationCount();
 }
 
 NKV_API uint64_t nkv_get_point_intensity_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetIntensityCount();
 }
 
 NKV_API uint64_t nkv_get_point_position_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetPositionUploadCount();
@@ -674,6 +727,7 @@ NKV_API int nkv_set_point_cloud_visible(NkvHandle handle, int visible) {
 }
 
 NKV_API int nkv_get_point_cloud_visible(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return -1;
     return inst->pointCloud.IsVisible() ? 1 : 0;
@@ -686,6 +740,7 @@ NKV_API int nkv_get_point_cloud_visible(NkvHandle handle) {
  * lut rising WHILE positions stay flat is the proof that a re-tint never
  * re-uploads the point buffer. */
 NKV_API uint64_t nkv_get_lut_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.GetLutUpdateCount();
@@ -693,16 +748,19 @@ NKV_API uint64_t nkv_get_lut_update_count(NkvHandle handle) {
 
 /* vkCmdDraw submissions. */
 NKV_API uint64_t nkv_get_point_draw_call_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetDrawCallCount();
 }
 NKV_API uint64_t nkv_get_surface_draw_call_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetDrawCallCount();
 }
 NKV_API uint64_t nkv_get_surface_overlay_draw_call_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetOverlayDrawCallCount();
@@ -710,7 +768,17 @@ NKV_API uint64_t nkv_get_surface_overlay_draw_call_count(NkvHandle handle) {
 
 /* Device point-size ceiling, limits.pointSizeRange[1] (float because Vulkan
  * reports it as a range). The shader clamps gl_PointSize to this. */
+NKV_API int nkv_get_line_width_range(NkvHandle handle, float* out_min, float* out_max) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    if (out_min) *out_min = inst->vector.GetLineWidthMin();
+    if (out_max) *out_max = inst->vector.GetLineWidthMax();
+    return 1;
+}
+
 NKV_API int nkv_get_max_point_size(NkvHandle handle, float* out) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out) return 0;
     *out = inst->pointCloud.GetMaxPointSizeDevice();
@@ -718,6 +786,7 @@ NKV_API int nkv_get_max_point_size(NkvHandle handle, float* out) {
 }
 
 NKV_API int nkv_get_render_origin(NkvHandle handle, double* out3) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out3) return 0;
     const RenderOrigin& o = inst->renderer.GetOrigin();
@@ -880,6 +949,7 @@ NKV_API int nkv_set_surface(NkvHandle handle,
 }
 
 NKV_API int nkv_set_dataset_revision(NkvHandle handle, uint64_t revision) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->surface.SetDatasetRevision(revision);
@@ -887,6 +957,7 @@ NKV_API int nkv_set_dataset_revision(NkvHandle handle, uint64_t revision) {
 }
 
 NKV_API int nkv_set_surface_revision(NkvHandle handle, uint64_t revision) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->surface.SetSurfaceRevision(revision);
@@ -894,11 +965,13 @@ NKV_API int nkv_set_surface_revision(NkvHandle handle, uint64_t revision) {
 }
 
 NKV_API uint64_t nkv_get_dataset_revision(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetDatasetRevision() : 0;
 }
 
 NKV_API uint64_t nkv_get_surface_revision(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetSurfaceRevision() : 0;
 }
@@ -1098,6 +1171,7 @@ NKV_API int nkv_set_surface_debug_wireframe(NkvHandle handle, int enabled) {
 }
 
 NKV_API int nkv_get_surface_debug_wireframe(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst && inst->surface.GetShadingMode() == ShadingMode::Wireframe;
 }
@@ -1136,26 +1210,31 @@ NKV_API int nkv_activate_pending_surface(NkvHandle handle, int* discarded_stale)
 }
 
 NKV_API uint32_t nkv_get_surface_total_tile_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetTotalTileCount() : 0;
 }
 
 NKV_API uint32_t nkv_get_surface_visible_tile_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetVisibleTileCount() : 0;
 }
 
 NKV_API uint64_t nkv_get_surface_total_triangle_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetTotalTriangleCount() : 0;
 }
 
 NKV_API uint64_t nkv_get_surface_visible_triangle_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetVisibleTriangleCount() : 0;
 }
 
 NKV_API uint32_t nkv_get_surface_lod(NkvHandle handle, int* out_is_moving) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (out_is_moving) {
         *out_is_moving = inst ? (inst->surface.IsInteractionMoving() ? 1 : 0) : 0;
@@ -1164,6 +1243,7 @@ NKV_API uint32_t nkv_get_surface_lod(NkvHandle handle, int* out_is_moving) {
 }
 
 NKV_API int nkv_get_surface_lod_triangle_counts(NkvHandle handle, uint64_t* out_counts) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out_counts) return 0;
     for (uint32_t i = 0; i < 3; ++i) out_counts[i] = inst->surface.GetLodTriangleCount(i);
@@ -1171,6 +1251,7 @@ NKV_API int nkv_get_surface_lod_triangle_counts(NkvHandle handle, uint64_t* out_
 }
 
 NKV_API int nkv_set_surface_interacting(NkvHandle handle, int moving, double idle_refine_ms) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     if (idle_refine_ms > 0.0) inst->surface.SetIdleRefineMs(idle_refine_ms);
@@ -1179,6 +1260,7 @@ NKV_API int nkv_set_surface_interacting(NkvHandle handle, int moving, double idl
 }
 
 NKV_API int nkv_set_surface_lod_error_pixels(NkvHandle handle, float pixels) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     if (pixels > 0.0f) inst->surface.SetLodErrorPixelLimit(pixels);
@@ -1186,16 +1268,19 @@ NKV_API int nkv_set_surface_lod_error_pixels(NkvHandle handle, float pixels) {
 }
 
 NKV_API int nkv_get_surface_state(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? static_cast<int>(inst->surface.GetState()) : 0;
 }
 
 NKV_API uint64_t nkv_get_surface_swap_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetSwapCount() : 0;
 }
 
 NKV_API uint64_t nkv_get_surface_stale_discard_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? inst->surface.GetStaleDiscardCount() : 0;
 }
@@ -1220,6 +1305,7 @@ NKV_API int nkv_get_surface_memory(NkvHandle handle,
 }
 
 NKV_API int nkv_get_surface_memory_rejected(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst ? (inst->surface.WasMemoryRejected() ? 1 : 0) : 0;
 }
@@ -1245,6 +1331,7 @@ NKV_API int nkv_estimate_surface_bytes(NkvHandle handle, uint64_t triangle_count
 }
 
 NKV_API int nkv_set_surface_budget_bytes(NkvHandle handle, uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     if (bytes > 0) {
@@ -1465,6 +1552,13 @@ NKV_API int nkv_set_shaded_class_surface(NkvHandle handle,
     return 1;
 }
 
+NKV_API int nkv_set_surface_elevation_color(NkvHandle handle, int on, float z0, float z1, float ramp) {
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->surface.SetElevationColor(on != 0, z0, z1, ramp);
+    return 1;
+}
+
 NKV_API int nkv_set_crisp_shading_parameters(NkvHandle handle,
                                               float azimuth_deg, float sharpness_raw,
                                               float ambient,
@@ -1504,6 +1598,7 @@ NKV_API int nkv_surface_tiles_release(NkvHandle handle) {
     return 1;
 }
 NKV_API int nkv_surface_tiles_active(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     return inst && inst->surface.TilesActive() ? 1 : 0;
 }
@@ -1535,6 +1630,23 @@ NKV_API int nkv_surface_tiles_set_palette(NkvHandle handle, const uint8_t* lut_r
     } catch (const std::exception& e) { SetError(e.what()); return 0; }
     return 1;
 }
+NKV_API int nkv_surface_tiles_patch_classes(NkvHandle handle, uint64_t key,
+                                            const uint32_t* vertex_index, const uint8_t* vertex_class,
+                                            uint32_t vertex_count, const uint32_t* coverage_index,
+                                            const uint8_t* coverage_class, uint32_t coverage_count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    try {
+        std::string error;
+        if (!inst->surface.PatchTileClasses(key, vertex_index, vertex_class, vertex_count,
+                                            coverage_index, coverage_class, coverage_count, &error)) {
+            SetError(error.c_str());
+            return 0;
+        }
+    } catch (const std::exception& e) { SetError(e.what()); return 0; }
+    return 1;
+}
 NKV_API int nkv_surface_tiles_set_draw_list(NkvHandle handle, const NkvSurfaceTileDraw* items, uint32_t count) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
@@ -1543,6 +1655,7 @@ NKV_API int nkv_surface_tiles_set_draw_list(NkvHandle handle, const NkvSurfaceTi
         reinterpret_cast<const naksha::SurfaceRenderer::TileDrawItem*>(items), count) ? 1 : 0;
 }
 NKV_API int nkv_surface_tiles_get_stats(NkvHandle handle, uint64_t* out, uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out) return 0;
     inst->surface.GetTileStats(out, count);
@@ -1558,6 +1671,7 @@ NKV_API int nkv_surface_tiles_get_stats(NkvHandle handle, uint64_t* out, uint32_
  * than an aspiration - compare nkv_get_surface_upload_count() across the call.
  */
 NKV_API int nkv_set_class_color_lut(NkvHandle handle, const uint8_t* lut_rgb) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     if (!lut_rgb) {
@@ -1569,6 +1683,7 @@ NKV_API int nkv_set_class_color_lut(NkvHandle handle, const uint8_t* lut_rgb) {
 }
 
 NKV_API uint64_t nkv_get_class_lut_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetClassLutUpdateCount();
@@ -1588,24 +1703,28 @@ NKV_API int nkv_set_color_parity_params(NkvHandle handle, int color_mode, int de
 }
 
 NKV_API uint64_t nkv_get_parity_param_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetParityParamUpdateCount();
 }
 
 NKV_API uint64_t nkv_get_surface_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetMeshUploadCount();
 }
 
 NKV_API uint64_t nkv_get_shade_param_update_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetShadeParamUpdateCount();
 }
 
 NKV_API uint64_t nkv_get_overlay_triangle_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->surface.GetOverlayTriangleCount();
@@ -1635,6 +1754,7 @@ NKV_API int nkv_set_camera_lookat(NkvHandle handle,
 }
 
 NKV_API int nkv_set_render_origin(NkvHandle handle, double x, double y, double z) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->renderer.SetOrigin(x, y, z);
@@ -1693,6 +1813,9 @@ NKV_API int nkv_render(NkvHandle handle) {
             if (inst->surface.IsLoaded() && inst->streamingSurface != 0) {
                 inst->surface.Record(cmd, slot);
             }
+            // Overlay linework last: the pass has depth test/write OFF, so it
+            // sits above the opaque point/surface geometry drawn before it.
+            inst->vector.Record(cmd, slot);
         }
         inst->lastPointDraws = inst->pointCloud.GetDrawCallCount() - pointDrawBefore;
         inst->lastIndexedDraws = inst->surface.GetIndexedDrawCallCount() - indexedDrawBefore;
@@ -1714,6 +1837,7 @@ NKV_API int nkv_set_clear_color(NkvHandle handle, float r, float g, float b, flo
 }
 
 NKV_API int nkv_get_clear_color(NkvHandle handle, float* out_rgba4) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out_rgba4) return 0;
     inst->renderer.GetClearColor(out_rgba4);
@@ -1721,6 +1845,7 @@ NKV_API int nkv_get_clear_color(NkvHandle handle, float* out_rgba4) {
 }
 
 NKV_API int nkv_get_last_mvp(NkvHandle handle, float* out_mvp16) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst || !out_mvp16) return 0;
     inst->renderer.GetLastMvp(out_mvp16);
@@ -1736,6 +1861,7 @@ NKV_API int nkv_capture_frame(NkvHandle handle, uint8_t* out_rgba, uint64_t capa
     uint32_t w = 0, h = 0;
     if (!inst->renderer.CaptureOffscreenRGBA8(inst->streamingSurface == 1 ? nullptr : &inst->pointCloud,
                                               inst->streamingSurface == 0 ? nullptr : &inst->surface,
+                                              &inst->vector,
                                               pixels, w, h)) {
         SetError("CaptureOffscreenRGBA8 failed (no frame resources yet?)");
         return 0;
@@ -1801,12 +1927,14 @@ NKV_API int nkv_get_frame_stats(NkvHandle handle, uint64_t* rendered,
 NKV_API int nkv_get_frame_timings(NkvHandle handle, double* out);
 
 NKV_API uint64_t nkv_get_point_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return static_cast<uint64_t>(inst->pointCloud.GetPointCount());
 }
 
 NKV_API int nkv_get_frame_timings(NkvHandle handle, double* out) {
+    std::lock_guard<std::mutex> lock(gMutex);
     if (!out) return 0;
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
@@ -1824,24 +1952,28 @@ NKV_API int nkv_get_frame_timings(NkvHandle handle, double* out) {
 }
 
 NKV_API uint64_t nkv_get_surface_vertex_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return static_cast<uint64_t>(inst->surface.GetVertexCount());
 }
 
 NKV_API uint64_t nkv_get_surface_index_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return static_cast<uint64_t>(inst->surface.GetIndexCount());
 }
 
 NKV_API uint64_t nkv_get_point_color_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetColorUploadCount();
 }
 
 NKV_API uint64_t nkv_get_point_classification_upload_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.GetClassificationUploadCount();
@@ -1930,11 +2062,130 @@ NKV_API uint64_t nkv_get_arena_uploaded_tiles(NkvHandle handle) {
     return inst ? static_cast<uint64_t>(inst->pointCloud.ArenaUploadedTiles()) : 0;
 }
 
+/* ---- VECTOR OVERLAY (SNT / CAD linework) ---------------------------------- */
+
+NKV_API int nkv_vector_available(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    return inst->vector.IsInitialized() ? 1 : 0;
+}
+
+NKV_API int nkv_vector_reserve(NkvHandle handle, uint64_t capacity_vertices,
+                               uint64_t capacity_indices) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || capacity_vertices == 0 || capacity_indices == 0) {
+        SetError("invalid handle or zero vector capacity");
+        return 0;
+    }
+    try {
+        // The previous arena (if any) is about to be destroyed and the GPU may
+        // still be reading it, so this is the one place a wait is legitimate -
+        // exactly the rule nkv_reserve_point_capacity follows.
+        inst->renderer.WaitIdle();
+        return inst->vector.Reserve(static_cast<std::size_t>(capacity_vertices),
+                                    static_cast<std::size_t>(capacity_indices));
+    } catch (const std::exception& e) {
+        SetError(e.what());
+        return 0;
+    }
+}
+
+NKV_API int nkv_vector_upload_strip(NkvHandle handle, uint64_t v_first, uint64_t v_count,
+                                    const double* xyz_world_f64, const uint8_t* rgb8,
+                                    uint64_t i_first, uint64_t i_count,
+                                    const uint32_t* indices_u32) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || (v_count == 0 && i_count == 0)) {
+        SetError("invalid handle or empty vector upload");
+        return 0;
+    }
+    try {
+        // Same floating-origin rule as the point arena: a caller-pinned origin
+        // wins; otherwise it is derived from the FIRST upload and then stays
+        // fixed, so linework and any point cloud share one render space.
+        if (xyz_world_f64)
+            AutoDeriveRenderOrigin(inst->renderer, xyz_world_f64,
+                                   static_cast<std::size_t>(v_count));
+        const UploadStats st = inst->vector.UploadStrips(
+            static_cast<std::size_t>(v_first), static_cast<std::size_t>(v_count),
+            xyz_world_f64, rgb8,
+            static_cast<std::size_t>(i_first), static_cast<std::size_t>(i_count),
+            indices_u32);
+        if (st.bytes == 0) {
+            SetError("vector upload failed (no arena, already full, or past capacity)");
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        SetError(e.what());
+        return 0;
+    }
+    return 1;
+}
+
+NKV_API int nkv_vector_set_draw_ranges(NkvHandle handle,
+                                       const uint32_t* index_firsts,
+                                       const uint32_t* index_counts,
+                                       uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->vector.SetDrawRanges(index_firsts, index_counts, count);
+    return 1;
+}
+
+NKV_API int nkv_vector_set_draw_ranges_ex(NkvHandle handle,
+                                          const uint32_t* index_firsts,
+                                          const uint32_t* index_counts,
+                                          const float* widths_px,
+                                          uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->vector.SetDrawRangesWithWidths(index_firsts, index_counts, widths_px, count);
+    return 1;
+}
+
+NKV_API int nkv_vector_clear_draw_ranges(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->vector.ClearDrawRanges();
+    return 1;
+}
+
+NKV_API int nkv_vector_set_line_width(NkvHandle handle, float pixels) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->vector.SetLineWidth(pixels);
+    return 1;
+}
+
+NKV_API int nkv_vector_clear(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->vector.Clear();
+    return 1;
+}
+
+NKV_API int nkv_vector_get_stats(NkvHandle handle, uint64_t* out, uint32_t count) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || !out || count == 0) return 0;
+    inst->vector.GetStats(out, count);
+    return 1;
+}
+
 NKV_API void nkv_clear(NkvHandle handle) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return;
     inst->renderer.WaitIdle();
+    inst->vector.Clear();   // vector counterpart of dropping point/surface buffers
     inst->surface.Shutdown();
     inst->pointCloud.Shutdown();
     inst->surface.Initialize(inst->renderer);
@@ -1976,6 +2227,7 @@ NKV_API int nkv_set_point_draw_ranges(NkvHandle handle,
 }
 
 NKV_API int nkv_clear_point_draw_ranges(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     inst->pointCloud.ClearDrawRanges();
@@ -1983,18 +2235,21 @@ NKV_API int nkv_clear_point_draw_ranges(NkvHandle handle) {
 }
 
 NKV_API uint32_t nkv_get_point_draw_range_count(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.DrawRangeCount();
 }
 
 NKV_API uint32_t nkv_get_point_draw_range_points(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->pointCloud.DrawRangePointTotal();
 }
 
 NKV_API double nkv_get_gpu_frame_time_ms(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return -1.0;
     const GpuTimings& t = inst->renderer.LastGpuTimings();
@@ -2003,6 +2258,7 @@ NKV_API double nkv_get_gpu_frame_time_ms(NkvHandle handle) {
 }
 
 NKV_API double nkv_last_frame_ms(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return -1.0;
     // Historically this returned "time since BeginFrame", which reads back as
@@ -2017,6 +2273,7 @@ NKV_API const char* nkv_last_error(void) {
 }
 
 NKV_API const char* nkv_get_device_name(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return "";
     return inst->deviceNameCache.c_str();
@@ -2032,6 +2289,7 @@ NKV_API const char* nkv_get_device_name(NkvHandle handle) {
  * margin is defined once, here, and every budget - point cloud and surface -
  * derives from it. */
 NKV_API uint64_t nkv_get_device_vram_budget(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     const uint64_t total = inst->renderer.GetContext().GetReport().vramBytes;
@@ -2042,12 +2300,14 @@ NKV_API uint64_t nkv_get_device_vram_budget(NkvHandle handle) {
 }
 
 NKV_API uint32_t nkv_get_api_version(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.GetContext().GetReport().apiVersion;
 }
 
 NKV_API uint64_t nkv_get_vram_bytes(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
     if (!inst) return 0;
     return inst->renderer.GetContext().GetReport().vramBytes;

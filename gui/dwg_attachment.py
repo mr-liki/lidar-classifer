@@ -1424,7 +1424,13 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
 
     def _remove_item(self, row: DWGFileItem):
         """Remove one DWG row — clears its VTK actors too."""
-        renderer = self._get_renderer()
+        from gui.native_attachments import is_native_main, layer_for
+        native = is_native_main(self.app)
+        if native:
+            native_layer = layer_for(self.app)
+            if native_layer is not None:
+                native_layer.remove_file('dwg', row.dwg_path.name)
+        renderer = None if native else self._get_renderer()
         if renderer:
             for actors in row.actor_cache.values():
                 for a in actors:
@@ -1486,8 +1492,10 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
                                     "No loaded DWG files are checked.")
             return
 
-        renderer = self._get_renderer()
-        if renderer is None:
+        from gui.native_attachments import is_native_main, render_dwg_geometry
+        native = is_native_main(self.app)
+        renderer = None if native else self._get_renderer()
+        if renderer is None and not native:
             QMessageBox.critical(self, "No Renderer",
                                  "Cannot access the VTK renderer.\n"
                                  "Make sure a point cloud is loaded first.")
@@ -1559,7 +1567,9 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
             self._set_status(f"🎨 Building actors for {row.dwg_path.name}…")
             QCoreApplication.processEvents()
 
-            actor_cache = _geom_to_actors(renderer, layer_geom)
+            actor_cache = (render_dwg_geometry(self.app, str(row.dwg_path), layer_geom)
+                           if native else _geom_to_actors(renderer, layer_geom))
+            actor_cache = actor_cache or {}
             row.actor_cache = actor_cache
 
             total_actors = sum(len(v) for v in actor_cache.values())
@@ -1585,8 +1595,9 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
         prog.close()
 
         if attached:
-            self._install_render_guard(renderer)
-            self._reset_camera_to_dwg(renderer)
+            if not native:
+                self._install_render_guard(renderer)
+                self._reset_camera_to_dwg(renderer)
             self.dwg_attached.emit(attached)
             self._set_status(f"✅ {len(attached)} DWG file(s) attached")
             QMessageBox.information(

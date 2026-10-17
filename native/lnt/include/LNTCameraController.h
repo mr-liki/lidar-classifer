@@ -1,11 +1,11 @@
 // LNTCameraController.h - interactive orbit / pan / zoom camera + SSE dial.
 //
-// MATH. Spherical coordinates about a target anchor: yaw (about +Y), pitch
+// MATH. Spherical coordinates about a target anchor: yaw (about +Z), pitch
 // (elevation, clamped to +-89 degrees so the view never goes parallel to the up
-// vector and the basis stays unique) and distance. Y-up is deliberate: it is the
-// up the engine and LNTCamera use (see LNTCamera::up). The eye is
+// vector and the basis stays unique) and distance. LiDAR world coordinates are
+// Z-up. The eye is
 //
-//     eye = target + d * ( cos(p) * sin(y),  sin(p),  cos(p) * cos(y) )
+//     eye = target + d * ( cos(p) * sin(y), cos(p) * cos(y), sin(p) )
 //
 // ORBIT moves the angles; PAN moves target AND eye together along the view's
 // right and up axes (so the orientation and distance are unchanged); ZOOM sets a
@@ -46,6 +46,10 @@ public:
     // Off = perspective 3D orbit. Switching ON snaps back to the plan orientation.
     void set_ortho2d(bool on);
     bool ortho2d() const { return ortho2d_; }
+    // 0 perspective 3D, 1 orthographic top (+Z),
+    // 2 perspective front (-Y), 3 perspective side (+X).
+    void set_view_preset(int preset);
+    int view_preset() const { return view_preset_; }
     void pan(float delta_x, float delta_y);             // metres, view right / up
     void zoom(float delta_distance);                    // metres, + = farther
     // Advances the zoom glide. Returns true while still moving.
@@ -79,6 +83,7 @@ private:
     double fov_ = 45.0, near_ = 1.0, far_ = 100000.0;
     double sse_ = 10.0;
     bool ortho2d_ = true;
+    int view_preset_ = 1;
 };
 
 }  // namespace lnt

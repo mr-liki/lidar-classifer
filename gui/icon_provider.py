@@ -691,6 +691,7 @@ RIBBON_ICONS = {
     "Export DSM": "export",
     "Load Tool": "import",
     "Manage": "settings_gear",
+    "Manager": "settings_gear",
 
     "Attach": "attach",
     "Attach DXF": "attach",

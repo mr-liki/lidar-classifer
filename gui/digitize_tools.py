@@ -4442,6 +4442,41 @@ class DigitizeManager:
         except Exception:
             return False
 
+    def _plan_working_z(self):
+        """Z the plan-view consistency fix would force anyway: the first drawn
+        point's Z while drawing, else the dragged vertex's Z, else the fallback
+        height. Used as the projection plane when picking misses."""
+        if self.temp_points:
+            try:
+                return float(self.temp_points[0][2])
+            except Exception:
+                pass
+        dragging = getattr(self, 'dragging_vertex', None)
+        if dragging:
+            try:
+                drawing = dragging.get('drawing')
+                if drawing and 'coords' in drawing and drawing['coords']:
+                    return float(drawing['coords'][0][2])
+            except Exception:
+                pass
+        return self._get_fallback_z_height()
+
+    def _background_no_points(self, x, y):
+        """True when the cursor is over background AND there is no point cloud
+        to pick against (e.g. after the project was cleared). The world-point
+        pick then lands on the far clip plane with garbage X/Y, so callers must
+        reproject onto the working plane instead. The extra prop pick only runs
+        in this cheap empty scene, never against a loaded cloud."""
+        try:
+            data = getattr(self.app, 'data', None)
+            if isinstance(data, dict):
+                xyz = data.get('xyz')
+                if xyz is not None and len(xyz) > 0:
+                    return False
+            return self._pick_hit_background(x, y)
+        except Exception:
+            return False
+
     def _hatch_flat_z(self):
         """Best flat Z for the Hatch tool when there's no point cloud to pick
         against. Reads the elevation straight off whatever grid/SNT/DXF
@@ -4503,6 +4538,14 @@ class DigitizeManager:
 
         if self.active_tool == "hatcharea" and self._pick_hit_background(x, y):
             pos = self._project_to_z_plane(x, y, self._hatch_flat_z())
+        elif self._background_no_points(x, y):
+            # Empty scene (e.g. project cleared): the depth pick lands on the
+            # far plane with garbage X/Y. Reproject onto the working plane so
+            # drawing works exactly like with a loaded cloud.
+            if getattr(self.app, 'is_3d_mode', False):
+                pos = self._project_to_z_plane(x, y, self._get_fallback_z_height())
+            else:
+                pos = self._project_to_z_plane(x, y, self._plan_working_z())
 
         # Always snap for line and smartline tools regardless of snap_enabled flag
         if self.active_tool in ("line", "smartline"):
@@ -4533,6 +4576,12 @@ class DigitizeManager:
 
         if self.active_tool == "hatcharea" and self._pick_hit_background(x, y):
             pos = self._project_to_z_plane(x, y, self._hatch_flat_z())
+        elif self._background_no_points(x, y):
+            # Same empty-scene fallback as _get_mouse_world (no snapping here).
+            if getattr(self.app, 'is_3d_mode', False):
+                pos = self._project_to_z_plane(x, y, self._get_fallback_z_height())
+            else:
+                pos = self._project_to_z_plane(x, y, self._plan_working_z())
 
 
         # ✅ FIX: Plan View Z-Consistency for unsnapped previews

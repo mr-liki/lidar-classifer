@@ -7983,7 +7983,7 @@ def _apply_classification(app, update_selection, from_classes, to_class: int) ->
         from gui.memory_manager import current_recommended_undo_steps
         max_undo = int(current_recommended_undo_steps(app))
     except Exception:
-        max_undo = int(getattr(app, '_max_undo_steps', 30))
+        max_undo = int(getattr(app, '_max_undo_steps', 10))
     while len(app.undo_stack) > max_undo:
         app.undo_stack.pop(0)
 
@@ -8810,6 +8810,37 @@ def classify_circle(app, center=None, radius=None, from_classes=None, to_class=N
         _apply_classification(app, selected_indices, from_classes, to_class)
 
 
+def _chunked_bbox_candidates(xyz, xmin, xmax, ymin, ymax, chunk: int = 2_000_000):
+    """Canonical ids inside an XY box without an N-point bool/mask temporary."""
+    n = int(len(xyz))
+    out = []
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        blk = xyz[s:e]
+        hit = np.flatnonzero(
+            (blk[:, 0] >= xmin) & (blk[:, 0] <= xmax) &
+            (blk[:, 1] >= ymin) & (blk[:, 1] <= ymax)
+        )
+        if hit.size:
+            out.append(hit + s)
+    if not out:
+        return np.empty(0, dtype=np.int64)
+    return (out[0] if len(out) == 1 else np.concatenate(out)).astype(np.int64, copy=False)
+
+
+def _chunked_contains_points(path, xyz, candidates, chunk: int = 1_000_000):
+    """Chunked point-in-polygon over canonical ids; bounded K-sized temps."""
+    out = []
+    for s in range(0, int(candidates.size), chunk):
+        c = candidates[s:s + chunk]
+        keep = path.contains_points(xyz[c, :2])
+        if np.any(keep):
+            out.append(c[keep])
+    if not out:
+        return np.empty(0, dtype=np.int64)
+    return (out[0] if len(out) == 1 else np.concatenate(out)).astype(np.int64, copy=False)
+
+
 @classify_with_stats_update
 def classify_polygon(app, polygon_xy=None, from_classes=None, to_class=None,
                      mask=None, section_points=None, visible_bounds=None):
@@ -8866,28 +8897,49 @@ def classify_polygon(app, polygon_xy=None, from_classes=None, to_class=None,
         selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
         _apply_classification(app, selected_indices, from_classes, to_class)
     else:
+        # ⚡ Main-view plan XY. Never gather `xyz[mask_or_indices]` (an N-point
+        # temporary) and never run one-shot point-in-polygon over the whole
+        # cloud: use the shared XY grid for the bbox candidate set and then
+        # chunk the PIP test so temporaries stay bounded no matter how many
+        # points the freehand polygon encloses.
         xyz = app.data["xyz"]
-        pts = xyz[mask_or_indices]
-        xmin, ymin = poly[:, 0].min(), poly[:, 1].min()
-        xmax, ymax = poly[:, 0].max(), poly[:, 1].max()
-        bbox_mask = (
-            (pts[:, 0] >= xmin) & (pts[:, 0] <= xmax) &
-            (pts[:, 1] >= ymin) & (pts[:, 1] <= ymax)
-        )
-        candidate_idx = np.flatnonzero(bbox_mask)
-        if candidate_idx.size == 0:
-            return
-
-        path = Path(poly, closed=True)
-        inside_candidates = path.contains_points(pts[candidate_idx, :2])
-        selected_local = candidate_idx[inside_candidates]
-        if selected_local.size == 0:
-            return
+        n_points = int(len(xyz))
         if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
             base_indices = np.flatnonzero(mask_or_indices)
         else:
             base_indices = np.asarray(mask_or_indices, dtype=np.int64).ravel()
-        _apply_classification(app, base_indices[selected_local], from_classes, to_class)
+        if base_indices.size == 0:
+            return
+
+        xmin, xmax = float(poly[:, 0].min()), float(poly[:, 0].max())
+        ymin, ymax = float(poly[:, 1].min()), float(poly[:, 1].max())
+        candidates = None
+        try:
+            from gui.spatial_index import get_cached_index, schedule_shared_index_build
+            _sidx = get_cached_index(xyz)
+            if _sidx is None:
+                schedule_shared_index_build(app, xyz)
+            # Only the shared XY grid gives an O(cells) box query; the legacy
+            # 3-D kdtree backend would fall back to an O(N) mask scan.
+            if _sidx is not None and getattr(_sidx, "method", "") == "grid2d":
+                candidates = _sidx.query_rectangle_2d(xmin, xmax, ymin, ymax)
+        except Exception:
+            candidates = None
+        if candidates is None:
+            candidates = _chunked_bbox_candidates(xyz, xmin, xmax, ymin, ymax)
+        if candidates.size == 0:
+            return
+
+        selected = _chunked_contains_points(Path(poly, closed=True), xyz, candidates)
+        if selected.size == 0:
+            return
+        if base_indices.size != n_points:
+            # The index query is only an accelerator; a caller-supplied base
+            # selection stays authoritative.
+            selected = np.intersect1d(selected, base_indices)
+            if selected.size == 0:
+                return
+        _apply_classification(app, selected, from_classes, to_class)
 
 
 # @classify_with_stats_update
@@ -9060,7 +9112,7 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
         from gui.memory_manager import current_recommended_undo_steps
         max_steps = int(current_recommended_undo_steps(app))
     except Exception:
-        max_steps = int(getattr(app, '_max_undo_steps', 30))
+        max_steps = int(getattr(app, '_max_undo_steps', 10))
     while len(app.undo_stack) > max_steps:
         from gui.memory_manager import _free_undo_entry
         _free_undo_entry(app.undo_stack.pop(0))

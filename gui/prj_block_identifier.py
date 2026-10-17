@@ -6429,6 +6429,7 @@ Loads PRJ file and allows identification/highlighting of DXF blocks
 
 from gui.minimize_chip import MinimizableDialogMixin
 import os
+import time
 from typing import Optional, Set
 from pathlib import Path
 from gui.theme_manager import (
@@ -7541,12 +7542,12 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         layout.setMenuBar(self.menu_bar)
 
         file_menu = self.menu_bar.addMenu("File")
-        act_new = file_menu.addAction("New project...")
-        act_new.setToolTip("Create a brand-new, empty PRJ file and load it.")
-        act_new.triggered.connect(self._new_project)
         act_open = file_menu.addAction("Open project...")
         act_open.setToolTip("Load a PRJ file")
         act_open.triggered.connect(self.load_prj_file)
+        act_new = file_menu.addAction("New project...")
+        act_new.setToolTip("Create a brand-new, empty PRJ file and load it.")
+        act_new.triggered.connect(self._new_project)
         act_remove = file_menu.addAction("Remove project")
         act_remove.triggered.connect(self.remove_prj_file)
         file_menu.addSeparator()
@@ -8097,6 +8098,12 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
     def _safe_render_main_view(self):
         """Render main VTK view only when the widget/window is still usable."""
         try:
+            from gui.native_attachments import is_native_main, layer_for
+            if is_native_main(self.app):
+                layer = layer_for(self.app)
+                if layer is not None:
+                    layer.refresh()
+                return
             vtk_widget = getattr(self.app, 'vtk_widget', None)
             if vtk_widget is None:
                 return
@@ -8181,93 +8188,72 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             self._sort_header._sort_states = {}
             self._sort_header.viewport().update()
             
+            _t0 = time.perf_counter()
             with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            print(f"\n📄 Parsing PRJ file: {file_path}")
-            print(f"📄 Total lines in file: {len(lines)}")
-            
-            # Parse block entries: "Block DX5013255_000001.laz"
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
+                lines = f.read().splitlines()
+
+            # One pass over the file. Per-line/per-block console logging used to
+            # emit ~13 lines per block (157k lines for a 12k-block PRJ), and a
+            # Windows console write costs far more than the parse itself.
+            skipped_lines = 0
+            short_blocks = []
+            block_label = None
+            coords = []
+
+            def _flush_block():
+                if block_label is None:
+                    return
+                pts = coords
+                # Remove duplicate closing point if polygon is explicitly closed
+                if len(pts) >= 2 and pts[0] == pts[-1]:
+                    pts = pts[:-1]
+                if len(pts) >= 2:
+                    # Polygon-safe target point (a vertex average can drift
+                    # outside concave shapes).
+                    avg_x, avg_y = self._polygon_target_xy(pts)
+                    self.prj_data.append({
+                        'label': block_label,
+                        'easting': f"{avg_x:.2f}",
+                        'northing': f"{avg_y:.2f}",
+                        'description': f"Boundary: {len(pts)} points",
+                        'boundary_coords': pts,  # stored for Shoelace area
+                        'target_xy': (avg_x, avg_y),
+                    })
+                else:
+                    short_blocks.append(block_label)
+
+            for raw in lines:
+                line = raw.strip()
+                if not line:
+                    continue
                 if line.startswith('Block '):
-                    # Extract block filename
+                    _flush_block()
+                    # Block entries: "Block DX5013255_000001.laz"
                     block_file = line.replace('Block ', '').strip()
                     block_label = block_file.replace('.laz', '').replace('.las', '')
-                    
-                    print(f"\n  🔍 Found block: {block_label} at line {i}")
-                    
-                    # ✅ Read ALL lines until next Block or EOF — no arbitrary cap.
-                    # Previous <=10 limit was cutting off polygons with many vertices.
                     coords = []
-                    j = i + 1
-                    
-                    while j < len(lines):
-                        coord_line = lines[j].strip()
-                        
-                        # Stop at next block header
-                        if coord_line.startswith('Block '):
-                            print(f"    🛑 Hit next block at line {j}, stopping")
-                            break
-                        
-                        # Skip empty lines
-                        if coord_line == '':
-                            j += 1
-                            continue
-                        
-                        # ✅ Skip TerraScan metadata lines (GroupFirst=, GroupCount=, etc.)
-                        if '=' in coord_line:
-                            print(f"    ⏭️ Metadata: '{coord_line}', skipping")
-                            j += 1
-                            continue
-                        
-                        # Try to parse as "X Y" coordinate pair
-                        parts = coord_line.split()
-                        if len(parts) >= 2:
-                            try:
-                                x = float(parts[0])
-                                y = float(parts[1])
-                                coords.append((x, y))
-                                print(f"    ✅ Coord line {j}: ({x}, {y})")
-                            except ValueError:
-                                print(f"    ⚠️ Non-numeric line {j}: '{coord_line}', skipping")
-                        else:
-                            print(f"    ⚠️ Unexpected line {j}: '{coord_line}', skipping")
-                        
-                        j += 1
-                    
-                    # ✅ Remove duplicate closing point if polygon is explicitly closed
-                    if len(coords) >= 2 and coords[0] == coords[-1]:
-                        coords = coords[:-1]
-                        print(f"    ♻️ Removed duplicate closing point")
-                    
-                    print(f"    📊 Total unique boundary coords: {len(coords)}")
-                    
-                    if len(coords) >= 2:
-                        # Use a polygon-safe target point instead of a raw
-                        # vertex average, which can drift outside concave shapes.
-                        avg_x, avg_y = self._polygon_target_xy(coords)
-                        
-                        block_data = {
-                            'label': block_label,
-                            'easting': f"{avg_x:.2f}",
-                            'northing': f"{avg_y:.2f}",
-                            'description': f"Boundary: {len(coords)} points",
-                            'boundary_coords': coords,  # ✅ stored for Shoelace area
-                            'target_xy': (avg_x, avg_y),
-                        }
-                        self.prj_data.append(block_data)
-                        print(f"    ✅ Added: {block_label} at ({avg_x:.2f}, {avg_y:.2f})")
-                    else:
-                        print(f"    ⚠️ Not enough coordinates for {block_label}, skipping")
-                    
-                    # Resume outer loop from where inner loop ended
-                    i = j
+                    continue
+                if block_label is None or '=' in line:
+                    continue          # header / TerraScan metadata (GroupFirst=, ...)
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        coords.append((float(parts[0]), float(parts[1])))
+                    except ValueError:
+                        skipped_lines += 1
                 else:
-                    i += 1
-            
+                    skipped_lines += 1
+            _flush_block()
+
+            print(
+                f"\n📄 Parsed PRJ {file_path}: {len(lines):,} lines, "
+                f"{len(self.prj_data):,} blocks in {(time.perf_counter() - _t0) * 1000:.0f} ms"
+                + (f", {skipped_lines} unparsed line(s)" if skipped_lines else "")
+            )
+            if short_blocks:
+                print(f"  ⚠️ {len(short_blocks)} block(s) with < 2 coordinates skipped: "
+                      f"{', '.join(short_blocks[:10])}{' ...' if len(short_blocks) > 10 else ''}")
+
             # ── PRJ-authoritative LAZ/LAS discovery ───────────────────────────
             # PRJ Block Identifier is intentionally independent from SNT attachment
             # paths.  The currently loaded PRJ file owns the point-cloud lookup.
@@ -8286,24 +8272,17 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     prj_root = Path(self.current_directory).resolve()
                     print(f"  📁 PRJ-authoritative point-cloud root: {prj_root}")
 
-                    # Direct children first so they always win over a duplicate
-                    # filename found deeper in the PRJ directory tree.
-                    try:
-                        for fp in prj_root.iterdir():
-                            if fp.is_file() and fp.suffix.lower() in ('.laz', '.las'):
-                                prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
-                    except OSError as exc:
-                        print(f"  ⚠️ Could not scan PRJ directory directly: {exc}")
-
-                    # Then allow project-local subfolders without ever escaping to
-                    # an SNT directory or a previously loaded project directory.
-                    try:
-                        for fp in prj_root.rglob('*'):
-                            if not fp.is_file() or fp.suffix.lower() not in ('.laz', '.las'):
-                                continue
-                            prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
-                    except OSError as exc:
-                        print(f"  ⚠️ Could not recursively scan PRJ directory: {exc}")
+                    # One os.walk pass (top-down): the PRJ directory's direct
+                    # children are visited first, so they always win over a
+                    # duplicate filename deeper in the PRJ tree. Project-local
+                    # subfolders only - never an SNT or previous project folder.
+                    def _walk_error(exc):
+                        print(f"  ⚠️ Could not scan PRJ directory: {exc}")
+                    for dirpath, _dirnames, filenames in os.walk(str(prj_root), onerror=_walk_error):
+                        for fname in filenames:
+                            if fname[-4:].lower() in ('.laz', '.las'):
+                                prj_lidar_index.setdefault(
+                                    _lidar_block_key(fname), str(Path(dirpath) / fname))
 
                     print(
                         f"  ✅ PRJ-local point-cloud index: "
@@ -8317,10 +8296,15 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             # Populate table
             # Populate table + master sort list
             print(f"\n📊 Total blocks found: {len(self.prj_data)}")
+            _t_fill = time.perf_counter()
+            # Batch the fill: no repaint / signal per item for 12k rows.
+            self.table.setUpdatesEnabled(False)
+            _table_signals = self.table.blockSignals(True)
             self.table.setRowCount(len(self.prj_data))
             self._all_row_data = []   # ← cleared fresh every load
             files_found = 0
             files_missing = 0
+            red = QColor(ThemeColors.get("danger"))
 
             for row, data in enumerate(self.prj_data):
                 block_label = data['label']
@@ -8352,7 +8336,6 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     self._all_row_data.append((block_label, pts_str, area_str, None, None, row))
                     files_found += 1
                 else:
-                    red = QColor(ThemeColors.get("danger"))
                     item1 = QTableWidgetItem("No file in path")
                     item2 = QTableWidgetItem("No file in path")
                     item1.setForeground(red)
@@ -8363,7 +8346,10 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     self._all_row_data.append((block_label, "No file in path", "No file in path", red, red, row))
                     files_missing += 1
 
-            print(f"✅ Files found: {files_found}, ❌ Files missing: {files_missing}")
+            self.table.blockSignals(_table_signals)
+            self.table.setUpdatesEnabled(True)
+            print(f"✅ Files found: {files_found}, ❌ Files missing: {files_missing} "
+                  f"(table filled in {(time.perf_counter() - _t_fill) * 1000:.0f} ms)")
 
             # Reset sort state so header arrows go back to neutral on new load
             self._sort_header._sort_states = {}
@@ -8438,6 +8424,16 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            from gui.native_attachments import is_native_main, layer_for
+            if is_native_main(self.app):
+                layer = layer_for(self.app)
+                if layer is not None:
+                    layer.remove('prj', '__selection__')
+                self._highlight_actors = []
+                self._highlighted_labels = []
+                self._highlighted_blocks = {}
+                self._identified_prj_block_labels = set()
+                return
             if hasattr(self.app, 'vtk_widget') and self.app.vtk_widget:
                 renderer = self.app.vtk_widget.renderer
 
@@ -8987,6 +8983,28 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     def _highlight_prj_boundaries(self, blocks):
         """Draw selected PRJ polygons and return their combined XY bounds."""
+        from gui.native_attachments import is_native_main, render_entities
+        if is_native_main(self.app):
+            entities = []
+            all_x, all_y = [], []
+            for block in blocks:
+                coords = block.get('boundary_coords') or []
+                if len(coords) < 3:
+                    continue
+                ring = [(float(x), float(y), 0.0) for x, y in coords]
+                entities.append({'type': 'polyline', 'points': ring, 'closed': True,
+                                 'layer': 'PRJ selection', 'color': (255, 38, 0)})
+                all_x.extend(point[0] for point in ring)
+                all_y.extend(point[1] for point in ring)
+            if not entities:
+                return None
+            cache = render_entities(self.app, 'prj', {
+                'filename': '__selection__', 'full_path': '__selection__',
+                'entities': entities,
+            }) or {}
+            self._highlight_actors = [handle for group in cache.values() for handle in group]
+            return min(all_x), min(all_y), max(all_x), max(all_y)
+
         vtk_widget = getattr(self.app, "vtk_widget", None)
         renderer = getattr(vtk_widget, "renderer", None)
         if renderer is None:
@@ -9113,6 +9131,22 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         """
         try:
             from PySide6.QtCore import QTimer
+
+            from gui.native_attachments import is_native_main, layer_for
+            if is_native_main(self.app):
+                view = self.app._lnt_main_view
+                widget = view.owner.vulkan_widget
+                ratio = float(widget.devicePixelRatioF())
+                projected = view.native.world_to_screen(float(x), float(y))
+                if projected is not None:
+                    centre_x = widget.width() * ratio * 0.5
+                    centre_y = widget.height() * ratio * 0.5
+                    view.native.pan(centre_x - projected[0], centre_y - projected[1])
+                native_layer = layer_for(self.app)
+                if native_layer is not None:
+                    native_layer.refresh()
+                self.app._prj_fly_camera_active = False
+                return
 
             if not hasattr(self.app, 'vtk_widget') or not self.app.vtk_widget:
                 return
