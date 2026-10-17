@@ -1986,6 +1986,16 @@ class MeasurementTool(AreaIndex):
             "📏 Left-click: measure | Middle-click: pan | Right-click: finish/select | ESC: cancel",
             5000
         )
+        self._refresh_measure_ribbon()
+
+
+    def _refresh_measure_ribbon(self):
+        """Keep the Measure ribbon highlight in step with the live tool state."""
+        try:
+            from gui.native_shortcuts import refresh_measure_ribbon
+            refresh_measure_ribbon(self.app)
+        except Exception as exc:      # noqa: BLE001 - sync must never break a tool
+            print(f"⚠️ Measure ribbon sync failed: {exc}")
 
 
     def deactivate(self):
@@ -2011,6 +2021,7 @@ class MeasurementTool(AreaIndex):
         self._force_full_render()
 
         print("📏 Measurement drawing deactivated (selection/deletion still active)")
+        self._refresh_measure_ribbon()
     
     def _on_click(self, _obj, _evt):  # noqa: unused-args — VTK callback signature
         """Handle left click to add measurement point."""
@@ -3691,6 +3702,7 @@ class MeasurementTool(AreaIndex):
         self._invalidate_measure_snap_cache()
 
         print("📏 Drawing stopped (selection/deletion still active)")
+        self._refresh_measure_ribbon()
 
     def _prepare_next_measurement(self):
         """
@@ -3712,6 +3724,7 @@ class MeasurementTool(AreaIndex):
         self._invalidate_measure_snap_cache()
         self._render_overlay_only()
         print("📏 Measurement tool armed for next measurement")
+        self._refresh_measure_ribbon()
 
 
     def deactivate_completely(self):
@@ -3755,6 +3768,7 @@ class MeasurementTool(AreaIndex):
         self._last_cursor_pos = None
         self._invalidate_measure_snap_cache()
         print("📏 Measurement tool fully deactivated")
+        self._refresh_measure_ribbon()
 
     def pause_without_clearing(self):
         """
@@ -3787,6 +3801,7 @@ class MeasurementTool(AreaIndex):
             self._render_observer_tag = None
 
         print("📏 Measurement tool paused (state preserved)")
+        self._refresh_measure_ribbon()
 
     def reinstall_observers(self):
         """Re-register VTK observers without resetting any measurement state.

@@ -230,9 +230,20 @@ class NativeMeasure:
         return False
 
     def cancel(self):
+        was_active = self.active
         self.active = False
         self.points, self.hover = [], None
         self._paint()
+        if was_active:
+            self._refresh_ribbon()
+
+    def _refresh_ribbon(self):
+        """Keep the Measure ribbon highlight in step with the live tool state."""
+        try:
+            from gui.native_shortcuts import refresh_measure_ribbon
+            refresh_measure_ribbon(self.app)
+        except Exception as exc:      # noqa: BLE001 - sync must never break a tool
+            print(f'⚠️ Measure ribbon sync failed: {exc}')
 
     def clear(self):
         self.points, self.completed, self.completed_modes, self.hover = [], [], [], None

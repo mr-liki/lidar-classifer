@@ -20,6 +20,11 @@ VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
 
 MODE_CLASS, MODE_INTENSITY, MODE_ELEVATION, MODE_NEUTRAL, MODE_DEPTH = 1, 2, 3, 5, 6
 
+# Wheel zoom geometry: one notch scales the 2D-plan distance by this fraction
+# (engine parity - native/lnt/lnt_view_api.cpp lnt_view_zoom asks for
+# -goal_distance * 0.12 per step, i.e. a 1 - 0.12*steps distance factor).
+ZOOM_STEP_FRACTION = 0.12
+
 # Presentation modes of lnt_view_set_shading (LNTShadingModes.h). NOT the engine's
 # MODE_* numbers above: these are the shading API's own enumeration.
 SHADE_RGB, SHADE_INTENSITY, SHADE_ELEVATION, SHADE_CLASSIFICATION, SHADE_NORMAL = 0, 1, 2, 3, 4
@@ -206,6 +211,10 @@ class NativeView:
             raise RuntimeError(err.value.decode("utf-8", "replace") or "viewer open failed")
         self.stats = LntViewStats()
         self.last_error = ""
+        # Device-pixel extent this renderer draws into (lnt_view_screen_to_world
+        # and lnt_view_world_to_screen both work in this space). Needed by
+        # zoom_at() to convert the anchor shift into a frame_region width.
+        self._w, self._h = int(width), int(height)
 
     def close(self):
         if self.h:
@@ -224,6 +233,7 @@ class NativeView:
         return bool(self.h)
 
     def resize(self, w, h):
+        self._w, self._h = int(w), int(h)
         return self._ok() and lib().lnt_view_resize(c_void_p(self.h), int(w), int(h))
 
     def orbit(self, dx, dy):
@@ -234,6 +244,49 @@ class NativeView:
 
     def zoom(self, steps):
         self._ok() and lib().lnt_view_zoom(c_void_p(self.h), steps)
+
+    def zoom_at(self, steps, px, py):
+        """Zoom one wheel notch about the device-pixel point (px, py).
+
+        Keeps the world point under the cursor fixed while the scale changes
+        by the engine's own per-notch factor (ZOOM_STEP_FRACTION).
+
+        The engine's lnt_view_zoom only dollies about the view centre and
+        eases distance toward a goal, so the anchor is emulated EXACTLY with
+        the engine's own affine 2D-plan mapping: screen = centre +
+        (world - target) * metres_per_px. Centre-dollying scales that factor
+        by 1/k; re-centring through lnt_view_frame_region (an exact target +
+        distance setter, no glide) then holds the cursor's world point in
+        place: target = anchor - (cursor - centre) * new_metres_per_px.
+
+        2D plan only - in 3D orbit the mapping APIs report no plan projection
+        and the caller must fall back to the engine's centre zoom(). Returns
+        False when the anchor could not be applied (no plan mapping, zero-size
+        view, predated DLL, clamped extreme distances).
+        """
+        if not steps or not self._ok():
+            return False
+        anchor = self.screen_to_world(px, py)
+        probe = self.screen_to_world(px + 1.0, py)
+        if not anchor or not probe:
+            return False                       # 3D orbit mode: no plan mapping
+        m0 = abs(probe[0] - anchor[0])         # metres per device pixel now
+        if m0 <= 0.0:
+            return False
+        k = max(0.05, 1.0 - ZOOM_STEP_FRACTION * float(steps))
+        m1 = m0 * k
+        w, h = float(getattr(self, "_w", 0) or 0), float(getattr(self, "_h", 0) or 0)
+        if w < 1.0 or h < 1.0:
+            return False
+        self.frame_region(anchor[0] - (px - .5 * w) * m1,
+                          anchor[1] + (py - .5 * h) * m1,
+                          w * m1)
+        # Prove the engine actually applied it: frame_region silently no-ops
+        # on a DLL that predates it, and the engine clamps extreme distances.
+        after = self.screen_to_world(px + 1.0, py)
+        if not after or abs(abs(after[0] - anchor[0]) - m1) > m1 * 1e-6 + 1e-12:
+            return False
+        return True
 
     def set_sse(self, px):
         self._ok() and lib().lnt_view_set_sse(c_void_p(self.h), px)

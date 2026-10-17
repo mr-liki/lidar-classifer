@@ -83,15 +83,24 @@ def snt_viewport_measure(app, name, key_label=''):
     """
     if name not in ('MeasureLine', 'MeasurePath', 'MeasureGridArea', 'MeasureBlockArea'):
         return False
-    from gui.native_vector_overlay import _view_for, snt_viewport_active
+    from gui.native_vector_overlay import (_view_for, promote_snt_viewport,
+                                           snt_viewport_active)
     if not snt_viewport_active(app):
-        return False
+        # Fresh session with nothing loaded: the canvas is still VTK's, so
+        # arming the native overlay would draw where nobody looks. Take the
+        # viewport for the native tools instead - the same §5 promotion an
+        # SNT attach uses. It declines (-> VTK fallback stays) when a
+        # VTK-rendered cloud owns the data or the engine cannot serve the
+        # surface, so a data-bearing VTK session keeps its VTK tool.
+        if not promote_snt_viewport(app):
+            return False
     view = _view_for(app)
     widget = getattr(getattr(view, 'owner', None), 'vulkan_widget', None)
     if view is None or widget is None:
         return False
     from gui.native_main_classify import MainCanvas
     from gui.native_measure import NativeMeasure, ensure_snt_input
+    stand_down_vtk_measurement(app)
     measurement = getattr(view, 'measurement', None)
     if measurement is None:
         measurement = view.measurement = NativeMeasure(MainCanvas(view))
@@ -125,6 +134,107 @@ def _arm_measurement(measurement, name):
     measurement.area_mode = {'MeasureGridArea': 'grid',
                              'MeasureBlockArea': 'block'}.get(name)
     measurement.active = True
+    refresh_measure_ribbon(measurement.app)
+
+
+_MEASURE_RIBBON_IDS = {'MeasureLine': 'measure_line', 'MeasurePath': 'measure_path',
+                       'MeasureGridArea': 'measure_grid_area',
+                       'MeasureBlockArea': 'measure_block_area'}
+
+
+def _measurement_ribbon_id(measurement):
+    """Ribbon id of a native measurement overlay (None for the XS line)."""
+    if getattr(measurement, 'style_key', None) == 'cross_section':
+        return None
+    if getattr(measurement, 'area_mode', None) == 'grid':
+        return 'measure_grid_area'
+    if getattr(measurement, 'area_mode', None) == 'block':
+        return 'measure_block_area'
+    return 'measure_path' if getattr(measurement, 'path', False) else 'measure_line'
+
+
+def active_measure_ribbon_id(app):
+    """The Line/Path/Block/Grid tool actually armed right now, if any.
+
+    Native overlays win over the VTK tool: when a native viewport owns the
+    clicks, the VTK MeasurementTool is only a stand-in.
+    """
+    for measurement in native_measurements(app):
+        if getattr(measurement, 'active', False):
+            ribbon_id = _measurement_ribbon_id(measurement)
+            if ribbon_id is not None:
+                return ribbon_id
+    tool = getattr(app, 'measurement_tool', None)
+    if (tool is not None and getattr(tool, 'active', False)
+            and getattr(tool, 'is_measuring', False)):
+        mode = str(getattr(tool, 'mode', '') or '')
+        if mode in _MEASURE_RIBBON_IDS.values():
+            return mode
+    return None
+
+
+def xs_measure_active(app):
+    """XS (CrossSectionMeasure) armed: VTK tool, native flag, or an XS overlay.
+
+    The native flag stays set while XS waits for section windows to open, so
+    it counts as armed even when no measurement overlay exists yet - exactly
+    like the button's own semantics.
+    """
+    tool = getattr(app, 'cross_section_measurement_tool', None)
+    if tool is not None and getattr(tool, 'active', False):
+        return True
+    if getattr(app, '_native_xs_active', False):
+        return True
+    for measurement in native_measurements(app):
+        if (getattr(measurement, 'style_key', None) == 'cross_section'
+                and getattr(measurement, 'active', False)):
+            return True
+    return False
+
+
+def refresh_measure_ribbon(app):
+    """Match the Measure ribbon highlight to the armed tools (or clear them)."""
+    try:
+        ribbon = getattr(getattr(app, 'ribbon_manager', None), 'ribbons', {}).get('measure')
+        sync = getattr(ribbon, 'sync_active_tool', None)
+        if sync is not None:
+            sync(active_measure_ribbon_id(app), xs_measure_active(app))
+    except Exception as exc:      # noqa: BLE001 - sync must never break a tool
+        print(f'⚠️ Measure ribbon sync failed: {exc}')
+
+
+def deactivate_native_measurement(app, tool_id):
+    """Stand down the native Line/Path/Block/Grid tool behind one ribbon id."""
+    cancelled = False
+    for measurement in native_measurements(app):
+        if (getattr(measurement, 'active', False)
+                and _measurement_ribbon_id(measurement) == tool_id):
+            measurement.cancel()      # also refreshes the ribbon
+            cancelled = True
+    return cancelled
+
+
+def stand_down_vtk_measurement(app):
+    """A native measure owns the clicks now: the VTK tool must not observe.
+
+    deactivate_completely() (not deactivate()) uninstalls the VTK observers,
+    so Esc, right-click and Ctrl+Z reach only the native overlay while a
+    Vulkan canvas - .lnt main view or promoted SNT viewport - is on screen.
+    """
+    tool = getattr(app, 'measurement_tool', None)
+    if tool is None:
+        return
+    if not (getattr(tool, 'active', False)
+            or getattr(tool, 'is_measuring', False)
+            or getattr(tool, '_observer_tags', None)):
+        return                    # never armed: leave unrelated VTK state alone
+    try:
+        if hasattr(tool, 'deactivate_completely'):
+            tool.deactivate_completely()
+        elif getattr(tool, 'active', False) or getattr(tool, 'is_measuring', False):
+            tool.deactivate()
+    except Exception as exc:      # noqa: BLE001 - arming must never fail
+        print(f'⚠️ VTK measurement stand-down failed: {exc}')
 
 
 def _xs_button(app):
@@ -167,9 +277,28 @@ def native_section_measure(app, on):
                 c.classifier for c in sections.views.values()]:
             if classifier is not None:
                 classifier.cancel()
+        # Native owns XS on the Vulkan section canvases now: stand the VTK
+        # CrossSectionMeasurementTool down so its observers stop stealing the
+        # same clicks (and Ctrl+Z/Ctrl+Y) from the native overlay.
+        try:
+            tool = getattr(app, 'cross_section_measurement_tool', None)
+            if tool is not None and getattr(tool, 'active', False):
+                tool.deactivate()
+        except Exception as exc:      # noqa: BLE001
+            print(f'⚠️ VTK XS stand-down failed: {exc}')
+    else:
+        # Toggled off in a native session: make sure the VTK tool is not left
+        # armed either (the ribbon handler returns early on the native path).
+        try:
+            tool = getattr(app, 'cross_section_measurement_tool', None)
+            if tool is not None and getattr(tool, 'active', False):
+                tool.deactivate()
+        except Exception as exc:      # noqa: BLE001
+            print(f'⚠️ VTK XS stand-down failed: {exc}')
     for slot, canvas in sections.views.items():
         if slot != CUT_SLOT:
             arm_section_measure(canvas, on)
+    refresh_measure_ribbon(app)       # keep the XS button honest for direct callers
     return True
 
 
@@ -285,12 +414,14 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
         if canvas is None:
             from gui.native_main_classify import MainCanvas
             if not view.mode_2d:
+                refresh_measure_ribbon(app)   # nothing was armed: keep the ribbon honest
                 status('Native measurements require the 2D plan view.')
                 return True
             target = MainCanvas(view)
             owner = view
         else:
             target = owner = canvas
+        stand_down_vtk_measurement(app)
         measurement = getattr(owner, 'measurement', None)
         if measurement is None:
             measurement = owner.measurement = NativeMeasure(target)

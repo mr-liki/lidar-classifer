@@ -7172,6 +7172,15 @@ class NakshaApp(QMainWindow):
         self.data["_layer_crs_info"] = list(result.get("layer_info_list") or [])
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
+        # A native canvas promoted while nothing was loaded (measure tools,
+        # SNT-only attach) must not cover this VTK-rendered cloud: hand the
+        # viewport back to VTK. No-op for .lnt sessions and resident linework.
+        try:
+            from gui.lnt_open import take_back_viewport_for_vtk_load
+            take_back_viewport_for_vtk_load(self)
+        except Exception as _e:
+            print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
+
         # Track whether this load was class-filtered so auto-save skips the file.
         _b = getattr(self, "_batch_import_options_last", None)
         self._loaded_with_class_filter = bool(
@@ -7835,6 +7844,14 @@ class NakshaApp(QMainWindow):
         # Set main data only after coordinates are in project space.
         self.data = lidar_data
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
+
+        # This is a VTK-side load: a native canvas promoted for empty-session
+        # tools must not cover it - hand the viewport back to VTK.
+        try:
+            from gui.lnt_open import take_back_viewport_for_vtk_load
+            take_back_viewport_for_vtk_load(self)
+        except Exception as _e:
+            print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
 
         # Track whether this load was class-filtered so auto-save skips the file.
         _io = lidar_data.get("import_options") or {}
@@ -15078,6 +15095,7 @@ class NakshaApp(QMainWindow):
         # =========================
         measure_ribbon = self.ribbon_manager.ribbons["measure"]
         measure_ribbon.measure_tool_selected.connect(self.activate_measurement_tool)
+        measure_ribbon.measure_tool_deactivated.connect(self.deactivate_measurement_tool)
         measure_ribbon.clear_measurements.connect(self.clear_all_measurements)
 
         # =========================
@@ -16814,10 +16832,17 @@ class NakshaApp(QMainWindow):
         from gui.native_shortcuts import (cancel_native_measurements,
                                           execute_native_shortcut)
         if execute_native_shortcut(self, tool_name):
+            # Native Vulkan owns the measure gesture: keep the legacy VTK tool
+            # fully stood down (observers removed), never merely paused.
             _mt = getattr(self, "measurement_tool", None)
-            if _mt is not None and getattr(_mt, "active", False):
+            if _mt is not None and (getattr(_mt, "active", False)
+                                    or getattr(_mt, "is_measuring", False)
+                                    or getattr(_mt, "_observer_tags", None)):
                 try:
-                    _mt.deactivate()
+                    if hasattr(_mt, "deactivate_completely"):
+                        _mt.deactivate_completely()
+                    else:
+                        _mt.deactivate()
                 except Exception as _e:
                     print(f"⚠️ Legacy measurement deactivate failed: {_e}")
             return
@@ -16885,6 +16910,32 @@ class NakshaApp(QMainWindow):
         }.get(tool_name)
         if status_message:
             self.statusBar().showMessage(status_message, 5000)
+
+    def deactivate_measurement_tool(self, tool_name):
+        """Toggle-off from the Measure ribbon: stand one tool down.
+
+        Mirrors activate_measurement_tool for the unchecked-button direction.
+        Only the named Line/Path/Block/Grid tool is cancelled, so the XS
+        button and already-finished measurements are left untouched. The
+        ribbon highlight clears itself through the same state sync the tool
+        uses when it deactivates on its own (Esc, another tool taking over).
+        """
+        from gui.native_shortcuts import deactivate_native_measurement
+        try:
+            deactivate_native_measurement(self, tool_name)
+        except Exception as _e:
+            print(f"⚠️ Native measurement deactivate failed: {_e}")
+        tool = getattr(self, "measurement_tool", None)
+        if (tool is not None and getattr(tool, "active", False)
+                and getattr(tool, "mode", None) == tool_name):
+            try:
+                if hasattr(tool, "deactivate_completely"):
+                    tool.deactivate_completely()
+                else:
+                    tool.deactivate()
+            except Exception as _e:
+                print(f"⚠️ Measurement deactivate failed: {_e}")
+        self.statusBar().showMessage("📏 Measurement tool deactivated", 2500)
 
     def clear_all_measurements(self):
         """Clear all measurement lines and labels — main view AND cross-section."""
@@ -17562,6 +17613,14 @@ class NakshaApp(QMainWindow):
                     "classification": tile_data["classification"]
                 }
                 self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
+
+                # VTK-side tile load: hand a promoted empty-session native
+                # canvas back to VTK so the cloud is visible.
+                try:
+                    from gui.lnt_open import take_back_viewport_for_vtk_load
+                    take_back_viewport_for_vtk_load(self)
+                except Exception as _e:
+                    print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
                 
                 # Track whether this load was class-filtered so auto-save skips the file.
                 _io = tile_data.get("import_options") or {}
