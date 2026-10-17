@@ -14,6 +14,7 @@ layout(push_constant) uniform PushConstant {
     vec4 lightDirAmbient;
     vec4 elevRangeMode;
     vec4 shadeParamsA;   // x=azimuthDeg, y=sharpnessRaw, z=ambient, w=unused (crisp-hybrid modes 4/5 only)
+    vec4 elevationColor;
     vec4 shadeParamsB;   // x=keyIntensity, y=fillIntensity, z/w=unused
 } pc;
 

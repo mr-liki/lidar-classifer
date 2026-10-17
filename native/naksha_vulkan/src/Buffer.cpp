@@ -81,7 +81,7 @@ uint8_t* UploadContext::Stage(VkDeviceSize bytes) {
 }
 
 UploadStats UploadContext::Execute(const std::vector<CopyRegion>& regions,
-                                     double cpuPrepMs, double stageMs) {
+                                     double cpuPrepMs, double stageMs, bool overwriteInUse) {
     UploadStats stats{};
     stats.cpuPrepMs = cpuPrepMs;
     stats.stageMs = stageMs;
@@ -107,6 +107,16 @@ UploadStats UploadContext::Execute(const std::vector<CopyRegion>& regions,
     if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) return stats;
 
     VkDeviceSize srcOffset = 0;
+    if (overwriteInUse) {
+        // Copies share the graphics queue with draws. Order prior reads before
+        // overwriting resident colours, without stalling every device queue.
+        VkMemoryBarrier before{};
+        before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        before.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    }
     if (timestampPeriodNs_ > 0.0f) {
         vkCmdResetQueryPool(cmd, queryPool_, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0);
@@ -118,6 +128,14 @@ UploadStats UploadContext::Execute(const std::vector<CopyRegion>& regions,
         copy.size = r.size;
         vkCmdCopyBuffer(cmd, staging_.buffer, r.dst, 1, &copy);
         srcOffset += r.size;
+    }
+    if (overwriteInUse) {
+        VkMemoryBarrier after{};
+        after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
     }
     if (timestampPeriodNs_ > 0.0f) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, 1);

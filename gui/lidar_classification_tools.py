@@ -5208,7 +5208,7 @@ class _BaseClassifyDialog(QDialog):
                     if _redo is not None:
                         _redo.clear()
 
-                    max_steps = getattr(self.app, "_max_undo_steps", 30)
+                    max_steps = getattr(self.app, "_max_undo_steps", 10)
                     while len(_stack) > max_steps:
                         from gui.memory_manager import _free_undo_entry
                         _free_undo_entry(_stack.pop(0))

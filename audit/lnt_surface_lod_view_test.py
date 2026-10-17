@@ -288,9 +288,9 @@ def phase_edit():
         assert q is not None and len(q['node']) > 0
         assert nv.set_classes(q['node'], q['local'], np.full(len(q['node']), 6, np.uint8)), nv.last_error
         s = v.settle()
-        assert s['built'] > 0, s
+        assert s['built'] == 0, s
         v.flush()
-        print(f'PASS class edit invalidated stored tiles: {s["built"]} rebuilt from the edited records, archive re-keyed', flush=True)
+        print(f'PASS class edit patched stored tiles: {s["built"]} rebuilt, archive re-keyed', flush=True)
     finally:
         v.close()
     v = View(nat, WORK)

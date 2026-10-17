@@ -9,10 +9,11 @@ from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QSizePolicy, QDialog, QDialogButtonBox,
     QComboBox, QMessageBox, QAbstractItemView, QApplication, QRadioButton, QMenu  # ✅ ADD THIS
 )
-from PySide6.QtCore import Qt, Signal, QEvent, QSize, QSettings
+from PySide6.QtCore import Qt, Signal, QEvent, QSize, QSettings, QObject
 from PySide6.QtGui import QFont, QPixmap, QIcon, QColor, QPainter, QPen
 from html import escape
 import json
+import weakref
 import numpy as np
 from scipy.spatial import cKDTree
 from gui.prj_block_identifier import show_block_identifier_dialog
@@ -23,6 +24,111 @@ from .draw_settings_dialog import DrawToolSettingsDialog
 from .icon_provider import get_button_icon
 # Add with other imports at the top of menu_sidebar_system.py (around line 10-15)
 from gui.undo_context_manager import get_undo_context_manager
+
+
+# ── SNT dialog button highlight ─────────────────────────────────────────
+# Keeps the File ▸ Attachments ▸ SNT ribbon button in a "medium bright white"
+# highlighted state while the Attach SNT window is visible, so users can see
+# the feature is still open / in use. Cleared when the dialog is hidden.
+_SNT_HIGHLIGHT_QSS = """
+QPushButton#ribbonButton[sntOpen="true"] {
+    background-color: #9aa0a6;
+    border: 1px solid #c8cdd2;
+    border-radius: 10px;
+}
+QPushButton#ribbonButton[sntOpen="true"]:hover {
+    background-color: #a8adb3;
+    border: 1px solid #d5dade;
+}
+"""
+
+
+def _find_snt_ribbon_button(app):
+    """Return the File ▸ Attachments ▸ SNT ribbon QPushButton, or None."""
+    try:
+        manager = getattr(app, "ribbon_manager", None)
+        ribbons = getattr(manager, "ribbons", None) if manager is not None else None
+        file_ribbon = ribbons.get("file") if isinstance(ribbons, dict) else None
+        if file_ribbon is None:
+            return None
+        candidates = file_ribbon.findChildren(QPushButton)
+        for btn in candidates:
+            text = str(btn.property("ribbonText") or "").strip().lower()
+            section = str(btn.property("ribbonSection") or "").strip().lower()
+            if section == "attachments" and text in ("snt", "attach snt"):
+                return btn
+        return None
+    except Exception:
+        return None
+
+
+def _set_snt_button_highlight(app, on: bool) -> None:
+    """Toggle the SNT ribbon button highlight on/off (safe no-op on failure)."""
+    try:
+        btn = _find_snt_ribbon_button(app)
+        if btn is None:
+            return
+        btn.setProperty("sntOpen", True if on else False)
+        if on:
+            # Prepend our highlight QSS so it wins over the theme's inline style
+            # without wiping it (theme refresh reapplies via setStyleSheet).
+            existing = str(btn.styleSheet() or "")
+            if "sntOpen" not in existing:
+                btn.setStyleSheet(_SNT_HIGHLIGHT_QSS + existing)
+        else:
+            existing = str(btn.styleSheet() or "")
+            if "sntOpen" in existing:
+                btn.setStyleSheet(existing.replace(_SNT_HIGHLIGHT_QSS, ""))
+        # Force QSS re-evaluation of the dynamic property
+        try:
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        except Exception:
+            pass
+        btn.update()
+    except Exception:
+        pass
+
+
+class _SntDialogVisibilityFilter(QObject):
+    """Clears the SNT button highlight when the dialog is hidden/destroyed."""
+
+    def __init__(self, app_ref, parent=None):
+        super().__init__(parent)
+        try:
+            self._app_ref = weakref.ref(app_ref) if app_ref is not None else lambda: None
+        except Exception:
+            self._app_ref = lambda: None
+
+    def eventFilter(self, obj, event):
+        try:
+            etype = event.type()
+            if etype == QEvent.Hide:
+                app = self._app_ref()
+                if app is not None:
+                    _set_snt_button_highlight(app, False)
+            elif etype == QEvent.Show:
+                app = self._app_ref()
+                if app is not None:
+                    _set_snt_button_highlight(app, True)
+        except Exception:
+            pass
+        return False
+
+
+def _track_snt_dialog_visibility(app, dlg) -> None:
+    """Install the visibility filter (once) and light the SNT button."""
+    try:
+        if getattr(dlg, "_snt_btn_filter_installed", False):
+            _set_snt_button_highlight(app, True)
+            return
+        filt = _SntDialogVisibilityFilter(app, parent=dlg)
+        dlg.installEventFilter(filt)
+        dlg._snt_btn_filter = filt
+        dlg._snt_btn_filter_installed = True
+        _set_snt_button_highlight(app, True)
+    except Exception:
+        pass
 
 
 def _safe_populate_byclass(dlg):
@@ -1187,6 +1293,7 @@ class FileRibbon(QWidget):
                         app.snt_dialog.show()
                         app.snt_dialog.raise_()
                         app.snt_dialog.activateWindow()
+                    _track_snt_dialog_visibility(app, app.snt_dialog)
                     return  # ✅ guard: prevents fall-through to dialog re-creation below
 
                 except (RuntimeError, ReferenceError):
@@ -1196,6 +1303,7 @@ class FileRibbon(QWidget):
             # First launch OR after garbage-collection: create fresh dialog
             from gui.snt_attachment import show_snt_attachment_dialog
             app.snt_dialog = show_snt_attachment_dialog(app)
+            _track_snt_dialog_visibility(app, app.snt_dialog)
 
         except Exception as e:
             print(f"SNT attachment failed: {e}")
@@ -2882,6 +2990,19 @@ class DrawRibbon(QWidget):
 
     def _handle_clear_click(self):
         main_window = self.window()
+        # An open LNT view owns its Draw figures in the native drawing layer.
+        # Clear that layer directly and stop here: the legacy path below also
+        # knows about classified fences, VTK curves and text actors, none of
+        # which belong to the Draw-tab Clear operation in the native viewport.
+        from gui.native_draw import get_native_draw
+        native_draw = get_native_draw(main_window)
+        if native_draw is not None:
+            native_draw.clear()
+            try:
+                main_window.statusBar().showMessage('Draw figures cleared', 2500)
+            except Exception:
+                pass
+            return
         if not hasattr(main_window, "digitizer") or not main_window.digitizer:
             return
 
@@ -3003,6 +3124,11 @@ class DrawRibbon(QWidget):
         then shows the SelectionModeDialog which activates ElementSelectTool.
         """
         main_window = self.window()
+
+        from gui.native_draw import activate_native_draw
+        if activate_native_draw(main_window, 'select'):
+            main_window.statusBar().showMessage('Native Vulkan Select: click a drawing', 3000)
+            return
 
         self._deactivate_accudraw_before_other_tool("Select Drawing")
 
@@ -3250,6 +3376,11 @@ class DrawRibbon(QWidget):
     def _handle_parallel_click(self):
         """Handle Parallel button click — open the Parallel Figure dialog."""
         main_window = self.window()
+        from gui.native_draw import activate_native_draw
+        if activate_native_draw(main_window, 'parallel'):
+            main_window.statusBar().showMessage(
+                'Native Parallel: select a drawing first, then click the offset position', 4000)
+            return
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Parallel tool: digitizer not available")
@@ -3327,6 +3458,11 @@ class DrawRibbon(QWidget):
     def _handle_centerline_click(self):
         """Handle Centerline button click — open the Centerline dialog."""
         main_window = self.window()
+        from gui.native_draw import activate_native_draw
+        if activate_native_draw(main_window, 'centerline'):
+            main_window.statusBar().showMessage(
+                'Native Centerline: select the first drawing, then click the second', 4000)
+            return
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Centerline tool: digitizer not available")
@@ -3530,6 +3666,10 @@ class RibbonManager:
                 if hasattr(self.parent, 'measurement_tool') and self.parent.measurement_tool:
                     try: self.parent.measurement_tool.deactivate()
                     except Exception: pass
+                try:
+                    from gui.native_shortcuts import cancel_native_measurements
+                    cancel_native_measurements(self.parent)
+                except Exception: pass
             
             # ◀◀◀ NEW: Deactivate Identify tools when leaving 'identify' tab
             elif self.current_ribbon == 'identify' and ribbon_name != 'identify':
@@ -3620,6 +3760,9 @@ class BlockRibbon(QWidget):
     def _show_block_creation_settings(self):
         try:
             app = getattr(self, "app", None) or self.window()
+            from gui.native_create import show_native_block_dialog
+            if show_native_block_dialog(app):
+                return
             existing = getattr(app, "block_creation_settings_dialog", None)
             
             # Check if the dialog exists and is valid
@@ -3658,6 +3801,9 @@ class BlockRibbon(QWidget):
         """Open the (currently static) Cell Creation Settings window."""
         try:
             app = getattr(self, "app", None) or self.window()
+            from gui.native_create import show_native_cell_dialog
+            if show_native_cell_dialog(app):
+                return
             existing = getattr(app, "cell_creation_settings_dialog", None)
 
             # Check if the dialog exists and is valid
@@ -4013,6 +4159,12 @@ class IdentificationRibbon(QWidget):
             # ✅ RESET: Clear the pick method so the user MUST pick every time
             if hasattr(self.app, 'select_rectangle_tool'):
                 self.app.select_rectangle_tool.pick_method = None
+            try:
+                _nv = self._native_view()
+                if _nv is not None and getattr(_nv, "native_select", None) is not None:
+                    _nv.native_select.pick_method = "Block"
+            except Exception:
+                pass
 
             # ✅ TRIGGER: Show the Pick Method selector popup
             try:
@@ -4024,9 +4176,13 @@ class IdentificationRibbon(QWidget):
                 # Fallback to default block if popup fails
                 self.status_label.setText("Draw rectangle to select points")
                 self.status_label.setStyleSheet("color: #ff9800; font-weight: bold;")
-                if hasattr(self.app, 'select_rectangle_tool'):
-                    self.app.select_rectangle_tool.activate()
-                    self.app.select_rectangle_tool.set_pick_method("Block")
+                if self._activate_native_select():
+                    try:
+                        self._native_view().native_select.set_pick_method("Block")
+                    except Exception:
+                        pass
+                else:
+                    print("Select needs an open native (.lnt) view")
                 
         else:
             self._deactivate_select_rectangle()
@@ -4074,9 +4230,13 @@ class IdentificationRibbon(QWidget):
 
         self.status_label.setText(f"Selection Mode: {method}")
         self.status_label.setStyleSheet("color: #4caf50; font-weight: bold;")
-        if hasattr(self.app, 'select_rectangle_tool'):
-            self.app.select_rectangle_tool.activate()
-            self.app.select_rectangle_tool.set_pick_method(method)
+        if self._activate_native_select():
+            try:
+                self._native_view().native_select.set_pick_method(method)
+            except Exception:
+                pass
+        else:
+            print("Select needs an open native (.lnt) view")
 
     def _on_pick_method_popup_rejected(self):
         if not self.select_rectangle_active:
@@ -4107,6 +4267,7 @@ class IdentificationRibbon(QWidget):
         self.identify_active = False
         self.identify_btn.setChecked(False)
         self._reset_button_style(self.identify_btn)
+        self._stand_down_native_identify_tools()
 
         if self.app and hasattr(self.app, 'identification_tool'):
             self.app.identification_tool.deactivate()
@@ -4116,6 +4277,7 @@ class IdentificationRibbon(QWidget):
         self.zoom_rectangle_active = False
         self.zoom_rect_btn.setChecked(False)
         self._reset_button_style(self.zoom_rect_btn)
+        self._stand_down_native_identify_tools()
 
         if self.app and hasattr(self.app, 'zoom_rectangle_tool'):
             self.app.zoom_rectangle_tool.deactivate()
@@ -4126,6 +4288,7 @@ class IdentificationRibbon(QWidget):
         self.select_rect_btn.setChecked(False)
         self._reset_button_style(self.select_rect_btn)
         self.delete_btn.setVisible(False)
+        self._stand_down_native_identify_tools()
 
         popup = self._get_pick_method_popup()
         if popup is not None:
@@ -4146,6 +4309,13 @@ class IdentificationRibbon(QWidget):
 
     def delete_selected_points(self):
         """Delete the selected points"""
+        try:
+            _nv = self._native_view()
+            if _nv is not None and getattr(_nv, "native_select", None) is not None:
+                _nv.native_select.delete_selected_points()
+                return
+        except Exception:
+            pass
         if self.app and hasattr(self.app, 'select_rectangle_tool'):
             self.app.select_rectangle_tool.delete_selected_points()
             
@@ -4195,11 +4365,11 @@ class IdentificationRibbon(QWidget):
 
             self.status_label.setStyleSheet("color: #4caf50; font-weight: bold;")
            
-            # Activate the identification tool
-            if self.app and hasattr(self.app, 'identification_tool'):
-                self.app.identification_tool.activate()
+            # Activate the identification tool (native Vulkan only)
+            if self._activate_native_identify():
+                pass
             else:
-                print("❌ ERROR: Cannot find identification_tool!")
+                print("Identify needs an open native (.lnt) view")
                
         else:
             self._deactivate_identify()
@@ -4208,6 +4378,99 @@ class IdentificationRibbon(QWidget):
         self.identify_toggled.emit(self.identify_active)
         
         
+    def _native_view(self):
+        """The .lnt main view when one is open, else None (VTK path)."""
+        try:
+            from gui.lnt_section_bridge import active_view  # noqa: PLC0415
+            return active_view(self.app)
+        except Exception:
+            return None
+
+    def _activate_native_identify(self):
+        """Arm the native pick tool; True when native owns the gesture."""
+        try:
+            view = self._native_view()
+            if view is None:
+                return False
+            from gui.native_identify import NativeIdentify  # noqa: PLC0415
+            tool = getattr(view, "native_identify", None)
+            if tool is None:
+                tool = view.native_identify = NativeIdentify(view)
+            if tool.activate():
+                return True
+        except Exception as exc:  # noqa: BLE001 - fall back to VTK
+            print(f"⚠️ Native identify unavailable, using VTK: {exc}")
+        try:
+            view = self._native_view()
+            if view is not None:
+                view.native_identify = None
+        except Exception:
+            pass
+        return False
+
+    def _activate_native_zoom(self):
+        """Arm the native zoom-rectangle tool; True when native owns it."""
+        try:
+            view = self._native_view()
+            if view is None:
+                return False
+            from gui.native_zoom_rect import NativeZoomRect  # noqa: PLC0415
+            tool = getattr(view, "native_zoom", None)
+            if tool is None:
+                tool = view.native_zoom = NativeZoomRect(view)
+            if tool.activate():
+                return True
+        except Exception as exc:  # noqa: BLE001 - fall back to VTK
+            print(f"⚠️ Native zoom unavailable, using VTK: {exc}")
+        try:
+            view = self._native_view()
+            if view is not None:
+                view.native_zoom = None
+        except Exception:
+            pass
+        return False
+
+    def _activate_native_select(self):
+        """Arm the native select tool; True when native owns the gesture."""
+        try:
+            view = self._native_view()
+            if view is None:
+                return False
+            from gui.native_select_rect import NativeSelectRect  # noqa: PLC0415
+            tool = getattr(view, "native_select", None)
+            if tool is None:
+                tool = view.native_select = NativeSelectRect(view)
+            if tool.activate():
+                return True
+        except Exception as exc:  # noqa: BLE001 - fall back to VTK
+            print(f"⚠️ Native select unavailable, using VTK: {exc}")
+        try:
+            view = self._native_view()
+            if view is not None:
+                view.native_select = None
+        except Exception:
+            pass
+        return False
+
+    def _stand_down_native_identify_tools(self):
+        """Cancel any armed native Identify-tab tools (called on deactivate)."""
+        try:
+            view = self._native_view()
+            targets = ([view] if view is not None
+                       else [getattr(self.app, "_lnt_main_view", None)])
+            for v in targets:
+                if v is None:
+                    continue
+                for attr in ("native_identify", "native_zoom", "native_select"):
+                    try:
+                        tool = getattr(v, attr, None)
+                        if tool is not None and hasattr(tool, "cancel"):
+                            tool.cancel()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def toggle_zoom_rectangle(self):
         """Toggle zoom rectangle mode on/off"""
         self.zoom_rectangle_active = not self.zoom_rectangle_active
@@ -4224,9 +4487,11 @@ class IdentificationRibbon(QWidget):
             self.status_label.setText("Draw rectangle & right-click")
             self.status_label.setStyleSheet("color: #2196f3; font-size: 9px; font-weight: bold; padding: 4px;")
 
-            # Activate zoom rectangle tool
-            if self.app and hasattr(self.app, 'zoom_rectangle_tool'):
-                self.app.zoom_rectangle_tool.activate()
+            # Activate zoom rectangle tool (native Vulkan only)
+            if self._activate_native_zoom():
+                pass
+            else:
+                print("Zoom needs an open native (.lnt) view")
 
         else:
             self._deactivate_zoom_rectangle()
@@ -12928,7 +13193,7 @@ class SyncViewsDialog(QDialog):
     """
     Synchronize Views dialog like MicroStation.
     Rows:
-      View N: [No synch | Match]  [View 1..View 5]
+      View N: [No synch | Match]  [View 1..View 8]
     """
     def __init__(self, app, parent=None):
         super().__init__(parent or app)
@@ -12942,7 +13207,7 @@ class SyncViewsDialog(QDialog):
         layout.setSpacing(6)
 
         self.rows = []
-        self.num_views = 5  # You currently support View 1..View 5
+        self.num_views = 8
 
         for v in range(1, self.num_views + 1):
             row_layout = QHBoxLayout()
@@ -12953,6 +13218,7 @@ class SyncViewsDialog(QDialog):
 
             mode_combo = QComboBox()
             mode_combo.addItems(["No synch", "Match"])
+            mode_combo.setToolTip('Match this view to the selected view. Any linked view can drive the group.')
 
             source_combo = QComboBox()
             for s in range(1, self.num_views + 1):
@@ -12983,101 +13249,38 @@ class SyncViewsDialog(QDialog):
         row["source"].setEnabled(is_match)
 
     def _load_from_app_state(self):
-        """
-        Load current settings from app.view_sync_map with semantics:
-
-        view_sync_map[target_idx] = source_idx
-
-        But in the UI, each row is:
-
-        "View A : [mode] [View B]"
-
-        and represents:
-
-        View B = Match View A
-
-        i.e. A = source, B = target.
-        """
+        """Each row is the target view; its dropdown selects the view to match."""
         match_map = getattr(self.app, "view_sync_map", {})
-
         for row in self.rows:
-            source_view_num = row["view_num"]   # left "View A"
-            source_idx = source_view_num - 1
+            target = row["view_num"] - 1
+            source = match_map.get(target)
+            row["mode"].setCurrentIndex(1 if source is not None else 0)
+            if source is not None:
+                index = row["source"].findData(source + 1)
+                if index >= 0:
+                    row["source"].setCurrentIndex(index)
+            self._update_row_enabled(row)
 
-            # Find any target that is set to match this source
-            target_view_num = None
-            for target_idx, src_idx in match_map.items():
-                if src_idx == source_idx:
-                    target_view_num = target_idx + 1
-                    break
-
-            if target_view_num is not None:
-                # This source has at least one target; show "Match target_view_num"
-                row["mode"].setCurrentIndex(1)  # Match
-                i = row["source"].findData(target_view_num)
-                if i >= 0:
-                    row["source"].setCurrentIndex(i)
-            else:
-                # No target currently matches this source
-                row["mode"].setCurrentIndex(0)  # No synch
-                # (we leave source combo as-is; it doesn't matter when mode=No synch)
     def _apply_to_app(self):
-        """
-        Apply mappings using app.set_view_sync() with your dialog semantics:
-
-        Row: "View A : Match View B"
-        Means: View B = Match View A
-
-        Fix:
-        - Do NOT clear a target just because mode is "No synch" and the combo happens
-        to be sitting on View 1 by default.
-        - Only clear mappings that are actually affected.
-        """
-        existing = dict(getattr(self.app, "view_sync_map", {}) or {})
-
-        desired = {}            # target_idx -> source_idx
-        sources_no_sync = set() # source_idx that user set to "No synch" explicitly (in UI)
-
-        # 1) Read UI into desired mapping
+        """View A: Match View B joins A to B's bidirectional sync group."""
+        desired = {}
         for row in self.rows:
-            source_view_num = int(row["view_num"])          # A (1-based)
-            source_idx = source_view_num - 1                # A (0-based)
-            mode = row["mode"].currentIndex()               # 0=No synch, 1=Match
-
-            if mode == 0:
-                sources_no_sync.add(source_idx)
-                continue
-
-            target_view_num = row["source"].currentData()   # B (1-based)
-            if target_view_num is None:
-                continue
-
-            target_idx = int(target_view_num) - 1
-
-            # Ignore self-sync (treat as no mapping)
-            if target_idx == source_idx:
-                continue
-
-            desired[target_idx] = source_idx
-
-        # 2) Decide what to clear (unique targets only)
-        to_clear = set()
-
-        for target_idx, src_idx in existing.items():
-            if target_idx in desired and desired[target_idx] != src_idx:
-                to_clear.add(target_idx)
-                continue
-
-            if (target_idx not in desired) and (src_idx in sources_no_sync):
-                to_clear.add(target_idx)
-
-        # 3) Apply clears
-        for target_idx in sorted(to_clear):
-            self.app.set_view_sync(target_idx + 1, None)
-
-        # 4) Apply new mappings
-        for target_idx, source_idx in desired.items():
-            self.app.set_view_sync(target_idx + 1, source_idx + 1)
+            target = row["view_num"] - 1
+            source = row["source"].currentData()
+            if row["mode"].currentIndex() == 1 and source is not None:
+                source = int(source) - 1
+                if target != source:
+                    desired[target] = source
+        existing = dict(getattr(self.app, "view_sync_map", {}) or {})
+        native_sections = getattr(self.app, '_native_sections', None)
+        if native_sections is not None:
+            return native_sections.apply_sync_map(desired)
+        for target in sorted(existing):
+            if target not in desired:
+                self.app.set_view_sync(target + 1, None)
+        for target, source in desired.items():
+            if existing.get(target) != source:
+                self.app.set_view_sync(target + 1, source + 1)
 
     def _apply_and_close(self):
         self._apply_to_app()
@@ -13256,9 +13459,9 @@ class PluginsRibbon(QWidget):
                     widget.setParent(None)
                     widget.deleteLater()
 
-        # Re-add core plugins section with Manage button only
+        # Re-add core plugins section with Manager button only
         section = RibbonSection("Plugins", self)
-        section.add_button("Manage", "", self._manage_plugins, toggleable=False)
+        section.add_button("Manager", "", self._manage_plugins, toggleable=False)
         layout.addWidget(section)
 
         # Dynamic addition of plugin-defined ribbon buttons

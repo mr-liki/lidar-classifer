@@ -1,0 +1,10 @@
+{
+  "created": "2026-10-17 11:08:11",
+  "dll": "native/naksha_vulkan/build_msvc/naksha_vulkan.dll",
+  "dll_exports": 137,
+  "dll_sha256": "d07d3ed35831ac78da8b9b17513fdced6b508e5209a2b5d0badd61544a0b94a3",
+  "missing_exports": [],
+  "source_digest": "9ac39d41cb600a995ed16b1908c0a566e19c64c7ad8033713660fdd3439a41a2",
+  "source_files": 72,
+  "source_newest": "src/SurfaceRenderer.cpp"
+}

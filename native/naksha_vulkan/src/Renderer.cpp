@@ -1,6 +1,7 @@
 #include "naksha/Renderer.hpp"
 #include "naksha/PointCloudRenderer.hpp"
 #include "naksha/SurfaceRenderer.hpp"
+#include "naksha/VectorOverlayRenderer.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -295,6 +296,7 @@ void Renderer::Shutdown() {
     for (auto& b : frameUboBuffers_)
         VulkanAllocator::Get().DestroyBuffer(b);
     frameUboBuffers_.clear();
+    lastFrameUboSlot_ = UINT32_MAX;
 
     if (timestampPool_) {
         vkDestroyQueryPool(context_.GetDevice(), timestampPool_, nullptr);
@@ -1534,6 +1536,7 @@ void Renderer::UpdateFrameUbo(uint32_t slot) {
     std::memcpy(ubo.clipPlanes, clipPlanes_, sizeof(ubo.clipPlanes));
     ubo.clipInfo[0] = clipCount_;
     std::memcpy(frameUboBuffers_[slot].mappedData, &ubo, sizeof(ubo));
+    lastFrameUboSlot_ = slot;
     // Host-visible memory is not guaranteed to be HOST_COHERENT, and VMA only
     // flushes automatically on vmaUnmapMemory - these buffers stay mapped for
     // the lifetime of the renderer, so an explicit flush is required or the
@@ -1592,7 +1595,9 @@ void Renderer::GetClearColor(float out[4]) const {
 void Renderer::GetLastMvp(float out[16]) const {
     if (!out) return;
     for (int i = 0; i < 16; ++i) out[i] = 0.0f;
-    const uint32_t slot = frameManager_.GetCurrentFrameIndex();
+    // EndFrame advances the frame manager to the NEXT slot. Labels queried
+    // between frames must use the UBO just drawn, not that older slot.
+    const uint32_t slot = lastFrameUboSlot_;
     if (slot >= frameUboBuffers_.size()) return;
     const FrameUbo* ubo = static_cast<const FrameUbo*>(frameUboBuffers_[slot].mappedData);
     if (!ubo) return;
@@ -1673,6 +1678,7 @@ void Renderer::DestroyCaptureTarget() {
 // Blocking by design (vkDeviceWaitIdle + vkQueueWaitIdle): a diagnostic /
 // parity-test path, never a per-frame call.
 bool Renderer::CaptureOffscreenRGBA8(PointCloudRenderer* pointCloud, SurfaceRenderer* surface,
+                                     VectorOverlayRenderer* vector,
                                      std::vector<uint8_t>& outRGBA, uint32_t& outW, uint32_t& outH) {
     outRGBA.clear();
     outW = outH = 0;
@@ -1799,6 +1805,8 @@ bool Renderer::CaptureOffscreenRGBA8(PointCloudRenderer* pointCloud, SurfaceRend
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
         if (pointCloud && pointCloud->IsLoaded()) pointCloud->Record(cmd, slot);
         if (surface && surface->IsLoaded()) surface->Record(cmd, slot);
+        // Overlay linework, in the same order the live frame records it.
+        if (vector) vector->Record(cmd, slot);
     }
     vkCmdEndRenderPass(cmd);
 

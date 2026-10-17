@@ -148,15 +148,118 @@ class _InputFilter(QObject):
         if nv is None:
             return False
         E = QEvent
+        creation = getattr(self.view, 'creation', None)
+        if creation is not None and creation.active:
+            middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
+            if (t == E.MouseButtonPress and ev.button() != Qt.MiddleButton
+                    and creation.press(ev.position(), ev.button(), ev.modifiers())):
+                self._last = None; obj.setFocus(); return True
+            if t == E.MouseMove and not middle_drag and creation.move(ev.position()):
+                return True
+            if t == E.KeyPress and creation.key(ev.key()):
+                return True
+            if t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                self._last = None; return True
+        drawing = getattr(self.view, 'drawing', None)
+        if drawing is not None and drawing.active():
+            middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
+            if (t == E.MouseButtonPress and ev.button() != Qt.MiddleButton
+                    and drawing.press(ev.position(), ev.button())):
+                self._last = None; obj.setFocus(); return True
+            if t == E.MouseMove and not middle_drag and drawing.move(ev.position(), ev.buttons()):
+                return True
+            if t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                if drawing.release(ev.position(), ev.button()):
+                    self._last = None; return True
+            if t == E.MouseButtonDblClick and drawing.double_click(ev.position(), ev.button()):
+                return True
+            if t == E.KeyPress and drawing.key(ev.key()):
+                return True
+        measurement = getattr(self.view, 'measurement', None)
+        if measurement is not None and measurement.active:
+            # Measurement owns left/right clicks, but middle-drag always stays
+            # with the native camera so the user can pan while placing points.
+            middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
+            if (t == E.MouseButtonPress and ev.button() != Qt.MiddleButton
+                    and measurement.press(ev.position(), ev.button())):
+                self._last = None
+                obj.setFocus()
+                return True
+            if t == E.MouseMove and not middle_drag and measurement.move(ev.position()):
+                return True
+            if t == E.MouseButtonDblClick and measurement.double_click(ev.position(), ev.button()):
+                return True
+            if t == E.KeyPress and measurement.key(ev.key()):
+                return True
+            if t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                self._last = None
+                return True
+        classifier = getattr(self.view, 'classifier', None)
+        if classifier is not None and self.view.mode_2d and classifier.active():
+            if t == E.MouseButtonPress and classifier.press(ev.position(), ev.button()):
+                self._last = None
+                obj.setFocus()
+                return True
+            if t == E.MouseMove and (classifier.move(ev.position()) or ev.buttons() & Qt.LeftButton):
+                return True
+            if t == E.MouseButtonRelease and classifier.release(ev.position(), ev.button()):
+                self._last = None
+                return True
+            if t == E.MouseButtonDblClick and classifier.double_click(ev.position()):
+                return True
+            if t == E.KeyPress and classifier.key(ev.key()):
+                return True
+        # Identify-tab tools own their gestures while armed (native Vulkan,
+        # no VTK observers). Order: select/zoom swallow drags; identify takes
+        # single clicks. Middle-drag always stays with the camera. An armed
+        # Cross Section picker owns left-press and is checked first.
+        if t == E.MouseButtonPress and ev.button() == Qt.LeftButton:
+            _armed_picker = getattr(self.view, "picker", None)
+            if _armed_picker is not None:
+                obj.setFocus()
+                self._last = None
+                _armed_picker.on_press(ev.position())
+                return True
+        for _attr in ("native_identify", "native_zoom", "native_select"):
+            _tool = getattr(self.view, _attr, None)
+            if _tool is None or not getattr(_tool, "active", False):
+                continue
+            _middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
+            if t == E.MouseButtonPress and ev.button() != Qt.MiddleButton:
+                if _tool.press(ev.position(), ev.button()):
+                    self._last = None
+                    obj.setFocus()
+                    return True
+            elif t == E.MouseMove and not _middle_drag:
+                if _tool.move(ev.position()):
+                    return True
+            elif t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                _release = getattr(_tool, "release", None)
+                if callable(_release) and _release(ev.position(), ev.button()):
+                    self._last = None
+                    return True
+                self._last = None
+                return True
+            elif t == E.KeyPress:
+                if _tool.key(ev.key()):
+                    return True
         if t == E.MouseButtonPress:
             picker = getattr(self.view, "picker", None)
             if picker is not None and ev.button() == Qt.LeftButton:
-                # An armed Cross Section tool owns the left button (P1 / P2 / width).
+                # Handled above (armed Cross Section owns left-press); kept as
+                # a safety net in case a future branch reorders the filter.
                 obj.setFocus()
                 self._last = None
                 picker.on_press(ev.position())
                 return True
-            self._last = ev.position()
+            # In 2D plan mode only the physical middle button owns camera
+            # panning. Left clicks remain available for tools/selection and a
+            # bare left drag must never move the point cloud.
+            self._last = (
+                ev.position()
+                if not self.view.mode_2d or ev.button() == Qt.MiddleButton
+                else None
+            )
             obj.setFocus()
             return True
         if t == E.MouseButtonRelease:
@@ -173,8 +276,8 @@ class _InputFilter(QObject):
             self._last = p
             b = ev.buttons()
             if self.view.mode_2d:
-                # 2D plan mode: any drag pans the map; there is no orbit.
-                if b & (Qt.LeftButton | Qt.RightButton | Qt.MiddleButton):
+                # 2D plan mode: middle-drag is the sole pan gesture.
+                if b & Qt.MiddleButton:
                     nv.pan(dx, dy)
             elif b & Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
                 nv.orbit(dx, dy)
@@ -188,7 +291,19 @@ class _InputFilter(QObject):
         if t == E.KeyPress:
             k = ev.key()
             if k == Qt.Key_Escape and getattr(self.view, "picker", None) is not None:
-                self.view.picker.cancel()
+                try:
+                    self.view.picker.cancel()
+                finally:
+                    # Esc must fully stand the tool down (flags, cursor, ribbon
+                    # toggle), not just clear the in-progress clicks: route it
+                    # through the same app-level helper every other Esc path
+                    # uses so the tool does not stay armed.
+                    app = getattr(self.view, "app", None)
+                    if app is not None and hasattr(app, "deactivate_cross_section_tool"):
+                        try:
+                            app.deactivate_cross_section_tool()
+                        except Exception:  # noqa: BLE001
+                            pass
             elif k == Qt.Key_R:
                 nv.reset()
                 self.view.set_2d(True)
@@ -227,6 +342,9 @@ class LntMainView(QObject):
         super().__init__(app)
         self.app, self.lnt_path, self.name = app, lnt_path, name
         self.native = None
+        self.native_identify = None  # NativeIdentify while the Identify tool is armed
+        self.native_zoom = None      # NativeZoomRect while the Zoom tool is armed
+        self.native_select = None    # NativeSelectRect while the Select tool is armed
         self.owner = None
         self.sse = 8.0
         self._palette_baseline = None
@@ -297,21 +415,67 @@ class LntMainView(QObject):
         self._filter = _InputFilter(self)
         widget.installEventFilter(self._filter)
         widget.setFocusPolicy(Qt.StrongFocus)
+        # The cross-section gesture is click-P1, HOVER to P2, click, HOVER for
+        # width, click: hover moves arrive only with mouse tracking on. Without
+        # it the live rubber band never follows the cursor and the user only
+        # sees the (surprising) finished box.
+        try:
+            widget.setMouseTracking(True)
+        except Exception:  # noqa: BLE001
+            pass
         pts, nodes, ext = self.native.info()
-        self._status(f"LNT: {self.name} - {pts:,} points, {nodes:,} nodes, "
-                     f"{ext[0]:,.0f} x {ext[1]:,.0f} m  [2D plan: drag=pan  wheel=zoom  D=3D orbit  "
-                     f"[ ]=detail  1/2/3=colour  R=reset]")
+        self.total_points = int(pts)        # footer "Total Points" (app.update_total_points_label)
+        # Point Statistics: exact per-class counts, scanned from the file in the
+        # background and kept current by every class write (NativeView.set_classes).
+        self.ptc_applied = False            # classes are listed once a .ptc is Applied
+        self.class_counts = None
+        try:
+            from gui.lnt_class_counts import LntClassCounts
+            self.class_counts = LntClassCounts(self.lnt_path, self)
+            self.class_counts.ready.connect(self._refresh_point_statistics)
+            self.native.class_counts = self.class_counts
+        except Exception as exc:   # noqa: BLE001 - statistics are informational
+            print(f"[LNT] class counts unavailable: {exc}")
+        self._log(f"LNT: {self.name} - {pts:,} points, {nodes:,} nodes, "
+                  f"{ext[0]:,.0f} x {ext[1]:,.0f} m", force=True)
         self._t = time.perf_counter()
         self._timer.start()
         print(f"[LNT] showing {self.lnt_path} in the main viewport ({pts:,} points)")
 
-    def stop(self, restore=True):
+    def stop(self, restore=True, flush_pending=True):
+        drawing = getattr(self, 'drawing', None)
+        if drawing is not None:
+            drawing.shutdown()
+            self.drawing = None
+        measurement = getattr(self, 'measurement', None)
+        if measurement is not None:
+            measurement.shutdown()
+            self.measurement = None
+        classifier = getattr(self, 'classifier', None)
+        if classifier is not None:
+            classifier.canvas._closed = True
+            classifier.shutdown()
+            self.classifier = None
+        for _attr in ("native_identify", "native_zoom", "native_select"):
+            try:
+                _tool = getattr(self, _attr, None)
+                if _tool is not None and hasattr(_tool, "cancel"):
+                    _tool.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                setattr(self, _attr, None)
+            except Exception:  # noqa: BLE001
+                pass
         self._timer.stop()
         try:
             if self.picker is not None:
                 self.picker.cleanup()
             from gui import lnt_section_bridge
-            lnt_section_bridge.release(self.app)     # flush class edits, hand app.data back
+            try:
+                lnt_section_bridge.release(self.app, flush_pending=flush_pending)
+            except TypeError:
+                lnt_section_bridge.release(self.app)     # flush class edits, hand app.data back
         except Exception as exc:   # noqa: BLE001
             print(f"[LNT] section state release failed: {exc}")
         owner, widget = self.owner, getattr(self.owner, "vulkan_widget", None)
@@ -320,7 +484,12 @@ class LntMainView(QObject):
                 widget.removeEventFilter(self._filter)
             except Exception:   # noqa: BLE001
                 pass
+        counts = getattr(self, "class_counts", None)
+        if counts is not None:
+            counts.close()
+            self.class_counts = None
         if self.native is not None:
+            self.native.class_counts = None
             self.native.close()          # destroys the LNT renderer (frees the slot)
             self.native = None
         if owner is not None and not restore:
@@ -386,6 +555,8 @@ class LntMainView(QObject):
                   self.native.set_classification_lut(packed))
             if ok:
                 self._palette_baseline = self.app.class_palette
+                self.ptc_applied = True
+                self._refresh_point_statistics()
             print("[LNT] applied the palette from the Display dialog (Apply)")
             return ok
         except Exception as exc:   # noqa: BLE001
@@ -434,6 +605,15 @@ class LntMainView(QObject):
         """Select a native presentation mode. Shaded builds a triangulated, lit
         surface from the visible .lnt cut; other modes update GPU uniforms."""
         name = str(ui_mode or "").strip().lower()
+        if name == "depth":
+            # Genuine Vulkan view-space depth. It is derived in the point
+            # shader from resident XYZ and the live native camera; no VTK
+            # colours, actors, lookup tables, or point-buffer rebuild.
+            if self.native is None:
+                return False
+            self.native.set_mode(nat.MODE_DEPTH)
+            self.shading_name = name
+            return True
         if name == "neutral":
             if self.native is None:
                 return False
@@ -477,13 +657,20 @@ class LntMainView(QObject):
         they are."""
         if self._palette_was_applied():
             self._push_applied_palette()
-        if not self.apply_shading(ui_mode) and self.native is not None:
+        normalized = str(ui_mode or "").strip().lower()
+        native_only = normalized in ("depth", "intensity", "elevation")
+        applied = self.apply_shading(normalized)
+        if not applied and native_only:
+            # Never fall through to a VTK display implementation for these
+            # modes while the native LNT viewport owns the point cloud.
+            raise RuntimeError(f"native Vulkan display mode unavailable: {normalized}")
+        if not applied and self.native is not None:
             self.native.set_mode(nat.MODE_CLASS)         # an unknown name falls back to class
         try:
-            self.app.display_mode = ui_mode
+            self.app.display_mode = normalized
         except Exception:   # noqa: BLE001
             pass
-        print(f"[LNT] display mode -> {ui_mode} (native shading)")
+        print(f"[LNT] display mode -> {normalized} (native Vulkan)")
         return True
 
     # -- controls --------------------------------------------------------
@@ -505,6 +692,24 @@ class LntMainView(QObject):
             self.app.statusBar().showMessage(text)
         except Exception:   # noqa: BLE001
             pass
+
+    def _refresh_point_statistics(self):
+        try:
+            from gui.point_count_widget import refresh_point_statistics
+            refresh_point_statistics(self.app)
+        except Exception as exc:   # noqa: BLE001
+            print(f"[LNT] point statistics refresh failed: {exc}")
+
+    _LOG_INTERVAL_S = 10.0
+
+    def _log(self, text, force=False):
+        """Engine diagnostics (nodes, cache, LOD tiles...) go to the log, not the
+        status bar. The render tick produces one per second, so the log gets
+        at most one line per _LOG_INTERVAL_S."""
+        now = time.perf_counter()
+        if force or now - getattr(self, "_log_t", -1e9) >= self._LOG_INTERVAL_S:
+            self._log_t = now
+            print(f"[LNT] {text}")
 
     @staticmethod
     def _px(widget):
@@ -537,7 +742,7 @@ class LntMainView(QObject):
                 self._status(f"LNT Shading: {error}")
             elif lod is not None:
                 pending = lod["queued"] + lod["inflight"] + lod["wanted_missing"]
-                self._status(
+                self._log(
                     f"LNT {self.name} | surface LOD: {lod['drawn_tiles']:,} tiles "
                     f"({lod['drawn_exact_tiles']:,} full resolution) | {lod['source_covered']:,} source records "
                     f"covered, {lod['source_exact']:,} at full resolution | {lod['represented_drawn']:,} "
@@ -547,13 +752,13 @@ class LntMainView(QObject):
                 self._status(f"LNT {self.name}: building full-detail shaded surface…")
             elif self._n % 60 == 0 and surface_mode:
                 source, visible, coverage = nv.surface_point_counts()
-                self._status(
+                self._log(
                     f"LNT {self.name} | {visible:,} visible records accounted for | "
                     f"{visible-coverage:,} triangle-referenced | {coverage:,} coverage | "
                     f"{source:,} source records")
             elif self._n % 60 == 0:
                 s = nv.stats
-                self._status(
+                self._log(
                     f"LNT {self.name} | nodes {s.active_nodes:,} | points "
                     f"{s.points_rendered:,}/{s.points_wanted:,} | cache "
                     f"{s.cache_used_bytes / 1048576:.0f}/{s.cache_capacity_bytes / 1048576:.0f} MiB | "
@@ -639,30 +844,62 @@ def open_with_lnt(main_window, source):
     return True
 
 
-def close_lnt_view(app):
-    """Return the main viewport to VTK if an .lnt is currently shown."""
+def _keep_vector_overlay(app):
+    """The renderer behind the viewport was replaced: re-upload attached SNT/DXF
+    linework to the one now drawing, so it does not vanish."""
+    try:
+        from gui.native_vector_overlay import rebind_after_viewport_change
+        rebind_after_viewport_change(app)
+    except Exception as exc:   # noqa: BLE001 - never block opening/closing a cloud
+        print(f"[LNT] attached linework could not follow the viewport: {exc}")
+
+
+def close_lnt_view(app, flush_pending=True, reopening=False):
+    """Return the main viewport to VTK if an .lnt is currently shown.
+
+    `reopening`: another .lnt is about to be shown, so attached linework moves
+    straight to that view instead of bouncing through Naksha's renderer."""
     v = getattr(app, "_lnt_main_view", None)
     if v is not None:
-        v.stop()
+        try:
+            v.stop(flush_pending=flush_pending)
+        except TypeError:
+            v.stop()
         v.deleteLater()
         app._lnt_main_view = None
         print("[LNT] closed the .lnt view; main viewport returned to VTK")
+        if not reopening:
+            _keep_vector_overlay(app)
+            _refresh_total_points(app)
+
+
+def _refresh_total_points(app):
+    """Footer "Total Points": the open .lnt's record count, or app.data's once closed."""
+    update = getattr(app, "update_total_points_label", None)
+    if callable(update):
+        try:
+            update()
+        except Exception as exc:   # noqa: BLE001
+            print(f"[LNT] total points label update failed: {exc}")
 
 
 def _show(app, lnt_path, name):
-    close_lnt_view(app)
+    close_lnt_view(app, reopening=True)
     view = LntMainView(app, lnt_path, name)
     try:
         view.start()
     except Exception as exc:   # noqa: BLE001 - surfaced to the user
         view.stop()
+        _keep_vector_overlay(app)
         print(f"[LNT] cannot show {lnt_path}: {exc}")
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
     app._lnt_main_view = view
+    _keep_vector_overlay(app)
     app.data = None   # full-cloud records are owned by the native file, not a VTK array
     app.loaded_file = getattr(app, "_lnt_source_path", lnt_path)
     app.setWindowTitle(f"NakshaAI-LiDAR - {name}")
+    _refresh_total_points(app)
     if not getattr(app, "_lnt_quit_hook", False):
         app._lnt_quit_hook = True
         from PySide6.QtWidgets import QApplication

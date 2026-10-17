@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QFrame, QScrollArea
 )
 
+from gui.theme_manager import ThemeColors, ThemeManager, get_dialog_stylesheet
+
 
 class PluginLoaderDialog(QDialog):
     def __init__(self, plugin_manager, parent=None):
@@ -24,45 +26,31 @@ class PluginLoaderDialog(QDialog):
         self.discovered = []
         self._selected_plugin_name = None
 
-        try:
-            from gui.theme_manager import ThemeColors
-            is_light = ThemeColors.is_light() if hasattr(ThemeColors, "is_light") else True
-        except Exception:
-            is_light = True
-
-        # Color palette
-        if is_light:
-            self.c_bg          = "#ffffff"
-            self.c_bg_alt      = "#f5f5f5"
-            self.c_bg_sidebar  = "#3a3a3a"
-            self.c_sidebar_sel = "#4a4a4a"
-            self.c_sidebar_txt = "#cccccc"
-            self.c_sidebar_txt_active = "#ffffff"
-            self.c_border      = "#d0d5dd"
-            self.c_text        = "#1b2838"
-            self.c_text_muted  = "#6b7280"
-            self.c_accent      = "#2c5f8a"
-            self.c_accent_dark = "#245079"
-            self.c_row_sel     = "#dce8f5"
-            self.c_link        = "#2c7bca"
-        else:
-            self.c_bg          = "#1e1e2e"
-            self.c_bg_alt      = "#2a2a3a"
-            self.c_bg_sidebar  = "#181820"
-            self.c_sidebar_sel = "#2a2a3a"
-            self.c_sidebar_txt = "#aaaacc"
-            self.c_sidebar_txt_active = "#e0e0ff"
-            self.c_border      = "#3c3c5c"
-            self.c_text        = "#e0e0f0"
-            self.c_text_muted  = "#888899"
-            self.c_accent      = "#4a90d9"
-            self.c_accent_dark = "#3a7bc8"
-            self.c_row_sel     = "#2a3a5a"
-            self.c_link        = "#5b9bd5"
+        # Use the same palette as the main native UI.  This dialog contains
+        # ordinary Qt widgets only; it deliberately has no VTK renderer or VTK
+        # fallback path.
+        self.setProperty("renderBackend", "native-vulkan")
+        self.c_bg          = ThemeColors.get("bg_primary")
+        self.c_bg_alt      = ThemeColors.get("bg_secondary")
+        self.c_bg_sidebar  = ThemeColors.get("ribbon_section")
+        self.c_sidebar_sel = ThemeColors.get("ribbon_btn_checked")
+        self.c_sidebar_txt = ThemeColors.get("text_secondary")
+        self.c_sidebar_txt_active = ThemeColors.get("text_primary")
+        self.c_border      = ThemeColors.get("border_light")
+        self.c_text        = ThemeColors.get("text_primary")
+        self.c_text_muted  = ThemeColors.get("text_secondary")
+        self.c_accent      = ThemeColors.get("border_active")
+        self.c_accent_dark = ThemeColors.get("bg_active_border")
+        self.c_row_sel     = ThemeColors.get("dialog_selection")
+        self.c_link        = ThemeColors.get("accent_hover")
+        self.c_hover       = ThemeColors.get("bg_button_hover")
+        self.c_button      = ThemeColors.get("bg_button")
+        self.c_danger      = ThemeColors.get("danger")
 
         self._build_ui()
         self._refresh()
         self.category_list.setCurrentRow(0)
+        ThemeManager.apply_native_window_theme(self)
 
     # ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -73,10 +61,7 @@ class PluginLoaderDialog(QDialog):
         # ── Title bar
         title_bar = QLabel("  Plugins Manager")
         title_bar.setFixedHeight(28)
-        title_bar.setStyleSheet(
-            f"background:{self.c_accent}; color:#ffffff; font-weight:bold;"
-            "font-size:11pt; padding-left:8px;"
-        )
+        title_bar.setObjectName("pluginsManagerTitle")
         root.addWidget(title_bar)
 
         # ── Body splitter (sidebar | main)
@@ -111,7 +96,7 @@ class PluginLoaderDialog(QDialog):
                 font-weight:bold;
             }}
             QListWidget#sidebar::item:hover:!selected {{
-                background:#444444;
+                background:{self.c_hover};
             }}
         """)
         body.addWidget(self.category_list)
@@ -132,20 +117,6 @@ class PluginLoaderDialog(QDialog):
 
         # ── Page 1: ZIP install
         self.stack.addWidget(self._build_zip_page())
-
-        # ── Bottom close bar
-        close_bar = QHBoxLayout()
-        close_bar.setContentsMargins(8, 6, 8, 6)
-        close_bar.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setFixedWidth(80)
-        close_btn.clicked.connect(self.accept)
-        close_bar.addWidget(close_btn)
-        help_btn = QPushButton("Help")
-        help_btn.setFixedWidth(80)
-        close_bar.addWidget(help_btn)
-        right_layout.addWidget(self._make_separator())
-        right_layout.addLayout(close_bar)
 
         body.addWidget(right)
         body.setSizes([140, 720])
@@ -310,9 +281,17 @@ class PluginLoaderDialog(QDialog):
 
     # ──────────────────────────────────────────────────────────────────
     def _apply_global_style(self):
-        self.setStyleSheet(f"""
+        self.setStyleSheet(get_dialog_stylesheet() + f"""
             QDialog {{
                 background:{self.c_bg};
+            }}
+            QLabel#pluginsManagerTitle {{
+                background:{self.c_bg_alt};
+                color:{self.c_text};
+                border-bottom:1px solid {self.c_border};
+                font-weight:bold;
+                font-size:11pt;
+                padding-left:8px;
             }}
             QTableWidget {{
                 background:{self.c_bg};
@@ -361,20 +340,20 @@ class PluginLoaderDialog(QDialog):
                 max-height:22px;
                 border:1px solid {self.c_border};
                 border-radius:3px;
-                background:{self.c_bg_alt};
+                background:{self.c_button};
                 color:{self.c_text};
             }}
             QPushButton:hover {{
-                background:{self.c_border};
+                background:{self.c_hover};
             }}
             QPushButton:disabled {{
                 color:{self.c_text_muted};
                 background:{self.c_bg_alt};
             }}
             QPushButton[danger="true"]:hover {{
-                background:#fee2e2;
-                color:#991b1b;
-                border-color:#ef4444;
+                background:{self.c_danger};
+                color:{ThemeColors.get('text_on_active')};
+                border-color:{self.c_danger};
             }}
             QGroupBox {{
                 font-size:9.5pt;

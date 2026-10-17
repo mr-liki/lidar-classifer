@@ -3075,6 +3075,10 @@ class CutSectionController:
         return True
 
     def activate_from_cross_shortcut(self):
+        from gui.native_sections import manager
+        native_sections = manager(self.app)
+        if native_sections is not None:
+            return native_sections.arm_cut(False)
         """Shortcut: Shift+1 - new cut from cross-section, reusing dock if present."""
         try:
             if self._cut_source == 'cross' and self._state in (
@@ -3103,6 +3107,10 @@ class CutSectionController:
 
 
     def activate_from_cut_shortcut(self):
+        from gui.native_sections import manager
+        native_sections = manager(self.app)
+        if native_sections is not None:
+            return native_sections.arm_cut(True)
         """Shortcut: Shift+2 – nested cut from existing cut view."""
         try:
             if self._cut_source == 'cut' and self._state in (
@@ -3399,6 +3407,10 @@ class CutSectionController:
             traceback.print_exc()
          
     def activate(self, show_source_dialog: bool = True, shortcut_preference: str | None = None):
+        from gui.native_sections import manager
+        native_sections = manager(self.app)
+        if native_sections is not None:
+            return native_sections.arm_cut(shortcut_preference == 'cut')
         """Enable CutSection in all open cross-section panes."""
         try:
             # ✅ MUTUAL EXCLUSION: Identify (Point Target) must never be active
@@ -3804,6 +3816,10 @@ class CutSectionController:
             traceback.print_exc()
         
     def cancel_cut_section(self):
+        from gui.native_sections import manager
+        native_sections = manager(self.app, create=False)
+        if native_sections is not None:
+            return native_sections.cancel_cut()
         """
         Cancel cut section, clear previews, and close dedicated widget.
         ✅ FIXED: Prevents crash by properly detaching all observers and interactors.

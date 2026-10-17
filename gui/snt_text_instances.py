@@ -6,13 +6,45 @@ import vtk
 from vtk.util.numpy_support import numpy_to_vtk
 
 
+def _group_key(entity):
+    """Hashable instancing key without ``repr()`` formatting.
+
+    The previous implementation called ``repr()`` on 11 fields per entity;
+    on files with hundreds of thousands of labels that string formatting
+    alone dominated the "grouping labels" stage. Tuples of the raw values
+    compare identically for grouping purposes. Mutable colour sequences are
+    normalised to tuples so the key stays hashable.
+    """
+    color = entity.get('color')
+    if isinstance(color, (list, tuple)):
+        try:
+            color = tuple(color)
+        except Exception:
+            color = None
+    return (
+        entity.get('text'),
+        entity.get('layer'),
+        color,
+        entity.get('height'),
+        entity.get('font_size'),
+        entity.get('rotation'),
+        entity.get('type'),
+        entity.get('digitized'),
+        entity.get('_lineweight'),
+        entity.get('width_factor'),
+        entity.get('alignment'),
+    )
+
+
 def text_instance_groups(entities, minimum=16):
     groups = {}
     for entity in entities:
         if entity.get('snt_binary'):
-            key = tuple(repr(entity.get(k)) for k in (
-                'text', 'layer', 'color', 'height', 'font_size', 'rotation',
-                'type', 'digitized', '_lineweight', 'width_factor', 'alignment'))
+            try:
+                key = _group_key(entity)
+                hash(key)
+            except Exception:
+                key = ('individual', id(entity))
         else:
             key = ('individual', id(entity))
         groups.setdefault(key, []).append(entity)

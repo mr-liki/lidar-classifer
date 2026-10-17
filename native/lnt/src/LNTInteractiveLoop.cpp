@@ -78,6 +78,12 @@ bool LntInteractiveLoop::render_frame(VulkanEngine& engine, LntScene& scene,
 
     LNT_STAGE("render_frame: set_camera_lookat");
     // The engine renders the same eye/target/lens the frustum was built from.
+    // Eye/target alone do not define camera roll. Push the controller's view-up
+    // first so rolled presets such as horizontal Side reach the Vulkan camera.
+    if (!engine.set_camera_view_up(cam_.up[0], cam_.up[1], cam_.up[2])) {
+        err_ = std::string("set_camera_view_up failed: ") + engine.last_error();
+        return false;
+    }
     if (cam_.ortho) {
         double d[3] = {cam_.target[0] - cam_.eye[0], cam_.target[1] - cam_.eye[1],
                        cam_.target[2] - cam_.eye[2]};

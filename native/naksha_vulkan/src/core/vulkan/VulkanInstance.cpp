@@ -1,11 +1,40 @@
 #include "naksha/core/vulkan/VulkanInstance.h"
+#include <map>
+#include <mutex>
 
 namespace naksha {
 namespace vulkan {
+namespace {
+struct SharedInstance {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    unsigned references = 0;
+};
+std::mutex instanceMutex;
+std::map<std::string, SharedInstance> sharedInstances;
+std::string InstanceKey(const VulkanInstanceConfig& config) {
+    std::string key = config.enableValidation ? "validation" : "production";
+    for (const auto& extension : config.requiredExtensions) key += "|ext:" + extension;
+    for (const auto& layer : config.requiredLayers) key += "|layer:" + layer;
+    return key;
+}
+}
 
 VulkanInstance::~VulkanInstance() { Shutdown(); }
 
 bool VulkanInstance::Initialize(const VulkanInstanceConfig& config) {
+    std::lock_guard<std::mutex> lock(instanceMutex);
+    if (instance_) return true;
+    const auto key = InstanceKey(config);
+    auto found = sharedInstances.find(key);
+    if (found != sharedInstances.end()) {
+        instance_ = found->second.instance;
+        debugMessenger_ = found->second.messenger;
+        validationEnabled_ = config.enableValidation;
+        ++found->second.references;
+        volkLoadInstance(instance_);
+        return true;
+    }
     if (volkInitialize() != VK_SUCCESS) {
         return false;
     }
@@ -60,10 +89,23 @@ bool VulkanInstance::Initialize(const VulkanInstanceConfig& config) {
             createDebugFunc(instance_, &debugInfo, nullptr, &debugMessenger_);
         }
     }
+    sharedInstances.emplace(key, SharedInstance{instance_, debugMessenger_, 1});
     return true;
 }
 
 void VulkanInstance::Shutdown() {
+    std::lock_guard<std::mutex> lock(instanceMutex);
+    if (!instance_) return;
+    for (auto it = sharedInstances.begin(); it != sharedInstances.end(); ++it) {
+        if (it->second.instance != instance_) continue;
+        if (--it->second.references != 0) {
+            instance_ = VK_NULL_HANDLE;
+            debugMessenger_ = VK_NULL_HANDLE;
+            return;
+        }
+        sharedInstances.erase(it);
+        break;
+    }
     if (debugMessenger_) {
         auto func = (PFN_vkDestroyDebugUtilsMessengerEXT)
             vkGetInstanceProcAddr(instance_, "vkDestroyDebugUtilsMessengerEXT");

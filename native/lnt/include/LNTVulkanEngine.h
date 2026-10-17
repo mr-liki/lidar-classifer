@@ -186,6 +186,10 @@ public:
     }
     // Push-constant only: never re-uploads geometry. Mirrors
     // _configure_microstation_color_blend_lighting()'s light rig.
+    bool has_surface_elevation_color() const { return api_.surface_elevation_color != nullptr; }
+    bool set_surface_elevation_color(bool on, double z0, double z1, uint32_t ramp) {
+        return handle_ && api_.surface_elevation_color && api_.surface_elevation_color(handle_, on, float(z0), float(z1), float(ramp));
+    }
     bool set_crisp_shading_parameters(double azimuth_deg, double sharpness_raw, double ambient,
                                       double key_intensity, double fill_intensity);
     // ---- viewport-LOD surface tiles (engine tile arena; LNTSurfaceLod.h) -------------
@@ -231,6 +235,12 @@ public:
     bool surface_tiles_set_palette(const uint8_t* lut_rgb, float coverage_shade) {
         return handle_ && api_.surface_tiles_set_palette &&
                api_.surface_tiles_set_palette(handle_, lut_rgb, coverage_shade) != 0;
+    }
+    bool surface_tiles_patch_classes(uint64_t key, const std::vector<uint32_t>& vi, const std::vector<uint8_t>& vc,
+                                     const std::vector<uint32_t>& ci, const std::vector<uint8_t>& cc) {
+        return handle_ && api_.surface_tiles_patch_classes &&
+               api_.surface_tiles_patch_classes(handle_, key, vi.data(), vc.data(), uint32_t(vi.size()),
+                                                ci.data(), cc.data(), uint32_t(ci.size())) != 0;
     }
     bool surface_tiles_set_draw_list(const std::vector<SurfaceTileDraw>& items) {
         return handle_ && api_.surface_tiles_set_draw_list &&
@@ -297,6 +307,7 @@ public:
     bool set_camera_lookat(double ex, double ey, double ez,
                            double tx, double ty, double tz,
                            double fov_y_degrees, double near_clip, double far_clip);
+    bool set_camera_view_up(double x, double y, double z);
     bool set_render_origin(double x, double y, double z);
     bool resize(uint32_t width, uint32_t height);
     // 2 = drawn+submitted+presented, 1 = skipped (minimized/out-of-date, NOT an
@@ -368,6 +379,7 @@ private:
         int (*set_shaded_class_surface)(uint64_t, const double*, uint64_t, const int32_t*, uint64_t,
                                         const uint8_t*, const uint8_t*, const int32_t*,
                                         uint64_t) = nullptr;
+        int (*surface_elevation_color)(uint64_t, int, float, float, float) = nullptr;
         int (*set_crisp_shading_parameters)(uint64_t, float, float, float, float, float) = nullptr;
         // Compact form (shared vertices + one index buffer + coverage points): ~28 B per point
         // of VRAM, so a 50M-point full-detail cut fits a 4 GB GPU.
@@ -384,6 +396,8 @@ private:
         int (*surface_tiles_set_palette)(uint64_t, const uint8_t*, float) = nullptr;
         int (*surface_tiles_set_draw_list)(uint64_t, const void*, uint32_t) = nullptr;
         int (*surface_tiles_get_stats)(uint64_t, uint64_t*, uint32_t) = nullptr;
+        int (*surface_tiles_patch_classes)(uint64_t, uint64_t, const uint32_t*, const uint8_t*, uint32_t,
+                                           const uint32_t*, const uint8_t*, uint32_t) = nullptr;
         int          (*set_surface_revision)(uint64_t, uint64_t) = nullptr;
         int          (*set_streaming_surface_active)(uint64_t, int) = nullptr;
         uint64_t     (*get_surface_total_triangle_count)(uint64_t) = nullptr;
@@ -400,6 +414,7 @@ private:
         int          (*set_camera_lookat)(uint64_t, double, double, double,
                                           double, double, double,
                                           double, double, double) = nullptr;
+        int          (*set_camera_view_up)(uint64_t, double, double, double) = nullptr;
         int          (*set_camera_ortho)(uint64_t, double, double, double, double, double,
                                          double, double, double, double, double) = nullptr;
         int          (*set_point_luts)(uint64_t, const uint8_t*, const uint8_t*,
@@ -568,6 +583,7 @@ inline bool VulkanEngine::resolve_all(std::string& err) {
     LNT_RESOLVE(get_point_draw_range_count, "nkv_get_point_draw_range_count");
     LNT_RESOLVE(get_point_draw_range_points, "nkv_get_point_draw_range_points");
     LNT_RESOLVE(set_camera_lookat, "nkv_set_camera_lookat");
+    LNT_RESOLVE(set_camera_view_up, "nkv_set_camera_view_up");
     LNT_RESOLVE(set_point_luts, "nkv_set_point_luts");
     // Optional for an older/headless engine DLL; the wrapper reports failure.
     { std::string optional_error;
@@ -587,6 +603,7 @@ inline bool VulkanEngine::resolve_all(std::string& err) {
         // Crisp shaded-classification path (VTK parity). Optional: an engine DLL that
         // predates it leaves the .lnt view on the legacy CPU-baked facet colours.
         resolve(api_.set_shaded_class_surface, "nkv_set_shaded_class_surface", ignore);
+        resolve(api_.surface_elevation_color, "nkv_set_surface_elevation_color", ignore);
         resolve(api_.set_crisp_shading_parameters, "nkv_set_crisp_shading_parameters", ignore);
         resolve(api_.set_shaded_class_surface_indexed, "nkv_set_shaded_class_surface_indexed", ignore); }
       resolve(api_.set_streaming_surface_active, "nkv_set_streaming_surface_active", optional_error);
@@ -608,6 +625,7 @@ inline bool VulkanEngine::resolve_all(std::string& err) {
         resolve(api_.surface_tiles_set_palette, "nkv_surface_tiles_set_palette", ignore);
         resolve(api_.surface_tiles_set_draw_list, "nkv_surface_tiles_set_draw_list", ignore);
         resolve(api_.surface_tiles_get_stats, "nkv_surface_tiles_get_stats", ignore);
+        resolve(api_.surface_tiles_patch_classes, "nkv_surface_tiles_patch_classes", ignore);
     }
     LNT_RESOLVE(set_render_origin, "nkv_set_render_origin");
     LNT_RESOLVE(resize, "nkv_resize");
@@ -1035,6 +1053,10 @@ inline bool VulkanEngine::set_camera_lookat(double ex, double ey, double ez,
     if (handle_ == 0 || api_.set_camera_lookat == nullptr) return false;
     return api_.set_camera_lookat(handle_, ex, ey, ez, tx, ty, tz, fov_y_degrees,
                                   near_clip, far_clip) != 0;
+}
+inline bool VulkanEngine::set_camera_view_up(double x, double y, double z) {
+    if (handle_ == 0 || api_.set_camera_view_up == nullptr) return false;
+    return api_.set_camera_view_up(handle_, x, y, z) != 0;
 }
 inline bool VulkanEngine::set_render_origin(double x, double y, double z) {
     if (handle_ == 0 || api_.set_render_origin == nullptr) return false;

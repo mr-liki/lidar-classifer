@@ -4102,9 +4102,18 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
         try:
             target = os.path.basename(filename)
 
+            from gui.native_attachments import is_native_main, layer_for
+            native_mode = is_native_main(self.app)
+            if native_mode:
+                native_layer = layer_for(self.app)
+                if native_layer is not None:
+                    native_layer.remove_file('dxf', target)
+
             renderer = None
             try:
                 if (
+                    not native_mode
+                    and
                     hasattr(self.app, "vtk_widget")
                     and self.app.vtk_widget is not None
                     and hasattr(self.app.vtk_widget, "renderer")
@@ -5483,6 +5492,23 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
         Refined batched rendering with layer properties and actors tagged with _naksha_snt_layer.
         """
         try:
+            from gui.native_attachments import is_native_main, render_entities
+            if is_native_main(self.app):
+                actor_cache = render_entities(self.app, 'dxf', attachment_data) or {}
+                item = attachment_data.get('_dxf_item')
+                if item is not None:
+                    item.actor_cache = actor_cache
+                actors = [actor for group in actor_cache.values() for actor in group]
+                attachment_data['actors'] = actors
+                name = attachment_data.get('filename', 'DXF')
+                self.app.dxf_actors = [entry for entry in getattr(self.app, 'dxf_actors', [])
+                                       if entry.get('filename') != name]
+                self.app.dxf_actors.append({
+                    'filename': name, 'full_path': attachment_data.get('full_path'),
+                    'actors': actors, 'bounds': attachment_data.get('bounds'),
+                })
+                print(f"Native Vulkan DXF overlay: {len(actors)} layer group(s)")
+                return
             import vtk
             from collections import defaultdict
             import time

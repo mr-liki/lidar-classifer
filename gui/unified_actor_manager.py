@@ -8670,7 +8670,8 @@ def build_section_unified_actor(
 # ─────────────────────────────────────────────────────────────────────────────
 # PARTIAL UPDATES (The "Real" Performance Fix for 48M+ points)
 # ─────────────────────────────────────────────────────────────────────────────
-def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: np.ndarray):
+def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask=None,
+                                      *, changed_indices=None, delta=None):
     """Updates ONLY the points that changed within a specific cross-section."""
     if not hasattr(app, 'section_vtks') or view_idx not in app.section_vtks:
         return False
@@ -8696,20 +8697,45 @@ def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: n
     # Using np.where(section_mask) order is incorrect and can miss/shift updates.
     section_global_indices = getattr(app, f"_section_{view_idx}_global_indices", None)
     if section_global_indices is not None and len(section_global_indices) > 0:
-        try:
-            max_idx = int(section_global_indices.max(initial=0))
-        except Exception:
-            max_idx = 0
-        if len(global_changed_mask) < (max_idx + 1):
+        # Sparse-first: avoid materializing an N-point mask for large edits.
+        ci = _phase1_changed_indices(
+            app, changed_mask=global_changed_mask,
+            changed_indices=changed_indices, delta=delta,
+        )
+        if ci.size == 0:
             return True
-        local_indices = np.flatnonzero(global_changed_mask[section_global_indices])
+        try:
+            local_indices = _map_global_changed_to_local(
+                np.asarray(section_global_indices, dtype=np.int64).ravel(),
+                ci, cache_owner=actor,
+            )
+        except Exception:
+            from gui.classification_delta import materialize_changed_mask
+            _mask = materialize_changed_mask(
+                app, global_changed_mask if global_changed_mask is not None
+                else (delta if delta is not None else ci),
+                reason="section_sparse_fallback",
+            )
+            max_idx = int(np.asarray(section_global_indices).max(initial=0))
+            if len(_mask) < (max_idx + 1):
+                return True
+            local_indices = np.flatnonzero(_mask[np.asarray(section_global_indices)])
     else:
         # Fallback (older views): derive using combined mask and actor-local map.
+        # Sparse-first to avoid an N-point `mask & section_mask` scan.
         section_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
         if section_mask is None:
             return False
 
-        changed_in_view_global_indices = np.where(global_changed_mask & section_mask)[0]
+        ci = _phase1_changed_indices(
+            app, changed_mask=global_changed_mask,
+            changed_indices=changed_indices, delta=delta,
+        )
+        if ci.size == 0:
+            return True
+        _sec = np.asarray(section_mask, dtype=bool).ravel()
+        _ok = (ci >= 0) & (ci < _sec.size) & _sec[ci]
+        changed_in_view_global_indices = ci[_ok]
         if len(changed_in_view_global_indices) == 0:
             return True
 

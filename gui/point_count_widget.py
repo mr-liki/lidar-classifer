@@ -292,7 +292,12 @@ class PointCountWidget(QWidget):
             child = self.stats_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
-        
+
+        lnt_view = getattr(self.app, "_lnt_main_view", None) if self.app is not None else None
+        if lnt_view is not None and getattr(lnt_view, "native", None) is not None:
+            self._update_lnt_statistics(lnt_view)
+            return
+
         if self.app is None or self.app.data is None:
             self.total_label.setText("Total: 0")
             return
@@ -333,10 +338,102 @@ class PointCountWidget(QWidget):
                 self.stats_layout.addWidget(widget)
             return
         
-        # Count points per class
-        unique_classes, counts = np.unique(classification, return_counts=True)
-        point_counts = {int(cls): int(cnt) for cls, cnt in zip(unique_classes, counts)}
+        # Count points per class — incremental fast path: a classification
+        # commit owns before/after arrays, so adjust the cached histogram
+        # O(K) instead of re-scanning all N points with np.unique.
+        point_counts = None
+        try:
+            _cached = getattr(self.app, "_stats_point_counts", None)
+            _delta = getattr(self.app, "_last_classification_delta", None)
+            _old = getattr(_delta, "old_classes", None) if _delta is not None else None
+            _new = getattr(_delta, "new_classes", None) if _delta is not None else None
+            # The cached histogram already reflects exactly one delta. Without
+            # this identity guard a second refresh (debounced timer re-fire,
+            # manual refresh, undo/redo bookkeeping) re-applied the SAME
+            # commit and drifted the counts by +-K.
+            _already = getattr(self.app, "_stats_applied_delta", None) is _delta
+            # O(1) provenance signature: same dataset dict, same classification
+            # array, same size, same sampled classes. A load/clear/replace
+            # changes it, so a stale histogram can never be reused.
+            _n_cls = int(classification.shape[0])
+            _src_sig = (
+                id(getattr(self.app, "data", None)), id(classification), _n_cls,
+                int(classification[0]), int(classification[_n_cls // 2]),
+                int(classification[-1]),
+            )
+            _reusable = (
+                isinstance(_cached, dict) and _cached and _already
+                and getattr(self.app, "_stats_source_sig", None) == _src_sig
+            )
+            if _reusable:
+                # Same transaction, nothing changed since: O(#classes) reuse
+                # instead of an O(N) recount.
+                point_counts = dict(_cached)
+            elif (isinstance(_cached, dict) and _cached and not _already
+                    and _old is not None and _new is not None
+                    and len(np.asarray(_old).ravel()) == len(np.asarray(_new).ravel())
+                    and len(np.asarray(_old).ravel()) > 0):
+                point_counts = dict(_cached)
+                for _o, _nw in zip(np.asarray(_old).ravel(), np.asarray(_new).ravel()):
+                    _o = int(_o)
+                    _nw = int(_nw)
+                    if _o != _nw:
+                        point_counts[_o] = point_counts.get(_o, 0) - 1
+                        if point_counts[_o] <= 0:
+                            point_counts.pop(_o, None)
+                        point_counts[_nw] = point_counts.get(_nw, 0) + 1
+                self.app._stats_applied_delta = _delta
+        except Exception:
+            point_counts = None
+        if point_counts is None:
+            unique_classes, counts = np.unique(classification, return_counts=True)
+            point_counts = {int(cls): int(cnt) for cls, cnt in zip(unique_classes, counts)}
+            # A recount always reflects the current transaction, so mark it as
+            # applied to keep the next refresh from adjusting it again.
+            try:
+                _d_now = getattr(self.app, "_last_classification_delta", None)
+                if _d_now is not None:
+                    self.app._stats_applied_delta = _d_now
+            except Exception:
+                pass
+        try:
+            self.app._stats_point_counts = dict(point_counts)
+            try:
+                self.app._stats_source_sig = _src_sig
+            except Exception:
+                pass
+        except Exception:
+            pass
 
+        self._render_classes(class_info, point_counts)
+
+    def _update_lnt_statistics(self, view):
+        """Open .lnt: the file's record total, then - once a .ptc is Applied in Display
+        Mode - every class with its exact count (gui/lnt_class_counts.py)."""
+        total = int(getattr(view, "total_points", 0) or 0)
+        self.total_label.setText(f"Total: {total:,}")
+        if not getattr(view, "ptc_applied", False):
+            self._add_note("Apply a .ptc in Display Mode to list the classes.")
+            return
+        counter = getattr(view, "class_counts", None)
+        store = getattr(self.app, "_lnt_section_store", None)
+        if getattr(store, "view", None) is not view:
+            store = None                 # a previous .lnt's store
+        point_counts = counter.counts(store) if counter is not None else None
+        if point_counts is None:
+            self._add_note("Counting points per class…" if counter is not None
+                           else "Per-class counts are unavailable for this file.")
+            return
+        self._render_classes(self.get_class_info_from_ptc(), point_counts)
+
+    def _add_note(self, text):
+        note = QLabel(text)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: palette(mid);")
+        self.stats_layout.addWidget(note)
+
+    def _render_classes(self, class_info, point_counts):
+        """One row per class: the .ptc classes plus any class present in the data."""
         # Ensure classes present in data are still shown even if Display Mode table
         # does not currently contain a row for that class.
         palette_fallback = {}
@@ -376,7 +473,7 @@ class PointCountWidget(QWidget):
                 info["lvl"],  # ✅ Pass the LVL
             )
             self.stats_layout.addWidget(widget)
-    
+
     def _create_class_widget(self, code, description, count, color, visible, lvl):
         """
         ✅ FIXED: Properly displays LVL (Level/Class Name) prominently

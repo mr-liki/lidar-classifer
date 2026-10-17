@@ -2606,6 +2606,11 @@ class ThemeManager:
         if app_window is None:
             return
 
+        from gui.native_settings import native_viewport_active, apply_native_background
+        if native_viewport_active(app_window):
+            apply_native_background(app_window, cls.canvas_background_rgb())
+            return
+
         for vtk_widget in cls._iter_vtk_widgets(app_window):
             cls._apply_vtk_widget_theme(vtk_widget)
         try:
@@ -2696,6 +2701,23 @@ class ThemeManager:
                                 btn.setStyleSheet(get_active_button_style())
                             else:
                                 btn.setStyleSheet(get_inactive_button_style())
+                        except Exception:
+                            pass
+
+                        # Re-apply the SNT "dialog open" highlight if it was on —
+                        # this refresh rewrites every button stylesheet, which
+                        # would otherwise wipe the highlight mid-session.
+                        try:
+                            if btn.property("sntOpen"):
+                                from gui.menu_sidebar_system import _SNT_HIGHLIGHT_QSS as _snt_hl
+                                existing = str(btn.styleSheet() or "")
+                                if "sntOpen" not in existing:
+                                    btn.setStyleSheet(_snt_hl + existing)
+                                    try:
+                                        btn.style().unpolish(btn)
+                                        btn.style().polish(btn)
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
@@ -3334,8 +3356,9 @@ def get_progress_dialog_stylesheet() -> str:
     c = ThemeColors
     primary_bg = c.get("dialog_primary_bg")
     primary_border = c.get("dialog_primary_border")
-    progress_start = c.get("accent") if c.is_light() else primary_border
-    progress_end = c.get("accent_hover") if c.is_light() else primary_bg
+    # Blue fill in both themes: the grey dialog colours read as "disabled".
+    progress_start = c.get("accent")
+    progress_end = c.get("accent_hover")
     return f"""
     QProgressDialog {{
         background: {c.get('bg_secondary')};

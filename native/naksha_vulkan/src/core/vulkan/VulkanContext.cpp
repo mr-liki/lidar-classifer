@@ -142,6 +142,8 @@ void VulkanContext::FillReport() {
     report_.minUniformBufferOffsetAlignment = props.limits.minUniformBufferOffsetAlignment;
     report_.nonCoherentAtomSize = props.limits.nonCoherentAtomSize;
     report_.maxPointSize = props.limits.pointSizeRange[1];
+    report_.minLineWidth = props.limits.lineWidthRange[0];
+    report_.maxLineWidth = props.limits.lineWidthRange[1];
 }
 
 VkInstance VulkanContext::GetInstance() const { return instance_.GetInstance(); }

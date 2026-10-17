@@ -23,6 +23,9 @@ DEFAULT_RESOLUTION = 0.5
 DEFAULT_COVERAGE_BUFFER = 1.5
 MAX_RASTER_CELLS = 30_000_000
 _CHUNK_POINTS = 2_000_000
+# Native .lnt tile size for streamed elevation builds: bounds memory per query
+# (~2 M points × ~45 B) while keeping the number of native round-trips low.
+_LNT_STREAM_TILE = 2_000_000
 
 
 class ElevationModelError(ValueError):
@@ -127,6 +130,32 @@ def _finite_xy_bounds(
     return xmin, ymin, xmax, ymax
 
 
+def _finite_stream_bounds(stream, progress, cancelled):
+    """XY bounds for a native .lnt stream, chunk by chunk (no full copy)."""
+    xmin = ymin = np.inf
+    xmax = ymax = -np.inf
+    finite_points = 0
+    consumed = 0
+    total = max(len(stream), 1)
+    for chunk_xyz, _chunk_cls in stream.iter_chunks(_CHUNK_POINTS):
+        _check_cancelled(cancelled)
+        block = np.asarray(chunk_xyz)[:, :3]
+        consumed += len(block)
+        finite = np.isfinite(block).all(axis=1)
+        if np.any(finite):
+            xy = block[finite, :2]
+            xmin = min(xmin, float(np.min(xy[:, 0])))
+            xmax = max(xmax, float(np.max(xy[:, 0])))
+            ymin = min(ymin, float(np.min(xy[:, 1])))
+            ymax = max(ymax, float(np.max(xy[:, 1])))
+            finite_points += int(np.count_nonzero(finite))
+        _notify(progress, 5 + int(10 * min(consumed, total) / total),
+                "Inspecting point-cloud extent…")
+    if finite_points == 0:
+        raise ElevationModelError("The loaded point cloud has no finite XYZ points.")
+    return xmin, ymin, xmax, ymax
+
+
 def build_elevation_model(
     xyz,
     classifications=None,
@@ -161,12 +190,19 @@ def build_elevation_model(
     if not np.isfinite(coverage_buffer) or coverage_buffer < 0:
         raise ElevationModelError("Coverage buffer cannot be negative.")
 
-    points = np.asarray(xyz)
-    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
-        raise ElevationModelError("Loaded point data must be a non-empty Nx3 array.")
+    points = xyz
+    points_is_stream = hasattr(points, "iter_chunks")
+    if not points_is_stream:
+        points = np.asarray(xyz)
+        if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+            raise ElevationModelError("Loaded point data must be a non-empty Nx3 array.")
 
     classes = None if classifications is None else np.asarray(classifications).reshape(-1)
-    if kind == "DTM" and (classes is None or len(classes) != len(points)):
+    if kind == "DTM" and not points_is_stream and (classes is None or len(classes) != len(points)):
+        raise ElevationModelError(
+            "DTM creation requires one classification value per loaded point."
+        )
+    if kind == "DTM" and points_is_stream and classes is not None and len(classes) != len(points):
         raise ElevationModelError(
             "DTM creation requires one classification value per loaded point."
         )
@@ -176,7 +212,10 @@ def build_elevation_model(
         raise ElevationModelError("Select at least one ground class for the DTM.")
 
     _notify(progress, 2, "Preparing elevation model…")
-    xmin, ymin, xmax, ymax = _finite_xy_bounds(points, progress, cancelled)
+    if points_is_stream:
+        xmin, ymin, xmax, ymax = _finite_stream_bounds(points, progress, cancelled)
+    else:
+        xmin, ymin, xmax, ymax = _finite_xy_bounds(points, progress, cancelled)
     width = max(1, int(np.floor((xmax - xmin) / resolution)) + 1)
     height = max(1, int(np.floor((ymax - ymin) / resolution)) + 1)
     cell_count = width * height
@@ -200,14 +239,14 @@ def build_elevation_model(
     point_count = len(points)
 
     _notify(progress, 18, f"Rasterizing {kind} points…")
-    for start in range(0, point_count, _CHUNK_POINTS):
-        _check_cancelled(cancelled)
-        stop = min(point_count, start + _CHUNK_POINTS)
-        block = points[start:stop, :3]
+    consumed = 0
+
+    def _rasterize_block(block_xyz, block_classes):
+        nonlocal selected_points, consumed
+        block = np.asarray(block_xyz)[:, :3]
         finite = np.isfinite(block).all(axis=1)
         if not np.any(finite):
-            continue
-
+            return 0
         valid_xyz = block[finite]
         columns = np.floor((valid_xyz[:, 0] - xmin) / resolution).astype(np.int64)
         rows = np.floor((ymax - valid_xyz[:, 1]) / resolution).astype(np.int64)
@@ -217,27 +256,43 @@ def build_elevation_model(
         flat_cells *= width
         flat_cells += columns
         coverage[flat_cells] = True
-
         if kind == "DSM":
             target_cells = flat_cells
             target_z = valid_xyz[:, 2]
             np.maximum.at(grid, target_cells, target_z)
             selected_points += len(target_z)
         else:
-            block_classes = classes[start:stop][finite]
-            ground_mask = np.isin(block_classes, parsed_ground)
+            bc = np.asarray(block_classes).reshape(-1)[np.flatnonzero(finite)]
+            ground_mask = np.isin(bc, parsed_ground)
             if np.any(ground_mask):
                 target_cells = flat_cells[ground_mask]
                 target_z = valid_xyz[ground_mask, 2].astype(np.float32, copy=False)
                 np.add.at(grid, target_cells, target_z)
                 np.add.at(ground_counts, target_cells, 1)
                 selected_points += len(target_z)
+        return int(np.count_nonzero(finite))
 
-        _notify(
-            progress,
-            18 + int(42 * stop / point_count),
-            f"Rasterizing {kind}: {stop:,} / {point_count:,} points…",
-        )
+    if points_is_stream:
+        for chunk_xyz, chunk_cls in points.iter_chunks(_CHUNK_POINTS):
+            _check_cancelled(cancelled)
+            consumed += _rasterize_block(chunk_xyz, chunk_cls)
+            _notify(
+                progress,
+                18 + int(42 * min(consumed, point_count) / max(point_count, 1)),
+                f"Rasterizing {kind}: {min(consumed, point_count):,} / {point_count:,} points…",
+            )
+    else:
+        for start in range(0, point_count, _CHUNK_POINTS):
+            _check_cancelled(cancelled)
+            stop = min(point_count, start + _CHUNK_POINTS)
+            block = points[start:stop, :3]
+            block_classes = None if classes is None else classes[start:stop]
+            consumed += _rasterize_block(block, block_classes)
+            _notify(
+                progress,
+                18 + int(42 * stop / point_count),
+                f"Rasterizing {kind}: {stop:,} / {point_count:,} points…",
+            )
 
     if selected_points == 0:
         if kind == "DTM":
@@ -491,10 +546,146 @@ def _project_crs(app):
 
 
 def _loaded_model_data(app):
+    """Return (xyz, classifications) for the loaded cloud — VTK or native .lnt.
+
+    Never uses VTK: the classic path reads the in-memory dict, while a native
+    view (app.data is None) streams points straight out of the open .lnt
+    through the Vulkan engine's point-query API, so no backup dict of the
+    whole cloud is ever required.
+    """
     data = getattr(app, "data", None)
-    if not isinstance(data, dict) or data.get("xyz") is None:
-        raise ElevationModelError("Load a LAS/LAZ point cloud before creating a DTM or DSM.")
-    return data["xyz"], data.get("classification")
+    if isinstance(data, dict) and data.get("xyz") is not None:
+        return data["xyz"], data.get("classification")
+    native = _native_view(app)
+    if native is not None:
+        return _NativePointStream(app, native), None
+    raise ElevationModelError("Load a LAS/LAZ point cloud before creating a DTM or DSM.")
+
+
+def _native_view(app):
+    """The open native .lnt view, or None (classic VTK path)."""
+    try:
+        view = getattr(app, "_lnt_main_view", None)
+        native = getattr(view, "native", None)
+        if native is not None and hasattr(native, "query_points"):
+            return native
+    except Exception:
+        pass
+    return None
+
+
+class _NativePointStream:
+    """Lazy xyz/classification stream over the open .lnt (no VTK, no full copy).
+
+    The elevation builder consumes sequential xyz + classification chunks, so
+    this walks the cloud's XY extent in tiles and issues one native
+    ``query_points`` per tile.
+    """
+
+    def __init__(self, app, native):
+        self._app = app
+        self._native = native
+        self._tiles = None
+        self._count = None
+        self._bounds = None
+
+    def _prepare(self):
+        if self._tiles is not None:
+            return
+        native = self._native
+        try:
+            total, _nodes, ext = native.info()
+        except Exception as exc:
+            raise ElevationModelError(f"Could not read the loaded point cloud: {exc}")
+        total = int(total or 0)
+        if total <= 0:
+            raise ElevationModelError("The loaded point cloud has no points.")
+        self._count = total
+        tiles = max(1, min(total, (total + _LNT_STREAM_TILE - 1) // _LNT_STREAM_TILE))
+        side = max(1, int(tiles ** 0.5))
+        try:
+            ex = float(ext[0])
+        except Exception:
+            ex = 0.0
+        self._tiles = (side, ex)
+
+    def __len__(self):
+        self._prepare()
+        return int(self._count)
+
+    def _cloud_xy_bounds(self, native):
+        import numpy as _np
+
+        big = 1.0e12
+        probe = native.query_points((-big, -big, -big), ((big, big, big)))
+        if probe is not None:
+            xy = np.asarray(probe.get("xyz"), dtype=np.float64)
+            if xy.size:
+                xy = xy[:, :2]
+                finite = np.isfinite(xy).all(axis=1)
+                if np.any(finite):
+                    return (float(np.min(xy[finite, 0])), float(np.min(xy[finite, 1])),
+                            float(np.max(xy[finite, 0])), float(np.max(xy[finite, 1])))
+        xmin = ymin = _np.inf
+        xmax = ymax = -_np.inf
+        strips = 8
+        for i in range(strips):
+            lo = -big + (2 * big / strips) * i
+            hi = -big + (2 * big / strips) * (i + 1)
+            res = native.query_points((lo, -big, -big), ((hi, big, big)))
+            if res is None:
+                continue
+            xy = np.asarray(res.get("xyz"), dtype=np.float64)
+            if xy.size == 0:
+                continue
+            xy = xy[:, :2]
+            finite = np.isfinite(xy).all(axis=1)
+            if not np.any(finite):
+                continue
+            xmin = min(xmin, float(np.min(xy[finite, 0])))
+            xmax = max(xmax, float(np.max(xy[finite, 0])))
+            ymin = min(ymin, float(np.min(xy[finite, 1])))
+            ymax = max(ymax, float(np.max(xy[finite, 1])))
+        if not _np.isfinite(xmin):
+            raise ElevationModelError("The loaded point cloud has no finite XY points.")
+        return (xmin, ymin, xmax, ymax)
+
+    def iter_chunks(self, chunk_points=_CHUNK_POINTS):
+        """Yield (xyz float64 Nx3, classification uint8 N) tile by tile."""
+        self._prepare()
+        side, ex = self._tiles
+        native = self._native
+        big = 1.0e12
+        if not np.isfinite(ex) or ex <= 0:
+            boxes = [((-big, -big, -big), ((big, big, big)))]
+        else:
+            if self._bounds is None:
+                self._bounds = self._cloud_xy_bounds(native)
+            xmin, ymin, xmax, ymax = self._bounds
+            dx = max((xmax - xmin) / side, 1e-6)
+            dy = max((ymax - ymin) / side, 1e-6)
+            boxes = []
+            for ix in range(side):
+                for iy in range(side):
+                    boxes.append((
+                        (xmin + ix * dx, ymin + iy * dy, -big),
+                        (min(xmax, xmin + (ix + 1) * dx), min(ymax, ymin + (iy + 1) * dy), big),
+                    ))
+        for mn, mx in boxes:
+            res = native.query_points(mn, mx)
+            if res is None:
+                raise ElevationModelError(
+                    f"Could not read the loaded point cloud: {getattr(native, 'last_error', '') or 'query failed'}"
+                )
+            xyz = np.asarray(res.get("xyz"), dtype=np.float64)
+            if xyz.size == 0:
+                continue
+            cls = np.asarray(res.get("classification"), dtype=np.uint8).reshape(-1)
+            if cls.shape[0] != xyz.shape[0]:
+                cls = np.zeros(xyz.shape[0], dtype=np.uint8)
+            for start in range(0, xyz.shape[0], int(chunk_points)):
+                stop = min(xyz.shape[0], start + int(chunk_points))
+                yield xyz[start:stop], cls[start:stop]
 
 
 def _default_export_path(app, kind: str) -> str:
@@ -584,11 +775,25 @@ def _show_model_dialog(app, kind: str):
     estimate = QLabel(dialog)
     estimate.setWordWrap(True)
     root.addWidget(estimate)
-    xyz_array = np.asarray(xyz)
-    # A sampled extent is sufficient for the dialog estimate and avoids a
-    # multi-hundred-megabyte boolean/copy spike on very large clouds.
-    stride = max(1, len(xyz_array) // 1_000_000)
-    estimate_xy = xyz_array[::stride, :2]
+    if hasattr(xyz, "iter_chunks"):
+        # Native .lnt stream: sample the first chunks for the estimate instead
+        # of materialising the whole cloud.
+        try:
+            _samples = []
+            for _cx, _cc in xyz.iter_chunks(250_000):
+                _samples.append(np.asarray(_cx)[:, :2])
+                if sum(len(s) for s in _samples) >= 1_000_000:
+                    break
+            estimate_xy = np.concatenate(_samples, axis=0) if _samples else np.empty((0, 2))
+        except Exception:
+            estimate_xy = np.empty((0, 2))
+        stride = 1
+    else:
+        xyz_array = np.asarray(xyz)
+        # A sampled extent is sufficient for the dialog estimate and avoids a
+        # multi-hundred-megabyte boolean/copy spike on very large clouds.
+        stride = max(1, len(xyz_array) // 1_000_000)
+        estimate_xy = xyz_array[::stride, :2]
     finite = np.isfinite(estimate_xy).all(axis=1)
     if np.any(finite):
         xy = estimate_xy[finite]

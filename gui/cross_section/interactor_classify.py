@@ -11481,7 +11481,7 @@ class ClassificationInteractor:
                     from gui.memory_manager import current_recommended_undo_steps
                     max_steps = int(current_recommended_undo_steps(self.app))
                 except Exception:
-                    max_steps = int(getattr(self.app, "_max_undo_steps", 30))
+                    max_steps = int(getattr(self.app, "_max_undo_steps", 10))
                 while len(self.app.undo_stack) > max_steps:
                     from gui.memory_manager import _free_undo_entry
                     _free_undo_entry(self.app.undo_stack.pop(0))
@@ -15398,6 +15398,8 @@ class ClassificationInteractor:
                             "new_classes": new_cls,
                         })
                         self.app.redo_stack.clear()
+                        from gui.memory_manager import trim_undo_stack
+                        trim_undo_stack(self.app)
                         self.app._last_changed_mask = undo_mask
                         self.app._last_changed_indices = indices.copy()
 
@@ -15681,6 +15683,8 @@ class ClassificationInteractor:
                                 "new_classes": new_cls,
                             })
                             self.app.redo_stack.clear()
+                            from gui.memory_manager import trim_undo_stack
+                            trim_undo_stack(self.app)
                             self.app._last_changed_mask = undo_mask
                             self.app._last_changed_indices = indices.copy()
 
@@ -17135,7 +17139,24 @@ class ClassificationInteractor:
         # request_render().
         self.app._last_classify_ts = time.time()
 
-        if mask is None or not np.any(mask):
+        # ⚡ Phase-1 sparse core. `mask` may be a legacy bool[N] (rect/circle
+        # callers) or an int64 canonical-id array (polygon/freehand/grid
+        # path). Either way the selection is reduced to canonical ids ONCE
+        # and everything below is index-space O(K), so a commit no longer
+        # performs repeated O(N) scans and N-sized temporaries (each ~300 MB
+        # on a 300M-point project).
+        import time as _ct
+        _commit_t0 = _ct.perf_counter()
+        if mask is None:
+            sel_idx = np.empty(0, dtype=np.int64)
+        else:
+            _sel = np.asarray(mask)
+            if _sel.dtype == bool:
+                sel_idx = np.flatnonzero(_sel)
+            else:
+                sel_idx = _sel.astype(np.int64, copy=False).ravel()
+
+        if sel_idx.size == 0:
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage("No points found in selection.", 2000)
             return False
@@ -17150,9 +17171,11 @@ class ClassificationInteractor:
         classes = self.app.data["classification"]
 
         # ---------------------------------------------------------
-        # ✅ 1) Enforce from_classes filter (safe even if caller did it already)
+        # ⚡ Index-space: same test, applied to K canonical ids rather than a
+        # bool[N] round-trip.
         # ---------------------------------------------------------
-        mask = self._filter_from_classes(mask)
+        if getattr(self.app, "from_classes", None):
+            sel_idx = self._filter_from_classes_idx(sel_idx)
 
         # ---------------------------------------------------------
         # ✅ 1b) In Surface mode, only allow edits on visible classes.
@@ -17165,14 +17188,12 @@ class ClassificationInteractor:
                 return False
 
             if visible_classes is not None:
-                sel_idx = np.flatnonzero(mask)
                 if sel_idx.size > 0:
                     keep = np.isin(
                         classes[sel_idx],
                         np.asarray(visible_classes, dtype=classes.dtype),
                     )
-                    mask = np.zeros_like(mask)
-                    mask[sel_idx[keep]] = True
+                    sel_idx = sel_idx[keep]
 
         # ---------------------------------------------------------
         # ✅ 2) Enforce Display Mode visibility filter for MAIN VIEW (slot 0)
@@ -17186,25 +17207,19 @@ class ClassificationInteractor:
                 return False
 
             if visible_classes is not None:
-                # ⚡ O(K) filter — only check the K selected points (typically
-                # a few thousand for rect/circle/freehand), not all 39M
-                # points. The naive `np.isin(classes, visible_classes)` over
-                # 39M points takes 100–200 ms and was the dominant cost for
-                # main-view rect/circle/freehand classify.
-                sel_idx = np.flatnonzero(mask)
+                # ⚡ O(K) index-space filter — only the K selected points are
+                # tested, so main-view rect/circle/freehand/polygon stays
+                # flat as the dataset grows (the naive np.isin over all N
+                # took 100–200 ms on 39M and dominated the edit).
                 if sel_idx.size > 0:
                     keep = np.isin(
                         classes[sel_idx],
                         np.asarray(visible_classes, dtype=classes.dtype),
                     )
-                    mask = np.zeros_like(mask)
-                    mask[sel_idx[keep]] = True
+                    sel_idx = sel_idx[keep]
 
-        # Compute changed_indices ONCE — the previous code scanned the full
-        # N=300M-point mask up to 5 separate times (np.any, classes[mask].copy,
-        # np.flatnonzero, classes[mask] = to_class). Working in index-space
-        # below saves ~3 full-array scans (~300-400 ms per classify on 300M pts).
-        changed_indices = np.flatnonzero(mask).astype(np.int64, copy=False)
+        # Already canonical and index-space: no further N-point scan.
+        changed_indices = sel_idx.astype(np.int64, copy=False)
         # Disabled LAS flight lines are protected for every tool and view,
         # independent of the active display colour mode.
         from gui.flight_line_filter import filter_visible_flight_line_indices
@@ -17228,16 +17243,55 @@ class ClassificationInteractor:
             "new_classes": new,
         })
         self.app.redo_stack.clear()
+        # Bound retained undo memory the same way the Phase-1 engine already
+        # does. A step payload is O(K) (ids + old + new), so an unbounded
+        # stack over multi-million-point selections is the dominant retained
+        # cost. Record format/order is unchanged: oldest steps are dropped
+        # past the same recommended depth, exactly like _apply_classification.
+        try:
+            from gui.memory_manager import current_recommended_undo_steps
+            _max_undo = int(current_recommended_undo_steps(self.app))
+        except Exception:
+            _max_undo = int(getattr(self.app, '_max_undo_steps', 10))
+        while len(self.app.undo_stack) > _max_undo:
+            self.app.undo_stack.pop(0)
 
         classes[changed_indices] = to_class
         # Downstream partial refreshes must use the final protected set.
-        mask = np.zeros_like(mask, dtype=bool)
+        # ⚡ This is the ONE N-point allocation for the whole commit.
+        mask = np.zeros(len(classes), dtype=bool)
         mask[changed_indices] = True
         self.app._last_changed_mask = mask
         self.app._last_changed_indices = changed_indices.copy()
 
         # ✅ Store from_classes for undo
         self.app._last_from_classes = list(getattr(self.app, "from_classes", []) or [])
+
+        # Sparse transaction record for every downstream consumer (delta
+        # publish, section/cut overlap skip, shading, stats). edit_bbox is
+        # O(K) and lets each section view be skipped without an N-mask scan.
+        delta = None
+        _edit_bb = None
+        try:
+            from gui.classification_delta import make_delta
+            _xyz_edit = self.app.data.get("xyz")
+            if _xyz_edit is not None and changed_indices.size:
+                from gui.classification_tools import _edit_bbox
+                _edit_bb = _edit_bbox(_xyz_edit, changed_indices)
+            delta = make_delta(
+                self.app,
+                changed_indices,
+                old_classes=old,
+                new_classes=new,
+                dataset_size=int(len(classes)),
+                operation="classification",
+                origin_view="main_view" if self._is_main_view() else "cross_section",
+                edit_bbox=_edit_bb,
+            )
+            self.app._last_classification_delta = delta
+        except Exception:
+            delta = None
+            _edit_bb = None
 
         # ─────────────────────────────────────────────────────────────
         # ⚡ NAKSHATECH-STYLE INSTANT GPU INJECTION (replaces heavy optimizer)
@@ -17246,22 +17300,38 @@ class ClassificationInteractor:
             from gui.unified_actor_manager import fast_partial_classify_update, fast_partial_cross_section_update
             
             # 1. Main view: inject colors directly into GPU buffer (O(changed_points))
-            fast_partial_classify_update(self.app, mask)
+            fast_partial_classify_update(
+                self.app,
+                changed_indices=changed_indices,
+                delta=delta,
+            )
             
             # 2. Cross-sections: partial shared memory slave update
             section_widgets_to_render = []
             if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
+                from gui.classification_tools import _section_bbox_overlaps
                 for view_idx, section_widget in self.app.section_vtks.items():
                     try:
+                        # Cheapest possible skip first: a view whose stored
+                        # bounding box cannot intersect the O(K) edit box is
+                        # never patched or rendered (O(1), no N-mask scan).
+                        if (_edit_bb is not None
+                                and not _section_bbox_overlaps(self.app, view_idx, _edit_bb)):
+                            continue
                         # Render only views that actually contain changed points.
                         should_render = False
                         section_mask = getattr(self.app, f"section_{view_idx}_combined_mask", None)
                         if (section_mask is not None
-                                and len(section_mask) == len(mask)
+                                and len(section_mask) == len(classes)
                                 and changed_indices.size > 0):
                             should_render = bool(np.any(section_mask[changed_indices]))
 
-                        fast_partial_cross_section_update(self.app, view_idx, mask)
+                        fast_partial_cross_section_update(
+                            self.app,
+                            view_idx,
+                            changed_indices=changed_indices,
+                            delta=delta,
+                        )
 
                         if should_render and section_widget is not None:
                             section_widgets_to_render.append(section_widget)
@@ -17305,6 +17375,12 @@ class ClassificationInteractor:
             n_pts = int(changed_indices.size)
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage(f"✅ {n_pts:,} points → class {to_class}", 3000)
+            print(
+                f"CLASSIFY_COMMIT changed={n_pts} dataset={int(len(classes))} "
+                f"sparse=1 mask_allocs=1 "
+                f"mode={str(getattr(self.app, 'display_mode', '') or '').lower()} "
+                f"apply_ms={(_ct.perf_counter() - _commit_t0) * 1000.0:.1f}"
+            )
 
             # ✅ FIX: Signal that GPU sync is complete — prevents the
             # classify_with_stats_update decorator from triggering a
@@ -17315,8 +17391,11 @@ class ClassificationInteractor:
                 from gui.unified_actor_manager import guarantee_main_view_visual_refresh
                 guarantee_main_view_visual_refresh(
                     self.app,
-                    changed_mask=mask,
+                    changed_indices=changed_indices,
+                    delta=delta,
                     to_class=to_class,
+                    old_classes=old,
+                    new_classes=new,
                     reason="main_view_commit",
                 )
             except Exception:
@@ -17406,76 +17485,163 @@ class ClassificationInteractor:
         out = np.zeros_like(mask)
         out[sel_idx[keep]] = True
         return out
- 
-    def _classify_rectangle_main(self, p1, p2, to_class):
-        """Rectangle selection on plan view (XY)."""
+
+    def _filter_from_classes_idx(self, indices):
+        """Index-space from_classes filter (no N-point mask)."""
+        fc = getattr(self.app, "from_classes", None)
+        idx = np.asarray(indices, dtype=np.int64).ravel()
+        if idx.size == 0 or not fc:
+            return idx
+        classes = self.app.data["classification"]
+        keep = np.isin(classes[idx], np.asarray(fc, dtype=classes.dtype))
+        return idx[keep]
+
+    def _apply_indices_and_record(self, indices, to_class):
+        """Sparse entry point: canonical point IDs in, one N-mask allocation out.
+
+        Callers that already know the exact canonical ids (plan-view polygon /
+        freehand / grid-queried selections) use this instead of building their
+        own bool[N]. The shared commit core accepts either representation and
+        performs every protection filter in index space, so this path never
+        creates an N-sized temporary of its own.
+        """
+        return self._apply_mask_and_record(indices, to_class)
+
+    def _planview_bbox_candidates(self, xmin, xmax, ymin, ymax):
+        """Canonical ids inside an XY box: shared grid first, chunked scan last.
+
+        Plan-view rect/circle/polygon/freehand all need the same candidate set,
+        and none of them may build a bool[N] to get it. The shared spatial grid
+        is consulted first when it is already warm; otherwise the background
+        builder is kicked off (never awaited on the UI thread) and this call
+        falls back to a chunked scan whose largest temporary is one chunk.
+        """
         xyz = self.app.data["xyz"]
+        n = int(len(xyz))
+        try:
+            from gui.spatial_index import get_cached_index, schedule_shared_index_build
+            sidx = get_cached_index(xyz)
+            if sidx is None:
+                schedule_shared_index_build(self.app, xyz)
+            # Only the XY grid answers a box query in O(cells). The legacy 3-D
+            # kdtree backend (auto-selected below 2M points) makes
+            # query_rectangle_2d fall back to a full O(N) mask scan with
+            # several N-sized temporaries, so for those clouds the chunked
+            # scan below is strictly cheaper.
+            if sidx is not None and getattr(sidx, "method", "") == "grid2d":
+                return np.asarray(
+                    sidx.query_rectangle_2d(xmin, xmax, ymin, ymax), dtype=np.int64
+                ).ravel()
+        except Exception:
+            pass
+        out = []
+        chunk = 2_000_000
+        for s in range(0, n, chunk):
+            e = min(n, s + chunk)
+            blk = xyz[s:e]
+            hit = np.flatnonzero(
+                (blk[:, 0] >= xmin) & (blk[:, 0] <= xmax) &
+                (blk[:, 1] >= ymin) & (blk[:, 1] <= ymax)
+            )
+            if hit.size:
+                out.append(hit + s)
+        if not out:
+            return np.empty(0, dtype=np.int64)
+        return (out[0] if len(out) == 1
+                else np.concatenate(out)).astype(np.int64, copy=False)
+
+
+    def _classify_rectangle_main(self, p1, p2, to_class):
+        """Rectangle selection on plan view (XY). Grid-first, one N-alloc total."""
         x1, y1 = p1
         x2, y2 = p2
         xmin, xmax = sorted([x1, x2])
         ymin, ymax = sorted([y1, y2])
-        mask = (xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax) & (xyz[:, 1] >= ymin) & (xyz[:, 1] <= ymax)
-        # _apply_mask_and_record calls _filter_from_classes internally — no need to call it here
-        self._apply_mask_and_record(mask, to_class)
+        # The commit core applies from-class/visible-class/flight-line
+        # protection in index space, so the caller must not build a bool[N].
+        candidates = self._planview_bbox_candidates(xmin, xmax, ymin, ymax)
+        self._apply_indices_and_record(candidates, to_class)
 
     def _classify_circle_main(self, center, radius, to_class):
-        """Circle selection on plan view (XY). Bounding-box pre-filter for large datasets."""
+        """Circle selection on plan view (XY). Grid bbox + chunked radius test."""
         xyz = self.app.data["xyz"]
         cx, cy = center
         r2 = radius * radius
-        # BB pre-filter eliminates ~75% of points before the distance check
-        bb = (xyz[:, 0] >= cx - radius) & (xyz[:, 0] <= cx + radius) & \
-             (xyz[:, 1] >= cy - radius) & (xyz[:, 1] <= cy + radius)
-        cands = np.flatnonzero(bb)
-        final_mask = np.zeros(len(xyz), dtype=bool)
-        if cands.size > 0:
-            dx = xyz[cands, 0] - cx
-            dy = xyz[cands, 1] - cy
-            final_mask[cands[(dx * dx + dy * dy) <= r2]] = True
-        # _apply_mask_and_record calls _filter_from_classes internally — no need to call it here
-        self._apply_mask_and_record(final_mask, to_class)
+        candidates = self._planview_bbox_candidates(
+            cx - radius, cx + radius, cy - radius, cy + radius
+        )
+        if candidates.size == 0:
+            # Identical "no points" behaviour, no bool[N] temporary.
+            self._apply_indices_and_record(candidates, to_class)
+            return
+        # Chunked distance test: at most one chunk of candidate coords exists
+        # at a time, so brush/circle stays flat for huge candidate sets too.
+        hits = []
+        for s in range(0, candidates.size, 1_000_000):
+            c = candidates[s:s + 1_000_000]
+            dx = xyz[c, 0] - cx
+            dy = xyz[c, 1] - cy
+            keep = (dx * dx + dy * dy) <= r2
+            if np.any(keep):
+                hits.append(c[keep])
+        if not hits:
+            self._apply_indices_and_record(np.empty(0, dtype=np.int64), to_class)
+            return
+        inside = (hits[0] if len(hits) == 1 else np.concatenate(hits))
+        self._apply_indices_and_record(inside, to_class)
  
     def _classify_polygon_main(self, poly2d, to_class):
-        """Polygon/freehand selection on plan view (XY)."""
+        """Polygon/freehand selection on plan view (XY). Sparse grid + chunked PIP."""
+        import time as _pt
+        _pt0 = _pt.perf_counter()
         xs = np.array([p[0] for p in poly2d], dtype=np.float64)
         ys = np.array([p[1] for p in poly2d], dtype=np.float64)
-        xmin, xmax = xs.min(), xs.max()
-        ymin, ymax = ys.min(), ys.max()
- 
-        xy = self.app.data["xyz"][:, :2]
-        bbmask = (xy[:, 0] >= xmin) & (xy[:, 0] <= xmax) & (xy[:, 1] >= ymin) & (xy[:, 1] <= ymax)
-        candidates = np.flatnonzero(bbmask)
+        xmin, xmax = float(xs.min()), float(xs.max())
+        ymin, ymax = float(ys.min()), float(ys.max())
+        xyz = self.app.data["xyz"]
+        # Shared grid-first candidate set: no UI-thread index build, no bool[N].
+        candidates = self._planview_bbox_candidates(xmin, xmax, ymin, ymax)
  
         if candidates.size == 0:
-            self._apply_mask_and_record(bbmask, to_class)  # no points
+            # Sparse "no points" entry: identical behaviour (status message,
+            # GPU-sync reset) with zero N-point allocation.
+            self._apply_indices_and_record(np.empty(0, dtype=np.int64), to_class)
             return
  
-        # Fast point-in-polygon using matplotlib, with fallback
+        # Chunked point-in-polygon (bounded temporaries for large selections).
         try:
             from matplotlib.path import Path
             path = Path(np.c_[xs, ys], closed=True)
-            inside = path.contains_points(xy[candidates])
-            final_mask = np.zeros(len(xy), dtype=bool)
-            final_mask[candidates[inside]] = True
+            _hits = []
+            for _s in range(0, candidates.size, 500000):
+                _c = candidates[_s:_s + 500000]
+                _in = path.contains_points(xyz[_c, :2])
+                if np.any(_in):
+                    _hits.append(_c[_in])
+            inside_idx = (_hits[0] if len(_hits) == 1 else np.concatenate(_hits) if _hits else np.empty(0, dtype=np.int64))
         except Exception:
-            # Ray casting fallback
-            final_mask = np.zeros(len(xy), dtype=bool)
             poly = np.c_[xs, ys]
-            for idx in candidates:
-                x, y = xy[idx]
-                c = False
-                j = len(poly) - 1
-                for i in range(len(poly)):
-                    xi, yi = poly[i]
-                    xj, yj = poly[j]
-                    if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
-                        c = not c
-                    j = i
-                if c:
-                    final_mask[idx] = True
- 
-        final_mask = self._filter_from_classes(final_mask)
-        self._apply_mask_and_record(final_mask, to_class)
+            _hits = []
+            for _s in range(0, candidates.size, 200000):
+                _c = candidates[_s:_s + 200000]
+                _px = xyz[_c, 0]
+                _py = xyz[_c, 1]
+                _m = np.zeros(_c.size, dtype=bool)
+                for _i in range(len(poly)):
+                    _j = (_i + 1) % len(poly)
+                    _xi, _yi = poly[_i]
+                    _xj, _yj = poly[_j]
+                    _m ^= (((_yi > _py) != (_yj > _py)) & (_px < (_xj - _xi) * (_py - _yi) / (_yj - _yi + 1e-12) + _xi))
+                if np.any(_m):
+                    _hits.append(_c[_m])
+            inside_idx = (_hits[0] if len(_hits) == 1 else np.concatenate(_hits) if _hits else np.empty(0, dtype=np.int64))
+        if inside_idx.size == 0:
+            self._apply_indices_and_record(np.empty(0, dtype=np.int64), to_class)
+            return
+        print(f"POLYGON_SELECT candidates={candidates.size:,} inside={inside_idx.size:,} select_ms={(_pt.perf_counter() - _pt0) * 1000:.1f}")
+        # The commit core re-applies from-classes/visible-class protection in
+        # index space, so no extra O(K) pass is needed here.
+        self._apply_indices_and_record(inside_idx, to_class)
  
     def _classify_brush_main(self, center, radius, to_class):
         """Brush = circle selection at current mouse position (plan view)."""
@@ -17556,9 +17722,9 @@ class ClassificationInteractor:
         dist2 = dist2[eligible]
         chosen_idx = int(candidates[int(np.argmin(dist2))])
 
-        mask = np.zeros(len(xyz), dtype=bool)
-        mask[chosen_idx] = True
-        self._apply_mask_and_record(mask, to_class)
+        # One point: go through the sparse entry so no bool[N] is created for
+        # a single canonical id.
+        self._apply_indices_and_record(np.array([chosen_idx], dtype=np.int64), to_class)
         
     def _draw_circle_preview_main(self, P1, P2):
         """✅ PERFORMANCE FIX: Circle preview for MAIN VIEW (XY plane). One-time VTK pipeline init."""
@@ -20347,7 +20513,7 @@ class ClassificationInteractor:
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self.app))
         except Exception:
-            max_steps = int(getattr(self.app, '_max_undo_steps', 30))
+            max_steps = int(getattr(self.app, '_max_undo_steps', 10))
         while len(self.app.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.app.undo_stack.pop(0))

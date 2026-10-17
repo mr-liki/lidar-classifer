@@ -103,52 +103,62 @@ def _runtime_self_check(win):
     for _n, _p in mods.items():
         print(f"  {_n + ':':<18}{_p}")
 
-    # ---- native DLL: which one, and is it stale? (sections 9/10) ----------
-    dll_path = "<not found>"
-    dll_mtime = ""
-    src_mtime = ""
-    stale = False
+    # ---- native DLL: is it the build these sources describe? (9/10) ------
+    # Content, not mtime (see gui/native_build_freshness.py): a checkout,
+    # restore or backup copy re-stamps every file it writes, which made a
+    # matching DLL look stale. A declared export the binary does not provide
+    # and a build-stamp mismatch are the real, provable staleness signals;
+    # being unable to read the binary is reported, not fatal (a missing DLL
+    # is already handled by the VTK fallback).
     try:
-        from gui import render_backend as _rb
-        _bk = getattr(_rb, "VulkanRenderBackend", None)
-        for _cand in (
-            _os.path.join(PROJECT_ROOT, "native", "naksha_vulkan",
-                          "build_msvc", "naksha_vulkan.dll"),
-            _os.path.join(PROJECT_ROOT, "naksha_vulkan.dll"),
-        ):
-            if _os.path.isfile(_cand):
-                dll_path = _cand
-                break
-        if dll_path != "<not found>":
-            dll_mtime = _os.path.getmtime(dll_path)
-            _latest = 0.0
-            _ndir = _os.path.join(PROJECT_ROOT, "native", "naksha_vulkan")
-            if _os.path.isdir(_ndir):
-                for _dp, _dn, _fs in _os.walk(_ndir):
-                    if "build" in _dp.replace("\\", "/").split("/"):
-                        continue
-                    for _f in _fs:
-                        if _f.endswith((".cpp", ".hpp", ".h", ".glsl")):
-                            try:
-                                _latest = max(_latest,
-                                              _os.path.getmtime(
-                                                  _os.path.join(_dp, _f)))
-                            except Exception:
-                                pass
-            src_mtime = _latest
-            stale = bool(_latest and _latest > dll_mtime)
+        from gui.native_build_freshness import assess as _assess_native
+        _native = _assess_native(PROJECT_ROOT)
     except Exception as _e:
-        failures.append(f"native dll probe: {_e!r}")
+        _native = {
+            "verdict": "UNVERIFIED",
+            "rebuild_required": False,
+            "reasons": [],
+            "notes": [f"native dll probe failed: {_e!r}"],
+        }
+    dll_path = _native.get("dll_path") or "<not found>"
+    _dll_sha = str(_native.get("dll_sha256") or "-")[:16]
+    try:
+        _dll_mt = (f"{float(_native['dll_mtime']):.3f}"
+                   if _native.get("dll_mtime") else "-")
+    except Exception:
+        _dll_mt = "-"
+    try:
+        _sm = float(_native.get("source_latest_mtime") or 0.0)
+        _dm = float(_native.get("dll_mtime") or 0.0)
+        _delta = f"{_sm - _dm:+.2f}s" if (_sm and _dm) else "-"
+    except Exception:
+        _delta = "-"
 
     print("[NAKSHA NATIVE BUILD]")
     print(f"  dll_path:                    {dll_path}")
-    print(f"  dll_mtime:                   {dll_mtime}")
-    print(f"  native_source_latest_mtime:  {src_mtime}")
-    print(f"  stale:                       {'YES' if stale else 'NO'}")
-    if stale:
-        failures.append(
-            "NAKSHA VULKAN DLL IS STALE - REBUILD REQUIRED. Rebuild with the "
-            "existing native build (native\\naksha_vulkan\\build_msvc).")
+    print(f"  dll_sha256:                  {_dll_sha}")
+    print(f"  dll_mtime:                   {_dll_mt}")
+    print(f"  exports:                     {_native.get('dll_exports')} "
+          f"of {_native.get('declared_exports')} declared by the C API header")
+    print(f"  missing_exports:             "
+          f"{len(_native.get('missing_exports') or [])}")
+    print(f"  native_sources:              {_native.get('source_files')} "
+          f"files digest={_native.get('source_digest')}")
+    print(f"  source_newest:               {_native.get('source_newest')}")
+    print(f"  source_mtime_delta:          {_delta} "
+          "(advisory only: mtimes are re-stamped by checkout/restore)")
+    _stamp = (f"present {_native.get('stamp_created')}"
+              if _native.get("stamp_present")
+              else "absent (provenance unverified)")
+    print(f"  build_stamp:                 {_stamp}")
+    print(f"  verdict:                     {_native.get('verdict')}")
+    for _n in _native.get("notes") or []:
+        print(f"  note: {_n}")
+    for _r in _native.get("reasons") or []:
+        failures.append(_r)
+    if _native.get("rebuild_required"):
+        print("  -> rebuild the native Vulkan renderer (build_native.ps1), "
+              "then run write_native_build_stamp.py")
 
     # ---- which main view is actually visible (section 4/14) --------------
     try:

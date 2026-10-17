@@ -7,9 +7,8 @@
  *
  * Design rules (per integration task boundaries):
  *  - No Vulkan handle types cross this boundary (opaque uint64 handle only).
- *  - One process-wide renderer instance is enough for this phase (the app
- *    has a single main viewport); the API is still handle-shaped so a
- *    second instance could be added later without an ABI break.
+ *  - Independent viewport handles share the Vulkan instance, logical device
+ *    and allocator. Each owns its swapchain, camera and draw buffers.
  *  - Every function is safe to call in "not initialized" / "already failed"
  *    states and returns a bool/int status rather than throwing or crashing
  *    - this DLL must never be able to take the Python process down.
@@ -310,6 +309,7 @@ NKV_API int nkv_get_render_origin(NkvHandle handle, double* out3);
  * The real projection for the Naksha main view. Camera state is centre +
  * parallel scale + aspect + near/far; there is no eye distance, so zoom only
  * changes parallel_scale and pan only moves the centre. */
+NKV_API int nkv_set_camera_view_up(NkvHandle handle, double x, double y, double z);
 NKV_API int nkv_set_camera_ortho(NkvHandle handle,
                                  double centre_x, double centre_y, double centre_z,
                                  double dir_x, double dir_y, double dir_z,
@@ -549,6 +549,8 @@ NKV_API int nkv_set_shaded_class_surface_indexed(NkvHandle handle,
  * legacy/overdrive split and effective light elevation are derived
  * IN-SHADER from this single value every frame, so this call is always a
  * few bytes regardless of how the Python-side derivation works. */
+NKV_API int nkv_set_surface_elevation_color(NkvHandle handle, int on, float z0, float z1, float ramp);
+
 NKV_API int nkv_set_crisp_shading_parameters(NkvHandle handle,
                                               float azimuth_deg, float sharpness_raw,
                                               float ambient,
@@ -587,6 +589,12 @@ NKV_API int nkv_surface_tiles_upload(NkvHandle handle, NkvSurfaceTileDesc* tiles
 NKV_API int nkv_surface_tiles_evict(NkvHandle handle, const uint64_t* keys, uint32_t count);
 NKV_API int nkv_surface_tiles_set_palette(NkvHandle handle, const uint8_t* lut_rgb /* 256*3 */,
                                           float coverage_shade);
+/* Class edits on one resident tile: rewrites only the listed (tile-local) vertex and
+ * coverage colours from the current palette. Positions and triangles are unchanged. */
+NKV_API int nkv_surface_tiles_patch_classes(NkvHandle handle, uint64_t key,
+                                            const uint32_t* vertex_index, const uint8_t* vertex_class,
+                                            uint32_t vertex_count, const uint32_t* coverage_index,
+                                            const uint8_t* coverage_class, uint32_t coverage_count);
 NKV_API int nkv_surface_tiles_set_draw_list(NkvHandle handle, const NkvSurfaceTileDraw* items,
                                             uint32_t count);
 /* out[0..15]: resident tiles, vertices used/capacity, faces used/capacity, coverage
@@ -781,6 +789,105 @@ NKV_API uint64_t nkv_get_point_capacity(NkvHandle handle);
 NKV_API uint64_t nkv_get_arena_uploaded_tiles(NkvHandle handle);
 NKV_API uint32_t nkv_get_point_draw_range_count(NkvHandle handle);
 NKV_API uint32_t nkv_get_point_draw_range_points(NkvHandle handle);
+
+/* ---- VECTOR OVERLAY (SNT / CAD linework) ------------------------------------
+ *
+ * The native-vulkan counterpart of the SNT/DXF vector attachments. Until this
+ * existed, visible overlay linework went through the transparent Qt overlay:
+ * every entity was re-projected world->screen and re-stroked by QPainter on a
+ * 33 ms repaint, which a 1.1M-entity file cannot sustain. This path uploads the
+ * linework to the GPU ONCE (an 11-group SNT file is ~11 draw calls) and leaves
+ * only the labels on the Qt overlay (no text in the engine - there is no font
+ * atlas here, and adding one is explicitly out of scope).
+ *
+ * Geometry mirrors the point arena's contract, NOT a new one:
+ *   - nkv_vector_reserve() fixes a capacity once; strips are written at
+ *     caller-chosen STABLE offsets, so a new group never re-uploads the ones
+ *     already resident and never moves their offsets.
+ *   - Positions are WORLD float64 like every other upload; the engine applies
+ *     the SAME floating render origin (world - origin) internally, and the
+ *     pass uses the existing frame MVP. There is deliberately NO new camera
+ *     API: world-space line strips go through nkv_set_camera_lookat /
+ *     nkv_set_camera_ortho exactly like points and surfaces.
+ *   - Visibility is a DRAW RANGE, never an upload: layer/file toggles and a
+ *     file removal change only the list of index windows drawn.
+ *
+ * One vertex arena is interleaved float32 render-space XYZ (12 B) + RGBA8
+ * colour (4 B) = 16 B. One uint32 index arena carries every strip; strips are
+ * separated by PRIMITIVE-RESTART (0xFFFFFFFF) so one group is ONE
+ * vkCmdDrawIndexed. A closed polyline repeats its first index, matching the VTK
+ * actor path this replaces.
+ *
+ * The pass itself is VK_PRIMITIVE_TOPOLOGY_LINE_STRIP with primitive restart,
+ * dynamic line width, and depth test AND write OFF - the always-on-top
+ * semantics of the Qt overlay it replaces. */
+
+/* 0 = failed, 1 = ready (nothing to re-upload), 2 = (re)allocated (every
+ * earlier strip is invalid). Same contract as nkv_reserve_point_capacity. */
+NKV_API int nkv_vector_reserve(NkvHandle handle, uint64_t capacity_vertices,
+                               uint64_t capacity_indices);
+
+/* Uploads line strips that SHARE the arena.
+ *   xyz_world_f64  v_count*3 WORLD float64 positions (converted internally)
+ *   rgb8           v_count*3 authored RGB bytes
+ *   indices_u32    i_count uint32 LOCAL vertex indices, with a 0xFFFFFFFF
+ *                  separator between consecutive strips
+ * Vertex and index ranges are written independently, so a group's vertices and
+ * its indices can be uploaded in separate calls. Returns 1 on success, 0 on
+ * failure (handle invalid, no arena, or the range runs past the capacity). */
+NKV_API int nkv_vector_upload_strip(NkvHandle handle, uint64_t v_first, uint64_t v_count,
+                                    const double* xyz_world_f64, const uint8_t* rgb8,
+                                    uint64_t i_first, uint64_t i_count,
+                                    const uint32_t* indices_u32);
+
+/* The visible index windows: indexFirsts/counts are i_count-long windows into
+ * the resident index arena. One window = one draw call, so "draw_call_count
+ * ~= layer groups" is measured, not assumed. Passing n==0 (or null pointers)
+ * restores "draw nothing" - a full-arena draw would rasterise the gaps between
+ * groups, exactly the behaviour PointCloudRenderer::SetDrawRanges avoids. */
+/* Same, with an EXPLICIT pixel width per range (`widths_px` may be NULL to use
+ * the global nkv_vector_set_line_width value). Line width is dynamic state, so
+ * Record() sets it immediately before each range's draw: an SNT layer group
+ * drawn at its authored lineweight costs one extra command and never a buffer
+ * touch or a pipeline rebuild. This is the per-layer-group width the SNT
+ * lineweight (1.0 + lw*0.5, clamped) needs. */
+NKV_API int nkv_vector_set_draw_ranges_ex(NkvHandle handle,
+                                          const uint32_t* index_firsts,
+                                          const uint32_t* index_counts,
+                                          const float* widths_px,
+                                          uint32_t count);
+NKV_API int nkv_vector_clear_draw_ranges(NkvHandle handle);
+
+/* The device's VkPhysicalDeviceLimits.lineWidthRange, as actually probed on the
+ * physical device this handle runs on - the Phase-0 question "can this GPU draw
+ * a line thicker than 1 px in core Vulkan?". Wide lines above max are clamped
+ * by the pass, and max is forced to 1.0 when the wideLines feature is not
+ * enabled, so a [1,1] device draws 1 px lines instead of emitting an invalid
+ * command (thicker strokes then need CPU ribbon tessellation). Both out
+ * pointers are optional. Returns 1 when the handle is valid. */
+NKV_API int nkv_get_line_width_range(NkvHandle handle, float* out_min, float* out_max);
+
+/* Dynamic line width in PIXELS for every subsequent frame (clamped by the
+ * driver to the device's lineWidthRange; the T400 reports [1.0, 64.0]). Dynamic
+ * state only - never a pipeline rebuild and never a buffer touch. */
+NKV_API int nkv_vector_set_line_width(NkvHandle handle, float pixels);
+
+/* Drops the vector arenas and draw ranges, keeping the renderer alive (the
+ * vector counterpart of nkv_clear, and what a file removal uses). */
+NKV_API int nkv_vector_clear(NkvHandle handle);
+
+/* Counters for the log/perf discipline. out must hold NKV_VECTOR_STATS_WORDS:
+ *   [0] uploads            [1] indices drawn (last frame)  [2] draw calls (last frame)
+ *   [3] resident bytes      [4] vertex capacity            [5] index capacity
+ *   [6] draw range count
+ * Returns 1 when the handle is valid, else 0. */
+#define NKV_VECTOR_STATS_WORDS 7
+NKV_API int nkv_vector_get_stats(NkvHandle handle, uint64_t* out, uint32_t count);
+
+/* 1 when the vector overlay pass was built (shaders present, pipeline created),
+ * else 0. Lets a caller (and a test) tell "no linework uploaded yet" from
+ * "this DLL cannot draw vectors" and fall back to the Qt overlay. */
+NKV_API int nkv_vector_available(NkvHandle handle);
 
 /* Real GPU frame time in ms, from the VK_QUERY_TYPE_TIMESTAMP pool, corrected
  * by timestampPeriod. Returns -1.0 when unavailable (disabled / unsupported /

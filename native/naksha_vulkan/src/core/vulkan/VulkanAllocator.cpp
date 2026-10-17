@@ -1,6 +1,7 @@
 #include "naksha/core/vulkan/VulkanAllocator.h"
 
 #include <cstdio>
+#include <stdexcept>
 
 namespace naksha {
 namespace vulkan {
@@ -14,6 +15,13 @@ void VulkanAllocator::Initialize(VkInstance instance, VkPhysicalDevice physicalD
                                   VkDevice device, VkQueue graphicsQueue,
                                   uint32_t graphicsFamilyIndex,
                                   const VmaVulkanFunctions& vulkanFunctions) {
+    if (allocator_) {
+        if (device_ != device) {
+            throw std::runtime_error("Vulkan allocator requires a shared viewport device");
+        }
+        ++references_;
+        return;
+    }
     device_ = device;
     graphicsQueue_ = graphicsQueue;
 
@@ -42,9 +50,11 @@ void VulkanAllocator::Initialize(VkInstance instance, VkPhysicalDevice physicalD
     allocatorInfo.instance = instance;
 
     vmaCreateAllocator(&allocatorInfo, &allocator_);
+    if (allocator_) references_ = 1;
 }
 
 void VulkanAllocator::Shutdown() {
+    if (references_ && --references_ != 0) return;
     if (allocator_) {
         vmaDestroyAllocator(allocator_);
         allocator_ = VK_NULL_HANDLE;

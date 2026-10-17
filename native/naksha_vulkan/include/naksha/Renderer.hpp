@@ -314,7 +314,12 @@ public:
     // (last camera set via nkv_set_camera_lookat), so the captured image
     // reflects the same camera as the live view. Returns RGBA8,
     // top-to-bottom row order, width*height*4 bytes.
+    // `vector` (optional) is the overlay pass. It is recorded here for the same
+    // reason the point/surface passes are: a capture that silently omitted the
+    // linework would disagree with the window and make a pixel comparison claim
+    // the overlay is missing when it is not.
     bool CaptureOffscreenRGBA8(class PointCloudRenderer* pointCloud, class SurfaceRenderer* surface,
+                                class VectorOverlayRenderer* vector,
                                 std::vector<uint8_t>& outRGBA, uint32_t& outW, uint32_t& outH);
 
     // Depth buffer readback for the SAME offscreen capture above, as float32
@@ -365,6 +370,7 @@ private:
     std::vector<VkFramebuffer> framebuffers_;
     // Persistently mapped UBO, one per in-flight frame slot.
     std::vector<GPUBuffer> frameUboBuffers_;
+    uint32_t lastFrameUboSlot_ = UINT32_MAX;
     std::vector<VmaAllocation> frameUboAllocs_;
     std::vector<VkDescriptorSet> frameSets_;
     // One depth image + view per swapchain image (no shared depth
@@ -487,6 +493,9 @@ private:
 
     friend class PointCloudRenderer;
     friend class SurfaceRenderer;
+    // Needs cfg_.shaderDirectory to load vector.vert/frag.spv from the DLL's own
+    // directory, exactly like the two sub-renderers above.
+    friend class VectorOverlayRenderer;
 };
 
 } // namespace naksha

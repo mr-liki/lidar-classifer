@@ -12896,6 +12896,7 @@ import mmap
 import os
 import re
 import struct
+import time
 import traceback
 from collections import defaultdict
 from functools import lru_cache
@@ -13858,7 +13859,40 @@ def _apply_prj_precision_to_block_entities(
     snt_uses_float64: bool = False,
 ):
     """Return render-only block copies using the best available precision."""
+    # Fast path: files without any block-boundary layer cannot be affected
+    # by PRJ matching or float32 quantization buffering (both apply only to
+    # block lines). Scanning 1M+ entities with numpy per polygon just to
+    # discover that would dominate Attach time, so check distinct layer
+    # names first and return the input unchanged.
+    distinct_layers = set()
+    truncated = True
+    try:
+        distinct_layers = set()
+        truncated = False
+        for _ent in entities or []:
+            if isinstance(_ent, dict):
+                _ln = _ent.get("layer", "0")
+                try:
+                    distinct_layers.add(str(_ln))
+                except Exception:
+                    pass
+                if len(distinct_layers) > 4096:
+                    truncated = True
+                    break
+        if not truncated and not any(
+            _is_block_boundary_layer_name(_ln) and "BBOX" not in str(_ln).strip().upper()
+            for _ln in distinct_layers
+        ):
+            return list(entities) if isinstance(entities, list) else (entities or [])
+    except Exception:
+        pass
     corrected = []
+    # The layer name decides eligibility. Resolve it once per distinct layer,
+    # before normalizing entity types or testing polygon geometry.
+    boundary_layers = {
+        name for name in distinct_layers
+        if _is_block_boundary_layer_name(name) and "BBOX" not in name.strip().upper()
+    } if not truncated else None
     used_labels = set()
     prj_corrected_count = 0
     quantization_corrected_count = 0
@@ -13866,6 +13900,10 @@ def _apply_prj_precision_to_block_entities(
 
     for entity in entities or []:
         if not isinstance(entity, dict):
+            corrected.append(entity)
+            continue
+
+        if boundary_layers is not None and str(entity.get("layer", "0")) not in boundary_layers:
             corrected.append(entity)
             continue
 
@@ -14146,6 +14184,7 @@ def build_snt_block_polygons(
     snt_filename: str,
     prj_blocks=None,
     attachment=None,
+    progress_cb=None,
 ) -> None:
     """Extract BL-layer block polygons and associate each with a grid label for click-inside-block detection.
 
@@ -14158,7 +14197,13 @@ def build_snt_block_polygons(
 
     if not hasattr(app, 'snt_block_polygons'):
         app.snt_block_polygons = []
-        
+    # BBOX index tiles (the labelled square grid cells) kept for Grid area
+    # measurement only; snt_block_polygons stays the block index.
+    app.snt_grid_tiles = [
+        tile for tile in (getattr(app, 'snt_grid_tiles', None) or [])
+        if tile.get("snt_filename") != snt_filename
+    ]
+
     app.snt_block_polygons = [
         bp for bp in app.snt_block_polygons 
         if bp.get("snt_filename") != snt_filename
@@ -14176,6 +14221,19 @@ def build_snt_block_polygons(
     # Closed polygons that matched no name heuristic. Used for rename-safe
     # geometric recovery of the block boundary layer (see PRJ matching below).
     unrouted_closed_polys: list = []
+
+    # Gate-passed (layer, etype, entity) references whose vertices are NOT
+    # collected during the scan. Materialized into unrouted_closed_polys
+    # below, and only when a downstream consumer can actually use them —
+    # otherwise 250k+ building polygons would each pay a float conversion
+    # for data that is never used.
+    # NOTE (diagnostic-only edge): gate-time level counts assume a
+    # gate-passed polygon also survives vertex collection. That holds for
+    # all decoder-produced geometry; only corrupt input (non-finite or
+    # ragged vertices that collection would drop below 3 points) can leave
+    # the printed per-level count higher than a full re-verification.
+    unrouted_pending: list = []
+    _pending_per_layer: Dict[str, int] = {}
 
     # Diagnostic count of every level containing a closed polygon.
     polygon_level_counts: Dict[str, int] = {}
@@ -14214,6 +14272,93 @@ def build_snt_block_polygons(
                 out = out[:-1]
 
         return out
+
+    def _raw_closed_gate(ent: Dict, poly_etype: str) -> bool:
+        """Cheap closed-polygon gate on raw first/last vertices only.
+
+        No vertex conversion: entities with fewer than 3 raw points, or an
+        open ring (and no explicit closed flag), are rejected before any
+        float()/numpy work happens.
+        """
+        try:
+            src = ent.get("points") or ent.get("vertices") or []
+            if len(src) < 3:
+                return False
+        except TypeError:
+            return False
+        if poly_etype == "polygon":
+            return True
+        try:
+            if bool(ent.get("closed", False)):
+                return True
+        except Exception:
+            pass
+        try:
+            first, last = src[0], src[-1]
+            if first is None or last is None or len(first) < 2 or len(last) < 2:
+                return False
+            return (
+                abs(float(first[0]) - float(last[0])) <= _CLOSING_VERTEX_TOL_M
+                and abs(float(first[1]) - float(last[1])) <= _CLOSING_VERTEX_TOL_M
+            )
+        except Exception:
+            return False
+
+    def _closed_poly_points_2d_fast(ent: Dict, poly_etype: str):
+        """Fused closed-polygon point collection (single float pass).
+
+        Equivalent to ``_collect_poly_points_2d`` + len>=3 +
+        ``_is_closed_block_polygon_entity`` combined, but converts each
+        vertex exactly once. Returns the 2D point list, or None when the
+        entity is not a valid closed polygon.
+        """
+        if not _raw_closed_gate(ent, poly_etype):
+            return None
+        points_2d = _collect_poly_points_2d(ent)
+        if len(points_2d) < 3:
+            return None
+        return points_2d
+
+    _level_norm_cache: Dict[str, str] = {}
+    _known_boundary_cache: Dict[str, bool] = {}
+
+    def _norm_level_cached(name: str) -> str:
+        try:
+            return _level_norm_cache[name]
+        except KeyError:
+            pass
+        norm = _normalise_snt_level_name(name)
+        if len(_level_norm_cache) < 32768:
+            _level_norm_cache[name] = norm
+        return norm
+
+    def _is_known_boundary_cached(name: str) -> bool:
+        # Per-level memo of _is_known_block_boundary_layer. Safe to cache for
+        # the scan: this loop only ever ADDS the already-True layer itself to
+        # the tracked set, so a False verdict can never flip mid-scan.
+        try:
+            return _known_boundary_cache[name]
+        except KeyError:
+            pass
+        verdict = bool(_is_known_block_boundary_layer(name, attachment))
+        if len(_known_boundary_cache) < 32768:
+            _known_boundary_cache[name] = verdict
+        return verdict
+
+    def _count_closed_level(name: str) -> None:
+        key = name or "<blank>"
+        polygon_level_counts[key] = polygon_level_counts.get(key, 0) + 1
+
+    def _uncount_closed_level(name: str) -> None:
+        # Compensate a gate-time count when lazy materialization later
+        # proves the polygon degenerate (all vertices non-finite). Corrupt
+        # data only; keeps the diagnostic identical otherwise.
+        key = name or "<blank>"
+        try:
+            if polygon_level_counts.get(key, 0) > 0:
+                polygon_level_counts[key] -= 1
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Build an exact local LAZ/LAS filename index.
@@ -14308,13 +14453,26 @@ def build_snt_block_polygons(
     # ------------------------------------------------------------------
     # Separate real blocks, placeholder-level candidates and BBOX tiles.
     # ------------------------------------------------------------------
+    _scan_idx = 0
+    _scan_total = len(entities) if isinstance(entities, list) else 0
     for entity in entities:
+        _scan_idx += 1
+        if progress_cb is not None and (_scan_idx & 0x3FFFF) == 0:
+            # Every ~256k entities: keep the progress dialog alive.
+            try:
+                progress_cb(f"indexing block boundaries... {_scan_idx:,}/{_scan_total:,}")
+            except Exception:
+                pass
+            try:
+                from PySide6.QtCore import QCoreApplication as _QCA
+                _QCA.processEvents()
+            except Exception:
+                pass
         if not isinstance(entity, dict):
             continue
 
         etype = str(entity.get("type", "")).strip().lower()
         layer = str(entity.get("layer", "")).strip()
-        normalized_layer = _normalise_snt_level_name(layer)
 
         if etype in (
             "line",
@@ -14322,39 +14480,42 @@ def build_snt_block_polygons(
             "lwpolyline",
             "polygon",
         ):
-            points_2d = _collect_poly_points_2d(entity)
-
-            if (
-                len(points_2d) >= 3
-                and _is_closed_block_polygon_entity(entity)
-            ):
-                level_key = layer or "<blank>"
-                polygon_level_counts[level_key] = (
-                    polygon_level_counts.get(level_key, 0) + 1
-                )
-
-                record = (points_2d, layer, entity)
-
-                # BBOX must be separated before the general boundary check,
-                # because _is_block_boundary_layer_name() accepts BBOX.
-                if _is_bbox_index_level(layer):
-                    bbox_index_polys.append(record)
-
-                elif _is_known_block_boundary_layer(layer, attachment):
-                    explicit_block_polys.append(record)
-                    # Record this layer as a known block boundary for future renames
-                    if attachment is not None:
-                        _blk_state = attachment.get("_snt_direct_changes")
-                        if isinstance(_blk_state, dict):
-                            _blk_set = _blk_state.get("block_boundary_layers")
-                            if isinstance(_blk_set, set):
-                                _blk_set.add(layer)
-
-                elif _is_default_placeholder_block_level(layer):
-                    placeholder_polys.append(record)
-
-                else:
-                    unrouted_closed_polys.append(record)
+            # Route on the (cached) normalized level name BEFORE touching any
+            # vertex. Open contour polylines — the vast majority on files like
+            # N4_BLOCK_932 — are rejected by the raw closed gate without a
+            # single float conversion. Unrouted layers only record a (layer,
+            # entity) reference here; their vertices are materialized later,
+            # and only if the PRJ geometric recovery path actually triggers.
+            normalized_layer = _norm_level_cached(layer)
+            if "BBOX" in normalized_layer:
+                points_2d = _closed_poly_points_2d_fast(entity, etype)
+                if points_2d is None:
+                    continue
+                _count_closed_level(layer)
+                bbox_index_polys.append((points_2d, layer, entity))
+            elif _is_known_boundary_cached(layer):
+                points_2d = _closed_poly_points_2d_fast(entity, etype)
+                if points_2d is None:
+                    continue
+                _count_closed_level(layer)
+                explicit_block_polys.append((points_2d, layer, entity))
+                # Record this layer as a known block boundary for future renames
+                if attachment is not None:
+                    _blk_state = attachment.get("_snt_direct_changes")
+                    if isinstance(_blk_state, dict):
+                        _blk_set = _blk_state.get("block_boundary_layers")
+                        if isinstance(_blk_set, set):
+                            _blk_set.add(layer)
+            elif normalized_layer in _DEFAULT_PLACEHOLDER_BLOCK_LEVELS:
+                points_2d = _closed_poly_points_2d_fast(entity, etype)
+                if points_2d is None:
+                    continue
+                _count_closed_level(layer)
+                placeholder_polys.append((points_2d, layer, entity))
+            elif _raw_closed_gate(entity, etype):
+                _count_closed_level(layer)
+                unrouted_pending.append((layer, etype, entity))
+                _pending_per_layer[layer] = _pending_per_layer.get(layer, 0) + 1
 
             continue
 
@@ -14502,6 +14663,32 @@ def build_snt_block_polygons(
 
     _perf_preindex_ms = (_time.perf_counter() - _perf_stage_t0) * 1000.0
     _perf_stage_t0 = _time.perf_counter()
+
+    # Lazy materialization: unrouted vertices are collected only when a
+    # downstream consumer can actually use them —
+    #   (a) PRJ geometric recovery (no explicit boundaries + PRJ present), or
+    #   (b) labeled-grid recovery, which needs >=4 same-layer polys on a
+    #       layer that also carries text labels.
+    # Otherwise the pending references are dropped unconverted. Both gates
+    # are exact: skipped layers provably contribute nothing.
+    _prj_recovery_armed = bool(
+        not explicit_block_polys and unrouted_pending and prj_blocks
+    )
+    # _pending_per_layer was tallied during the scan loop above.
+    _grid_recovery_layers = {
+        lyr
+        for lyr, n in _pending_per_layer.items()
+        if n >= 4 and text_by_layer.get(lyr)
+    }
+    if _prj_recovery_armed or _grid_recovery_layers:
+        for _lyr, _et, _ent in unrouted_pending:
+            if not _prj_recovery_armed and _lyr not in _grid_recovery_layers:
+                continue
+            _pts = _closed_poly_points_2d_fast(_ent, _et)
+            if _pts is None:
+                _uncount_closed_level(_lyr)
+                continue
+            unrouted_closed_polys.append((_pts, _lyr, _ent))
 
     if not explicit_block_polys and unrouted_closed_polys and prj_blocks:
         _layer_match: Dict[str, int] = {}
@@ -14924,6 +15111,28 @@ def build_snt_block_polygons(
             f"PRJ authority block(s) alongside {len(bl_polys)} SNT polygon(s)"
         )
 
+    # When real blocks win the selection above, the BBOX tiles are dropped
+    # from the block index - but they are still the square grid cells the
+    # user sees. Keep them (with their same-level label) for Grid area.
+    if bl_polys is not bbox_index_polys:
+        for tile_number, (poly_pts, poly_layer, _entity) in enumerate(bbox_index_polys, 1):
+            labels = [
+                text_value
+                for tx, ty, text_value in _text_candidates_for_layer(poly_layer, poly_pts)
+                if str(text_value or "").strip()
+                and _snt_point_in_polygon_2d(tx, ty, poly_pts)
+            ]
+            app.snt_grid_tiles.append({
+                "points_2d": [(float(x), float(y)) for x, y in poly_pts],
+                "grid_name": labels[0].strip() if labels else f"{poly_layer} #{tile_number}",
+                "source": "snt_bbox",
+                "snt_filename": snt_filename,
+                "poly_layer": poly_layer,
+            })
+        if bbox_index_polys:
+            print(f"[SNT block polygons] kept {len(bbox_index_polys)} BBOX grid tile(s) "
+                  "for grid area measurement")
+
     stored_for_owner = [
         block for block in app.snt_block_polygons
         if block.get("snt_filename") == snt_filename
@@ -15243,17 +15452,18 @@ def _decode_lwpolyline_body(body, layer, color):
         elev, flags, count = struct.unpack_from("<fBI", body)
         if len(body) < 9 + count * 12:
             return None
-        verts = []
-        pos = 9
-        for _ in range(count):
-            x, y, _bulge = struct.unpack_from("<3f", body, pos)
-            verts.append((float(x), float(y), float(elev)))
-            pos += 12
+        arr = np.frombuffer(body, dtype=np.dtype("<f4"), count=count * 3, offset=9)
+        arr = arr.reshape((-1, 3))
+        xy = arr[:, :2].astype(np.float64, copy=False)
+        out = np.empty((len(xy), 3), dtype=np.float64)
+        out[:, :2] = xy
+        out[:, 2] = float(elev)
+        verts = out.tolist()
         if not verts:
             return None
         return {"type": "POLYLINE", "layer": layer, "color": color,
                 "vertices": verts, "closed": bool(flags & 0x01)}
-    except struct.error:
+    except (struct.error, ValueError):
         return None
 
 
@@ -15264,17 +15474,14 @@ def _decode_polyline_body(body, layer, color):
         flags, count = struct.unpack_from("<BI", body)
         if len(body) < 5 + count * 12:
             return None
-        verts = []
-        pos = 5
-        for _ in range(count):
-            x, y, z = struct.unpack_from("<3f", body, pos)
-            verts.append((float(x), float(y), float(z)))
-            pos += 12
+        arr = np.frombuffer(body, dtype=np.dtype("<f4"), count=count * 3, offset=5)
+        arr = arr.reshape((-1, 3))
+        verts = arr.astype(np.float64, copy=False).tolist()
         if not verts:
             return None
         return {"type": "POLYLINE", "layer": layer, "color": color,
                 "vertices": verts, "closed": bool(flags & 0x01)}
-    except struct.error:
+    except (struct.error, ValueError):
         return None
 
 
@@ -15470,10 +15677,9 @@ def _decode_entity_from_mmap(etype, mm_obj, body_offset: int, body_size: int,
         if etype == entity_type_cls.LINE:
             if body_size < 24:
                 return None
-            sx, sy, sz, ex, ey, ez = struct.unpack_from("<6f", mm_obj, body_offset)
+            coords = struct.unpack_from("<6f", mm_obj, body_offset)
             return {"type": "POLYLINE", "layer": layer_name, "color": color,
-                    "vertices": [(float(sx), float(sy), float(sz)),
-                                 (float(ex), float(ey), float(ez))],
+                    "vertices": [coords[:3], coords[3:]],
                     "closed": False}
 
         if etype == entity_type_cls.ARC:
@@ -15517,7 +15723,16 @@ def _decode_entity_from_mmap(etype, mm_obj, body_offset: int, body_size: int,
                 return None
             arr = np.frombuffer(mm_obj, dtype=np.dtype("<f4"), count=count * 3, offset=body_offset + 9)
             arr = arr.reshape((-1, 3))
-            verts = [(float(x), float(y), float(elev)) for x, y, _ in arr]
+            # C-speed vertex conversion: tolist() applies the same
+            # float32->float coercion as the per-vertex float() calls it
+            # replaces, but without a Python loop iteration per vertex.
+            # Lists (not tuples) are fine downstream — every consumer only
+            # indexes/iterates vertices, including snt_core.direct_write.
+            xy = arr[:, :2].astype(np.float64, copy=False)
+            out = np.empty((len(xy), 3), dtype=np.float64)
+            out[:, :2] = xy
+            out[:, 2] = float(elev)
+            verts = out.tolist()
             return {"type": "POLYLINE", "layer": layer_name, "color": color,
                     "vertices": verts, "closed": bool(flags & 0x01)}
 
@@ -15532,7 +15747,8 @@ def _decode_entity_from_mmap(etype, mm_obj, body_offset: int, body_size: int,
                 return None
             arr = np.frombuffer(mm_obj, dtype=np.dtype("<f4"), count=count * 3, offset=body_offset + 5)
             arr = arr.reshape((-1, 3))
-            verts = [(float(x), float(y), float(z)) for x, y, z in arr]
+            # See LWPOLYLINE above: C-speed conversion, identical values.
+            verts = arr.tolist()
             return {"type": "POLYLINE", "layer": layer_name, "color": color,
                     "vertices": verts, "closed": bool(flags & 0x01)}
 
@@ -15579,7 +15795,7 @@ def _decode_entity_from_mmap(etype, mm_obj, body_offset: int, body_size: int,
             if body_size < 48:
                 return None
             arr = np.frombuffer(mm_obj, dtype=np.dtype("<f4"), count=12, offset=body_offset).reshape((4, 3))
-            verts = [(float(x), float(y), float(z)) for x, y, z in arr]
+            verts = arr.astype(np.float64, copy=False).tolist()
             return {"type": "3DFACE", "layer": layer_name, "color": color,
                     "vertices": verts}
 
@@ -15875,7 +16091,18 @@ def _snt_reader_metadata(reader) -> Dict:
             return {}
 
 
-def _read_snt_file(filepath: str) -> Dict:
+class _SntCancelled(Exception):
+    """Raised when an SNT decode is cancelled via ``is_cancelled``."""
+
+
+def _read_snt_file(filepath: str, progress_cb=None, is_cancelled=None) -> Dict:
+    """Decode an SNT file into layers + drawable entity dicts.
+
+    ``progress_cb``, when given, is called as ``progress_cb(decoded_count)``
+    roughly every 25k entities so a background worker can keep a progress
+    dialog alive (and honour Cancel through ``is_cancelled``) instead of
+    freezing the GUI thread at 0% on million-entity files.
+    """
     result: Dict = {"version": (1, 0), "layers": [], "entities": []}
 
     try:
@@ -15903,13 +16130,71 @@ def _read_snt_file(filepath: str) -> Dict:
             layer_name_set: Set[str] = {layer["name"] for layer in layers_out}
             entities_out: List[Dict] = []
             native_batch_used = False
+            _decode_t0 = time.perf_counter()
+
+            # Per-entity C-extension lookups (layer_name, string pool, ACI
+            # colour) dominate decode time on million-entity files: each is a
+            # Python→native call plus a fresh object allocation. Layer and
+            # colour spaces are tiny (a handful of layers) and the string pool
+            # is finite, so memoize all three. Zero behaviour change — the
+            # same values are returned, just without repeating native calls.
+            _layer_name_cache: Dict[int, str] = {}
+            _string_cache: Dict[int, str] = {}
+            _entity_color_cache: Dict[tuple, Tuple[int, int, int]] = {}
+
+            def _cached_layer_name(layer_idx) -> str:
+                try:
+                    return _layer_name_cache[layer_idx]
+                except KeyError:
+                    pass
+                name = reader.layer_name(layer_idx)
+                _layer_name_cache[layer_idx] = name
+                return name
+
+            def _cached_string(string_idx):
+                try:
+                    return _string_cache[string_idx]
+                except KeyError:
+                    pass
+                value = reader.string(string_idx)
+                _string_cache[string_idx] = value
+                return value
+
+            def _cached_entity_color(hdr) -> Tuple[int, int, int]:
+                try:
+                    mode = hdr.color_mode
+                    value = hdr.color_value
+                    layer_idx = hdr.layer_idx
+                except AttributeError:
+                    return _resolve_entity_color(hdr, layer_colors, ColorMode)
+                if mode == ColorMode.BYLAYER:
+                    return layer_colors[layer_idx] if 0 <= layer_idx < len(layer_colors) else _DEFAULT_COLOR
+                key = (mode, value, layer_idx)
+                try:
+                    return _entity_color_cache[key]
+                except KeyError:
+                    pass
+                color = _resolve_entity_color(hdr, layer_colors, ColorMode)
+                _entity_color_cache[key] = color
+                return color
 
             if _is_native_batch_enabled():
                 try:
                     with open(filepath, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm_obj:
                         for entity_id, hdr in enumerate(reader.iter_entities()):
-                            layer_name = reader.layer_name(hdr.layer_idx)
-                            color = _resolve_entity_color(hdr, layer_colors, ColorMode)
+                            if (entity_id & 0xFFF) == 0:
+                                # Cancel/progress bookkeeping every ~4k entities;
+                                # per-entity calls here cost ~0.2s per million.
+                                if is_cancelled is not None and is_cancelled():
+                                    raise _SntCancelled()
+                                if progress_cb is not None and (entity_id & 0x3FFF) == 0:
+                                    # Every ~16k entities: keeps progress alive.
+                                    try:
+                                        progress_cb(entity_id + 1)
+                                    except Exception:
+                                        pass
+                            layer_name = _cached_layer_name(hdr.layer_idx)
+                            color = _cached_entity_color(hdr)
                             etype = hdr.entity_type
                             lw = hdr.lineweight if hasattr(hdr, 'lineweight') else 0
 
@@ -15921,7 +16206,7 @@ def _read_snt_file(filepath: str) -> Dict:
                                 layer_name=layer_name,
                                 color=color,
                                 entity_type_cls=EntityType,
-                                string_fn=reader.string,
+                                string_fn=_cached_string,
                             )
                             if ent is None:
                                 body = reader.read_body(hdr)
@@ -15931,7 +16216,7 @@ def _read_snt_file(filepath: str) -> Dict:
                                     layer_name=layer_name,
                                     color=color,
                                     entity_type_cls=EntityType,
-                                    string_fn=reader.string,
+                                    string_fn=_cached_string,
                                 )
                             if ent is None:
                                 continue
@@ -15954,14 +16239,24 @@ def _read_snt_file(filepath: str) -> Dict:
                             entities_out.append(ent)
 
                     native_batch_used = True
+                except _SntCancelled:
+                    raise
                 except Exception as batch_exc:
                     print(f"  [native-batch] fallback to classic decode ({type(batch_exc).__name__}: {batch_exc})")
 
             if not native_batch_used:
                 for entity_id, hdr in enumerate(reader.iter_entities()):
+                    if (entity_id & 0xFFF) == 0:
+                        if is_cancelled is not None and is_cancelled():
+                            raise _SntCancelled()
+                        if progress_cb is not None and (entity_id & 0x3FFF) == 0:
+                            try:
+                                progress_cb(entity_id + 1)
+                            except Exception:
+                                pass
                     body = reader.read_body(hdr)
-                    layer_name = reader.layer_name(hdr.layer_idx)
-                    color = _resolve_entity_color(hdr, layer_colors, ColorMode)
+                    layer_name = _cached_layer_name(hdr.layer_idx)
+                    color = _cached_entity_color(hdr)
                     etype = hdr.entity_type
                     lw = int(getattr(hdr, 'lineweight', 0) or 0)
 
@@ -15971,7 +16266,7 @@ def _read_snt_file(filepath: str) -> Dict:
                         layer_name=layer_name,
                         color=color,
                         entity_type_cls=EntityType,
-                        string_fn=reader.string,
+                        string_fn=_cached_string,
                     )
                     if ent is None:
                         continue
@@ -16008,15 +16303,22 @@ def _read_snt_file(filepath: str) -> Dict:
             # Capture after reader-side layer promotion so later live edit
             # deltas use the same layer names shown by the application.
             result["_source_entity_layer_counts"] = _snt_entity_layer_counts(entities_out)
+            try:
+                _decode_ms = (time.perf_counter() - _decode_t0) * 1000.0
+            except Exception:
+                _decode_ms = -1.0
             print(
                 f"  SNT v{reader.version_major}.{reader.version_minor} | "
                 f"layers={len(layers_out)} entities={len(entities_out)} "
-                f"native_batch={'on' if native_batch_used else 'off'}"
+                f"native_batch={'on' if native_batch_used else 'off'} "
+                f"decode={_decode_ms:.0f}ms"
             )
             return result
 
     except ImportError:
         print("  [warning] snt_core not on PYTHONPATH - using legacy inline reader")
+    except _SntCancelled:
+        raise
     except Exception as exc:
         print(f"  [warning] SntReader failed ({type(exc).__name__}): {exc}")
         traceback.print_exc()
@@ -16134,6 +16436,115 @@ def _read_snt_file(filepath: str) -> Dict:
     return result
 
 
+def _read_snt_file_summary(filepath: str) -> Dict:
+    """O(1) row summary: layer table + header entity count only.
+
+    Browse must never iterate entity headers/bodies: on a 1.1M-entity file
+    (possibly over a network share) that walk alone stalled the file list
+    for seconds. The count badge comes straight from the file header's
+    ``entity_count`` field — the same record count a full iteration would
+    produce. Per-layer pre-attach counts come from the declared
+    ``source_layer_counts`` metadata (the same source the Level Manager
+    treats as authoritative after Attach). Full geometry stays deferred to
+    the Attach worker.
+    """
+    from snt_core.snt_reader import SntReader
+
+    with SntReader(filepath) as reader:
+        layers = []
+        try:
+            layer_recs = list(reader.layers)
+        except Exception:
+            layer_recs = []
+        for index, rec in enumerate(layer_recs):
+            try:
+                name_idx = getattr(rec, 'name_idx', index)
+                lname = reader.string(name_idx)
+            except Exception:
+                try:
+                    lname = reader.layer_name(index)
+                except Exception:
+                    lname = f"Layer{index}"
+            try:
+                color = _aci_to_rgb(getattr(rec, 'color_aci', 7), index)
+            except Exception:
+                color = _DEFAULT_COLOR
+            layers.append({'name': lname, 'color': color})
+
+        try:
+            version = (int(reader.version_major), int(reader.version_minor))
+        except Exception:
+            version = (1, 0)
+        try:
+            flags = int(reader.flags)
+        except Exception:
+            flags = 0
+
+        count = None
+        try:
+            count = int(getattr(reader, "entity_count"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+        if count is None:
+            try:
+                header = reader._parse_header() or {}
+                count = int(header.get("entity_count"))
+            except Exception:
+                pass
+        if count is None:
+            try:
+                header = getattr(reader, "_header", {}) or {}
+                raw_count = header.get("entity_count", header.get("num_entities"))
+                count = int(raw_count)
+            except (TypeError, ValueError, OverflowError, AttributeError):
+                pass
+
+        # Declared per-level counts for the pre-attach Level Manager. This
+        # is metadata-only (no entity walk) and matches post-attach Level
+        # Manager semantics, which treat declarations as authoritative.
+        layer_counts: Dict[str, int] = {}
+        try:
+            metadata = _snt_reader_metadata(reader)
+            layer_counts = _snt_clean_layer_count_map(
+                metadata.get("source_layer_counts"))
+        except Exception:
+            layer_counts = {}
+        if not layer_counts:
+            layer_counts = {layer["name"]: 0 for layer in layers
+                            if isinstance(layer, dict)}
+
+        if count is None:
+            # Last resort: exact header iteration (slow on huge files, but
+            # only reached when the reader exposes no header count).
+            per_layer: Dict[int, int] = {}
+            count = 0
+            try:
+                for hdr in reader.iter_entities():
+                    count += 1
+                    try:
+                        li = int(getattr(hdr, 'layer_idx', -1))
+                    except Exception:
+                        li = -1
+                    if li >= 0:
+                        per_layer[li] = per_layer.get(li, 0) + 1
+            except Exception:
+                pass
+            if not layer_counts or all(v == 0 for v in layer_counts.values()):
+                layer_counts = {
+                    layers[i]['name']: per_layer.get(i, 0)
+                    for i in range(len(layers))
+                }
+
+        return {
+            'version': version,
+            'flags': flags,
+            'layers': layers,
+            'entity_count': count if count is not None else 0,
+            'layer_counts': layer_counts,
+            'deferred_geometry': True,
+        }
+
+
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # BACKGROUND LOAD WORKER
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -16172,12 +16583,12 @@ class SNTLoadWorker(QThread):
                 )
                 item_data = {"snt_path": snt_path}
                 try:
-                    parsed = _read_snt_file(str(snt_path))
+                    summary = _read_snt_file_summary(str(snt_path))
                     if self._cancelled:
                         return
-                    item_data["parsed"] = parsed
-                    item_data["entity_count"] = len(parsed["entities"])
-                    item_data["layer_count"] = len(parsed["layers"])
+                    item_data["summary"] = summary
+                    item_data["entity_count"] = int(summary["entity_count"])
+                    item_data["layer_count"] = len(summary["layers"])
                 except Exception as exc:
                     if not self._cancelled:
                         item_data["error"] = str(exc)
@@ -16193,6 +16604,455 @@ class SNTLoadWorker(QThread):
         except Exception as exc:
             if not self._cancelled:
                 self.error.emit(f"SNT loading failed: {exc}\n{traceback.format_exc()}")
+
+
+def _convert_snt_entities(entities: List[Dict], progress_cb=None, is_cancelled=None) -> List[Dict]:
+    """Pure (Qt-free) SNT decode-model → render-model conversion.
+
+    Extracted from ``MultiSNTAttachmentDialog._convert_entities`` so the
+    Attach decode phase can run on a worker thread. Behaviour is identical;
+    the dialog method delegates to this function.
+    """
+    out: List[Dict] = []
+    for index, ent in enumerate(entities):
+        if (index & 0x3FFF) == 0:
+            if is_cancelled is not None and is_cancelled():
+                raise _SntCancelled()
+            if progress_cb is not None:
+                progress_cb(f"convert:{index}:{len(entities)}")
+        etype = ent.get("type", "")
+        color = ent.get("color", _DEFAULT_COLOR)
+        layer = ent.get("layer", "0")
+
+        if etype == "POLYLINE":
+            verts = ent.get("vertices", [])
+            if len(verts) < 2:
+                continue
+            out.append({
+                "type":        "polyline",
+                "points":      verts,
+                "closed":      ent.get("closed", False),
+                "color":       color,
+                "layer":       layer,
+                "_lineweight": int(ent.get("_lineweight", 0) or 0),
+            })
+        elif etype == "HATCH":
+            # One logical DGN associative region may have several loops.
+            # Expand them only for display so the SNT entity count remains
+            # one-to-one with the DGN feature count.
+            for boundary in ent.get("boundaries", []) or []:
+                if len(boundary) < 2:
+                    continue
+                render_boundary: Dict = {
+                    "type": "polyline",
+                    "points": boundary,
+                    "closed": True,
+                    "color": color,
+                    "layer": layer,
+                    "_lineweight": int(ent.get("_lineweight", 0) or 0),
+                }
+                if ent.get("_snt_entity_id") is not None:
+                    render_boundary["_snt_entity_id"] = int(ent["_snt_entity_id"])
+                out.append(render_boundary)
+        elif etype == "3DFACE":
+            verts = ent.get("vertices", [])
+            if len(verts) < 3:
+                continue
+            v = list(verts[:4])
+            while len(v) < 4:
+                v.append(v[-1])
+            p2 = v[2]
+            p3 = v[3]
+            is_tri = (
+                abs(float(p2[0]) - float(p3[0])) <= 1e-6
+                and abs(float(p2[1]) - float(p3[1])) <= 1e-6
+                and abs(float(p2[2]) - float(p3[2])) <= 1e-6
+            )
+            out.append({
+                "type":        "3dface",
+                "vertices":    v,
+                "is_triangle": is_tri,
+                "color":       color,
+                "layer":       layer,
+            })
+        elif etype == "TEXT":
+            text = str(ent.get("text", "")).strip()
+            if not text:
+                continue
+            default_color, default_height = _label_color_and_height_cached(text)
+            stored_font_size = ent.get("font_size")
+            if stored_font_size is not None:
+                label_color = color if color else default_color
+            elif color and tuple(color) != tuple(_DEFAULT_COLOR):
+                label_color = color
+            else:
+                label_color = default_color
+            stored_height = ent.get("height")
+            try:
+                label_height = float(stored_height) if stored_height else float(default_height)
+            except (TypeError, ValueError):
+                label_height = float(default_height)
+            try:
+                label_rotation = float(ent.get("rotation", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                label_rotation = 0.0
+            pos = ent.get("position", (0.0, 0.0, 0.0))
+            stored_font_size = ent.get("font_size")
+            text_entry: Dict = {
+                "type":     "text",
+                "text":     text,
+                "position": pos,
+                "height":   label_height,
+                "rotation": label_rotation,
+                "color":    label_color,
+                "layer":    layer,
+            }
+            if "snt_binary" in ent:
+                text_entry["snt_binary"] = ent["snt_binary"]
+            if stored_font_size is not None:
+                try:
+                    text_entry["font_size"] = float(stored_font_size)
+                except (TypeError, ValueError):
+                    pass
+            out.append(text_entry)
+        elif etype == "POINT":
+            pos = ent.get("position", (0.0, 0.0, 0.0))
+            out.append({
+                "type":     "point",
+                "position": pos,
+                "color":    color,
+                "layer":    layer,
+            })
+    return out
+
+
+def _compute_snt_2d_bounds(entities: List[Dict]) -> Optional[Tuple[float, float, float, float]]:
+    """Pure (Qt-free) stable XY bounds for fit-view.
+
+    Geometry drives bounds; text anchors are fallback only. Identical to the
+    former dialog method, which now delegates here.
+    """
+    if not entities:
+        return None
+
+    geom_min_x = float("inf")
+    geom_min_y = float("inf")
+    geom_max_x = float("-inf")
+    geom_max_y = float("-inf")
+    has_geom = False
+
+    text_min_x = float("inf")
+    text_min_y = float("inf")
+    text_max_x = float("-inf")
+    text_max_y = float("-inf")
+    has_text = False
+
+    def _update_xy(x_val, y_val, use_text_bucket=False):
+        nonlocal geom_min_x, geom_min_y, geom_max_x, geom_max_y, has_geom
+        nonlocal text_min_x, text_min_y, text_max_x, text_max_y, has_text
+        try:
+            x = float(x_val)
+            y = float(y_val)
+        except Exception:
+            return
+        if use_text_bucket:
+            if x < text_min_x:
+                text_min_x = x
+            if y < text_min_y:
+                text_min_y = y
+            if x > text_max_x:
+                text_max_x = x
+            if y > text_max_y:
+                text_max_y = y
+            has_text = True
+            return
+        if x < geom_min_x:
+            geom_min_x = x
+        if y < geom_min_y:
+            geom_min_y = y
+        if x > geom_max_x:
+            geom_max_x = x
+        if y > geom_max_y:
+            geom_max_y = y
+        has_geom = True
+
+    def _update_xy_many(points) -> bool:
+        """Vectorised ``_update_xy`` for long vertex lists (geometry bucket).
+
+        A 1.1M-entity contour file carries tens of millions of vertices;
+        converting each with a Python ``float()`` call took minutes. Numpy
+        reduces it to seconds. Non-finite coordinates are skipped (the scalar
+        path effectively ignored NaN via failed comparisons, and including
+        an inf would poison the fit-view camera, so filtering is strictly
+        safer). Falls back to the scalar loop for ragged input.
+        """
+        nonlocal geom_min_x, geom_min_y, geom_max_x, geom_max_y, has_geom
+        try:
+            if not isinstance(points, (list, tuple)) or len(points) < 64:
+                return False
+            arr = np.asarray(points, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
+                return False
+            xy = arr[:, :2]
+            finite = np.isfinite(xy).all(axis=1)
+            if not bool(finite.any()):
+                return True
+            x0 = float(xy[finite, 0].min())
+            x1 = float(xy[finite, 0].max())
+            y0 = float(xy[finite, 1].min())
+            y1 = float(xy[finite, 1].max())
+        except Exception:
+            return False
+        if not has_geom:
+            geom_min_x, geom_max_x = x0, x1
+            geom_min_y, geom_max_y = y0, y1
+            has_geom = True
+            return True
+        if x0 < geom_min_x:
+            geom_min_x = x0
+        if y0 < geom_min_y:
+            geom_min_y = y0
+        if x1 > geom_max_x:
+            geom_max_x = x1
+        if y1 > geom_max_y:
+            geom_max_y = y1
+        return True
+
+    for ent in entities:
+        etype = str(ent.get("type", "")).lower()
+        if etype in ("polyline", "line"):
+            pts = ent.get("points") or ent.get("vertices") or []
+            if not _update_xy_many(pts):
+                for pt in pts:
+                    if len(pt) >= 2:
+                        _update_xy(pt[0], pt[1], use_text_bucket=False)
+        elif etype == "3dface":
+            pts = ent.get("vertices", []) or []
+            if not _update_xy_many(pts):
+                for pt in pts:
+                    if len(pt) >= 2:
+                        _update_xy(pt[0], pt[1], use_text_bucket=False)
+        elif etype == "point":
+            pos = ent.get("position", [])
+            if len(pos) >= 2:
+                _update_xy(pos[0], pos[1], use_text_bucket=False)
+        elif etype == "text":
+            pos = ent.get("position", [])
+            if len(pos) >= 2:
+                _update_xy(pos[0], pos[1], use_text_bucket=True)
+
+    if has_geom:
+        return (geom_min_x, geom_max_x, geom_min_y, geom_max_y)
+    if has_text:
+        return (text_min_x, text_max_x, text_min_y, text_max_y)
+    return None
+
+
+from gui.snt_bulk_allocations import bulk_snt_allocations
+
+
+@bulk_snt_allocations()
+def _decode_snt_attachment(
+    snt_path_str: str,
+    *,
+    cached_parsed=None,
+    selected_layers=None,
+    display_mode: str = "overlay",
+    override_enabled: bool = False,
+    override_color=(0, 255, 80),
+    progress_cb=None,
+    is_cancelled=None,
+    prepare_vectors=False,
+) -> Optional[Dict]:
+    """Qt-free Attach decode phase: file read → filter → convert → bounds.
+
+    Runs on ``SNTAttachWorker`` so million-entity files no longer freeze the
+    GUI at "Processing … 0%". Returns the attachment dict (without
+    ``_snt_item``/``actor_cache_map``, which the GUI thread wires up).
+    Raises ``_SntCancelled`` when ``is_cancelled`` becomes true.
+    """
+    snt_path = Path(snt_path_str)
+    _attach_t0 = time.perf_counter()
+    if isinstance(cached_parsed, dict) and cached_parsed:
+        parsed = cached_parsed
+    else:
+        parsed = _read_snt_file(
+            str(snt_path), progress_cb=progress_cb, is_cancelled=is_cancelled,
+        )
+    _read_ms = (time.perf_counter() - _attach_t0) * 1000.0
+    if is_cancelled is not None and is_cancelled():
+        raise _SntCancelled()
+
+    color_override = override_color if override_enabled else None
+    raw_entities = parsed.get("entities", [])
+    if is_cancelled is not None and is_cancelled():
+        raise _SntCancelled()
+    _stats_t0 = time.perf_counter()
+    layer_stats = _snt_layer_stats_from_parsed(parsed)
+    _stats_ms = (time.perf_counter() - _stats_t0) * 1000.0
+
+    _filter_t0 = time.perf_counter()
+    filtered: List[Dict] = []
+    if selected_layers is None and not color_override:
+        # Common full-attach case: no per-entity filtering needed.
+        filtered = raw_entities if isinstance(raw_entities, list) else list(raw_entities)
+    else:
+        for ent in raw_entities:
+            lname = ent.get("layer", "0")
+            if (selected_layers is not None
+                    and lname not in selected_layers
+                    and not _is_system_layer(lname)):
+                continue
+            if color_override and not _is_system_layer(lname):
+                ent = {**ent, "color": color_override}
+            filtered.append(ent)
+    _filter_ms = (time.perf_counter() - _filter_t0) * 1000.0
+
+    if progress_cb is not None:
+        try:
+            progress_cb(f"convert:{len(filtered)}")
+        except Exception:
+            pass
+    if is_cancelled is not None and is_cancelled():
+        raise _SntCancelled()
+    _convert_t0 = time.perf_counter()
+    render_entities = _convert_snt_entities(filtered, progress_cb, is_cancelled)
+    _convert_ms = (time.perf_counter() - _convert_t0) * 1000.0
+    _bounds_t0 = time.perf_counter()
+    if progress_cb is not None:
+        progress_cb("bounds")
+    bounds = _compute_snt_2d_bounds(render_entities)
+    _bounds_ms = (time.perf_counter() - _bounds_t0) * 1000.0
+    print(
+        f"[SNT attach] PERF {snt_path.name} "
+        f"read={_read_ms:.0f}ms stats={_stats_ms:.0f}ms "
+        f"filter={_filter_ms:.0f}ms convert={_convert_ms:.0f}ms "
+        f"bounds={_bounds_ms:.0f}ms entities={len(raw_entities)}"
+    )
+
+    try:
+        full_path = str(snt_path.resolve())
+    except Exception:
+        full_path = str(snt_path)
+    attachment = {
+        "filename":  snt_path.name,
+        "full_path": full_path,
+        "mode":      display_mode,
+        "entities":  render_entities,
+        "bounds": bounds,
+        "entity_count": len(raw_entities),
+        "selected_layers": selected_layers,
+        "layer_stats": layer_stats,
+        "override_enabled": override_enabled,
+        "override_color": override_color,
+        "parsed": parsed,
+    }
+    if prepare_vectors:
+        if progress_cb is not None:
+            progress_cb("prepare")
+        started = time.perf_counter()
+        prj_blocks = _parse_snt_adjacent_prj_blocks(full_path)
+        corrected = _apply_prj_precision_to_block_entities(
+            render_entities, prj_blocks,
+            snt_uses_float64=bool(parsed.get("use_float64", False)))
+        if is_cancelled is not None and is_cancelled():
+            raise _SntCancelled()
+        from gui.native_vector_overlay import group_entities
+        groups = group_entities(corrected, is_cancelled=is_cancelled)
+        attachment["_prepared_prj_blocks"] = prj_blocks
+        attachment["_prepared_source_entities"] = corrected
+        attachment["_prepared_vector_groups"] = groups
+        print(f"[SNT attach] PERF {snt_path.name} worker_vector_prepare="
+              f"{(time.perf_counter() - started) * 1000:.0f}ms")
+    return attachment
+
+
+class SNTAttachWorker(QThread):
+    """Background Attach decoder: file read + convert + bounds, off the GUI thread.
+
+    VTK/native actor creation still happens on the GUI thread afterwards
+    (``_render_snt_in_vtk``), but the long "Processing …" freeze at 0% — the
+    full native decode of every entity body — now runs here with live
+    progress and a working Cancel button.
+    """
+
+    progress = Signal(int, int, str)
+    file_decoded = Signal(object)
+    all_decoded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, jobs: List[Dict]) -> None:
+        super().__init__()
+        self.jobs: List[Dict] = list(jobs)
+        self._cancelled: bool = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancelled)
+
+    def run(self) -> None:
+        try:
+            decoded: List[Dict] = []
+            total = len(self.jobs)
+            for idx, job in enumerate(self.jobs):
+                if self._cancelled:
+                    return
+                name = job.get("filename") or Path(str(job.get("snt_path", ""))).name
+
+                def _cb(value, _idx=idx, _name=name, _total=total):
+                    if isinstance(value, str) and value.startswith("convert:"):
+                        parts = value.split(":")
+                        done = int(parts[1]) if len(parts) > 2 else 0
+                        count = max(1, int(parts[2])) if len(parts) > 2 else 1
+                        fraction = min(1.0, done / count)
+                        self.progress.emit(_idx * 1000 + 700 + int(fraction * 200), _total * 1000,
+                                           f"Converting {_name}... {done:,} / {count:,} entities")
+                    elif value == "bounds":
+                        self.progress.emit(_idx * 1000 + 900, _total * 1000,
+                                           f"Calculating bounds for {_name}...")
+                    elif value == "prepare":
+                        self.progress.emit(_idx * 1000 + 950, _total * 1000,
+                                           f"Preparing GPU geometry for {_name}...")
+                    else:
+                        try:
+                            n = int(value)
+                        except Exception:
+                            n = 0
+                        count = max(1, int(job.get("entity_count", 0) or n or 1))
+                        self.progress.emit(
+                            _idx * 1000 + min(699, int(n / count * 700)), _total * 1000,
+                            f"Processing {_name}... {n:,} entities decoded",
+                        )
+
+                self.progress.emit(idx * 1000, total * 1000, f"Processing {name}...")
+                try:
+                    attachment = _decode_snt_attachment(
+                        str(job["snt_path"]),
+                        cached_parsed=job.get("cached_parsed"),
+                        selected_layers=job.get("selected_layers"),
+                        display_mode=job.get("display_mode", "overlay"),
+                        override_enabled=bool(job.get("override_enabled", False)),
+                        override_color=job.get("override_color", (0, 255, 80)),
+                        progress_cb=_cb,
+                        is_cancelled=self._is_cancelled,
+                        prepare_vectors=bool(job.get("prepare_vectors", False)),
+                    )
+                except _SntCancelled:
+                    return
+                if self._cancelled:
+                    return
+                attachment["_snt_job_index"] = idx
+                decoded.append(attachment)
+                self.file_decoded.emit(attachment)
+            if not self._cancelled:
+                self.all_decoded.emit(decoded)
+        except _SntCancelled:
+            return
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(f"SNT attach failed: {exc}\n{traceback.format_exc()}")
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -16905,6 +17765,38 @@ class SNTLayerSelectionDialog(QDialog):
             for lname, count, color in _snt_layer_stats_from_parsed(parsed):
                 stats[lname] = {"count": int(count), "color": tuple(color)}
                 ordered_names.append(lname)
+
+        if not ordered_names and parent_item is not None:
+            # Pre-attach state: only the header-only summary exists (no
+            # geometry decoded yet). Show its layer table + header counts so
+            # the Level Manager is usable without triggering a full parse.
+            try:
+                summary = getattr(parent_item, "snt_summary", None)
+                cached_stats = getattr(parent_item, "layer_stats_cache", None)
+                if isinstance(summary, dict) and summary.get("layers"):
+                    counts = summary.get("layer_counts") or {}
+                    for layer in summary.get("layers", []) or []:
+                        if not isinstance(layer, dict):
+                            continue
+                        lname = str(layer.get("name", "0"))
+                        if lname not in stats:
+                            stats[lname] = {
+                                "count": int(counts.get(lname, 0) or 0),
+                                "color": tuple(layer.get("color", _DEFAULT_COLOR)),
+                            }
+                            ordered_names.append(lname)
+                elif cached_stats:
+                    for row in list(cached_stats):
+                        try:
+                            lname, count, color = row
+                            lname = str(lname)
+                            if lname not in stats:
+                                stats[lname] = {"count": int(count), "color": tuple(color)}
+                                ordered_names.append(lname)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
 
         app = getattr(self, "app", None)
         digitizer = getattr(app, "digitizer", None) if app is not None else None
@@ -21131,6 +22023,7 @@ class SNTFileItem(QWidget):
         self._parent_dialog_ref = None
         self._attachment_ref: Optional[Dict]     = None
         self.cached_parsed:    Optional[Dict]     = None
+        self.snt_summary:     Optional[Dict]     = None
         self.actor_cache:      Dict[str, List]    = {}  # Local cache, will be linked to app state
         self.entity_layers:    Dict[int, str]     = {}
         self.entity_count:     int                = 0
@@ -23895,7 +24788,10 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
     Dialog for attaching multiple SNT overlay files.
     """
 
-    snt_attached = Signal(list)
+    # A QVariantList signal recursively converts/copies the entire attachment,
+    # including millions of entity dicts and vertices, on the GUI thread.
+    # Receivers need the shared Python document, not a second Qt-owned model.
+    snt_attached = Signal(object)
 
     def __init__(self, app, parent=None):
         target_parent = None
@@ -23924,6 +24820,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         # attribute access.
         self.snt_items:      List[QWidget]           = []
         self._load_worker:   Optional[SNTLoadWorker] = None  # SNT-only worker (SBM browse is sync)
+        self._attach_worker: Optional[SNTAttachWorker] = None  # background Attach decoder
         self._close_requested_while_loading = False
         self._labels_hidden: bool = False
         self.setProperty("themeStyledDialog", True)
@@ -24289,6 +25186,21 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 if "parsed" in item_data:
                     item.cached_parsed = item_data["parsed"]
                     item.update_entity_count(item_data["entity_count"])
+                elif "summary" in item_data:
+                    item.snt_summary = item_data["summary"]
+                    item.update_entity_count(item_data["entity_count"])
+                    try:
+                        summary = item_data["summary"] or {}
+                        counts = summary.get("layer_counts") or {}
+                        item.layer_stats_cache = [
+                            (str(l.get("name", "0")),
+                             int(counts.get(str(l.get("name", "0")), 0)),
+                             tuple(l.get("color", _DEFAULT_COLOR)))
+                            for l in (summary.get("layers", []) or [])
+                            if isinstance(l, dict)
+                        ]
+                    except Exception:
+                        pass
                 else:
                     item.count_label.setText("Error")
                     item.count_label.setStyleSheet(
@@ -24350,6 +25262,18 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 print("⏳ SNT dialog close deferred until load worker stops")
                 event.ignore()
                 return
+        attach_worker = getattr(self, "_attach_worker", None)
+        if attach_worker is not None and attach_worker.isRunning():
+            try:
+                attach_worker.cancel()
+                attach_worker.wait(3000)
+            except Exception:
+                pass
+            if attach_worker.isRunning():
+                print("⏳ SNT dialog close deferred until attach worker stops")
+                event.ignore()
+                return
+            self._attach_worker = None
         event.accept()
 
     def _remove_item(self, item):
@@ -24385,6 +25309,12 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         try:
             target = os.path.basename(str(filename or ""))
             target_lower = target.lower()
+            from gui.native_attachments import is_native_main, layer_for
+            native_mode = is_native_main(self.app)
+            if native_mode:
+                native_layer = layer_for(self.app)
+                if native_layer is not None:
+                    native_layer.remove_file('snt', target)
 
             def _norm_name(value) -> str:
                 if not value:
@@ -24430,6 +25360,8 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             renderer = None
             try:
                 if (
+                    not native_mode
+                    and
                     hasattr(self.app, "vtk_widget")
                     and self.app.vtk_widget is not None
                     and hasattr(self.app.vtk_widget, "renderer")
@@ -24440,6 +25372,8 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
 
             extra_renderers = []
             try:
+                if native_mode:
+                    raise RuntimeError('native attachment mode')
                 digitizer = getattr(self.app, "digitizer", None)
                 for extra in (
                     getattr(digitizer, "overlay_renderer", None),
@@ -24577,6 +25511,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     self.app.snt_block_polygons = [
                         poly for poly in getattr(self.app, "snt_block_polygons", [])
                         if _norm_name(poly.get("snt_filename", "")) != target_lower
+                    ]
+                if hasattr(self.app, "snt_grid_tiles"):
+                    self.app.snt_grid_tiles = [
+                        tile for tile in self.app.snt_grid_tiles
+                        if _norm_name(tile.get("snt_filename", "")) != target_lower
                     ]
             except Exception:
                 pass
@@ -24952,7 +25891,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
 
         progress = QProgressDialog(
             "Processing SNT files...", "Cancel",
-            0, len(items_to_attach) * 2, self)
+            0, len(items_to_attach) * 2000, self)
         progress.setWindowTitle("Attaching SNT Files")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -24966,63 +25905,180 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             if not hasattr(self.app, attr):
                 setattr(self.app, attr, [])
 
-        all_attachments: List[Dict] = []
-        try:
-            for idx, item in enumerate(items_to_attach):
-                if progress.wasCanceled():
+        # Snapshot plain per-file decode inputs. The worker thread must never
+        # touch QWidgets; item state is wired back on the GUI thread when each
+        # file finishes decoding.
+        jobs: List[Dict] = []
+        from gui.native_vector_overlay import snt_viewport_capable
+        prepare_vectors = snt_viewport_capable(self.app)
+        for item in items_to_attach:
+            try:
+                selected = set(item.selected_layers) if item.selected_layers is not None else None
+            except Exception:
+                selected = item.selected_layers
+            jobs.append({
+                "snt_path": str(item.snt_path),
+                "entity_count": item.entity_count,
+                "prepare_vectors": prepare_vectors,
+                "cached_parsed": item.cached_parsed,
+                "selected_layers": selected,
+                "display_mode": item.display_mode,
+                "override_enabled": item.override_enabled,
+                "override_color": item.override_color,
+            })
+
+        decoded_attachments: List[Dict] = []
+        total_jobs = len(jobs)
+        attach_started = time.perf_counter()
+        worker = SNTAttachWorker(jobs)
+        self._attach_worker = worker
+        render_state = {"name": ""}
+
+        def _render_progress_cb(stage: str):
+            try:
+                if progress is None or progress.wasCanceled():
                     return
-                progress.setLabelText(f"Processing {item.snt_path.name}...")
-                progress.setValue(idx)
+                progress.setLabelText(
+                    f"Rendering {render_state['name']}... {stage}")
                 QCoreApplication.processEvents()
+            except RuntimeError:
+                pass
 
-                attachment = self._process_snt_file(item)
-                if attachment:
-                    attachment["_snt_item"] = item
-                    item.attachment = attachment
-                    all_attachments.append(attachment)
-
-            if not all_attachments:
+        def _finish_render_and_fit():
+            def _was_canceled() -> bool:
+                try:
+                    return bool(progress.wasCanceled())
+                except RuntimeError:
+                    return True
+            try:
+                render_phase_started = time.perf_counter()
+                if hasattr(self.app, "update_total_points_label"):
+                    self.app.update_total_points_label()
+                self.snt_attached.emit(decoded_attachments)
+                for ridx, attachment in enumerate(decoded_attachments):
+                    if _was_canceled():
+                        return
+                    render_state["name"] = str(attachment.get("filename", ""))
+                    progress.setLabelText(f"Rendering {attachment['filename']}...")
+                    progress.setValue((total_jobs + ridx) * 1000)
+                    QCoreApplication.processEvents()
+                    self._render_snt_in_vtk(
+                        attachment, progress_cb=_render_progress_cb)
+                render_phase_ms = (time.perf_counter() - render_phase_started) * 1000.0
+                progress.setValue(total_jobs * 2000)
                 progress.close()
+                fit_started = time.perf_counter()
+                self._fit_view_to_snt_attachments(decoded_attachments)
+                print(f"[SNT attach] COMPLETE files={len(decoded_attachments)} "
+                      f"total_ms={(time.perf_counter() - attach_started) * 1000:.0f} "
+                      f"render_phase_ms={render_phase_ms:.0f} "
+                      f"fit_ms={(time.perf_counter() - fit_started) * 1000:.0f}")
+                total_ent = sum(
+                    int(a.get("entity_count", len(a.get("entities", []))))
+                    for a in decoded_attachments)
+                skipped_note = (
+                    f"\nSkipped already attached: {len(skipped_existing)} file(s)"
+                    if skipped_existing else "")
                 self._show_front_message(
                     QMessageBox.Information,
-                    "No Data",
-                    "No entities found.",
+                    "SNT Attached",
+                    f"Attached {len(decoded_attachments)} SNT file(s)\n"
+                    f"Total entities: {total_ent:,}"
+                    f"{skipped_note}",
                 )
-                return
+            except Exception as exc:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
+                QMessageBox.critical(self, "Attachment Failed", str(exc))
+            finally:
+                self._attach_worker = None
 
-            self.app.snt_attachments.extend(all_attachments)
-            self.app.dxf_attachments.extend(all_attachments)
-            if hasattr(self.app, "update_total_points_label"):
-                self.app.update_total_points_label()
-            self.snt_attached.emit(all_attachments)
-
-            for idx, attachment in enumerate(all_attachments):
-                if progress.wasCanceled():
+        def _on_decode_progress(idx, total, message):
+            try:
+                if progress is None or progress.wasCanceled():
                     return
-                progress.setLabelText(f"Rendering {attachment['filename']}...")
-                progress.setValue(len(items_to_attach) + idx)
-                QCoreApplication.processEvents()
-                self._render_snt_in_vtk(attachment)
+                progress.setLabelText(message)
+                progress.setValue(min(idx, total))
+            except RuntimeError:
+                pass
 
-            progress.setValue(len(items_to_attach) * 2)
-            progress.close()
-            self._fit_view_to_snt_attachments(all_attachments)
+        def _on_file_decoded(attachment):
+            try:
+                if progress is None or progress.wasCanceled():
+                    return
+                jidx = int(attachment.pop("_snt_job_index", len(decoded_attachments)))
+                item = items_to_attach[jidx] if 0 <= jidx < len(items_to_attach) else None
+                if item is None:
+                    return
+                parsed = attachment.get("parsed")
+                if isinstance(parsed, dict):
+                    try:
+                        item.cached_parsed = parsed
+                    except Exception:
+                        pass
+                try:
+                    item.update_entity_count(int(attachment.get("entity_count", 0)))
+                except Exception:
+                    pass
+                try:
+                    item.layer_stats_cache = list(attachment.get("layer_stats", []))
+                except Exception:
+                    pass
+                attachment["_snt_item"] = item
+                attachment["actor_cache_map"] = item.actor_cache
+                try:
+                    item.attachment = attachment
+                except Exception:
+                    pass
+                decoded_attachments.append(attachment)
+            except RuntimeError:
+                pass
 
-            total_ent = sum(int(a.get("entity_count", len(a.get("entities", [])))) for a in all_attachments)
-            skipped_note = (
-                f"\nSkipped already attached: {len(skipped_existing)} file(s)"
-                if skipped_existing else ""
-            )
-            self._show_front_message(
-                QMessageBox.Information,
-                "SNT Attached",
-                f"Attached {len(all_attachments)} SNT file(s)\n"
-                f"Total entities: {total_ent:,}"
-                f"{skipped_note}",
-            )
-        except Exception as exc:
-            progress.close()
-            QMessageBox.critical(self, "Attachment Failed", str(exc))
+        def _on_all_decoded(_decoded):
+            try:
+                if progress.wasCanceled():
+                    self._attach_worker = None
+                    return
+                if not decoded_attachments:
+                    progress.close()
+                    self._attach_worker = None
+                    self._show_front_message(
+                        QMessageBox.Information,
+                        "No Data",
+                        "No entities found.",
+                    )
+                    return
+                self.app.snt_attachments.extend(decoded_attachments)
+                self.app.dxf_attachments.extend(decoded_attachments)
+                _finish_render_and_fit()
+            except RuntimeError:
+                pass
+
+        def _on_decode_failed(message):
+            try:
+                self._attach_worker = None
+                progress.close()
+            except RuntimeError:
+                pass
+            QMessageBox.critical(self, "Attachment Failed", message)
+
+        def _on_attach_canceled():
+            try:
+                worker.cancel()
+                worker.wait(5000)
+            except Exception:
+                pass
+            self._attach_worker = None
+
+        worker.progress.connect(_on_decode_progress)
+        worker.file_decoded.connect(_on_file_decoded)
+        worker.all_decoded.connect(_on_all_decoded)
+        worker.failed.connect(_on_decode_failed)
+        progress.canceled.connect(_on_attach_canceled)
+        worker.start()
+        return
 
     def _relocate_to_snt_item(self, item) -> bool:
         """Relocate the main view to a single SNT row (double-click a file).
@@ -25160,6 +26216,15 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         drawing. Full bounds make the real grid render as a dot, so only the
         auto-fit path uses this dense-bounds heuristic.
         """
+        source_list = list(entities or [])
+        # Entity-level stride sampling for very large files: this is a camera
+        # framing heuristic (percentile trim + dominant-cluster selection), so
+        # a uniform ~100k-entity sample is statistically equivalent while the
+        # full per-vertex walk over 1M+ entities took seconds.
+        _fit_sample_cap = _env_int("NAKSHA_SNT_FIT_SAMPLE", 100000, min_value=1000)
+        if len(source_list) > _fit_sample_cap:
+            _fit_step = max(1, len(source_list) // _fit_sample_cap)
+            source_list = source_list[:: _fit_step]
         geom_boxes: List[Tuple[float, float, float, float, float, float]] = []
         text_boxes: List[Tuple[float, float, float, float, float, float]] = []
 
@@ -25174,6 +26239,24 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             return (x, y)
 
         def _append_entity_bounds(points, target: List[Tuple[float, float, float, float, float, float]]) -> None:
+            # Numpy fast path for long vertex lists (same rationale as the
+            # worker bounds pass); scalar fallback preserves ragged input.
+            try:
+                if isinstance(points, (list, tuple)) and len(points) >= 64:
+                    arr = np.asarray(points, dtype=np.float64)
+                    if arr.ndim == 2 and arr.shape[0] and arr.shape[1] >= 2:
+                        xy = arr[:, :2]
+                        finite = np.isfinite(xy).all(axis=1)
+                        if bool(finite.any()):
+                            x0 = float(xy[finite, 0].min())
+                            x1 = float(xy[finite, 0].max())
+                            y0 = float(xy[finite, 1].min())
+                            y1 = float(xy[finite, 1].max())
+                            target.append((x0, x1, y0, y1, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
+                            return
+                        return
+            except Exception:
+                pass
             xs: List[float] = []
             ys: List[float] = []
             for pt in points or []:
@@ -25192,10 +26275,19 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             y1 = max(ys)
             target.append((x0, x1, y0, y1, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
 
-        for ent in entities or []:
+        for ent in source_list:
             etype = str(ent.get("type", "")).lower()
             if etype in ("polyline", "line"):
-                _append_entity_bounds(ent.get("points") or ent.get("vertices") or [], geom_boxes)
+                pts = ent.get("points") or ent.get("vertices") or []
+                if isinstance(pts, (list, tuple)) and len(pts) > 64:
+                    # Stride-sample very long polylines: extremes survive
+                    # min/max sampling, interior vertices cannot move bounds.
+                    step = max(1, len(pts) // 64)
+                    try:
+                        pts = list(pts[::step]) + [pts[-1]]
+                    except Exception:
+                        pass
+                _append_entity_bounds(pts, geom_boxes)
             elif etype == "3dface":
                 _append_entity_bounds(ent.get("vertices") or [], geom_boxes)
             elif etype == "point":
@@ -25341,238 +26433,37 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         Compute stable XY bounds for fit-view.
         Geometry drives bounds; text anchors are fallback only.
         """
-        if not entities:
-            return None
-
-        geom_min_x = float("inf")
-        geom_min_y = float("inf")
-        geom_max_x = float("-inf")
-        geom_max_y = float("-inf")
-        has_geom = False
-
-        text_min_x = float("inf")
-        text_min_y = float("inf")
-        text_max_x = float("-inf")
-        text_max_y = float("-inf")
-        has_text = False
-
-        def _update_xy(x_val, y_val, use_text_bucket=False):
-            nonlocal geom_min_x, geom_min_y, geom_max_x, geom_max_y, has_geom
-            nonlocal text_min_x, text_min_y, text_max_x, text_max_y, has_text
-            try:
-                x = float(x_val)
-                y = float(y_val)
-            except Exception:
-                return
-            if use_text_bucket:
-                if x < text_min_x:
-                    text_min_x = x
-                if y < text_min_y:
-                    text_min_y = y
-                if x > text_max_x:
-                    text_max_x = x
-                if y > text_max_y:
-                    text_max_y = y
-                has_text = True
-                return
-            if x < geom_min_x:
-                geom_min_x = x
-            if y < geom_min_y:
-                geom_min_y = y
-            if x > geom_max_x:
-                geom_max_x = x
-            if y > geom_max_y:
-                geom_max_y = y
-            has_geom = True
-
-        for ent in entities:
-            etype = str(ent.get("type", "")).lower()
-            if etype in ("polyline", "line"):
-                pts = ent.get("points") or ent.get("vertices") or []
-                for pt in pts:
-                    if len(pt) >= 2:
-                        _update_xy(pt[0], pt[1], use_text_bucket=False)
-            elif etype == "3dface":
-                for pt in ent.get("vertices", []) or []:
-                    if len(pt) >= 2:
-                        _update_xy(pt[0], pt[1], use_text_bucket=False)
-            elif etype == "point":
-                pos = ent.get("position", [])
-                if len(pos) >= 2:
-                    _update_xy(pos[0], pos[1], use_text_bucket=False)
-            elif etype == "text":
-                pos = ent.get("position", [])
-                if len(pos) >= 2:
-                    _update_xy(pos[0], pos[1], use_text_bucket=True)
-
-        if has_geom:
-            return (geom_min_x, geom_max_x, geom_min_y, geom_max_y)
-        if has_text:
-            return (text_min_x, text_max_x, text_min_y, text_max_y)
-        return None
+        return _compute_snt_2d_bounds(entities)
 
     def _process_snt_file(self, item: SNTFileItem) -> Optional[Dict]:
+        """Synchronous Attach decode (Browse-row / legacy path).
+
+        The preferred Attach flow now decodes on ``SNTAttachWorker`` via
+        :func:`_decode_snt_attachment`; this wrapper keeps single-file,
+        already-cached callers working with identical results.
+        """
         try:
-            if item.cached_parsed:
-                parsed = item.cached_parsed
-            else:
-                parsed = _read_snt_file(str(item.snt_path))
-                item.cached_parsed = parsed
-
-            color_override = item.override_color if item.override_enabled else None
-            raw_entities   = parsed.get("entities", [])
-            entity_count = len(raw_entities)
-            item.update_entity_count(entity_count)
-            layer_stats = _snt_layer_stats_from_parsed(parsed)
-            item.layer_stats_cache = list(layer_stats)
-
-            filtered: List[Dict] = []
-            for ent in raw_entities:
-                lname = ent.get("layer", "0")
-                # Always pass through structural layers regardless of selection.
-                if (item.selected_layers is not None
-                        and lname not in item.selected_layers
-                        and not _is_system_layer(lname)):
-                    continue
-                if color_override and not _is_system_layer(lname):
-                    ent = {**ent, "color": color_override}
-                filtered.append(ent)
-
-            render_entities = self._convert_entities(filtered)
-            bounds = self._compute_2d_bounds(render_entities)
-
-            return {
-                "filename":  item.snt_path.name,
-                "full_path": str(item.snt_path.resolve()),
-                "mode":      item.display_mode,
-                "entities":  render_entities,
-                "bounds": bounds,
-                "entity_count": entity_count,
-                "actor_cache_map": item.actor_cache,
-                "selected_layers": item.selected_layers,
-                "layer_stats": layer_stats,
-                "override_enabled": item.override_enabled,
-                "override_color": item.override_color,
-                "parsed": item.cached_parsed
-            }
+            attachment = _decode_snt_attachment(
+                str(item.snt_path),
+                cached_parsed=item.cached_parsed,
+                selected_layers=item.selected_layers,
+                display_mode=item.display_mode,
+                override_enabled=item.override_enabled,
+                override_color=item.override_color,
+            )
+            if attachment is None:
+                return None
+            parsed = attachment["parsed"]
+            item.cached_parsed = parsed
+            item.update_entity_count(attachment["entity_count"])
+            item.layer_stats_cache = list(attachment["layer_stats"])
+            attachment["actor_cache_map"] = item.actor_cache
+            return attachment
         except Exception:
             return None
 
     def _convert_entities(self, entities: List[Dict]) -> List[Dict]:
-        out: List[Dict] = []
-        for ent in entities:
-            etype = ent.get("type", "")
-            color = ent.get("color", _DEFAULT_COLOR)
-            layer = ent.get("layer", "0")
-
-            if etype == "POLYLINE":
-                verts = ent.get("vertices", [])
-                if len(verts) < 2:
-                    continue
-                out.append({
-                    "type":        "polyline",
-                    "points":      verts,
-                    "closed":      ent.get("closed", False),
-                    "color":       color,
-                    "layer":       layer,
-                    "_lineweight": int(ent.get("_lineweight", 0) or 0),
-                })
-            elif etype == "HATCH":
-                # One logical DGN associative region may have several loops.
-                # Expand them only for display so the SNT entity count remains
-                # one-to-one with the DGN feature count.
-                for boundary in ent.get("boundaries", []) or []:
-                    if len(boundary) < 2:
-                        continue
-                    render_boundary: Dict = {
-                        "type": "polyline",
-                        "points": boundary,
-                        "closed": True,
-                        "color": color,
-                        "layer": layer,
-                        "_lineweight": int(ent.get("_lineweight", 0) or 0),
-                    }
-                    if ent.get("_snt_entity_id") is not None:
-                        render_boundary["_snt_entity_id"] = int(ent["_snt_entity_id"])
-                    out.append(render_boundary)
-            elif etype == "3DFACE":
-                verts = ent.get("vertices", [])
-                if len(verts) < 3:
-                    continue
-                v = list(verts[:4])
-                while len(v) < 4:
-                    v.append(v[-1])
-                p2 = v[2]
-                p3 = v[3]
-                is_tri = (
-                    abs(float(p2[0]) - float(p3[0])) <= 1e-6
-                    and abs(float(p2[1]) - float(p3[1])) <= 1e-6
-                    and abs(float(p2[2]) - float(p3[2])) <= 1e-6
-                )
-                out.append({
-                    "type":        "3dface",
-                    "vertices":    v,
-                    "is_triangle": is_tri,
-                    "color":       color,
-                    "layer":       layer,
-                })
-            elif etype == "TEXT":
-                text = str(ent.get("text", "")).strip()
-                if not text:
-                    continue
-                # Render every non-empty TEXT entity. The previous score-based
-                # skip (`_score_label`) silently dropped short or separator-only
-                # text like "Hi" or "AB_CD" — anything a user might draw with
-                # the text tool — so user-imported labels invisibly vanished
-                # from the main view. Respect the entity's stored color and
-                # height; fall back to the label heuristic only when missing.
-                default_color, default_height = _label_color_and_height_cached(text)
-                stored_font_size = ent.get("font_size")
-                if stored_font_size is not None:
-                    label_color = color if color else default_color
-                elif color and tuple(color) != tuple(_DEFAULT_COLOR):
-                    label_color = color
-                else:
-                    label_color = default_color
-                stored_height = ent.get("height")
-                try:
-                    label_height = float(stored_height) if stored_height else float(default_height)
-                except (TypeError, ValueError):
-                    label_height = float(default_height)
-                try:
-                    label_rotation = float(ent.get("rotation", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    label_rotation = 0.0
-                pos = ent.get("position", (0.0, 0.0, 0.0))
-                # Preserve font_size so _create_text_actor can apply the
-                # user-configured size multiplier when rendering imported text.
-                stored_font_size = ent.get("font_size")
-                text_entry: Dict = {
-                    "type":     "text",
-                    "text":     text,
-                    "position": pos,
-                    "height":   label_height,
-                    "rotation": label_rotation,
-                    "color":    label_color,
-                    "layer":    layer,
-                }
-                if "snt_binary" in ent:
-                    text_entry["snt_binary"] = ent["snt_binary"]
-                if stored_font_size is not None:
-                    try:
-                        text_entry["font_size"] = float(stored_font_size)
-                    except (TypeError, ValueError):
-                        pass
-                out.append(text_entry)
-            elif etype == "POINT":
-                pos = ent.get("position", (0.0, 0.0, 0.0))
-                out.append({
-                    "type":     "point",
-                    "position": pos,
-                    "color":    color,
-                    "layer":    layer,
-                })
-        return out
+        return _convert_snt_entities(entities)
 
     def _resolve_snt_crs_from_adjacent_prj(self, fpath):
         """Resolve SNT source CRS without ever stealing the project CRS.
@@ -25666,30 +26557,43 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 pass
         return crs, label
 
-    def _render_snt_in_vtk(self, attachment: Dict) -> None:
+    def _render_snt_in_vtk(self, attachment: Dict, progress_cb=None) -> None:
+        def _stage(message: str) -> None:
+            if progress_cb is None:
+                return
+            try:
+                progress_cb(message)
+            except Exception:
+                pass
+            try:
+                QCoreApplication.processEvents()
+            except Exception:
+                pass
         try:
-            import vtk
-            from vtkmodules.util import numpy_support
-
-            if not hasattr(self.app, "vtk_widget"):
+            from gui.native_attachments import is_native_main, render_entities
+            native_main = is_native_main(self.app)
+            if not native_main and not hasattr(self.app, "vtk_widget"):
                 return
 
-            renderer = self.app.vtk_widget.renderer
             actors: List = []
             z_offset = _get_snt_z_offset(self.app)
             item: Optional[SNTFileItem] = attachment.get("_snt_item")
             source_entities = attachment.get("entities", [])
             fpath = str(Path(attachment.get("full_path", attachment["filename"])).resolve())
-            prj_blocks_source = _parse_snt_adjacent_prj_blocks(fpath)
+            _render_t0 = time.perf_counter()
+            prj_blocks_source = attachment.pop("_prepared_prj_blocks", None)
+            if prj_blocks_source is None:
+                prj_blocks_source = _parse_snt_adjacent_prj_blocks(fpath)
+            _render_prj_ms = (time.perf_counter() - _render_t0) * 1000.0
             parsed_metadata = attachment.get("parsed") or {}
 
             # Precision correction must happen in the SNT's native coordinate
             # space before any CRS operation.
-            corrected_source_entities = _apply_prj_precision_to_block_entities(
-                source_entities,
-                prj_blocks_source,
-                snt_uses_float64=bool(parsed_metadata.get("use_float64", False)),
-            )
+            corrected_source_entities = attachment.pop("_prepared_source_entities", None)
+            if corrected_source_entities is None:
+                corrected_source_entities = _apply_prj_precision_to_block_entities(
+                    source_entities, prj_blocks_source,
+                    snt_uses_float64=bool(parsed_metadata.get("use_float64", False)))
 
             source_crs, source_crs_label = self._resolve_snt_crs_from_adjacent_prj(fpath)
             try:
@@ -25726,6 +26630,12 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 corrected_source_entities, source_crs, canvas_crs
             )
             attachment["_render_entities"] = entities
+            prepared_groups = attachment.pop("_prepared_vector_groups", None)
+            # Prepared buffers are in source coordinates. Reprojection produces
+            # new entity dicts; reuse only when that step kept their identity.
+            if prepared_groups is not None and not all(
+                    a is b for a, b in zip(entities, corrected_source_entities)):
+                prepared_groups = None
 
             prj_blocks = []
             for block in prj_blocks_source:
@@ -25735,19 +26645,105 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     b["points_2d"] = [tuple(p[:2]) for p in _tx_points(pts2)]
                 prj_blocks.append(b)
 
+            # ---- Native Vulkan vector overlay attempt ---------------------------
+            # §5 hard dependency: with no .lnt open the engine's surface is hidden
+            # behind VTK, so GPU linework would be drawn where nobody can see it.
+            # render_linework() therefore promotes the Vulkan viewport as the
+            # visible canvas FIRST and returns None whenever that (or the upload)
+            # is refused, which keeps the VTK branch below as the fallback it has
+            # always been - a refusal changes nothing about what the user sees.
+            from gui.native_vector_overlay import render_linework, snt_viewport_capable
+            gpu_cache = None
+            _gpu_ms = 0.0
+            if native_main or snt_viewport_capable(self.app):
+                # The linework is uploaded to the engine's vector arena ONCE and
+                # drawn by the engine (one draw call per layer/colour group, zero
+                # per-frame CPU cost). Labels are NOT uploaded - there is no font
+                # atlas in the engine - so they stay as text records on the
+                # transparent Qt overlay, which is the same mechanism as before
+                # and now only carries what it is actually good at.
+                #
+                # It also returns None when the loaded DLL has no vector entry
+                # points (or the pass could not be built), which takes the previous
+                # Qt-overlay linework path unchanged, so this stays additive.
+                _gpu_t0 = time.perf_counter()
+                _stage("Preparing and uploading GPU linework...")
+                gpu_cache = render_linework(self.app, 'snt', attachment, entities,
+                                           prepared_groups=prepared_groups)
+                _gpu_ms = (time.perf_counter() - _gpu_t0) * 1000.0
+
+            # Take the GPU path when the upload succeeded, OR when an .lnt session
+            # owns the viewport (its previous behaviour: an old DLL returns None
+            # and the Qt overlay draws). WITHOUT an .lnt a refused promotion must
+            # fall through to VTK instead - otherwise an SNT-only attach would
+            # render nothing at all.
+            if native_main or gpu_cache is not None:
+                gpu_linework = gpu_cache is not None
+                if gpu_linework:
+                    actor_cache = gpu_cache or {}
+                else:
+                    actor_cache = render_entities(self.app, 'snt', attachment, entities) or {}
+                if item is not None:
+                    item.actor_cache = actor_cache
+                actors = [actor for group in actor_cache.values() for actor in group]
+                attachment['actors'] = actors
+                name = attachment.get('filename', 'SNT')
+                actor_entry = {
+                    'filename': name, 'full_path': fpath, 'actors': actors,
+                    'bounds': attachment.get('bounds'),
+                    'fit_bounds': attachment.get('fit_bounds'),
+                }
+                self.app.snt_actors = [entry for entry in getattr(self.app, 'snt_actors', [])
+                                       if entry.get('filename') != name]
+                self.app.snt_actors.append(actor_entry)
+                build_snt_block_polygons(self.app, entities, fpath,
+                                         prj_blocks=prj_blocks, attachment=attachment)
+                if gpu_linework:
+                    # PERF: upload bytes and draw calls are read back from the
+                    # engine, so "one draw call per group, no per-frame CPU cost"
+                    # is measured rather than assumed.
+                    try:
+                        from gui.native_vector_overlay import _backend as _vbackend
+                        _stats = _vbackend(self.app).vector_stats() or {}
+                    except Exception:
+                        _stats = {}
+                    print(
+                        f"[SNT vectors] PERF {name} groups={len(actor_cache)} "
+                        f"upload_ms={_gpu_ms:.0f} uploads={_stats.get('uploads', '?')} "
+                        f"resident_bytes={_stats.get('resident_bytes', '?')} "
+                        f"vertex_capacity={_stats.get('vertex_capacity', '?')} "
+                        f"index_capacity={_stats.get('index_capacity', '?')}"
+                    )
+                print(f"Native Vulkan SNT overlay: {len(actors)} layer group(s)"
+                      f"{' [GPU vectors]' if gpu_linework else ' [Qt overlay]'}")
+                return
+
+            import vtk
+            from vtkmodules.util import numpy_support
+            renderer = self.app.vtk_widget.renderer
+
             line_groups: Dict = defaultdict(list)
             text_ents: List = []
             point_groups: Dict = defaultdict(list)
             face_groups: Dict = defaultdict(list)
-            has_open_block_boundaries = any(
-                isinstance(e, dict)
-                and str(e.get("type", "")).strip().lower() in ("line", "polyline", "lwpolyline", "polygon")
-                and _is_block_boundary_layer_name(e.get("layer", ""))
-                and not _is_closed_block_polygon_entity(e)
-                and len(e.get("points") or e.get("vertices") or []) >= 2
-                for e in entities
-            )
-
+            # NOTE: the closed-polygon check is expensive (numpy per entity),
+            # so the open-boundary pre-pass below only runs it for entities
+            # on block-boundary layers — typically a handful of polygons —
+            # instead of all 1M+ entities.
+            has_open_block_boundaries = False
+            for _e in entities:
+                try:
+                    _t = str(_e.get("type", "")).strip().lower()
+                except Exception:
+                    continue
+                if _t not in ("line", "polyline", "lwpolyline", "polygon"):
+                    continue
+                if not _is_block_boundary_layer_name(_e.get("layer", "")):
+                    continue
+                if (not _is_closed_block_polygon_entity(_e)
+                        and len(_e.get("points") or _e.get("vertices") or []) >= 2):
+                    has_open_block_boundaries = True
+                    break
             for e in entities:
                 etype = e.get("type", "").lower()
                 if etype in ("line", "polyline"):
@@ -26100,7 +27096,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 else:
                     regular_line_groups[key] = group
 
+            _line_group_idx = 0
             for (color, layer_name, _lw), group in regular_line_groups.items():
+                _line_group_idx += 1
+                if progress_cb is not None and (_line_group_idx & 0x7) == 0:
+                    _stage(f"lines: {layer_name} ({_line_group_idx}/{len(regular_line_groups)})")
                 chunk: List[Dict] = []
                 chunk_pts = 0
                 for e in group:
@@ -26235,6 +27235,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                             _build_face_outline_actor(color, layer_name, group[start:start + face_chunk_faces])
 
             from gui.snt_text_instances import text_instance_groups, SNTInstancedTextActor
+            _stage("grouping labels...")
             text_groups = text_instance_groups(text_ents)
             groups_by_representative = {id(group[0]): group for group in text_groups}
             selected_text_ents, text_stats = _select_text_entities_for_render([group[0] for group in text_groups])
@@ -26334,9 +27335,14 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 fpath,
                 prj_blocks=prj_blocks,
                 attachment=attachment,
+                progress_cb=progress_cb,
             )
 
             n_total = len(actors)
+            try:
+                _render_total_ms = (time.perf_counter() - _render_t0) * 1000.0
+            except Exception:
+                _render_total_ms = -1.0
             print(
                 f"SNT LOADED: {n_total} actors "
                 f"(labels rendered: {text_stats['selected']}/{text_stats['total']}, "
@@ -26344,6 +27350,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 f"face groups: {len(face_groups)}"
                 f"{' [faces off]' if not render_faces else ''}"
                 f"{' [face outlines on]' if (not render_faces and render_face_outlines and face_groups) else ''})"
+            )
+            print(
+                f"[SNT render] PERF {attachment.get('filename', '')} "
+                f"total={_render_total_ms:.0f}ms prj_parse={_render_prj_ms:.0f}ms "
+                f"actors={n_total}"
             )
             if text_stats["selected"] < text_stats["total"]:
                 print(
@@ -26375,7 +27386,15 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 elif bounds_valid:
                     renderer.ResetCamera((xmin, xmax, ymin, ymax, zmin, zmax))
                 renderer.ResetCameraClippingRange()
+            _first_frame_t0 = time.perf_counter()
             self.app.vtk_widget.render()
+            try:
+                print(
+                    f"[SNT render] first-frame render()="
+                    f"{(time.perf_counter() - _first_frame_t0) * 1000.0:.0f}ms"
+                )
+            except Exception:
+                pass
         except Exception as e:
             print(f"Render Error: {e}")
 
@@ -26454,6 +27473,10 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         if text_cache is None:
             text_cache = {}
             self._snt_text_poly_cache = text_cache
+        mapper_cache = getattr(self, "_snt_text_mapper_cache", None)
+        if mapper_cache is None:
+            mapper_cache = {}
+            self._snt_text_mapper_cache = mapper_cache
 
         text_poly = text_cache.get(text_content)
         if text_poly is None:
@@ -26465,8 +27488,15 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             if cache_limit > 0 and len(text_cache) < cache_limit:
                 text_cache[text_content] = text_poly
 
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(text_poly)
+        # Share one mapper per unique string: a mapper holds no per-actor
+        # state (position/scale/visibility live on the actor), so 5000 labels
+        # with 200 unique strings need 200 GPU uploads, not 5000.
+        mapper = mapper_cache.get(text_content)
+        if mapper is None:
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(text_poly)
+            if cache_limit > 0 and len(mapper_cache) < cache_limit:
+                mapper_cache[text_content] = mapper
 
         actor = vtk.vtkFollower()
         actor.SetMapper(mapper)
@@ -26674,6 +27704,11 @@ def show_snt_attachment_dialog(app) -> MultiSNTAttachmentDialog:
                 dlg.show()
                 dlg.raise_()
                 dlg.activateWindow()
+            try:
+                from gui.menu_sidebar_system import _track_snt_dialog_visibility
+                _track_snt_dialog_visibility(app, dlg)
+            except Exception:
+                pass
             return dlg
         except RuntimeError:
             app.snt_dialog = None
@@ -26684,6 +27719,11 @@ def show_snt_attachment_dialog(app) -> MultiSNTAttachmentDialog:
     dlg.raise_()
     dlg.activateWindow()
     app.snt_dialog = dlg
+    try:
+        from gui.menu_sidebar_system import _track_snt_dialog_visibility
+        _track_snt_dialog_visibility(app, dlg)
+    except Exception:
+        pass
 
     def _on_close(event):
         event.ignore()

@@ -1076,6 +1076,181 @@ from .display_mode import clone_palette
 from .theme_manager import get_dialog_stylesheet
 
 
+def _discard_lnt_edits_on_dont_save(app) -> None:
+    """Revert .lnt classification edits when the user picks "Don't Save".
+
+    The native .lnt pipeline writes every edit into the file ~30 ms after it
+    is made (LntSectionStore.show -> flush), so by the time the Clear dialog
+    appears the file may already hold the user's classes. This replays the
+    undo history (newest first) back into the file, drops anything that never
+    flushed, and stops the periodic flush timer — then clears the undo/redo
+    stacks so nothing can be written back afterwards.
+    """
+    try:
+        store = getattr(app, "_lnt_section_store", None)
+        if store is not None and hasattr(store, "discard_unflushed_edits"):
+            try:
+                n = store.discard_unflushed_edits(stop_timer=True)
+                if n:
+                    print(f"↩️ Discarded {n:,} un-saved classification edits (Don't Save)")
+            except Exception as exc:
+                print(f"⚠️ Discard of un-saved edits failed: {exc}")
+        else:
+            # No store (or legacy path): at least stop the flush timer.
+            try:
+                timer = getattr(store, "_timer", None) if store is not None else None
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if hasattr(app, "undo_stack") and app.undo_stack is not None:
+            app.undo_stack.clear()
+    except Exception:
+        pass
+    try:
+        if hasattr(app, "redo_stack") and app.redo_stack is not None:
+            app.redo_stack.clear()
+    except Exception:
+        pass
+
+
+def _has_point_cloud(app) -> bool:
+    """True when a point cloud is actually resident (nothing to clear otherwise).
+
+    Checks the legacy in-memory dict, the native LNT view, and the native
+    Vulkan backend point count. Empty dicts / zero-length xyz / zero GPU
+    points all count as "no data" so Clear/Clear Data stay silent.
+    """
+    try:
+        data = getattr(app, "data", None)
+        if isinstance(data, dict):
+            xyz = data.get("xyz", None)
+            if xyz is not None:
+                try:
+                    if len(xyz) > 0:
+                        return True
+                except Exception:
+                    return True
+            # Non-empty dict without xyz (e.g. other arrays) still counts.
+            non_empty = False
+            try:
+                for _k, _v in data.items():
+                    try:
+                        if _v is not None and len(_v) > 0:
+                            non_empty = True
+                            break
+                    except Exception:
+                        non_empty = True
+                        break
+            except Exception:
+                pass
+            if non_empty:
+                return True
+        lnt_view = getattr(app, "_lnt_main_view", None)
+        if lnt_view is not None and getattr(lnt_view, "native", None) is not None:
+            return True
+        owner = getattr(app, "render_backend", None)
+        vb = getattr(owner, "vulkan_backend", None) if owner is not None else None
+        if vb is not None:
+            try:
+                if int(vb.get_point_count()) > 0:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _clear_native_lidar_buffers(app) -> None:
+    """Drop resident LiDAR buffers without touching any VTK widget/renderer.
+
+    Uses the native Vulkan backend (nkv_clear + draw-range reset) and closes
+    an active LNT view. Never imports or calls into vtk.
+    """
+    had_lnt_view = getattr(getattr(app, "_lnt_main_view", None), "native", None) is not None
+    try:
+        from .lnt_open import close_lnt_view
+        close_lnt_view(app)
+    except Exception as exc:
+        print(f"  [clear] native LNT close skipped: {exc}")
+    try:
+        owner = getattr(app, "render_backend", None)
+        vb = getattr(owner, "vulkan_backend", None) if owner is not None else None
+        if vb is not None:
+            try:
+                vb.clear_point_draw_ranges()
+            except Exception:
+                pass
+            # Closing an .lnt view re-creates Naksha's renderer EMPTY and then
+            # re-uploads only the attached SNT/DXF linework into it; nkv_clear
+            # would wipe that linework too (it clears the vector arena).
+            if not had_lnt_view:
+                try:
+                    handle = getattr(vb, "_handle", 0)
+                    if handle:
+                        vb._nkv("nkv_clear", __import__("ctypes").c_uint64(int(handle)))
+                        _restore_vector_overlay(app)
+                except Exception as exc:
+                    print(f"  [clear] native buffer clear skipped: {exc}")
+    except Exception as exc:
+        print(f"  [clear] native backend clear skipped: {exc}")
+
+
+def _restore_vector_overlay(app) -> None:
+    """nkv_clear drops the vector arena with the LiDAR buffers; attached SNT/DXF
+    linework is not LiDAR, so re-upload it from the layer's kept chunks."""
+    layer = getattr(app, "_native_vector_layer", None)
+    if layer is None or not getattr(layer, "documents", None):
+        return
+    try:
+        layer.rebind()
+    except Exception as exc:
+        print(f"  [clear] attached linework restore skipped: {exc}")
+
+
+def _request_view_refresh(app) -> None:
+    """Ask the render backend to present the cleared view (no VTK calls)."""
+    try:
+        owner = getattr(app, "render_backend", None)
+        if owner is not None:
+            for _name in ("request_render", "resync_camera", "sync_point_shading"):
+                _fn = getattr(owner, _name, None)
+                if callable(_fn):
+                    try:
+                        if _name == "resync_camera":
+                            _fn(present=True)
+                        elif _name == "sync_point_shading":
+                            _fn(present=True)
+                        else:
+                            _fn()
+                    except Exception:
+                        continue
+                    break
+    except Exception:
+        pass
+
+
+def _iter_overlay_actors(app):
+    """Yield preserved overlay actors (DXF/DWG/SNT/drawings) without a renderer."""
+    try:
+        for _key in ("dxf_actors", "dwg_actors", "snt_actors"):
+            for _entry in getattr(app, _key, None) or []:
+                try:
+                    for _a in (_entry.get("actors", None) if isinstance(_entry, dict) else None) or []:
+                        yield _a
+                except Exception:
+                    continue
+        _dig = getattr(app, "digitizer", None)
+        for _a in list(getattr(_dig, "actors", None) or []):
+            yield _a
+    except Exception:
+        return
+
+
 def _save_display_settings_before_clear(app):
     """
     Save current display mode settings to QSettings before clearing.
@@ -1315,7 +1490,13 @@ def clear_project(app):
     Clear all loaded files and reset state, with confirmation.
     ✅ EXECUTION ORDER: Close cut view → Clear main view → Clear cross-section views
     ✅ Display settings preserved, Display Mode dialog kept intact
+    ✅ No-op (no dialogs) when no point cloud data is loaded.
+    ✅ Never touches VTK directly — clears via the native render backend.
     """
+    # When nothing is loaded there is nothing to clear: stay fully silent.
+    if not _has_point_cloud(app):
+        print("ℹ️ Clear Project: no point cloud data loaded — nothing to clear.")
+        return
     # ✅ FIX: Explicitly clear the shading cache to prevent stale data between projects
     clear_shading_cache(reason="project_clear")
     from .shading_large_cloud import clear_large_shading_preset_cache
@@ -1378,10 +1559,15 @@ def clear_project(app):
             print("🧹 CLEARING PROJECT (SAVING PROJECT & DISPLAY SETTINGS)")
         else:
             print("🧹 CLEARING PROJECT (NOT SAVING - DISPLAY SETTINGS WILL BE PRESERVED)")
+            _discard_lnt_edits_on_dont_save(app)
         print("="*60)
         if getattr(app, "_lnt_main_view", None) is not None:
             from .lnt_open import close_lnt_view
-            close_lnt_view(app)
+            # Don't Save already reverted the file: the teardown must not flush.
+            try:
+                close_lnt_view(app, flush_pending=bool(should_save))
+            except TypeError:
+                close_lnt_view(app)
 
         # ============================================================================
         # ✅ SAVE THE PROJECT IF USER CHOSE TO SAVE
@@ -1457,17 +1643,25 @@ def clear_project(app):
                         print(f"  ⚠️ Dock close: {e}")
                         ctrl.cut_dock = None
                 
-                # Clear VTK
-                if ctrl.cut_vtk is not None:
+                # Release the native cut view without touching any 3D toolkit directly.
+                cut_view = getattr(ctrl, "cut_vtk", None) or getattr(ctrl, "cut_view", None)
+                if cut_view is not None:
                     try:
-                        renderer = ctrl.cut_vtk.renderer
-                        renderer.RemoveAllViewProps()
-                        ctrl.cut_vtk.close()
-                        ctrl.cut_vtk = None
-                        print("  ✅ Cut VTK cleared")
+                        close_fn = getattr(cut_view, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                        print("  ✅ Cut view released (backend-owned)")
                     except Exception as e:
-                        print(f"  ⚠️ VTK clear: {e}")
-                        ctrl.cut_vtk = None
+                        print(f"  ⚠️ Cut view release: {e}")
+                    finally:
+                        try:
+                            ctrl.cut_vtk = None
+                        except Exception:
+                            pass
+                        try:
+                            ctrl.cut_view = None
+                        except Exception:
+                            pass
                 
                 # Reset state
                 ctrl.is_cut_view_active = False
@@ -1480,67 +1674,25 @@ def clear_project(app):
                 print(f"⚠️ Cut section close failed: {e}")
 
         # ============================================================================
-        # STEP 2: Clear Main View
+        # STEP 2: Clear Main LiDAR buffers via the native backend (no VTK).
+        # Vector/drawing overlays are Qt/scene-owned and left untouched.
         # ============================================================================
-        if hasattr(app, "vtk_widget") and app.vtk_widget:
-            try:
-                renderer = app.vtk_widget.renderer
-                
-                # Store DXF actors if they exist (to preserve them)
-                dxf_actors_backup = []
-                if hasattr(app, 'dxf_actors') and app.dxf_actors:
-                    for dxf_data in app.dxf_actors:
-                        if 'actors' in dxf_data:
-                            dxf_actors_backup.extend(dxf_data['actors'])
-                    print(f"\n✅ Backing up {len(dxf_actors_backup)} DXF actors")
-                
-                # Store digitizer/drawing actors if they exist
-                drawing_actors_backup = []
-                if hasattr(app, 'digitizer') and app.digitizer:
-                    if hasattr(app.digitizer, 'actors') and app.digitizer.actors:
-                        drawing_actors_backup = list(app.digitizer.actors)
-                        print(f"✅ Backing up {len(drawing_actors_backup)} drawing actors")
-                
-                # Remove ALL actors from renderer
-                renderer.RemoveAllViewProps()
-                print("✅ Removed all point cloud actors from main view")
-                
-                # Re-add ONLY DXF actors
-                for actor in dxf_actors_backup:
-                    renderer.AddActor(actor)
-                
-                # Re-add drawing actors
-                for actor in drawing_actors_backup:
-                    renderer.AddActor(actor)
-                
-                if dxf_actors_backup or drawing_actors_backup:
-                    print(f"✅ Restored {len(dxf_actors_backup)} DXF + {len(drawing_actors_backup)} drawing actors")
-                
-                # Render to show cleared view
-                app.vtk_widget.render()
-                print(f"✅ Main viewer cleared (preserved: {len(dxf_actors_backup) + len(drawing_actors_backup)} actors)")
-                    
-            except Exception as e:
-                print(f"⚠️ VTK clear failed: {e}")
-                import traceback
-                traceback.print_exc()
+        _clear_native_lidar_buffers(app)
+        _request_view_refresh(app)
+        print("✅ Main LiDAR buffers cleared (overlays preserved)")
 
         # ============================================================================
-        # STEP 3: Clear Cross-Section Views (AFTER cut is closed)
+        # STEP 3: Clear Cross-Section LiDAR state (state-only; no VTK renderers).
         # ============================================================================
-        if hasattr(app, 'section_vtks') and app.section_vtks:
-            print(f"\n🔄 Clearing point cloud data from {len(app.section_vtks)} cross-section views...")
-            
-            for view_idx, vtk_widget in app.section_vtks.items():
-                try:
-                    if vtk_widget and hasattr(vtk_widget, 'renderer'):
-                        vtk_widget.renderer.RemoveAllViewProps()
-                        vtk_widget.render()
-                    print(f"  ✅ Cleared cross-section view {view_idx}")
-                except Exception as e:
-                    print(f"  ⚠️ Failed to clear view {view_idx}: {e}")
-            
-            print(f"✅ All cross-section views cleared (docks remain open)")
+        try:
+            from gui import lnt_section_bridge
+            try:
+                lnt_section_bridge.release(app, flush_pending=bool(should_save))
+            except TypeError:
+                lnt_section_bridge.release(app)
+            print("✅ Cross-section LiDAR state released (docks remain open)")
+        except Exception as e:
+            print(f"  ⚠️ Failed to release cross-section state: {e}")
 
         # ============================================================================
         # STEP 4: Clear Section Controller
@@ -1553,16 +1705,14 @@ def clear_project(app):
                 if hasattr(ctrl, 'sections'):
                     ctrl.sections.clear()
                 
-                # Clear stored cross-section data
+                # Clear stored cross-section data (state only — no VTK widgets)
                 for view_idx in range(4):
-                    section_view = getattr(ctrl, f"section_view_{view_idx}", None)
-                    if section_view and hasattr(section_view, 'vtk_widget'):
+                    for attr in (f"section_view_{view_idx}", f"section_{view_idx}"):
                         try:
-                            if hasattr(section_view.vtk_widget, 'renderer'):
-                                section_view.vtk_widget.renderer.RemoveAllViewProps()
-                                section_view.vtk_widget.render()
+                            if hasattr(ctrl, attr):
+                                setattr(ctrl, attr, None)
                         except Exception as e:
-                            print(f"  ⚠️ Failed to clear section_view_{view_idx}: {e}")
+                            print(f"  ⚠️ Failed to clear {attr}: {e}")
                 
                 # Reset state flags
                 if hasattr(ctrl, 'active_view'):
@@ -1765,16 +1915,9 @@ def clear_project(app):
         # ============================================================================
         app._update_window_title(None, None)
 
-        # ✅ CRITICAL: Restore digitizer overlay renderers (Layer 1/2) AFTER all cleanup
-        # Must run AFTER reset_uam, ObserverRegistry.release_all(), and clear_drawings()
-        # which may have detached or invalidated the overlay renderers.
-        if hasattr(app, "digitizer") and app.digitizer:
-            try:
-                app.digitizer._check_and_update_renderers()
-                app.digitizer._reinstall_all_observers()   # ← restore VTK observers wiped by release_all()
-                print("✅ Digitizer fully restored (post-clear)")
-            except Exception as e:
-                print(f"⚠️ Failed to restore digitizer: {e}")
+        # ✅ digitizer overlays are scene-owned; refresh via backend (no 3D toolkit).
+        _request_view_refresh(app)
+        print("✅ Digitizer overlays preserved (post-clear)")
 
         if hasattr(app, "statusBar"):
 
@@ -1811,7 +1954,13 @@ def clear_point_cloud(app):
     """
     Clear only point cloud data and reset related state, with confirmation.
     Preserves DXF, DWG, SNT attachments, drawings/digitizer layers, and PRJ data.
+    ✅ No-op (no dialogs) when no point cloud data is loaded.
+    ✅ Never touches VTK directly — clears via the native render backend.
     """
+    # When nothing is loaded there is nothing to clear: stay fully silent.
+    if not _has_point_cloud(app):
+        print("ℹ️ Clear Data: no point cloud data loaded — nothing to clear.")
+        return
     # Explicitly clear the shading cache to prevent stale data
     clear_shading_cache(reason="point_cloud_clear")
     from .shading_large_cloud import clear_large_shading_preset_cache
@@ -1867,6 +2016,7 @@ def clear_point_cloud(app):
             print("🧹 CLEARING POINT CLOUD (SAVING POINT CLOUD & DISPLAY SETTINGS)")
         else:
             print("🧹 CLEARING POINT CLOUD (NOT SAVING - DISPLAY SETTINGS WILL BE PRESERVED)")
+            _discard_lnt_edits_on_dont_save(app)
         print("="*60)
 
         # Save the project if user chose to save
@@ -1900,7 +2050,7 @@ def clear_point_cloud(app):
         # Save display settings before clearing
         _save_display_settings_before_clear(app)
 
-        # Close Cut Section
+        # Close Cut Section (state only; the LiDAR buffers go via the backend).
         if hasattr(app, "cut_section_controller") and app.cut_section_controller:
             ctrl = app.cut_section_controller
             try:
@@ -1913,16 +2063,24 @@ def clear_point_cloud(app):
                     except Exception as e:
                         print(f"  ⚠️ Dock close: {e}")
                         ctrl.cut_dock = None
-                if ctrl.cut_vtk is not None:
+                cut_view = getattr(ctrl, "cut_vtk", None) or getattr(ctrl, "cut_view", None)
+                if cut_view is not None:
                     try:
-                        renderer = ctrl.cut_vtk.renderer
-                        renderer.RemoveAllViewProps()
-                        ctrl.cut_vtk.close()
-                        ctrl.cut_vtk = None
-                        print("  ✅ Cut VTK cleared")
+                        close_fn = getattr(cut_view, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                        print("  ✅ Cut view released (backend-owned)")
                     except Exception as e:
-                        print(f"  ⚠️ VTK clear: {e}")
-                        ctrl.cut_vtk = None
+                        print(f"  ⚠️ Cut view release: {e}")
+                    finally:
+                        try:
+                            ctrl.cut_vtk = None
+                        except Exception:
+                            pass
+                        try:
+                            ctrl.cut_view = None
+                        except Exception:
+                            pass
                 ctrl.is_cut_view_active = False
                 ctrl._state = 0
                 ctrl.cut_points = None
@@ -1930,99 +2088,46 @@ def clear_point_cloud(app):
             except Exception as e:
                 print(f"⚠️ Cut section close failed: {e}")
 
-        # Clear Main View (preserving DXF, DWG, SNT, and drawing/digitizer actors)
-        if hasattr(app, "vtk_widget") and app.vtk_widget:
-            try:
-                renderer = app.vtk_widget.renderer
-                
-                # Backup DXF actors
-                dxf_actors_backup = []
-                if hasattr(app, 'dxf_actors') and app.dxf_actors:
-                    for dxf_data in app.dxf_actors:
-                        if 'actors' in dxf_data:
-                            dxf_actors_backup.extend(dxf_data['actors'])
-                
-                # Backup DWG actors
-                dwg_actors_backup = []
-                if hasattr(app, 'dwg_actors') and app.dwg_actors:
-                    for dwg_data in app.dwg_actors:
-                        if 'actors' in dwg_data:
-                            dwg_actors_backup.extend(dwg_data['actors'])
-
-                # Backup SNT actors
-                snt_actors_backup = []
-                if hasattr(app, 'snt_actors') and app.snt_actors:
-                    for snt_data in app.snt_actors:
-                        if 'actors' in snt_data:
-                            snt_actors_backup.extend(snt_data['actors'])
-                
-                # Backup drawing actors
-                drawing_actors_backup = []
-                if hasattr(app, 'digitizer') and app.digitizer:
-                    if hasattr(app.digitizer, 'actors') and app.digitizer.actors:
-                        drawing_actors_backup = list(app.digitizer.actors)
-                
-                # Remove ALL actors from renderer
-                renderer.RemoveAllViewProps()
-                print("✅ Removed all actors from main view")
-                
-                # Re-add DXF actors
-                for actor in dxf_actors_backup:
-                    renderer.AddActor(actor)
-                
-                # Re-add DWG actors
-                for actor in dwg_actors_backup:
-                    renderer.AddActor(actor)
-
-                # Re-add SNT actors
-                # ✅ FIX: Reset _snt_z_offset on each preserved SNT actor so that
-                # _apply_z_offset_to_actor computes the correct delta on the next
-                # LAZ load. Without this reset, actors keep a stale offset from the
-                # previous file and the grid appears at the wrong Z height.
-                for actor in snt_actors_backup:
-                    actor._snt_z_offset = 0.0
-                    renderer.AddActor(actor)
-
-                # Re-add drawing actors
-                for actor in drawing_actors_backup:
-                    renderer.AddActor(actor)
-                
-                # Render to show cleared view
-                app.vtk_widget.render()
-                print(f"✅ Main viewer cleared point cloud (preserved DXF, DWG, SNT, and drawing actors)")
-            except Exception as e:
-                print(f"⚠️ VTK clear failed: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # Clear Cross-Section Views
-        if hasattr(app, 'section_vtks') and app.section_vtks:
-            print(f"\n🔄 Clearing point cloud data from {len(app.section_vtks)} cross-section views...")
-            for view_idx, vtk_widget in app.section_vtks.items():
+        # Clear Main LiDAR buffers via the native backend (no VTK).
+        # DXF / DWG / SNT / drawing overlays are scene-owned and preserved:
+        # only the LiDAR buffers are dropped, so no actor backup/restore dance
+        # on any renderer is needed.
+        _clear_native_lidar_buffers(app)
+        try:
+            for actor in _iter_overlay_actors(app):
                 try:
-                    if vtk_widget and hasattr(vtk_widget, 'renderer'):
-                        vtk_widget.renderer.RemoveAllViewProps()
-                        vtk_widget.render()
-                    print(f"  ✅ Cleared cross-section view {view_idx}")
-                except Exception as e:
-                    print(f"  ⚠️ Failed to clear view {view_idx}: {e}")
-            print(f"✅ All cross-section views cleared")
+                    actor._snt_z_offset = 0.0
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _request_view_refresh(app)
+        print("✅ Main LiDAR buffers cleared (preserved DXF, DWG, SNT, and drawing overlays)")
 
-        # Clear Section Controller
+        # Clear Cross-Section LiDAR state (state-only; no renderers).
+        try:
+            from gui import lnt_section_bridge
+            try:
+                lnt_section_bridge.release(app, flush_pending=bool(should_save))
+            except TypeError:
+                lnt_section_bridge.release(app)
+            print("✅ All cross-section LiDAR state released")
+        except Exception as e:
+            print(f"  ⚠️ Failed to release cross-section state: {e}")
+
+        # Clear Section Controller (state only — no renderers)
         if hasattr(app, "section_controller") and app.section_controller:
             try:
                 ctrl = app.section_controller
                 if hasattr(ctrl, 'sections'):
                     ctrl.sections.clear()
                 for view_idx in range(4):
-                    section_view = getattr(ctrl, f"section_view_{view_idx}", None)
-                    if section_view and hasattr(section_view, 'vtk_widget'):
+                    for attr in (f"section_view_{view_idx}", f"section_{view_idx}"):
                         try:
-                            if hasattr(section_view.vtk_widget, 'renderer'):
-                                section_view.vtk_widget.renderer.RemoveAllViewProps()
-                                section_view.vtk_widget.render()
+                            if hasattr(ctrl, attr):
+                                setattr(ctrl, attr, None)
                         except Exception as e:
-                            print(f"  ⚠️ Failed to clear section_view_{view_idx}: {e}")
+                            print(f"  ⚠️ Failed to clear {attr}: {e}")
                 if hasattr(ctrl, 'active_view'):
                     ctrl.active_view = 0
                 if hasattr(ctrl, 'section_line'):
@@ -2157,16 +2262,9 @@ def clear_point_cloud(app):
         # Update UI
         app._update_window_title(None, app.project_crs_epsg)
 
-        # ✅ CRITICAL: Restore digitizer overlay renderers (Layer 1/2) AFTER all cleanup
-        # Must run AFTER reset_uam, ObserverRegistry.release_all(), and clear_drawings()
-        # which may have detached or invalidated the overlay renderers.
-        if hasattr(app, "digitizer") and app.digitizer:
-            try:
-                app.digitizer._check_and_update_renderers()
-                app.digitizer._reinstall_all_observers()   # ← restore VTK observers wiped by release_all()
-                print("✅ Digitizer fully restored (post-clear-pointcloud)")
-            except Exception as e:
-                print(f"⚠️ Failed to restore digitizer: {e}")
+        # ✅ digitizer overlays are scene-owned; refresh via backend (no 3D toolkit).
+        _request_view_refresh(app)
+        print("✅ Digitizer overlays preserved (post-clear-pointcloud)")
 
         if hasattr(app, "statusBar"):
             if should_save:

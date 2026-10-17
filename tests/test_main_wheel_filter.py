@@ -237,14 +237,14 @@ def test_main_filter_owns_one_complete_middle_pan_before_vtk():
     ]
 
 
-def test_configured_left_pan_is_owned_before_vtk_button_swapper():
+def test_configured_left_pan_is_ignored_in_main_2d_view():
     app = _App()
     app.panning_button = "left"
     app._left_pan_shortcut_active = True
     canvas = _Canvas()
     navigation_filter = MainWheelZoomEventFilter(app)
 
-    assert navigation_filter.eventFilter(
+    assert not navigation_filter.eventFilter(
         canvas,
         _mouse_event(
             QEvent.MouseButtonPress,
@@ -254,7 +254,9 @@ def test_configured_left_pan_is_owned_before_vtk_button_swapper():
             buttons=Qt.LeftButton,
         ),
     )
-    assert navigation_filter.eventFilter(
+    assert not app._qt_main_pan_active
+    assert navigation_filter._owned_main_pan_button is None
+    assert not navigation_filter.eventFilter(
         canvas,
         _mouse_event(
             QEvent.MouseMove,
@@ -264,7 +266,7 @@ def test_configured_left_pan_is_owned_before_vtk_button_swapper():
             buttons=Qt.LeftButton,
         ),
     )
-    assert navigation_filter.eventFilter(
+    assert not navigation_filter.eventFilter(
         canvas,
         _mouse_event(
             QEvent.MouseButtonRelease,
@@ -275,11 +277,7 @@ def test_configured_left_pan_is_owned_before_vtk_button_swapper():
         ),
     )
 
-    assert app.pan_calls == [
-        ("press", 20.0, 30.0, 200, 100),
-        ("move", 35.0, 42.0, 200, 100, True),
-        ("release",),
-    ]
+    assert app.pan_calls == []
     assert not app._qt_main_pan_active
 
 

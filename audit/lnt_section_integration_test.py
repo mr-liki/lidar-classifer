@@ -82,12 +82,102 @@ try:
           back is not None and abs(back[0] - (x0 + 200.0)) < 1e-6 and abs(back[1] - (y0 + 200.0)) < 1e-6,
           f"{back}")
 
+    # ---- shared gesture driver for the native classification tools ----
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+    from gui.native_section_classify import select as tool_select
+    win.brush_radius, win.brush_shape, win.brush_preview_px = 1.0, "circle", 12.0
+    win.parallel_line_mode = "symmetric"            # skip the first-use settings dialogs
+    ctx = {}
+
+    def gesture(target, tool, pts):
+        """Drive `tool` on `target` (a native canvas widget) with real Qt mouse input.
+        Returns the shape the classifier saw, in its own coordinates."""
+        cv = ctx["canvas"]
+        qs = [QPoint(*map(round, cv.screen_from_section(*pt))) for pt in pts]
+        seen = [cv.section_at(q.x(), q.y()) for q in qs]
+        if tool in ("rectangle", "circle", "parallel_line"):            # press-drag-release
+            QTest.mousePress(target, Qt.LeftButton, Qt.NoModifier, qs[0])
+            QTest.mouseMove(target, qs[1])
+            QTest.mouseRelease(target, Qt.LeftButton, Qt.NoModifier, qs[1])
+        elif tool == "polygon":                                          # clicks + Enter
+            for q in qs:
+                QTest.mouseClick(target, Qt.LeftButton, Qt.NoModifier, q)
+                pump(0.05)
+            QTest.keyClick(target, Qt.Key_Return)
+        elif tool in ("freehand", "brush"):
+            QTest.mousePress(target, Qt.LeftButton, Qt.NoModifier, qs[0])
+            for q in qs[1:]:
+                QTest.mouseMove(target, q)
+                pump(0.02)
+            QTest.mouseRelease(target, Qt.LeftButton, Qt.NoModifier, qs[-1])
+            if tool == "freehand":
+                seen = seen + [seen[-1]]
+        elif tool == "point":
+            QTest.mouseClick(target, Qt.LeftButton, Qt.NoModifier, qs[0])
+            seen = [seen[0], seen[0]]
+        pump(0.3)
+        return seen
+
+    def radius_for(tool):
+        cv = ctx["canvas"]
+        if tool == "brush":
+            return ctx["clf"].brush_radius_px() * cv.world_per_pixel()
+        if tool == "point":
+            return 4. * cv.world_per_pixel()
+        return None
+
     # frame the data so the section line is on screen
     nv.frame_region(x0 + 200.0, y0 + 200.0, 500.0)
     pump(1.0)
 
+
+    # ---- 1b. classification on the native MAIN plan view, before any section ----
+    # (app.data is None here: the records live in the .lnt, not a VTK array)
+    main_tests = {"rectangle": [(x0 + 20, y0 + 120), (x0 + 40, y0 + 140)],
+                  "circle": [(x0 + 70, y0 + 130), (x0 + 78, y0 + 130)],
+                  "polygon": [(x0 + 100, y0 + 120), (x0 + 130, y0 + 125), (x0 + 110, y0 + 145)],
+                  "freehand": [(x0 + 150, y0 + 120), (x0 + 175, y0 + 122), (x0 + 170, y0 + 145), (x0 + 152, y0 + 140)],
+                  "brush": [(x0 + 30, y0 + 160), (x0 + 36, y0 + 160), (x0 + 42, y0 + 162)],
+                  "point": [(x0 + 80, y0 + 160)]}
+    for k, (tool, pts) in enumerate(main_tests.items()):
+        win.set_classify_tool(tool)
+        pump(0.3)
+        win.from_classes, win.to_class = None, 20 + k
+        mc = getattr(view, "classifier", None)
+        if mc is None or win.active_classify_tool != tool:
+            check(f"main view: {tool} arms natively", False, f"active {win.active_classify_tool}")
+            continue
+        ctx["canvas"], ctx["clf"] = mc.canvas, mc
+        vtk_attached = getattr(win, "classify_interactor", None) is not None
+        res0 = nv.query_points((x0 - 1, y0 + 100, 0), (x0 + 200, y0 + 175, 1e6))
+        seen = gesture(view.owner.vulkan_widget, tool, pts)
+        pump(.06)  # the preview is immediate; file persistence is deferred
+        res1 = nv.query_points((x0 - 1, y0 + 100, 0), (x0 + 200, y0 + 175, 1e6))
+        same = len(res0["xyz"]) == len(res1["xyz"]) and np.array_equal(res0["xyz"], res1["xyz"])
+        xy = res0["xyz"][:, :2]
+        want = tool_select(tool, xy, seen, win, radius_for(tool))
+        lo_h, hi_h, lo_z, hi_z = mc.canvas.visible_extent()
+        want &= (xy[:, 0] >= lo_h) & (xy[:, 0] <= hi_h) & (xy[:, 1] >= lo_z) & (xy[:, 1] <= hi_z)
+        shown = mc._visible_classes()
+        if shown is not None:
+            want &= np.isin(res0["classification"], shown)
+        changed = res1["classification"] != res0["classification"]
+        check(f"main view: {tool} classifies exactly its shape in the file (ribbon, no VTK)",
+              same and not vtk_attached and want.sum() > 0 and np.array_equal(changed, want)
+              and np.all(res1["classification"][want] == 20 + k),
+              f"{int(want.sum())} expected, {int(changed.sum())} changed, vtk {vtk_attached}")
+    win.set_classify_tool(None)
+    from gui import lnt_section_bridge
+    lnt_section_bridge.release(win)        # flush; the section checks below start from an empty store
+    pump(0.2)
+    check("main-view edits leave app.data empty once the store is released", not win.data)
+
     # ---- 2. arm the Cross Section tool ----
     win.current_view = "top"
+    # The native tool asks for the target view in a modal dialog; answer it.
+    from PySide6.QtWidgets import QInputDialog
+    QInputDialog.getItem = staticmethod(lambda *a, **k: ("View 1", True))
     win.enable_cross_section_mode()
     pump(1.0)
     picker = getattr(win, "cross_interactor", None)
@@ -164,47 +254,164 @@ try:
             untouched = res["classification"][~(wallpts & sel_in_box)]
             check("points that were not edited kept their class", not np.any(untouched == 9),
                   f"{int((untouched == 9).sum())} unexpected")
-            # ---- Cut Section on the cross-section view (runs on the same app.data indices) ----
-            ctrl = win.cut_section_controller
-            ctrl._cut_source = 'cross'
-            ctrl.center_point = np.array([50.0, 0.0, 107.0])     # along = 50 m: the wall
-            ctrl.dynamic_depth = 4.0
-            try:
-                ctrl._finalize_dynamic_cut_section()
-            except Exception:
-                traceback.print_exc()
-            pump(2.0)
-            cp = getattr(ctrl, "cut_points", None)
-            cmap = getattr(ctrl, "_cut_index_map", None)
-            check("Cut Section produced a cut from the cross-section view",
-                  cp is not None and cmap is not None and len(cp) > 100 and len(cp) == len(cmap),
-                  f"{0 if cp is None else len(cp):,} cut points")
-            check("the cut view is active", bool(getattr(ctrl, "is_cut_view_active", False)))
+            # ---- Native section dock: real Vulkan canvas, cut, classify ----
+            check("the cross-section tool stays armed after a section",
+                  type(getattr(win, "cross_interactor", None)).__name__ == "LntCrossPicker" and
+                  view.picker is win.cross_interactor)
+            ns = getattr(win, "_native_sections", None)
+            check("the section dock is a native Vulkan canvas (no VTK widget)",
+                  ns is not None and (vi + 1) in ns.views and ns.views[vi + 1].backend._handle,
+                  type(ns).__name__)
+            canvas = ns.views[vi + 1]
+            pump(0.5)
+            canvas.fit()
+            check("the section dock is a floating window like the VTK docks",
+                  ns.docks[vi + 1].isFloating() and ns.docks[vi + 1].isVisible())
+            lp = getattr(win, "cross_interactor", None)
+            ok = lp is not None and lp.slice_state == 0 and ns.locate(
+                canvas, QPointF(*canvas.screen_from_section(50.0, 107.0)))
+            pump(0.5)
+            sc_xy = nv.world_to_screen(x0 + 200.0, y0 + 200.0)
+            wdg = view.owner.vulkan_widget
+            r = max(wdg.devicePixelRatioF(), 1.0)
+            check("section locate seeds P1 at the clicked spot and centres the main view on it",
+                  ok and np.allclose(lp.P1[:2], (x0 + 200.0, y0 + 200.0), atol=1e-6) and lp.slice_state == 1
+                  and abs(sc_xy[0] / r - wdg.width() / 2) < 2 and abs(sc_xy[1] / r - wdg.height() / 2) < 2,
+                  f"P1 {None if lp is None or lp.P1 is None else (lp.P1[:2] - (x0, y0)).round(3)} screen {sc_xy}")
+            if lp is not None:
+                lp.cancel()
+            canvas.cut_centre = 50.0                              # along = 50 m: the wall
+            ns.finish_cut(canvas, 52.0)                           # depth 4 m
+            pump(1.0)
+            from gui.native_sections import CUT_SLOT
+            cut = ns.views.get(CUT_SLOT)
+            cmap = None if cut is None else cut.indices
+            check("Cut Section produced a native cut from the cross-section view",
+                  cmap is not None and len(cmap) > 100, f"{0 if cmap is None else len(cmap):,} cut points")
+            check("the cut view is active", bool(getattr(win.cut_section_controller, "is_cut_view_active", False)))
             if cmap is not None and len(cmap):
                 cx = win.data["xyz"][np.asarray(cmap, dtype=np.int64), 0]
                 check("every cut point maps back to the right app.data point (within the cut depth)",
-                      np.all(np.abs(cx - (x0 + 200.0)) <= 4.0 + 0.5) and int(np.asarray(cmap).max()) < len(win.data["xyz"]),
+                      np.all(np.abs(cx - (x0 + 200.0)) <= 2.0 + 1e-6) and int(np.asarray(cmap).max()) < len(win.data["xyz"]),
                       f"x {cx.min() - x0:.1f}..{cx.max() - x0:.1f}")
-                sel = np.asarray(cmap, dtype=np.int64)[:50]
-                win.data["classification"][sel] = 7
-                try:
-                    ctrl.onclassificationchanged(sel)
-                except Exception:
-                    traceback.print_exc()
-                wrote = store.flush()
-                check("a class edit made in the cut view is written into the .lnt",
-                      wrote == len(sel), f"{wrote} of {len(sel)} written")
-                res2 = nv.query_points((x0 - 5, y0 + 150, 0), (x0 + 405, y0 + 250, 1e6))
-                keys_new = set(map(tuple, np.round(win.data["xyz"][sel], 3)))
-                keys_file = {tuple(r) for r in np.round(res2["xyz"][res2["classification"] == 7], 3)}
-                check("the file holds class 7 for exactly those points",
-                      len(keys_new) > 0 and keys_new <= keys_file, f"{len(keys_new & keys_file)} of {len(keys_new)}")
+
+            # ---- Above / Below Line from the Classify ribbon, on the native dock ----
+            from PySide6.QtCore import QPoint
+            from PySide6.QtTest import QTest
+            canvas.fit()
+            pump(0.3)
+            win.from_classes = None
+            win.classify_interactors = {}
+            win.set_classify_tool("above_line")
+            pump(0.3)
+            win.to_class = 13                      # picked in the Class Picker after arming
+            check("Above Line arms on a native section (no VTK interactor attached)",
+                  win.active_classify_tool == "above_line" and not win.classify_interactors
+                  and canvas.classifier.active())
+
+            loc = canvas.local[:, [canvas.axis, 2]]
+            ids = canvas.indices
+            shown = canvas.classifier._visible_classes()
+
+            def expected(tool, a, b):
+                """The tool's own rule on the pixel-rounded line ends, limited to shown classes."""
+                (x1, z1), (x2, z2) = a, b
+                line_z = (z2 - z1) / (x2 - x1 + 1e-9) * (loc[:, 0] - x1) + z1
+                sel = (loc[:, 0] >= min(x1, x2)) & (loc[:, 0] <= max(x1, x2))
+                sel &= (loc[:, 1] >= line_z) if tool == "above_line" else (loc[:, 1] <= line_z)
+                if shown is not None:
+                    sel &= np.isin(win.data["classification"][ids], shown)
+                return sel
+
+            def to_px(pt):
+                q = QPoint(*map(round, canvas.screen_from_section(*pt)))
+                return q, canvas.section_at(q.x(), q.y())
+
+            # press-drag-release form
+            (pa, a), (pb, b) = to_px((20.0, 101.5)), to_px((40.0, 101.5))
+            cls_before = win.data["classification"][ids].copy()
+            above_sel = expected("above_line", a, b)
+            QTest.mousePress(canvas, Qt.LeftButton, Qt.NoModifier, pa)
+            QTest.mouseMove(canvas, pb)
+            shapes = list(canvas.classifier.overlay.shapes)
+            check("the Above Line preview draws the line with upward guides",
+                  len(shapes) == 1 and shapes[0][0] == "guided_line" and shapes[0][2][0] is True,
+                  f"{[(k, e[0] if e else e) for k, _, e in shapes]}")
+            QTest.mouseRelease(canvas, Qt.LeftButton, Qt.NoModifier, pb)
+            pump(0.3)
+            after = win.data["classification"][ids]
+            check("Above Line classifies exactly the shown points above the drawn line",
+                  above_sel.sum() > 0 and np.all(after[above_sel] == 13)
+                  and np.array_equal(after[~above_sel], cls_before[~above_sel]),
+                  f"{int(above_sel.sum())} selected, {int((after != cls_before).sum())} changed, "
+                  f"status '{win.statusBar().currentMessage()}'")
+            from gui.native_main_classify import ensure_classifier
+            main_cls = ensure_classifier(view)
+            check("the plan view refuses line tools (section-only, as in VTK)",
+                  main_cls is not None and not main_cls.active())
+
+            win.set_classify_tool("below_line")
+            pump(0.3)
+            win.to_class = 14
+            # click-click form: press/release at P1, then at P2
+            (pa, a), (pb, b) = to_px((0.0, 101.0)), to_px((30.0, 101.0))
+            cls_before = win.data["classification"][ids].copy()
+            below_sel = expected("below_line", a, b)
+            for p in (pa, pb):
+                QTest.mouseClick(canvas, Qt.LeftButton, Qt.NoModifier, p)
+                pump(0.2)
+            after = win.data["classification"][ids]
+            check("Below Line classifies exactly the shown points below the drawn line",
+                  below_sel.sum() > 0 and np.all(after[below_sel] == 14)
+                  and np.array_equal(after[~below_sel], cls_before[~below_sel]),
+                  f"{int(below_sel.sum())} selected, {int((after != cls_before).sum())} changed")
+            store.flush()
+            res = nv.query_points((x0 - 5, y0 + 180.0, 0), (x0 + 405, y0 + 220.0, 1e6))
+            check("line-tool edits are written into the .lnt",
+                  int((res["classification"] == 13).sum()) >= int(above_sel.sum())
+                  and int((res["classification"] == 14).sum()) >= int(below_sel.sum()),
+                  f"13: {int((res['classification'] == 13).sum())}, 14: {int((res['classification'] == 14).sum())}")
+
+            # ---- every other tool from the ribbon on the native section dock ----
+            ctx["canvas"], ctx["clf"] = canvas, canvas.classifier
+            shown = canvas.classifier._visible_classes()
+            sec_tests = {"parallel_line": [(5.0, 100.5), (25.0, 101.5)],
+                         "rectangle": [(60.0, 100.0), (66.0, 102.0)],
+                         "circle": [(70.0, 101.0), (71.5, 101.0)],
+                         "polygon": [(74.0, 100.0), (80.0, 100.2), (77.0, 102.0)],
+                         "freehand": [(82.0, 100.0), (86.0, 100.2), (85.0, 102.0), (82.5, 101.6)],
+                         "brush": [(88.0, 101.0), (89.0, 101.0), (90.0, 101.2)],
+                         "point": [(93.0, 101.0)]}
+            for k, (tool, pts) in enumerate(sec_tests.items()):
+                win.set_classify_tool(tool)
+                pump(0.3)
+                win.from_classes, win.to_class = None, 30 + k
+                ok_armed = win.active_classify_tool == tool and canvas.classifier.active()
+                loc = canvas.local[:, [canvas.axis, 2]]
+                ids = canvas.indices
+                before = win.data["classification"][ids].copy()
+                seen = gesture(canvas, tool, pts)
+                want = tool_select(tool, loc, seen, win, radius_for(tool))
+                lo_h, hi_h, lo_z, hi_z = canvas.visible_extent()
+                want &= (loc[:, 0] >= lo_h) & (loc[:, 0] <= hi_h) & (loc[:, 1] >= lo_z) & (loc[:, 1] <= hi_z)
+                if shown is not None:
+                    want &= np.isin(before, shown)
+                after = win.data["classification"][ids]
+                check(f"section dock: {tool} classifies exactly its shape (ribbon, no VTK)",
+                      ok_armed and not win.classify_interactors and want.sum() > 0
+                      and np.array_equal(after != before, want) and np.all(after[want] == 30 + k),
+                      f"{int(want.sum())} expected, {int((after != before).sum())} changed")
+            store.flush()
+            res = nv.query_points((x0 - 5, y0 + 180.0, 0), (x0 + 405, y0 + 220.0, 1e6))
+            got = {t: int((res["classification"] == 30 + k).sum()) for k, t in enumerate(sec_tests)}
+            check("section tool edits are written into the .lnt", all(got.values()), f"{got}")
+            win.set_classify_tool(None)
 
             # a second section reuses the same store; indices of the first stay valid
+            # (arming a classify tool disarms Cross Section, as with VTK: re-arm it)
+            win.enable_cross_section_mode()
+            pump(1.0)
             n_before = len(data["xyz"])
-            check("the tool re-arms itself after a section (a fresh picker is installed on the view)",
-                  type(getattr(win, "cross_interactor", None)).__name__ == "LntCrossPicker" and
-                  view.picker is win.cross_interactor and win.cross_interactor is not picker)
             click_world(x0 + 100.0, y0 + 300.0)
             click_world(x0 + 120.0, y0 + 300.0)
             click_world(x0 + 120.0, y0 + 305.0)

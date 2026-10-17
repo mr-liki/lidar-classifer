@@ -94,13 +94,17 @@ naksha_compile_shader(instant.frag)
 # Instant Shaded SPLAT pass: class colour + the STORED oct16x2 normal.
 naksha_compile_shader(splat.vert)
 naksha_compile_shader(splat.frag)
+# SNT / CAD vector overlay: world-space line strips through the shared frame MVP.
+naksha_compile_shader(vector.vert)
+naksha_compile_shader(vector.frag)
 set(SHADER_TARGETS naksha_shader_point.vert naksha_shader_point.frag
                     naksha_shader_surface.vert naksha_shader_surface.frag
                     naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_crisp_indexed.frag
                     naksha_shader_surface_indexed.vert naksha_shader_surface_indexed.frag
                     naksha_shader_surface_indexed_vc.vert naksha_shader_surface_indexed_vc.frag
                     naksha_shader_instant.vert naksha_shader_instant.frag
-                    naksha_shader_splat.vert naksha_shader_splat.frag)
+                    naksha_shader_splat.vert naksha_shader_splat.frag
+                    naksha_shader_vector.vert naksha_shader_vector.frag)
 
 # ---- Core library ----
 set(CORE_SOURCES
@@ -123,6 +127,7 @@ set(CORE_SOURCES
     src/Renderer.cpp
     src/PointCloudRenderer.cpp
     src/SurfaceRenderer.cpp
+    src/VectorOverlayRenderer.cpp
     src/SurfaceTiling.cpp
 )
 
@@ -213,6 +218,10 @@ add_custom_command(TARGET naksha_vulkan POST_BUILD
         "${SPIRV_DIR}/splat.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/splat.vert.spv"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${SPIRV_DIR}/splat.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/splat.frag.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/vector.vert.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/vector.vert.spv"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SPIRV_DIR}/vector.frag.spv" "$<TARGET_FILE_DIR:naksha_vulkan>/vector.frag.spv"
 )
 
 add_executable(naksha_startup_probe diagnostics/startup_probe.cpp)

@@ -816,6 +816,53 @@ class GlobalShortcutFilter(QObject):
                 pass
 
             # ====================================================================
+            # Native point-cloud shortcuts bypass the legacy inline VTK handlers.
+            from gui.native_shortcuts import execute_native_shortcut, focused_canvas
+            native_view = getattr(self.app_window, '_lnt_main_view', None)
+            if native_view is not None and getattr(native_view, 'native', None) is not None:
+                native_canvas = focused_canvas(self.app_window)
+                measurement = getattr(native_canvas if native_canvas is not None else native_view, 'measurement', None)
+                drawing = getattr(native_view, 'drawing', None)
+                # Shift+P is a preserved application shortcut. It must win over
+                # stale/imported user mappings and always put the native main
+                # viewport into 3D perspective/orbit mode.
+                if combo[0] == 'shift' and event.key() == Qt.Key_P:
+                    native_view.set_2d(False)
+                    self.app_window._main_view_3d_user_enabled = True
+                    self.app_window.is_3d_mode = True
+                    self.app_window.current_view = '3d'
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            '3D View (Shift+P)', 3000)
+                    return True
+                if configured_shortcut:
+                    if event.isAutoRepeat():
+                        return True
+                    if execute_native_shortcut(self.app_window, configured_shortcut.get('tool'),
+                            configured_shortcut.get('from'), configured_shortcut.get('to'),
+                            configured_shortcut.get('preset'), key_label):
+                        return True
+                elif combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
+                    redo = event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift'
+                    if drawing is not None and drawing.active():
+                        return drawing.history(redo)
+                    if measurement is not None and measurement.active:
+                        return measurement.history(redo)
+                    digitizer = getattr(self.app_window, 'digitizer', None)
+                    legacy_measurement = getattr(self.app_window, 'measurement_tool', None)
+                    if not getattr(digitizer, 'active_tool', None) and not getattr(legacy_measurement, 'active', False):
+                        from gui.native_shortcuts import native_classification_history
+                        if native_classification_history(self.app_window, redo):
+                            return True
+                elif combo[0] == 'shift' and event.key() == Qt.Key_F:
+                    return execute_native_shortcut(self.app_window, 'FitView', key_label=key_label)
+                elif event.key() == Qt.Key_Escape and (
+                        getattr(self.app_window, 'cross_section_active', False)
+                        or getattr(self.app_window, 'cut_section_mode_on', False)
+                        or (measurement is not None and measurement.active)
+                        or getattr(self.app_window, 'active_classify_tool', None)):
+                    return execute_native_shortcut(self.app_window, 'Escape', key_label=key_label)
+
             # PRIORITY -2: Shift+ESC - Exit active digitize tool, keep drawings
             # ====================================================================
             if event.key() == Qt.Key_Escape and (event.modifiers() & Qt.ShiftModifier):
@@ -1016,8 +1063,11 @@ class GlobalShortcutFilter(QObject):
                 cross_checked = bool(cross_action is not None and cross_action.isChecked())
                 cross_interactor_active = bool(getattr(self.app_window, 'cross_interactor', None) is not None)
                 cross_mode_flag = bool(getattr(self.app_window, 'cross_section_active', False))
+                # Native (.lnt) path: the armed tool is an LntCrossPicker on the
+                # LNT view; none of the VTK-era flags above may be set for it.
+                native_picker = getattr(getattr(self.app_window, '_lnt_main_view', None), 'picker', None)
 
-                if cross_checked or cross_interactor_active or cross_mode_flag:
+                if cross_checked or cross_interactor_active or cross_mode_flag or native_picker is not None:
                     print("🛑 ESC - deactivating cross-section")
 
                     try:
