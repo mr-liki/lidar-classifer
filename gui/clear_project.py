@@ -1170,11 +1170,16 @@ def _clear_native_lidar_buffers(app) -> None:
 
     Uses the native Vulkan backend (nkv_clear + draw-range reset) and closes
     an active LNT view. Never imports or calls into vtk.
+
+    The .lnt view closes with keep_native_viewport=True: clearing the data
+    must NOT hand the canvas back to VTK - the (now empty) native viewport
+    stays installed so measurement and other native tools keep routing to
+    Vulkan, exactly as they did while the cloud was loaded.
     """
     had_lnt_view = getattr(getattr(app, "_lnt_main_view", None), "native", None) is not None
     try:
         from .lnt_open import close_lnt_view
-        close_lnt_view(app)
+        close_lnt_view(app, keep_native_viewport=True)
     except Exception as exc:
         print(f"  [clear] native LNT close skipped: {exc}")
     try:
@@ -1564,10 +1569,13 @@ def clear_project(app):
         if getattr(app, "_lnt_main_view", None) is not None:
             from .lnt_open import close_lnt_view
             # Don't Save already reverted the file: the teardown must not flush.
+            # keep_native_viewport: clearing must not bounce the canvas to VTK -
+            # the empty native viewport stays so tools keep routing to Vulkan.
             try:
-                close_lnt_view(app, flush_pending=bool(should_save))
+                close_lnt_view(app, flush_pending=bool(should_save),
+                               keep_native_viewport=True)
             except TypeError:
-                close_lnt_view(app)
+                close_lnt_view(app, keep_native_viewport=True)
 
         # ============================================================================
         # ✅ SAVE THE PROJECT IF USER CHOSE TO SAVE
