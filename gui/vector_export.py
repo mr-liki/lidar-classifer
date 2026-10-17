@@ -14,6 +14,70 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from PySide6.QtWidgets import QMessageBox, QFileDialog
 
 
+def _native_drawing_store(app):
+    """Find geometry owned by the native Vulkan viewport, even in 3D."""
+    view = getattr(app, '_lnt_main_view', None)
+    if view is None:
+        view = getattr(app, '_snt_viewport_view', None)
+    return getattr(view, 'drawing', None) if view is not None else None
+
+
+def _drawings_for_export(app):
+    """Export authored native coordinates directly, without VTK actors."""
+    native = _native_drawing_store(app)
+    if native is None:
+        digitizer = getattr(app, 'digitizer', None)
+        return list(getattr(digitizer, 'drawings', []) or [])
+    drawings = []
+    for original in native.drawings:
+        if original.get('visible', True) is False:
+            continue
+        drawing = dict(original)
+        if drawing.get('source') == 'cell_creation':
+            drawing['type'] = 'circle'
+        drawing['coordinates'] = _normalize_drawing_coords(drawing.get('coords') or [])
+        color = drawing.get('color', (255, 255, 255))
+        if isinstance(color, str):
+            from PySide6.QtGui import QColor
+            parsed = QColor(color)
+            color = parsed.getRgb()[:3] if parsed.isValid() else (255, 255, 255)
+        drawing['color'] = _normalize_rgb_triplet(color)
+        drawing['original_width'] = drawing.get('width', 2)
+        drawing['original_style'] = drawing.get('line_style', 'solid')
+        drawing.pop('actor', None)
+        drawings.append(drawing)
+    return drawings
+
+
+def _cell_source_lines_for_export(app, drawings):
+    """Source CLs retained by live cells, excluding lines exported as drawings."""
+    records = []
+    has_cells = False
+    for drawing in drawings:
+        if drawing.get('source') == 'cell_creation':
+            has_cells = True
+            records.extend(drawing.get('source_cl_lines') or ())
+    if not has_cells:
+        return []
+    if _native_drawing_store(app) is None:
+        records.extend(getattr(app, 'cell_source_cl_lines', None) or ())
+    def key(coords):
+        xy = tuple((float(p[0]), float(p[1])) for p in coords)
+        return min(xy, xy[::-1])
+    known = {key(d.get('coordinates') or d.get('coords') or ())
+             for d in drawings if d.get('source') != 'cell_creation'}
+    result = []
+    for record in records:
+        coords = record.get('coords') or ()
+        if len(coords) < 2:
+            continue
+        signature = key(coords)
+        if signature not in known:
+            known.add(signature)
+            result.append(record)
+    return result
+
+
 def diagnose_app_data(app):
     """Debug helper to find where data is stored in the app"""
     print(f"\n{'='*60}")
@@ -961,8 +1025,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
         print("📤 EXPORTING DRAWINGS TO SINGLE SHAPEFILE (Linework mode)")
         print(f"   Output: {output_path}")
 
-        digitizer = getattr(app, "digitizer", None)
-        drawings = list(getattr(digitizer, "drawings", []) or [])
+        drawings = _drawings_for_export(app)
         if not drawings:
             print("   ⚠️  No drawings to export")
             return False
@@ -1005,7 +1068,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
         # ── Create Cell: add the SNT CL lines the cells were built on ──────
         # (SNT lines are not digitizer drawings, so the loop above never sees
         # them). Only when cell circles are still present in the drawings.
-        cl_records = list(getattr(app, "cell_source_cl_lines", None) or [])
+        cl_records = _cell_source_lines_for_export(app, drawings)
         if cl_records and any(d.get("source") == "cell_creation" for d in drawings):
             added = 0
             for rec in cl_records:
@@ -1116,8 +1179,7 @@ def _drawing_is_visible(drawing: dict) -> bool:
 
 def _collect_visible_digitizer_entities_for_snt_export(app) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    digitizer = getattr(app, "digitizer", None)
-    drawings = list(getattr(digitizer, "drawings", []) or [])
+    drawings = _drawings_for_export(app)
     if not drawings:
         return out
 
@@ -2105,8 +2167,7 @@ def export_drawings_to_gis_container(app, output_path: str, driver_name: str = "
         print(f"   ❌ Native GIS export requires GDAL Python bindings: {exc}")
         return False
 
-    digitizer = getattr(app, "digitizer", None)
-    drawings = list(getattr(digitizer, "drawings", []) or [])
+    drawings = _drawings_for_export(app)
     if not drawings:
         print("   ⚠️ No digitizer drawings to export")
         return False
@@ -2372,14 +2433,12 @@ def show_export_dialog(app):
                 "Failed to export data. Check console for details."
             )
 
-import vtk
-import numpy as np
-
 def create_vtk_actor_from_drawing(drawing, renderer ,z_offset=10.0):
     """
     Create a VTK actor from drawing data and add it to the renderer.
     Returns the actor so it can be stored in the drawing dict.
     """
+    import vtk
     shape_type = drawing.get('type', 'unknown')
     coords = drawing.get('coordinates', [])
     color = drawing.get('color', (255, 255, 255))
@@ -3176,128 +3235,126 @@ def export_drawings_to_tiff(app, output_path: str) -> bool:
         import numpy as np
         print("✅ All imports successful")
         
-        # Now run diagnostics
-        try:
-            diagnose_app_data(app)
-        except Exception as e:
-            print(f"❌ Diagnostic failed: {e}")
-            import traceback
-            traceback.print_exc()
-        # ADD THIS LINE HERE:
-        
-        print(f"\n{'='*60}")
-        print(f"📤 EXPORTING TO TIFF (Point Cloud + Drawings)")
-        print(f"   Path: {output_path}")
-        
-        # ============================================================
-        # STEP 1: Get Point Cloud Data
-        # ============================================================
-        point_cloud_data = None
-
-        print(f"\n   🔍 SEARCHING FOR POINT CLOUD DATA:")
-
-        # Try common attribute names
-        for attr_name in ['point_cloud', 'points', 'cloud', 'pc', 'vtk_points', 
-                        'point_data', 'xyz_data', 'las_points', 'filtered_points',
-                        'original_points', 'loaded_points']:
-            if hasattr(app, attr_name):
-                val = getattr(app, attr_name)
-                print(f"   • Found app.{attr_name}: {type(val)}")
-                
-                if val is not None:
-                    # Check if it's a VTK object
-                    if hasattr(val, 'GetNumberOfPoints'):
-                        num_points = val.GetNumberOfPoints()
-                        print(f"      → VTK PolyData with {num_points} points")
-                        # Extract points from VTK
-                        point_cloud_data = []
-                        for i in range(num_points):
-                            pt = val.GetPoint(i)
-                            point_cloud_data.append(pt)
-                        print(f"   ✅ Extracted {len(point_cloud_data)} points from VTK")
-                        break
-                    
-                    # Check if it's a numpy array
-                    elif hasattr(val, 'shape'):
-                        print(f"      → NumPy array: shape {val.shape}")
-                        if len(val.shape) >= 2 and val.shape[1] >= 2:
-                            point_cloud_data = val
-                            print(f"   ✅ Using numpy array: {len(point_cloud_data)} points")
-                            break
-                    
-                    # Check if it's a list
-                    elif isinstance(val, list) and len(val) > 0:
-                        print(f"      → List with {len(val)} items")
-                        # Check if first item looks like a point
-                        if len(val) > 0 and hasattr(val[0], '__len__') and len(val[0]) >= 2:
-                            point_cloud_data = val
-                            print(f"   ✅ Using list: {len(point_cloud_data)} points")
-                            break
-                        
-        # ✅ ADD THE VTK CHECK HERE - RIGHT AFTER THE FOR LOOP ENDS
-        # ✅ Check VTK widget for point cloud
-        # ✅ Check VTK widget for point cloud (improved version)
-        if point_cloud_data is None and hasattr(app, 'vtk_widget'):
-            print(f"   • Searching ALL VTK actors for point clouds...")
+        if _native_drawing_store(app) is not None:
+            point_cloud_data = None
+        else:
+            # Now run diagnostics
             try:
-                renderer = app.vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
-                actors = renderer.GetActors()
-                actors.InitTraversal()
-                
-                largest_actor = None
-                max_points = 0
-                
-                for i in range(actors.GetNumberOfItems()):
-                    actor = actors.GetNextActor()
-                    if not actor:
-                        continue
-                        
-                    mapper = actor.GetMapper()
-                    if not mapper:
-                        continue
-                        
-                    input_data = mapper.GetInput()
-                    if not input_data or not hasattr(input_data, 'GetNumberOfPoints'):
-                        continue
-                    
-                    num_points = input_data.GetNumberOfPoints()
-                    print(f"      → Actor {i}: {num_points} points")
-                    
-                    # Track largest actor (likely the point cloud)
-                    if num_points > max_points:
-                        max_points = num_points
-                        largest_actor = input_data
-                
-                # Use largest actor if it has many points (likely point cloud)
-                if largest_actor and max_points > 100:
-                    print(f"      → Using largest actor: {max_points} points")
-                    point_cloud_data = []
-                    for j in range(max_points):
-                        pt = largest_actor.GetPoint(j)
-                        point_cloud_data.append(pt)
-                    print(f"   ✅ Extracted {len(point_cloud_data)} points from VTK renderer")
+                diagnose_app_data(app)
             except Exception as e:
-                print(f"      ⚠️ Error searching VTK actors: {e}")
+                print(f"❌ Diagnostic failed: {e}")
                 import traceback
                 traceback.print_exc()
+            # ADD THIS LINE HERE:
+        
+            print(f"\n{'='*60}")
+            print(f"📤 EXPORTING TO TIFF (Point Cloud + Drawings)")
+            print(f"   Path: {output_path}")
+        
+            # ============================================================
+            # STEP 1: Get Point Cloud Data
+            # ============================================================
+            point_cloud_data = None
 
-        # This line stays where it is
-        if point_cloud_data is None:
-            print(f"   ⚠️ No point cloud data found in any standard location")
-        else:
-            print(f"   ✅ Point cloud data loaded: {len(point_cloud_data)} points")
+            print(f"\n   🔍 SEARCHING FOR POINT CLOUD DATA:")
+
+            # Try common attribute names
+            for attr_name in ['point_cloud', 'points', 'cloud', 'pc', 'vtk_points',
+                            'point_data', 'xyz_data', 'las_points', 'filtered_points',
+                            'original_points', 'loaded_points']:
+                if hasattr(app, attr_name):
+                    val = getattr(app, attr_name)
+                    print(f"   • Found app.{attr_name}: {type(val)}")
+                
+                    if val is not None:
+                        # Check if it's a VTK object
+                        if hasattr(val, 'GetNumberOfPoints'):
+                            num_points = val.GetNumberOfPoints()
+                            print(f"      → VTK PolyData with {num_points} points")
+                            # Extract points from VTK
+                            point_cloud_data = []
+                            for i in range(num_points):
+                                pt = val.GetPoint(i)
+                                point_cloud_data.append(pt)
+                            print(f"   ✅ Extracted {len(point_cloud_data)} points from VTK")
+                            break
+                    
+                        # Check if it's a numpy array
+                        elif hasattr(val, 'shape'):
+                            print(f"      → NumPy array: shape {val.shape}")
+                            if len(val.shape) >= 2 and val.shape[1] >= 2:
+                                point_cloud_data = val
+                                print(f"   ✅ Using numpy array: {len(point_cloud_data)} points")
+                                break
+
+                        # Check if it's a list
+                        elif isinstance(val, list) and len(val) > 0:
+                            print(f"      → List with {len(val)} items")
+                            # Check if first item looks like a point
+                            if len(val) > 0 and hasattr(val[0], '__len__') and len(val[0]) >= 2:
+                                point_cloud_data = val
+                                print(f"   ✅ Using list: {len(point_cloud_data)} points")
+                                break
+                        
+            # ✅ ADD THE VTK CHECK HERE - RIGHT AFTER THE FOR LOOP ENDS
+            # ✅ Check VTK widget for point cloud
+            # ✅ Check VTK widget for point cloud (improved version)
+            if point_cloud_data is None and hasattr(app, 'vtk_widget'):
+                print(f"   • Searching ALL VTK actors for point clouds...")
+                try:
+                    renderer = app.vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
+                    actors = renderer.GetActors()
+                    actors.InitTraversal()
+                
+                    largest_actor = None
+                    max_points = 0
+                
+                    for i in range(actors.GetNumberOfItems()):
+                        actor = actors.GetNextActor()
+                        if not actor:
+                            continue
+                        
+                        mapper = actor.GetMapper()
+                        if not mapper:
+                            continue
+                        
+                        input_data = mapper.GetInput()
+                        if not input_data or not hasattr(input_data, 'GetNumberOfPoints'):
+                            continue
+                    
+                        num_points = input_data.GetNumberOfPoints()
+                        print(f"      → Actor {i}: {num_points} points")
+                    
+                        # Track largest actor (likely the point cloud)
+                        if num_points > max_points:
+                            max_points = num_points
+                            largest_actor = input_data
+                
+                    # Use largest actor if it has many points (likely point cloud)
+                    if largest_actor and max_points > 100:
+                        print(f"      → Using largest actor: {max_points} points")
+                        point_cloud_data = []
+                        for j in range(max_points):
+                            pt = largest_actor.GetPoint(j)
+                            point_cloud_data.append(pt)
+                        print(f"   ✅ Extracted {len(point_cloud_data)} points from VTK renderer")
+                except Exception as e:
+                    print(f"      ⚠️ Error searching VTK actors: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # This line stays where it is
+            if point_cloud_data is None:
+                print(f"   ⚠️ No point cloud data found in any standard location")
+            else:
+                print(f"   ✅ Point cloud data loaded: {len(point_cloud_data)} points")
         
         
         # ============================================================
         # STEP 2: Get Drawings
         # ============================================================
-        drawings = []
-        if hasattr(app, 'digitizer') and app.digitizer:
-            drawings = app.digitizer.drawings or []
-            print(f"   📊 Drawings found: {len(drawings)}")
-        else:
-            print(f"   ⚠️ No drawings found")
-        
+        drawings = _drawings_for_export(app)
+
         # Check if we have ANY data to export
         if point_cloud_data is None and not drawings:
             print(f"   ❌ No data to export (no point cloud or drawings)")
@@ -3477,7 +3534,13 @@ def export_drawings_to_tiff(app, output_path: str) -> bool:
                 coords = drawing.get('coords', drawing.get('coordinates', []))
                 
                 try:
-                    if shape_type in ['circle', 'text'] and len(coords) >= 1:
+                    if shape_type == 'circle' and drawing.get('source') == 'cell_creation':
+                        _, feature = _drawing_to_shapefile_feature(drawing)
+                        if feature is not None:
+                            outline = feature['geometry'].boundary
+                            thickness = max(1., float(drawing.get('width', 2))) * resolution
+                            shapes.append((outline.buffer(thickness * 0.5), 255))
+                    elif shape_type in ['circle', 'text'] and len(coords) >= 1:
                         geom = Point(coords[0][:2])
                         shapes.append((geom.buffer(2.0), 255))  # White dots
                     
@@ -3514,6 +3577,10 @@ def export_drawings_to_tiff(app, output_path: str) -> bool:
         crs = f"EPSG:{app.project_crs_epsg}" if hasattr(app, 'project_crs_epsg') and app.project_crs_epsg else "EPSG:4326"
         print(f"   🌍 Using CRS: {crs}")
         
+        # Supply a complete CRS definition: GDAL and rasterio wheels can carry
+        # different PROJ database versions in the same Python process.
+        from pyproj import CRS as ProjectCRS
+        crs = ProjectCRS.from_user_input(crs).to_wkt()
         with rasterio.open(
             output_path,
             'w',

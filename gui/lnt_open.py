@@ -159,6 +159,7 @@ class _InputFilter(QObject):
             if t == E.KeyPress and creation.key(ev.key()):
                 return True
             if t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                creation.release(ev.position(), ev.button())
                 self._last = None; return True
         drawing = getattr(self.view, 'drawing', None)
         if drawing is not None and drawing.active():
@@ -443,6 +444,13 @@ class LntMainView(QObject):
         print(f"[LNT] showing {self.lnt_path} in the main viewport ({pts:,} points)")
 
     def stop(self, restore=True, flush_pending=True):
+        try:
+            from gui.lnt_ai_bridge import active_bridge
+            bridge = active_bridge(self.app)
+            if bridge is not None and bridge.view is self:
+                bridge.end()             # write the AI result before the renderer goes
+        except Exception as exc:   # noqa: BLE001
+            print(f"[LNT] AI session close failed: {exc}")
         drawing = getattr(self, 'drawing', None)
         if drawing is not None:
             drawing.shutdown()

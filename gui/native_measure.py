@@ -35,7 +35,10 @@ class NativeMeasure:
 
     def _style(self, path=None):
         styles = load_measure_settings()
-        return dict(styles['path' if (self.path if path is None else path) else 'line'])
+        key = getattr(self, 'style_key', None)    # 'cross_section' for XS
+        if key not in styles:
+            key = 'path' if (self.path if path is None else path) else 'line'
+        return dict(styles[key])
 
     @staticmethod
     def distance(points):
@@ -266,12 +269,13 @@ class NativeMeasure:
 
 
 class NativeMeasureInput(QObject):
-    """Feeds the Vulkan widget's input to view.measurement (SNT-only sessions).
+    """Feeds the Vulkan widget's input to the native tools of an SNT-only session.
 
-    An .lnt session routes through lnt_open's filter; without one, the
-    promoted SNT viewport's widget only navigates. Same rules as lnt_open:
-    while a measurement is active it owns left/right clicks, moves and keys,
-    and middle-drag stays with the camera so the user can pan while measuring.
+    An .lnt session routes through lnt_open's filter; without one, the promoted
+    SNT viewport's widget only navigates. Same order and rules as lnt_open:
+    Block/Cell creation (view.creation) first, then measurement. While a tool
+    is active it owns left/right clicks, moves and keys; middle-drag always
+    stays with the camera so the user can pan while selecting or measuring.
     """
 
     def __init__(self, view, widget):
@@ -280,10 +284,24 @@ class NativeMeasureInput(QObject):
         widget.installEventFilter(self)
 
     def eventFilter(self, obj, ev):
+        t = ev.type()
+        creation = getattr(self.view, 'creation', None)
+        if creation is not None and creation.active:
+            if t == QEvent.MouseButtonPress and ev.button() != Qt.MiddleButton:
+                if creation.press(ev.position(), ev.button(), ev.modifiers()):
+                    obj.setFocus()
+                    return True
+            elif t == QEvent.MouseMove and not ev.buttons() & Qt.MiddleButton:
+                return creation.move(ev.position())
+            elif t == QEvent.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                creation.release(ev.position(), ev.button())
+                return True      # no right-click context menu while selecting
+            elif t == QEvent.KeyPress:
+                return creation.key(ev.key())
+            return False
         measurement = getattr(self.view, 'measurement', None)
         if measurement is None or not measurement.active:
             return False
-        t = ev.type()
         if t == QEvent.MouseButtonPress and ev.button() != Qt.MiddleButton:
             if measurement.press(ev.position(), ev.button()):
                 obj.setFocus()
@@ -297,3 +315,12 @@ class NativeMeasureInput(QObject):
         elif t == QEvent.KeyPress:
             return measurement.key(ev.key())
         return False
+
+
+def ensure_snt_input(view):
+    """Install the SNT-viewport input filter once per view (measure and creation share it)."""
+    if getattr(view, '_measure_input', None) is None:
+        widget = getattr(getattr(view, 'owner', None), 'vulkan_widget', None)
+        if widget is not None:
+            view._measure_input = NativeMeasureInput(view, widget)
+    return getattr(view, '_measure_input', None)

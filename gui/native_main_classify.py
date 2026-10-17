@@ -59,6 +59,19 @@ class MainCanvas:
             return px / ratio, py / ratio
         return (key, ratio), logical
 
+    def world_projection_snapshot(self, z):
+        """SNT labels use their displayed height; point tools keep their own plane."""
+        from gui.native_vector_overlay import _MvpScreenMapping, _backend
+        owner = SimpleNamespace(vulkan_backend=_backend(self.view.app),
+                                vulkan_widget=self.widget)
+        mapping = _MvpScreenMapping(owner)
+        snapshot = mapping.projection_snapshot(z)
+        if snapshot is None:
+            return None
+        key, project = snapshot
+        ratio = self.widget.devicePixelRatioF()
+        return (key, ratio), lambda x, y: tuple(v / ratio for v in project(x, y))
+
     def world_per_pixel(self):
         a, b = self.section_at(0., 0.), self.section_at(1., 0.)
         return float(np.hypot(b[0]-a[0], b[1]-a[1]))

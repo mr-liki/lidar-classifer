@@ -48,12 +48,11 @@ def native_classification_history(app, redo=False):
     store = getattr(app, '_lnt_section_store', None)
     if view is None or getattr(view, 'native', None) is None:
         return False
-    if store is None:
-        app.statusBar().showMessage('Nothing to redo' if redo else 'Nothing to undo', 2500)
-        return True
     source = getattr(app, 'redo_stack' if redo else 'undo_stack', [])
     destination = getattr(app, 'undo_stack' if redo else 'redo_stack', [])
-    if not source:
+    if source and isinstance(source[-1], dict) and 'lnt_node' in source[-1]:
+        return _native_ai_history(app, view, source, destination, redo)
+    if store is None or not source:
         app.statusBar().showMessage('Nothing to redo' if redo else 'Nothing to undo', 2500)
         return True
     entry = source[-1]
@@ -92,12 +91,14 @@ def snt_viewport_measure(app, name, key_label=''):
     if view is None or widget is None:
         return False
     from gui.native_main_classify import MainCanvas
-    from gui.native_measure import NativeMeasure, NativeMeasureInput
+    from gui.native_measure import NativeMeasure, ensure_snt_input
     measurement = getattr(view, 'measurement', None)
     if measurement is None:
         measurement = view.measurement = NativeMeasure(MainCanvas(view))
-    if getattr(view, '_measure_input', None) is None:
-        view._measure_input = NativeMeasureInput(view, widget)
+    ensure_snt_input(view)
+    creation = getattr(view, 'creation', None)
+    if creation is not None and creation.active:
+        creation.disarm()                 # creation takes clicks first; measuring wins now
     _arm_measurement(measurement, name)
     widget.setFocus()
     app.statusBar().showMessage(
@@ -110,18 +111,114 @@ _MEASURE_HINTS = {
     'MeasurePath': 'Click points; right-click finishes the path.',
     'MeasureGridArea': 'Click inside a grid cell to measure its area.',
     'MeasureBlockArea': 'Click inside a block to measure its area.',
-    'CrossSectionMeasure': 'Click points; right-click finishes the path.',
+    'CrossSectionMeasure': 'Click 2 points in a cross-section view to measure.',
 }
 
 
 def _arm_measurement(measurement, name):
     measurement.cancel()
-    measurement.path = name in ('MeasurePath', 'CrossSectionMeasure')
+    # XS (CrossSectionMeasure) is the Line tool, confined to cross-section views.
+    measurement.path = name == 'MeasurePath'
+    measurement.style_key = 'cross_section' if name == 'CrossSectionMeasure' else None
     # Grid/block-area picking (cell or block polygon -> exact area) runs in
     # the same overlay tool; the mode switches click handling wholesale.
     measurement.area_mode = {'MeasureGridArea': 'grid',
                              'MeasureBlockArea': 'block'}.get(name)
     measurement.active = True
+
+
+def _xs_button(app):
+    ribbon = getattr(app, 'ribbon_manager', None)
+    measure = getattr(ribbon, 'ribbons', {}).get('measure') if ribbon is not None else None
+    return getattr(measure, 'cross_section_measure_btn', None)
+
+
+def arm_section_measure(canvas, on):
+    """XS on one cross-section canvas: a two-click Line NativeMeasure, or stood down."""
+    measurement = getattr(canvas, 'measurement', None)
+    if on:
+        if measurement is None:
+            from gui.native_measure import NativeMeasure
+            measurement = canvas.measurement = NativeMeasure(canvas)
+        _arm_measurement(measurement, 'CrossSectionMeasure')
+    elif measurement is not None and measurement.active:
+        measurement.cancel()          # finished measurements stay on screen
+
+
+def native_section_measure(app, on):
+    """XS (Measure ribbon > Cross Section) in a native .lnt session.
+
+    Arms the Line measurement on every open cross-section window - never the
+    main view or the cut view - and on windows opened while it is on
+    (NativeSections.ensure_dock). Returns False without a native session, so
+    the caller keeps the VTK CrossSectionMeasurementTool.
+    """
+    view = getattr(app, '_lnt_main_view', None)
+    if view is None or getattr(view, 'native', None) is None:
+        return False
+    app._native_xs_active = bool(on)
+    sections = manager(app)
+    if on:
+        # Classification and the section-drawing gestures own the same clicks.
+        app.active_classify_tool = None
+        sections.cancel_cut()
+        sections.cancel_cross()
+        for classifier in [getattr(view, 'classifier', None)] + [
+                c.classifier for c in sections.views.values()]:
+            if classifier is not None:
+                classifier.cancel()
+    for slot, canvas in sections.views.items():
+        if slot != CUT_SLOT:
+            arm_section_measure(canvas, on)
+    return True
+
+
+def set_xs(app, on):
+    """Switch XS through its ribbon button (the one source of truth), or directly."""
+    button = _xs_button(app)
+    if button is not None:
+        if button.isChecked() != bool(on):
+            button.setChecked(bool(on))   # toggled -> ribbon sync -> native_section_measure
+        elif bool(on) != bool(getattr(app, '_native_xs_active', False)):
+            native_section_measure(app, on)
+    else:
+        native_section_measure(app, on)
+
+
+# Tools that compete with XS for cross-section clicks switch it off (as the
+# VTK tool's stand-downs did); everything else leaves it armed.
+_XS_EXCLUSIVE = {'CrossSectionRect', 'CutSectionRect', 'CutFromCross', 'CutFromCut', 'Escape'}
+
+
+def _native_ai_history(app, view, source, destination, redo):
+    """Undo/redo one AI run on an .lnt: rewrite its points' classes by .lnt identity."""
+    import numpy as np
+    entry = source[-1]
+    if entry.get('lnt_path') != view.lnt_path:
+        app.statusBar().showMessage('That AI run belongs to another point cloud.', 3000)
+        return True
+    from gui.lnt_ai_bridge import active_bridge, sync_store_rows
+    if active_bridge(app) is not None:
+        app.statusBar().showMessage('Close the AI classification window before undoing it.', 3000)
+        return True
+    node, local = entry['lnt_node'], entry['lnt_local']
+    classes = np.asarray(entry['new_classes' if redo else 'old_classes'], dtype=np.uint8)
+    if not view.native.set_classes(node, local, classes):
+        app.statusBar().showMessage(f'AI {"redo" if redo else "undo"} failed: '
+                                    f'{view.native.last_error}', 4000)
+        return True
+    destination.append(source.pop())
+    app.classification_revision = int(getattr(app, 'classification_revision', 0)) + 1
+    sync_store_rows(app, view, node, local, classes)
+    view.native.frame(0.0)
+    try:
+        from gui.point_count_widget import refresh_point_statistics
+        refresh_point_statistics(app)
+    except Exception:
+        pass
+    app.statusBar().showMessage(f'AI classification {"redone" if redo else "undone"} '
+                                f'({len(classes):,} points)', 3000)
+    return True
 
 
 def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label=''):
@@ -160,6 +257,11 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
     if drawing is not None:
         drawing.cancel()
     app._left_pan_shortcut_active = False
+    if getattr(app, '_native_xs_active', False) and name != 'CrossSectionMeasure':
+        if name in DRAWABLE_TOOLS or name in _XS_EXCLUSIVE:
+            set_xs(app, False)
+        else:
+            native_section_measure(app, True)   # re-arm: the loop above cancelled it
     prefix = f'[{key_label}] ' if key_label else ''
 
     def status(message):
@@ -170,14 +272,16 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
         if widget is not None:
             widget.setFocus()
 
-    if name in ('MeasureLine', 'MeasurePath', 'MeasureGridArea', 'MeasureBlockArea',
-                'CrossSectionMeasure'):
+    if name == 'CrossSectionMeasure':
+        # Same as the XS button: toggle it (VTK shortcut semantics).
+        on = not getattr(app, '_native_xs_active', False)
+        set_xs(app, on)
+        if on and not any(slot != CUT_SLOT for slot in sections.views):
+            status('XS on - draw a cross section, then click 2 points in its view.')
+        else:
+            status(_MEASURE_HINTS[name] if on else 'Cross-section measurement disabled')
+    elif name in ('MeasureLine', 'MeasurePath', 'MeasureGridArea', 'MeasureBlockArea'):
         from gui.native_measure import NativeMeasure
-        if name == 'CrossSectionMeasure' and canvas is None:
-            canvas = sections.views.get(sections.active_slot)
-            if canvas is None:
-                status('Draw a cross section before measuring it.')
-                return True
         if canvas is None:
             from gui.native_main_classify import MainCanvas
             if not view.mode_2d:
