@@ -488,9 +488,18 @@ class CanvasOverlay(QWidget):
                     )
                     for point in vertex_points:
                         painter.drawEllipse(point, 2.5, 2.5)
-            elif kind == "cut_preview" and len(qpts) == 2:
-                painter.setPen(QPen(QColor(255, 165, 0), 2, Qt.DashLine))
-                painter.drawRect(QRectF(qpts[0], qpts[1]).normalized())
+            elif kind == "cut_preview" and qpts:
+                # Fallback for DLLs without the vector pass; same look as the
+                # engine preview (white centre, orange depth lines, full height).
+                half, cut_view = extra
+                x0, h = qpts[0].x(), float(self.height())
+                if half is not None:
+                    dx = half / max(self.canvas.world_per_pixel(), 1e-300)
+                    painter.setPen(QPen(QColor(255, 165, 0), 2))
+                    for x in (x0 - dx, x0 + dx):
+                        painter.drawLine(QPointF(x, 0.), QPointF(x, h))
+                painter.setPen(QPen(QColor(255, 255, 255), 2 if cut_view else 1))
+                painter.drawLine(QPointF(x0, 0.), QPointF(x0, h))
             elif kind == "stroke" and qpts:
                 # The brush's painted trail: exactly the area brush_sweep selects.
                 square, r, (color, _width) = extra

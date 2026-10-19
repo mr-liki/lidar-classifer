@@ -294,6 +294,34 @@ try:
                 check("every cut point maps back to the right app.data point (within the cut depth)",
                       np.all(np.abs(cx - (x0 + 200.0)) <= 2.0 + 1e-6) and int(np.asarray(cmap).max()) < len(win.data["xyz"]),
                       f"x {cx.min() - x0:.1f}..{cx.max() - x0:.1f}")
+            # Exercise the real shortcut/controller routing without allowing
+            # the nested operation to enter the legacy VTK implementation.
+            import builtins
+            real_import = builtins.__import__
+            def native_cut_import(name, *args, **kwargs):
+                assert name != 'vtk' and not name.startswith('vtkmodules'), name
+                return real_import(name, *args, **kwargs)
+            builtins.__import__ = native_cut_import
+            try:
+                win.cut_section_controller.activate_from_cut_shortcut()
+                parent, parent_ids, axis = cut.local.copy(), cut.indices.copy(), cut.axis
+                centre = float(np.median(parent[:, axis]))
+                half = max(.1, float(np.ptp(parent[:, axis])) * .3)
+                cut.cut_centre = centre
+                ns.finish_cut(cut, centre + half)
+                keep = np.abs(parent[:, axis] - centre) <= half + 1e-9
+                check('Cut-in-Cut shortcut filters native records and rearms without VTK',
+                      np.array_equal(cut.indices, parent_ids[keep]) and cut.cut_armed
+                      and ns._nested_cut_active and cut.axis == 0)
+                check('Cut-in-Cut rotates the native result 90 degrees',
+                      np.allclose(cut.local, np.column_stack((parent[keep, 1-axis],
+                                  -parent[keep, axis], parent[keep, 2]))))
+                ids_before_cancel = cut.indices.copy()
+                handled = win.cut_section_controller.cancel_persistent_cut_in_cut()
+                check('Escape controller route exits native Cut-in-Cut and preserves result',
+                      handled and not cut.cut_armed and np.array_equal(cut.indices, ids_before_cancel))
+            finally:
+                builtins.__import__ = real_import
 
             # ---- Above / Below Line from the Classify ribbon, on the native dock ----
             from PySide6.QtCore import QPoint

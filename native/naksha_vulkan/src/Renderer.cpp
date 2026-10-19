@@ -1830,9 +1830,10 @@ bool Renderer::CaptureOffscreenRGBA8(PointCloudRenderer* pointCloud, SurfaceRend
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
         if (pointCloud && pointCloud->IsLoaded()) pointCloud->Record(cmd, slot);
         if (surface && surface->IsLoaded()) surface->Record(cmd, slot);
-        // Overlay linework, in the same order the live frame records it.
-        if (vector) vector->Record(cmd, slot);
     }
+    // Overlay linework follows both ordinary and instant-shaded geometry,
+    // matching the live frame.
+    if (vector) vector->Record(cmd, slot);
     vkCmdEndRenderPass(cmd);
 
     // BUG FOUND AND FIXED THIS ROUND (confirmed via validation layers): this

@@ -350,7 +350,8 @@ def _native_ai_history(app, view, source, destination, redo):
     return True
 
 
-def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label=''):
+def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label='',
+                            pan_mode=None):
     view = getattr(app, '_lnt_main_view', None)
     if view is None or getattr(view, 'native', None) is None:
         name = MEASURE_NAMES.get(TOOL_NAMES.get(tool, tool), tool)
@@ -499,12 +500,18 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
             focus_main()
         status(f'{tool} ready in {"Main View" if canvas is None else "View " + str(canvas.slot)}')
     elif name == 'Pan':
+        # Mode comes from the Shortcut Manager's Pan cell; consumed by
+        # gui/native_pan.py in the main view and every cross/cut canvas.
+        app._pan_shortcut_mode = pan_mode if pan_mode in ('left', 'tap') else 'left'
         app._left_pan_shortcut_active = True
         if canvas is not None:
             canvas.setFocus()
         else:
             focus_main()
-        status('Pan active — left-drag to pan')
+        if app._pan_shortcut_mode == 'tap':
+            status('Pan active — tap to start, tap again / Esc to stop')
+        else:
+            status('Pan active — left-drag to pan')
     elif name == 'FitView':
         if canvas is not None:
             canvas.fit()
