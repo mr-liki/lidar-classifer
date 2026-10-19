@@ -5,10 +5,13 @@ laspy+lazrs, then converted by the native C++ builder). Every later open finds t
 .lnt newer than the source and loads it directly.
 """
 import ctypes
+import hashlib
 import os
 import shutil
 import tempfile
 import time
+
+import numpy as np
 
 from PySide6.QtCore import QEvent, QObject, QThread, Qt, QTimer, Slot, Signal
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
@@ -19,11 +22,37 @@ from gui.native_pan import NativePanGesture
 LNT_SUFFIXES = (".las", ".laz", ".lnt")
 
 
+def _local_lnt_path(source):
+    """Stable per-source cache path for sources that must not be modified."""
+    try:
+        stat = os.stat(source)
+        identity = (
+            f"{os.path.normcase(os.path.abspath(source))}|"
+            f"{stat.st_size}|{stat.st_mtime_ns}"
+        )
+    except OSError:
+        identity = os.path.normcase(os.path.abspath(source))
+    key = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+    root = os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "NakshaAI", "lnt_cache", key[:2], key,
+    )
+    return os.path.join(root, os.path.splitext(os.path.basename(source))[0] + ".lnt")
+
+
 def lnt_path_for(source):
-    return source if source.lower().endswith(".lnt") else os.path.splitext(source)[0] + ".lnt"
+    if source.lower().endswith(".lnt"):
+        return source
+    # Never try to replace a shared/network-side cache. Users commonly have
+    # read-only access to the authoritative project folder, and an existing
+    # .lnt may be owned by another account. Keep derived data local instead.
+    if os.path.abspath(source).startswith("\\\\"):
+        return _local_lnt_path(source)
+    return os.path.splitext(source)[0] + ".lnt"
 
 
-LNT_FORMAT_VERSION = 2      # 2: points carry a classification byte (11 B/pt)
+LNT_FORMAT_VERSION = 2      # points carry a classification byte (11 B/pt)
+LNT_CLASS_SEMANTICS = "legacy-packed-class-v1"
 
 
 def lnt_file_version(path):
@@ -38,13 +67,26 @@ def lnt_file_version(path):
         return 0
 
 
+def _class_semantics_path(lnt):
+    return lnt + ".class-semantics"
+
+
+def _has_current_class_semantics(lnt):
+    try:
+        with open(_class_semantics_path(lnt), "r", encoding="ascii") as marker:
+            return marker.read().strip() == LNT_CLASS_SEMANTICS
+    except OSError:
+        return False
+
+
 def lnt_is_current(source):
     """True when a usable .lnt of the CURRENT format exists for `source`. An .lnt
-    written by an older build (no classification) is treated as stale and rebuilt."""
+    written by an older build (or with collapsed legacy classes) is stale and rebuilt."""
     lnt = lnt_path_for(source)
     if source.lower().endswith(".lnt"):
         return os.path.isfile(source) and lnt_file_version(source) == LNT_FORMAT_VERSION
     return (os.path.isfile(lnt) and lnt_file_version(lnt) == LNT_FORMAT_VERSION
+            and _has_current_class_semantics(lnt)
             and os.path.getmtime(lnt) >= os.path.getmtime(source))
 
 
@@ -65,8 +107,11 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
             raise RuntimeError(
                 f"LAZ needs about {required / 1024**3:.1f} GiB of temporary space "
                 f"to decompress; only {free / 1024**3:.1f} GiB is free")
-        header = laspy.LasHeader(point_format=src.header.point_format,
-                                 version=src.header.version)
+        legacy = int(src.header.point_format.id) < 6
+        header = laspy.LasHeader(
+            point_format=6 if legacy else src.header.point_format,
+            version="1.4" if legacy else src.header.version,
+        )
         header.scales, header.offsets = src.header.scales, src.header.offsets
         total, done = max(1, src.header.point_count), 0
         started = time.perf_counter()
@@ -74,6 +119,23 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
             for pts in src.chunk_iterator(chunk):
                 if cancelled():
                     raise Cancelled()
+                if legacy:
+                    # The native DLL historically interpreted LAS 1.2 byte 15 as
+                    # only a 5-bit ASPRS class.  Our production files use that
+                    # complete packed byte for extended classes (51 = 19 | 0x20).
+                    # Promote the temporary stream to point format 6 and put the
+                    # reconstructed byte into its true 8-bit classification field.
+                    chunk_las = laspy.LasData(src.header, points=pts)
+                    chunk_las = laspy.convert(
+                        chunk_las, point_format_id=6, file_version="1.4"
+                    )
+                    base = np.asarray(pts.classification, dtype=np.uint8)
+                    packed = (base & np.uint8(0x1F)).copy()
+                    packed |= np.asarray(pts.synthetic, dtype=np.uint8) << np.uint8(5)
+                    packed |= np.asarray(pts.key_point, dtype=np.uint8) << np.uint8(6)
+                    packed |= np.asarray(pts.withheld, dtype=np.uint8) << np.uint8(7)
+                    chunk_las.classification = packed
+                    pts = chunk_las.points
                 dst.write_points(pts)
                 done += len(pts)
                 rate = done / max(time.perf_counter() - started, 0.001) / 1_000_000
@@ -84,8 +146,10 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
 def build_lnt(source, progress, cancelled):
     """Builds <source>.lnt. progress(percent, text); raises on failure."""
     lnt = lnt_path_for(source)
+    os.makedirs(os.path.dirname(lnt), exist_ok=True)
     tmp_las = None
     tmp_lnt = lnt + ".tmp"
+    marker_tmp = _class_semantics_path(lnt) + ".tmp"
     try:
         las = source
         if source.lower().endswith(".laz"):
@@ -98,10 +162,13 @@ def build_lnt(source, progress, cancelled):
         progress(92, "Building .lnt (octree + LOD)")
         pts, nodes = nat.convert_las(las, tmp_lnt)
         os.replace(tmp_lnt, lnt)
+        with open(marker_tmp, "w", encoding="ascii") as marker:
+            marker.write(LNT_CLASS_SEMANTICS + "\n")
+        os.replace(marker_tmp, _class_semantics_path(lnt))
         progress(100, f"Built {os.path.basename(lnt)}: {pts:,} points, {nodes:,} nodes")
         return lnt
     finally:
-        for p in (tmp_las, tmp_lnt):
+        for p in (tmp_las, tmp_lnt, marker_tmp):
             if p and os.path.exists(p):
                 try:
                     os.remove(p)
@@ -1043,6 +1110,26 @@ def _refresh_total_points(app):
 
 
 def _show(app, lnt_path, name):
+    # Saving a native document may change the source identity and therefore
+    # reopen it from a newly built local .lnt.  Preserve presentation state
+    # across that renderer handoff: start() intentionally installs a neutral
+    # palette for a genuinely new first open, but an already-applied PTC must
+    # not disappear merely because Save replaced/reopened the document.
+    previous = getattr(app, "_lnt_main_view", None)
+    restore_applied_palette = bool(
+        previous is not None and getattr(previous, "ptc_applied", False)
+    )
+    restore_shading_name = (
+        str(getattr(previous, "shading_name", "class") or "class")
+        if previous is not None else "class"
+    )
+    restore_palette = None
+    if restore_applied_palette:
+        try:
+            from gui.display_mode import clone_palette
+            restore_palette = clone_palette(getattr(app, "class_palette", {}) or {})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[LNT] could not snapshot the applied PTC before reopen: {exc}")
     close_lnt_view(app, reopening=True)
     view = LntMainView(app, lnt_path, name)
     try:
@@ -1054,6 +1141,34 @@ def _show(app, lnt_path, name):
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
     app._lnt_main_view = view
+    if restore_applied_palette and restore_palette:
+        # Restore all three owners of Main View presentation state atomically.
+        # If the dialog keeps its neutral/reinitialised checkbox snapshot, its
+        # next Apply would otherwise hide the cloud even after the GPU LUT was
+        # restored correctly.
+        from gui.display_mode import clone_palette
+        app.class_palette = clone_palette(restore_palette)
+        if not isinstance(getattr(app, "view_palettes", None), dict):
+            app.view_palettes = {}
+        app.view_palettes[0] = clone_palette(restore_palette)
+        dialog = (
+            getattr(app, "display_mode_dialog", None)
+            or getattr(app, "display_dialog", None)
+        )
+        if dialog is not None:
+            if not isinstance(getattr(dialog, "view_palettes", None), dict):
+                dialog.view_palettes = {}
+            dialog.view_palettes[0] = clone_palette(restore_palette)
+            if hasattr(dialog, "sync_slot_visibility_from_palette"):
+                dialog.sync_slot_visibility_from_palette(0, restore_palette)
+        if view._push_applied_palette():
+            view.apply_shading(restore_shading_name)
+            print(
+                "[LNT] restored the applied PTC palette after document reopen "
+                f"(mode={restore_shading_name})"
+            )
+        else:
+            print("[LNT] could not restore the applied PTC palette after document reopen")
     from gui.native_border import apply_border
     apply_border(app, 0)
     _keep_vector_overlay(app)

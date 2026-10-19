@@ -29,6 +29,10 @@ $root    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $native  = Join-Path $root 'native\naksha_vulkan'
 $build   = Join-Path $native $BuildDir
 $cmake   = 'H:\tools\CMake_64\bin\cmake.exe'
+if (-not (Test-Path $cmake)) {
+    $cmakeCommand = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if ($cmakeCommand) { $cmake = $cmakeCommand.Source }
+}
 $vcvars  = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
 
 foreach ($tool in @($cmake, $vcvars)) {

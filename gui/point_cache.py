@@ -32,7 +32,11 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
-CACHE_SCHEMA = 1
+# Bumped because classification loading now preserves LAS 1.2 extended class
+# values reconstructed from the legacy flag bits.  A cache made by the older
+# loader may contain the collapsed base value (for example 19 instead of 51)
+# and must never be served as if it were canonical.
+CACHE_SCHEMA = 2
 DEFAULT_THRESHOLD = 5_000_000
 DEFAULT_MAX_GB = 12.0
 DEFAULT_MAX_ENTRIES = 6

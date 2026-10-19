@@ -149,10 +149,14 @@ std::size_t LASReader::read_into(RawPoint* dst, std::size_t max_points) {
             o.z = double(rd<int32_t>(p + 8)) * hdr_.scale_z + hdr_.offset_z;
             const uint8_t inten = uint8_t(rd<uint16_t>(p + 12) >> 8);
             o.intensity = inten;
-            // Formats 0-5 keep the class in the low 5 bits of byte 15 (the top three
-            // are synthetic / key-point / withheld flags); formats 6-10 have a full
-            // byte at offset 16.
-            o.classification = (fmt_ >= 6) ? p[16] : uint8_t(p[15] & 0x1F);
+            // Preserve the complete stored classification byte in every LAS point
+            // format.  In legacy formats 0-5 the high bits are named flags by the
+            // LAS specification, but Naksha/TerraScan workflows also use the packed
+            // byte as an extended class code (for example 0x33 == class 51).  Masking
+            // with 0x1F silently changed class 51 to class 19 during .lnt conversion.
+            // This matches gui.data_loader's legacy-class reconstruction and keeps
+            // the source byte unchanged throughout loading, rendering and saving.
+            o.classification = (fmt_ >= 6) ? p[16] : p[15];
             if (rgb_offset_ >= 0) {
                 o.r = uint8_t(rd<uint16_t>(p + rgb_offset_) >> 8);
                 o.g = uint8_t(rd<uint16_t>(p + rgb_offset_ + 2) >> 8);

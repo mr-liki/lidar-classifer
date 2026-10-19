@@ -3260,6 +3260,10 @@ class GlobalShortcutFilter(QObject):
             to_cls   = shortcut.get("to")
             preset   = shortcut.get("preset")
 
+            # Identify the active class-bearing shortcut so editing its
+            # From/To pair can refresh the live ClassPicker immediately.
+            self.app_window._last_classification_shortcut_combo = combo
+
             print(f"✅ SHORTCUT MATCH: {combo} → {tool}, "
                 f"from={from_cls}, to={to_cls}")
             try:

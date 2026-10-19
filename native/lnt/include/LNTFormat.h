@@ -33,7 +33,7 @@ namespace lnt {
 
 // ---- constants ----------------------------------------------------------
 static constexpr char     kMagic[4]      = {'L', 'N', 'T', '\0'};
-static constexpr uint16_t kFormatVersion = 2;   // 2: LNTPoint gained `classification` (11 B/pt)
+static constexpr uint16_t kFormatVersion = 2;   // points carry classification (11 B/pt)
 
 // 21 bits/axis: 3 * 21 = 63 <= 64, so a 3-axis Morton key fits uint64 exactly
 // with one bit to spare. 22 bits/axis would be 66 bits and overflow silently.
@@ -97,7 +97,7 @@ struct LNTPoint {
     uint8_t  g;              //  7
     uint8_t  b;              //  8
     uint8_t  intensity;      //  9
-    uint8_t  classification; // 10  ASPRS class code, 0..255 (version 2)
+    uint8_t  classification; // 10  source classification byte, 0..255
 };
 // The pack(1) is what makes 11 a guarantee: unpacked, the uint16 members would
 // pad this to 12.
