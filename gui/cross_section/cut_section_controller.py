@@ -3035,6 +3035,12 @@ class CutSectionController:
 
     def cancel_persistent_cut_in_cut(self):
         """ESC: stop a re-armed nested cut while keeping its last result visible."""
+        from gui.native_sections import manager
+        native_sections = manager(self.app, create=False)
+        if native_sections is not None:
+            if native_sections._nested_cut_active:
+                return native_sections.cancel_cut()
+            return False
         waiting = self._state in (
             CutSectionState.WAITING_CENTER,
             CutSectionState.WAITING_DEPTH,

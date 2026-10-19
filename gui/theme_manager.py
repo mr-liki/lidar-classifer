@@ -2460,6 +2460,10 @@ class ThemeManager:
             except Exception as e:
                 print(f"⚠️ Failed to refresh activity bar theme: {e}")
 
+        panel = getattr(app_window, "_gis_layers_panel", None)
+        if panel is not None and callable(getattr(panel, "refresh_theme", None)):
+            panel.refresh_theme()
+
         settings = QSettings("NakshaAI", "LidarApp")
         settings.setValue("ui_theme", theme_name)
 

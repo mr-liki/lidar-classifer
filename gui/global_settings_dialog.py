@@ -734,7 +734,13 @@ class GlobalSettingsDialog(QDialog):
         # An explicit settings save re-arms Left/Tap-Tap pan if a previous
         # Escape had suspended it (the combo is the user's chosen mode).
         if hasattr(self.app, "_pan_nav_suspended_button"):
-            self.app._pan_nav_suspended_button = None
+            if getattr(self.app, "_left_pan_shortcut_active", False):
+                # A Pan-tool shortcut is currently armed with a temporary
+                # mode override. Keep the suspension slot so disarming
+                # restores THIS freshly-saved value, not a stale one.
+                self.app._pan_nav_suspended_button = panning_button
+            else:
+                self.app._pan_nav_suspended_button = None
 
     def _save_update_settings(self):
         self.update_manager.set_preferences(

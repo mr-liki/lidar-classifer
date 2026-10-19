@@ -78,6 +78,12 @@ def _class_picker_is_visible(picker) -> bool:
 def _deactivate_pan_navigation_safely(app_window) -> None:
     """Release latched pan state in main, cross, and cut viewports."""
     app_window._left_pan_shortcut_active = False
+    # Restore a Pan-shortcut's temporary panning-button override (Left -
+    # Click / Tap - Tap) to the persistent Global Settings preference.
+    saved_pan_button = getattr(app_window, "_pan_nav_suspended_button", None)
+    if saved_pan_button is not None:
+        app_window._pan_nav_suspended_button = None
+        app_window.panning_button = saved_pan_button
 
     release_main = getattr(app_window, "_handle_fast_main_pan_release", None)
     if callable(release_main) and getattr(app_window, "_qt_main_pan_active", False):

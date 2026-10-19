@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLabel, QFileDialog, QMessageBox, QWidget, QStackedWidget,
     QLineEdit, QSplitter, QTextBrowser, QListWidgetItem,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QGroupBox, QFormLayout, QFrame, QScrollArea
+    QGroupBox, QFormLayout, QFrame, QScrollArea, QProgressDialog, QApplication
 )
 
 from gui.theme_manager import ThemeColors, ThemeManager, get_dialog_stylesheet
@@ -649,13 +649,46 @@ class PluginLoaderDialog(QDialog):
         )
         if ans != QMessageBox.Yes:
             return
-        ok, msg = self.pm.reinstall_plugin(name)
+        ok, msg = self._with_install_progress(
+            f"Reinstalling '{name}'", lambda progress: self.pm.reinstall_plugin(name, progress))
         if ok:
             self._selected_plugin_name = name
             self._refresh()
             QMessageBox.information(self, "Success", msg)
         else:
             QMessageBox.critical(self, "Error", msg)
+
+    def _with_install_progress(self, title, run):
+        """Run an install with a modal progress popup fed by its progress callback.
+
+        The install stays on the GUI thread (loading a plugin builds ribbon
+        widgets); each progress report repaints the popup. There is no Cancel:
+        stopping half-way would leave a half-copied plugin directory.
+        """
+        dlg = QProgressDialog(title + "…", None, 0, 100, self)
+        dlg.setWindowTitle("Plugin Installation")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(380)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.show()
+        dlg.setValue(0)
+        QApplication.processEvents()
+
+        def progress(percent, text):
+            dlg.setLabelText(text)
+            dlg.setValue(max(0, min(100, int(percent))))
+            QApplication.processEvents()
+
+        try:
+            ok, msg = run(progress)
+        except Exception as exc:          # noqa: BLE001 - reported like any install failure
+            ok, msg = False, f"Plugin installation failed: {exc}"
+        finally:
+            dlg.close()
+            dlg.deleteLater()
+        return ok, msg
 
     def _on_browse_zip(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -670,7 +703,9 @@ class PluginLoaderDialog(QDialog):
             QMessageBox.warning(self, "Warning", "Please select a ZIP file first.")
             return
 
-        ok, msg = self.pm.install_plugin_from_zip(Path(zip_path))
+        ok, msg = self._with_install_progress(
+            f"Installing {Path(zip_path).name}",
+            lambda progress: self.pm.install_plugin_from_zip(Path(zip_path), progress))
         if ok:
             QMessageBox.information(self, "Success", msg)
             self.zip_line_edit.clear()

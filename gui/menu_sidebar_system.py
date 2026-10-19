@@ -3125,12 +3125,14 @@ class DrawRibbon(QWidget):
         """
         main_window = self.window()
 
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'select'):
-            main_window.statusBar().showMessage('Native Vulkan Select: click a drawing', 3000)
-            return
-
+        # Both renderers use the SAME selection panel. When Vulkan owns the
+        # visible viewport, SelectionModeDialog binds to native selection;
+        # otherwise its original VTK ElementSelectTool stays unchanged.
         self._deactivate_accudraw_before_other_tool("Select Drawing")
+        from gui.native_draw import activate_native_draw
+        native_selection = activate_native_draw(main_window, 'select')
+        if native_selection:
+            main_window.statusBar().showMessage('Vulkan Element Selection: choose a method in the panel', 3500)
 
         # Stand down draw tool — ElementSelectTool will also do this defensively
         if hasattr(main_window, 'digitizer') and main_window.digitizer:
@@ -3160,11 +3162,24 @@ class DrawRibbon(QWidget):
         try:
             existing = getattr(main_window, "_element_selection_dialog", None)
             if existing is not None:
-                try:
-                    self._restore_tool_dialog(existing)
-                    return
-                except Exception:
-                    pass
+                # The user can load/unload SNT between clicks: a dialog bound
+                # to VTK must not be reused after Vulkan takes ownership (or
+                # vice versa). Recreate only the panel, never the renderer.
+                old_native = getattr(existing, '_native_selection', None) is not None
+                if old_native != bool(native_selection):
+                    try:
+                        existing.close()
+                    except Exception:
+                        pass
+                    existing = None
+                    main_window._element_selection_dialog = None
+                else:
+                    try:
+                        existing.restore_pick_interaction()
+                        self._restore_tool_dialog(existing)
+                        return
+                    except Exception:
+                        pass
 
             from gui.selection_popup import SelectionModeDialog
             dlg = SelectionModeDialog(main_window)
@@ -3376,11 +3391,8 @@ class DrawRibbon(QWidget):
     def _handle_parallel_click(self):
         """Handle Parallel button click — open the Parallel Figure dialog."""
         main_window = self.window()
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'parallel'):
-            main_window.statusBar().showMessage(
-                'Native Parallel: select a drawing first, then click the offset position', 4000)
-            return
+        from gui.native_draw import get_native_draw
+        native_draw = get_native_draw(main_window, create=True)
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Parallel tool: digitizer not available")
@@ -3404,7 +3416,13 @@ class DrawRibbon(QWidget):
                 main_window._parallel_tool_dialog = None
 
         from gui.parallel_tool_dialog import ParallelToolDialog
+        if native_draw is not None:
+            native_draw.activate('parallel')
         dialog = ParallelToolDialog(digitizer, parent=main_window)
+        if native_draw is not None:
+            dialog._native_draw = native_draw
+            native_draw.bind_legacy_dialog(dialog)
+            dialog.finished.connect(lambda _=0, d=native_draw, dlg=dialog: d.unbind_legacy_dialog(dlg))
         main_window._parallel_tool_dialog = dialog
         dialog.finished.connect(
             lambda _=0, mw=main_window, dlg=dialog: self._clear_parallel_dialog_ref(mw, dlg)
@@ -3458,11 +3476,8 @@ class DrawRibbon(QWidget):
     def _handle_centerline_click(self):
         """Handle Centerline button click — open the Centerline dialog."""
         main_window = self.window()
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'centerline'):
-            main_window.statusBar().showMessage(
-                'Native Centerline: select the first drawing, then click the second', 4000)
-            return
+        from gui.native_draw import get_native_draw
+        native_draw = get_native_draw(main_window, create=True)
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Centerline tool: digitizer not available")
@@ -3487,7 +3502,13 @@ class DrawRibbon(QWidget):
                 main_window._centerline_tool_dialog = None
 
         from gui.centerline_tool_dialog import CenterlineToolDialog
+        if native_draw is not None:
+            native_draw.activate('centerline')
         dialog = CenterlineToolDialog(digitizer, parent=main_window)
+        if native_draw is not None:
+            dialog._native_draw = native_draw
+            native_draw.bind_legacy_dialog(dialog)
+            dialog.finished.connect(lambda _=0, d=native_draw, dlg=dialog: d.unbind_legacy_dialog(dlg))
         main_window._centerline_tool_dialog = dialog
         dialog.finished.connect(
             lambda _=0, mw=main_window, dlg=dialog: self._clear_centerline_dialog_ref(mw, dlg)
@@ -3667,8 +3688,18 @@ class RibbonManager:
                     try: self.parent.measurement_tool.deactivate()
                     except Exception: pass
                 try:
-                    from gui.native_shortcuts import cancel_native_measurements
+                    from gui.native_shortcuts import (cancel_native_measurements,
+                                                      refresh_measure_ribbon, set_xs)
+                    # XS stands down with the rest and its button follows, so
+                    # returning to the tab never shows a checked XS that is
+                    # silently disarmed (and _native_xs_active can't re-arm
+                    # section windows behind another tab).
+                    set_xs(self.parent, False)
+                    xs_tool = getattr(self.parent, 'cross_section_measurement_tool', None)
+                    if xs_tool is not None and getattr(xs_tool, 'active', False):
+                        xs_tool.deactivate()      # VTK XS; idempotent backstop
                     cancel_native_measurements(self.parent)
+                    refresh_measure_ribbon(self.parent)
                 except Exception: pass
             
             # ◀◀◀ NEW: Deactivate Identify tools when leaving 'identify' tab
@@ -3836,10 +3867,12 @@ class MeasurementRibbon(QWidget):
     """Ribbon for Measurement tools with live distance display"""
     
     measure_tool_selected = Signal(str)
+    measure_tool_deactivated = Signal(str)
     clear_measurements = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._measure_buttons = {}
         self.build_ribbon()
         
     def build_ribbon(self):
@@ -3849,13 +3882,13 @@ class MeasurementRibbon(QWidget):
         
         # 📏 Distance Tools
         distance = RibbonSection("Distance", self)
-        distance.add_button("Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
-        distance.add_button("Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
+        self._add_measure_button(distance, "Line", "📐", "measure_line")
+        self._add_measure_button(distance, "Path", "🛤️", "measure_path")
         layout.addWidget(distance)
 
         area = RibbonSection("Area", self)
-        area.add_button("Block", "▦", lambda: self.measure_tool_selected.emit("measure_block_area"))
-        area.add_button("Grid", "▦", lambda: self.measure_tool_selected.emit("measure_grid_area"))
+        self._add_measure_button(area, "Block", "▦", "measure_block_area")
+        self._add_measure_button(area, "Grid", "▦", "measure_grid_area")
         layout.addWidget(area)
     
         # 🗑️ Actions
@@ -3914,6 +3947,55 @@ class MeasurementRibbon(QWidget):
 
         layout.addStretch()
 
+    def _add_measure_button(self, section, text, icon_text, tool_id):
+        holder = {}
+
+        def on_click():
+            self._on_measure_clicked(holder["button"])
+
+        button = section.add_button(text, icon_text, on_click)
+        button.setProperty("measureToolId", tool_id)
+        holder["button"] = button
+        self._measure_buttons[tool_id] = (button, section)
+        return button
+
+    def _on_measure_clicked(self, button):
+        """Distance/Area click: checked arms that tool, unchecked stands it down."""
+        tool_id = button.property("measureToolId")
+        if button.isChecked():
+            self.measure_tool_selected.emit(tool_id)
+        else:
+            self.measure_tool_deactivated.emit(tool_id)
+
+    def sync_active_tool(self, tool_id=None, xs=None):
+        """Highlight exactly the armed Distance/Area tool, or none.
+
+        Programmatic counterpart of a ribbon click. Called whenever the tool
+        activates or deactivates from anywhere (shortcut, Esc, another tool
+        taking over), so the highlight lives exactly as long as the tool.
+        Never emits a click and never touches other ribbons.
+
+        `xs` mirrors the Cross Section button the same way; its signals are
+        blocked because that button's own handler drives the tool, and this
+        method only displays state - it must never toggle the tool.
+        """
+        for candidate, (button, section) in self._measure_buttons.items():
+            checked = candidate == tool_id
+            if button.isChecked() != checked:
+                button.setChecked(checked)
+            if checked:
+                section.active_button = button
+            elif section.active_button is button:
+                section.active_button = None
+        if xs is not None:
+            xs_button = self.cross_section_measure_btn
+            if xs_button.isChecked() != bool(xs):
+                blocked = xs_button.blockSignals(True)
+                try:
+                    xs_button.setChecked(bool(xs))
+                finally:
+                    xs_button.blockSignals(blocked)
+
     def _on_cross_section_measure_clicked(self):
         """add_button()'s clicked-driven callback — the button's checked
         state already reflects the click by the time this runs."""
@@ -3926,6 +4008,17 @@ class MeasurementRibbon(QWidget):
         button drives the tool through."""
         try:
             main_window = self.window()
+            # Native .lnt session: the section windows are Vulkan canvases the
+            # VTK tool's observers never see, so XS arms the native Line there.
+            from gui.native_shortcuts import native_section_measure
+            if native_section_measure(main_window, bool(checked)):
+                if hasattr(main_window, "statusBar"):
+                    main_window.statusBar().showMessage(
+                        "📏 Cross-section measurement enabled — click two points in a cross-section view"
+                        if checked else "📏 Cross-section measurement disabled",
+                        4000 if checked else 2000,
+                    )
+                return
             tool = getattr(main_window, "cross_section_measurement_tool", None)
             if tool is None:
                 return
@@ -13323,7 +13416,13 @@ class AIRibbon(QWidget):
                 app = getattr(self.parent(), 'app', None)
             if app is None:
                 app = self.parent().parent().parent()
-            
+
+            # Native .lnt session: AI runs on the source points, mapped onto the
+            # .lnt, and writes its classes back natively (gui/lnt_ai_bridge.py).
+            from gui.lnt_ai_bridge import start_lnt_ai
+            if start_lnt_ai(app):
+                return
+
             # Check if LAZ file is loaded
             if not hasattr(app, 'data') or app.data is None:
                 QMessageBox.warning(

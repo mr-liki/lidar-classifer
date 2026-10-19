@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QComboBox, QHeaderView, QMessageBox, QDialog,
     QListWidget, QListWidgetItem, QLabel, QCheckBox, QDoubleSpinBox, QMenu,
-    QSizePolicy
+    QRadioButton, QButtonGroup, QSizePolicy
 )
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QTimer
 from PySide6.QtWidgets import QGraphicsOpacityEffect
@@ -67,6 +67,31 @@ def decode_classes(text):
         return data.get("from"), data.get("to")
     except Exception:
         return None, None
+
+
+# Pan is the only simple tool with a required mode. It is stored in the
+# Classes cell and applied while the Pan shortcut is armed (see
+# gui/global_shortcuts.py) by temporarily overriding app.panning_button.
+PAN_MODE_LABELS = {
+    "left": "Left - Click Pan",
+    "tap": "Tap - Tap Pan",
+}
+
+
+def pan_mode_label(mode):
+    return PAN_MODE_LABELS.get(mode, "")
+
+
+def encode_pan_mode(mode):
+    return json.dumps({"pan_mode": mode})
+
+
+def decode_pan_mode(text):
+    try:
+        mode = json.loads(text).get("pan_mode")
+    except Exception:
+        return None
+    return mode if mode in PAN_MODE_LABELS else None
 
 
 def shortcut_row_sort_key(modifier, key):
@@ -3802,9 +3827,14 @@ class ShortcutManager(QWidget):
                     continue
 
                 if tool in simple_tools:
-                    shortcuts[(mod, key_upper)] = {
-                        "tool": tool, "from": None, "to": None
-                    }
+                    loaded = {"tool": tool, "from": None, "to": None}
+                    if tool == "Pan":
+                        loaded["pan_mode"] = (
+                            entry.get("pan_mode")
+                            if entry.get("pan_mode") in PAN_MODE_LABELS
+                            else None
+                        )
+                    shortcuts[(mod, key_upper)] = loaded
                     print(f"      ✅ {mod}+{key_upper} → {tool}")
                 else:
                     from_cls = entry.get("from_classes")
@@ -3878,6 +3908,26 @@ class ShortcutManager(QWidget):
             t for t in SIMPLE_SHORTCUT_TOOLS
             if t != "Surface" and t not in DISPLAY_VISIBILITY_TOOLS
         )
+
+        if tool_text == "Pan":
+            existing = self.table.item(row, self.COL_CLASSES)
+            mode = (
+                decode_pan_mode(existing.data(Qt.UserRole))
+                if existing is not None else None
+            )
+            if mode is None:
+                item = QTableWidgetItem("Click/Double-click to configure Pan")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setData(Qt.UserRole, encode_pan_mode(None))
+                self.table.setItem(row, self.COL_CLASSES, item)
+                if not self._is_loading_shortcuts:
+                    self._open_pan_mode_for_row(row)
+                return
+            item = QTableWidgetItem(f"Pan: {pan_mode_label(mode)}")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setData(Qt.UserRole, encode_pan_mode(mode))
+            self.table.setItem(row, self.COL_CLASSES, item)
+            return
 
         if tool_text in no_config_tools:
             item = QTableWidgetItem("N/A")
@@ -4706,6 +4756,9 @@ class ShortcutManager(QWidget):
         tool_combo = self.table.cellWidget(row, self.COL_TOOL)
         tool = tool_combo.currentText() if tool_combo else ""
 
+        if tool == "Pan":
+            self._open_pan_mode_for_row(row)
+            return
         if (tool in SIMPLE_SHORTCUT_TOOLS
                 and tool != "Surface"
                 and tool not in DISPLAY_VISIBILITY_TOOLS):
@@ -4994,6 +5047,79 @@ class ShortcutManager(QWidget):
             item.setData(Qt.UserRole, encode_sync_preset(preset))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             print(f"✅ Saved SyncViews preset into row {row + 1}: {summary}")
+
+    def _open_pan_mode_for_row(self, row: int):
+        """Open the required Pan-mode picker (Left - Click / Tap - Tap)."""
+        cell = self.table.item(row, self.COL_CLASSES)
+        existing = (
+            decode_pan_mode(cell.data(Qt.UserRole)) if cell else None
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Configure Pan Shortcut")
+        dlg.setModal(True)
+        dlg.setStyleSheet(get_dialog_stylesheet())
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel("Choose the pan style for this shortcut:"))
+        layout.addSpacing(4)
+
+        left_btn = QRadioButton("Left - Click Pan\n(hold left button and drag to pan)")
+        tap_btn = QRadioButton("Tap - Tap Pan\n"
+                               "(tap left to start, view follows cursor, "
+                               "tap again / Esc to stop)")
+        group = QButtonGroup(dlg)
+        group.addButton(left_btn)
+        group.addButton(tap_btn)
+        if existing == "left":
+            left_btn.setChecked(True)
+        elif existing == "tap":
+            tap_btn.setChecked(True)
+        layout.addWidget(left_btn)
+        layout.addWidget(tap_btn)
+        layout.addSpacing(8)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setEnabled(existing is not None)
+        cancel_btn = QPushButton("Cancel")
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+
+        def _selection_changed():
+            ok_btn.setEnabled(
+                left_btn.isChecked() or tap_btn.isChecked()
+            )
+
+        group.buttonToggled.connect(_selection_changed)
+
+        def _accept():
+            mode = "left" if left_btn.isChecked() else (
+                "tap" if tap_btn.isChecked() else None
+            )
+            if mode is None:
+                QMessageBox.warning(
+                    self, "Pan mode required",
+                    "Please choose one of the pan styles before continuing."
+                )
+                return
+            dlg.accept()
+
+        ok_btn.clicked.connect(_accept)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec() == QDialog.Accepted:
+            mode = "left" if left_btn.isChecked() else "tap"
+            item = self.table.item(row, self.COL_CLASSES)
+            if item is None:
+                item = QTableWidgetItem()
+                self.table.setItem(row, self.COL_CLASSES, item)
+            item.setText(f"Pan: {pan_mode_label(mode)}")
+            item.setData(Qt.UserRole, encode_pan_mode(mode))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            print(f"✅ Saved Pan mode into row {row + 1}: {pan_mode_label(mode)}")
 
     def _capture_display_mode_preset(self, payload: dict):
         row = self._pending_display_mode_row
@@ -5634,8 +5760,28 @@ class ShortcutManager(QWidget):
                     }
                     continue
                 if tool in simple_tools:
-                    shortcuts[(mod, key)] = {"tool": tool, "from": None, "to": None}
-                    print(f"   Row {row}: {mod}+{key} → {tool}")
+                    if tool == "Pan":
+                        cell = self.table.item(row, self.COL_CLASSES)
+                        pan_mode = (
+                            decode_pan_mode(cell.data(Qt.UserRole))
+                            if cell else None
+                        )
+                        if pan_mode is None:
+                            QMessageBox.warning(
+                                self, "Pan mode missing",
+                                f"Row {row + 1} uses Pan but has no pan mode."
+                                "\nDouble-click the Classes cell and choose "
+                                "'Left - Click Pan' or 'Tap - Tap Pan'."
+                            )
+                            return
+                        shortcuts[(mod, key)] = {
+                            "tool": "Pan", "from": None, "to": None,
+                            "pan_mode": pan_mode,
+                        }
+                        print(f"   Row {row}: {mod}+{key} → Pan ({pan_mode})")
+                    else:
+                        shortcuts[(mod, key)] = {"tool": tool, "from": None, "to": None}
+                        print(f"   Row {row}: {mod}+{key} → {tool}")
                 else:
                     cell = self.table.item(row, self.COL_CLASSES)
                     from_cls, to_cls = decode_classes(cell.data(Qt.UserRole)) if cell else (None, None)
@@ -5914,9 +6060,14 @@ class ShortcutManager(QWidget):
                         continue
 
                     if tool in simple_tools:
-                        shortcuts[(mod, key_upper)] = {
-                            "tool": tool, "from": None, "to": None
-                        }
+                        loaded = {"tool": tool, "from": None, "to": None}
+                        if tool == "Pan":
+                            loaded["pan_mode"] = (
+                                entry.get("pan_mode")
+                                if entry.get("pan_mode") in PAN_MODE_LABELS
+                                else None
+                            )
+                        shortcuts[(mod, key_upper)] = loaded
                         print(f"   ✅ {mod}+{key_upper} → {tool}")
                     else:
                         from_cls = entry.get("from_classes")
@@ -6076,9 +6227,26 @@ class ShortcutManager(QWidget):
                         self.table.setItem(row, self.COL_CLASSES, item)
 
                     elif tool in SIMPLE_SHORTCUT_TOOLS and tool != "Surface":
-                        item = QTableWidgetItem("N/A")
+                        if tool == "Pan":
+                            pan_mode = entry.get("pan_mode")
+                            if pan_mode in PAN_MODE_LABELS:
+                                item = QTableWidgetItem(
+                                    f"Pan: {pan_mode_label(pan_mode)}"
+                                )
+                                item.setData(
+                                    Qt.UserRole, encode_pan_mode(pan_mode)
+                                )
+                            else:
+                                item = QTableWidgetItem(
+                                    "Click/Double-click to configure Pan"
+                                )
+                                item.setData(
+                                    Qt.UserRole, encode_pan_mode(None)
+                                )
+                        else:
+                            item = QTableWidgetItem("N/A")
+                            item.setData(Qt.UserRole, encode_classes(None, None))
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        item.setData(Qt.UserRole, encode_classes(None, None))
                         self.table.setItem(row, self.COL_CLASSES, item)
 
                     else:
@@ -6153,7 +6321,10 @@ class ShortcutManager(QWidget):
                     }
                 elif tool in SIMPLE_SHORTCUT_TOOLS and tool != "Surface":
                     # Simple non-classification tools have no preset payload.
-                    pass
+                    if tool == "Pan" and cell:
+                        entry["pan_mode"] = decode_pan_mode(
+                            cell.data(Qt.UserRole)
+                        )
                 else:
                     if cell:
                         from_cls, to_cls = decode_classes(cell.data(Qt.UserRole))

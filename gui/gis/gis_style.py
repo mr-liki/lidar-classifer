@@ -143,5 +143,27 @@ def apply_gis_dialog_style(widget: QWidget) -> QWidget:
 
 
 def apply_gis_dock_style(widget: QWidget) -> QWidget:
-    return apply_gis_style(widget)
+    apply_gis_style(widget)
+    if widget.objectName() == "GisOCC":
+        # Retain the compact GIS layout while following the application theme.
+        import re
+        from gui.theme_manager import ThemeColors as c
+        roles = {
+            "bg_secondary": ("#e9edf2", "#f4f6f8", "#e3e9ee"),
+            "bg_input": ("#ffffff",),
+            "bg_tertiary": ("#f3f6f8", "#e5e8ea"),
+            "text_secondary": ("#53616c",),
+            "text_muted": ("#8b9298",),
+            "dialog_selection": ("#b8daf4", "#c4dbea", "#d3e5f2"),
+            "border_light": ("#9ba9b5", "#929da6", "#d8dee3", "#aab7c1", "#8798a5", "#a6b2bc", "#a8b3bc"),
+            "accent": ("#648eae", "#779bb5"),
+            "bg_button_hover": ("#dceaf5", "#e7f1f8"),
+            "bg_button": ("#edf1f4", "#edf0f2", "#ffffe1"),
+            "text_primary": ("#1d2730", "#152b3b", "#17354a", "#111111", "#202020"),
+            "border": ("#707070",),
+        }
+        colors = {value: c.get(role) for role, values in roles.items() for value in values}
+        widget.setStyleSheet(re.sub(r"#[0-9a-fA-F]{6}",
+                                   lambda match: colors.get(match[0].lower(), match[0]), _GIS_QSS))
+    return widget
 

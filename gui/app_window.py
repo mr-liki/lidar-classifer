@@ -1649,23 +1649,27 @@ class NakshaApp(QMainWindow):
         self._update_point_sync_footer_icon()
         self._update_point_sync_footer_state_visual(False)
 
-        # 3. SNT layer pick toggle + result text
+        # 3. Identify Layer toggle (click the name directly) + result text
         self.snt_layer_pick_footer_btn = QToolButton(self.status)
         self.snt_layer_pick_footer_btn.setObjectName("statusSntLayerPickButton")
         self.snt_layer_pick_footer_btn.setCheckable(True)
         self.snt_layer_pick_footer_btn.setAutoRaise(True)
-        self.snt_layer_pick_footer_btn.setFixedSize(22, 20)
-        self.snt_layer_pick_footer_btn.setIconSize(QSize(16, 16))
+        self.snt_layer_pick_footer_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.snt_layer_pick_footer_btn.setIconSize(QSize(14, 14))
+        self.snt_layer_pick_footer_btn.setText("Identify Layer")
         self.snt_layer_pick_footer_btn.setCursor(Qt.PointingHandCursor)
         self.snt_layer_pick_footer_btn.setFocusPolicy(Qt.NoFocus)
-        self.snt_layer_pick_footer_btn.setToolTip("Identify layer on main-view click")
+        self.snt_layer_pick_footer_btn.setToolTip(
+            "Click to activate layer identification, then click features in main view. Click again or press Esc to deactivate."
+        )
         self.snt_layer_pick_footer_btn.toggled.connect(self._toggle_snt_layer_pick_from_footer)
         self.status.addPermanentWidget(self.snt_layer_pick_footer_btn)
 
-        self.snt_layer_pick_footer_label = QLabel("Layer: -")
+        self.snt_layer_pick_footer_label = QLabel()
         self.snt_layer_pick_footer_label.setObjectName("sntLayerPickFooterLabel")
         self.snt_layer_pick_footer_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.snt_layer_pick_footer_label.setMinimumWidth(210)
+        self.snt_layer_pick_footer_label.setVisible(False)
         self.status.addPermanentWidget(self.snt_layer_pick_footer_label)
 
         self._update_snt_layer_pick_footer_icon()
@@ -3234,8 +3238,8 @@ class NakshaApp(QMainWindow):
     def _update_point_sync_footer_state_visual(self, enabled):
         from gui.theme_manager import ThemeColors
 
-        accent = ThemeColors.get("accent_alt")
-        accent_hover = ThemeColors.get("accent_hover")
+        accent = '#2196f3'
+        accent_hover = '#1976d2'
         button_hover = ThemeColors.get("bg_button_hover")
         button_idle = ThemeColors.get("bg_button")
         border = ThemeColors.get("border")
@@ -3294,13 +3298,10 @@ class NakshaApp(QMainWindow):
     def _update_snt_layer_pick_footer_state_visual(self, enabled):
         from gui.theme_manager import ThemeColors
 
-        accent = ThemeColors.get("accent")
-        accent_hover = ThemeColors.get("accent_hover")
-        button_hover = ThemeColors.get("bg_button_hover")
-        button_idle = ThemeColors.get("bg_button")
-        border = ThemeColors.get("border")
-        border_light = ThemeColors.get("border_light")
-        is_light = ThemeColors.is_light()
+        accent = ThemeColors.get("accent") or "#007acc"
+        accent_hover = ThemeColors.get("accent_hover") or "#0098ff"
+        text_on_active = ThemeColors.get("text_on_active") or "#FFFFFF"
+        text_primary = ThemeColors.get("text_primary") or "#DDDDDD"
 
         if hasattr(self, "snt_layer_pick_footer_btn"):
             if enabled:
@@ -3308,9 +3309,12 @@ class NakshaApp(QMainWindow):
                     QToolButton {{
                         border: 1px solid {accent};
                         border-radius: 4px;
-                        padding: 0px;
+                        padding: 0px 8px;
                         margin: 0 2px;
                         background: {accent};
+                        color: {text_on_active};
+                        font-size: 11px;
+                        font-weight: 600;
                     }}
                     QToolButton:hover {{
                         background: {accent_hover};
@@ -3321,32 +3325,34 @@ class NakshaApp(QMainWindow):
                         border-color: {accent};
                     }}
                 """)
-                self.snt_layer_pick_footer_btn.setToolTip("Layer identifier is enabled")
+                self.snt_layer_pick_footer_btn.setToolTip(
+                    "Layer identifier is enabled - click features in main view. Click again or press Esc to deactivate."
+                )
                 self.snt_layer_pick_footer_btn.setStatusTip("Layer identifier is enabled")
             else:
-                idle_bg = button_idle if is_light else ThemeColors.get("bg_secondary")
-                idle_border = border if is_light else border_light
-                hover_bg = button_hover if is_light else ThemeColors.get("bg_tertiary")
-                hover_border = border_light if is_light else ThemeColors.get("text_secondary")
-
                 self.snt_layer_pick_footer_btn.setStyleSheet(f"""
                     QToolButton {{
-                        border: 1px solid {idle_border};
+                        border: 1px solid transparent;
                         border-radius: 4px;
-                        padding: 0px;
+                        padding: 0px 8px;
                         margin: 0 2px;
-                        background: {idle_bg};
+                        background: transparent;
+                        color: {text_primary};
+                        font-size: 11px;
+                        font-weight: 600;
                     }}
                     QToolButton:hover {{
-                        background: {hover_bg};
-                        border-color: {hover_border};
+                        background: rgba(255, 255, 255, 0.08);
+                        border-color: rgba(255, 255, 255, 0.12);
                     }}
                     QToolButton:pressed {{
-                        background: {hover_bg};
+                        background: rgba(255, 255, 255, 0.14);
                         border-color: {accent};
                     }}
                 """)
-                self.snt_layer_pick_footer_btn.setToolTip("Layer identifier is disabled")
+                self.snt_layer_pick_footer_btn.setToolTip(
+                    "Click to activate layer identification, then click features in main view. Click again or press Esc to deactivate."
+                )
                 self.snt_layer_pick_footer_btn.setStatusTip("Layer identifier is disabled")
 
         self._update_snt_layer_pick_footer_icon()
@@ -3374,9 +3380,10 @@ class NakshaApp(QMainWindow):
             return
 
         if not layer_name:
-            self.snt_layer_pick_footer_label.setText("Layer: -")
-            self.snt_layer_pick_footer_label.setToolTip("Enable layer identifier and click features in main view")
+            self.snt_layer_pick_footer_label.setText("")
+            self.snt_layer_pick_footer_label.setToolTip("")
             self.snt_layer_pick_footer_label.setStatusTip("No layer selected")
+            self.snt_layer_pick_footer_label.setVisible(False)
             return
 
 
@@ -3396,6 +3403,7 @@ class NakshaApp(QMainWindow):
         self.snt_layer_pick_footer_label.setText(display)
         self.snt_layer_pick_footer_label.setToolTip(display)
         self.snt_layer_pick_footer_label.setStatusTip(display)
+        self.snt_layer_pick_footer_label.setVisible(True)
 
     def _toggle_point_sync_from_footer(self, enabled):
         if not hasattr(self, "point_sync_tool") or self.point_sync_tool is None:
@@ -3436,11 +3444,11 @@ class NakshaApp(QMainWindow):
 
         if enabled:
             self.snt_layer_pick_tool.activate()
-            self.statusBar().showMessage("🎯 Layer identifier enabled (click SNT, DXF, or GIS features in main view)", 2500)
+            self.statusBar().showMessage("🎯 Identify Layer activated (click SNT, DXF, or GIS features in main view). Click again or press Esc to deactivate.", 2500)
         else:
             self.snt_layer_pick_tool.deactivate()
             self._set_snt_layer_pick_footer_text(None, None, None)
-            self.statusBar().showMessage("🎯 Layer identifier disabled", 2000)
+            self.statusBar().showMessage("🎯 Identify Layer deactivated", 2000)
 
     def open_global_settings(self):
         """Open the consolidated global settings dialog."""
@@ -4256,6 +4264,13 @@ class NakshaApp(QMainWindow):
 
     def _sync_tools_for_ribbon_tab(self, ribbon_name):
         """Keep all tool tabs mutually exclusive when switching tabs."""
+        if ribbon_name != "draw":
+            # The native Vulkan layer is independent of digitizer.active_tool.
+            # Disarm it too, or it will keep capturing clicks on other tabs.
+            from gui.native_draw import get_native_draw
+            native = get_native_draw(self)
+            if native is not None and native.active():
+                native.cancel()
         if ribbon_name == "draw":
             self._enter_draw_tab_mode()
             self._clear_ribbon_active_buttons("classify")
@@ -7172,6 +7187,15 @@ class NakshaApp(QMainWindow):
         self.data["_layer_crs_info"] = list(result.get("layer_info_list") or [])
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
+        # A native canvas promoted while nothing was loaded (measure tools,
+        # SNT-only attach) must not cover this VTK-rendered cloud: hand the
+        # viewport back to VTK. No-op for .lnt sessions and resident linework.
+        try:
+            from gui.lnt_open import take_back_viewport_for_vtk_load
+            take_back_viewport_for_vtk_load(self)
+        except Exception as _e:
+            print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
+
         # Track whether this load was class-filtered so auto-save skips the file.
         _b = getattr(self, "_batch_import_options_last", None)
         self._loaded_with_class_filter = bool(
@@ -7835,6 +7859,14 @@ class NakshaApp(QMainWindow):
         # Set main data only after coordinates are in project space.
         self.data = lidar_data
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
+
+        # This is a VTK-side load: a native canvas promoted for empty-session
+        # tools must not cover it - hand the viewport back to VTK.
+        try:
+            from gui.lnt_open import take_back_viewport_for_vtk_load
+            take_back_viewport_for_vtk_load(self)
+        except Exception as _e:
+            print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
 
         # Track whether this load was class-filtered so auto-save skips the file.
         _io = lidar_data.get("import_options") or {}
@@ -15078,6 +15110,7 @@ class NakshaApp(QMainWindow):
         # =========================
         measure_ribbon = self.ribbon_manager.ribbons["measure"]
         measure_ribbon.measure_tool_selected.connect(self.activate_measurement_tool)
+        measure_ribbon.measure_tool_deactivated.connect(self.deactivate_measurement_tool)
         measure_ribbon.clear_measurements.connect(self.clear_all_measurements)
 
         # =========================
@@ -16814,10 +16847,17 @@ class NakshaApp(QMainWindow):
         from gui.native_shortcuts import (cancel_native_measurements,
                                           execute_native_shortcut)
         if execute_native_shortcut(self, tool_name):
+            # Native Vulkan owns the measure gesture: keep the legacy VTK tool
+            # fully stood down (observers removed), never merely paused.
             _mt = getattr(self, "measurement_tool", None)
-            if _mt is not None and getattr(_mt, "active", False):
+            if _mt is not None and (getattr(_mt, "active", False)
+                                    or getattr(_mt, "is_measuring", False)
+                                    or getattr(_mt, "_observer_tags", None)):
                 try:
-                    _mt.deactivate()
+                    if hasattr(_mt, "deactivate_completely"):
+                        _mt.deactivate_completely()
+                    else:
+                        _mt.deactivate()
                 except Exception as _e:
                     print(f"⚠️ Legacy measurement deactivate failed: {_e}")
             return
@@ -16885,6 +16925,32 @@ class NakshaApp(QMainWindow):
         }.get(tool_name)
         if status_message:
             self.statusBar().showMessage(status_message, 5000)
+
+    def deactivate_measurement_tool(self, tool_name):
+        """Toggle-off from the Measure ribbon: stand one tool down.
+
+        Mirrors activate_measurement_tool for the unchecked-button direction.
+        Only the named Line/Path/Block/Grid tool is cancelled, so the XS
+        button and already-finished measurements are left untouched. The
+        ribbon highlight clears itself through the same state sync the tool
+        uses when it deactivates on its own (Esc, another tool taking over).
+        """
+        from gui.native_shortcuts import deactivate_native_measurement
+        try:
+            deactivate_native_measurement(self, tool_name)
+        except Exception as _e:
+            print(f"⚠️ Native measurement deactivate failed: {_e}")
+        tool = getattr(self, "measurement_tool", None)
+        if (tool is not None and getattr(tool, "active", False)
+                and getattr(tool, "mode", None) == tool_name):
+            try:
+                if hasattr(tool, "deactivate_completely"):
+                    tool.deactivate_completely()
+                else:
+                    tool.deactivate()
+            except Exception as _e:
+                print(f"⚠️ Measurement deactivate failed: {_e}")
+        self.statusBar().showMessage("📏 Measurement tool deactivated", 2500)
 
     def clear_all_measurements(self):
         """Clear all measurement lines and labels — main view AND cross-section."""
@@ -17562,6 +17628,14 @@ class NakshaApp(QMainWindow):
                     "classification": tile_data["classification"]
                 }
                 self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
+
+                # VTK-side tile load: hand a promoted empty-session native
+                # canvas back to VTK so the cloud is visible.
+                try:
+                    from gui.lnt_open import take_back_viewport_for_vtk_load
+                    take_back_viewport_for_vtk_load(self)
+                except Exception as _e:
+                    print(f"⚠️ VTK-load viewport hand-back skipped: {_e}")
                 
                 # Track whether this load was class-filtered so auto-save skips the file.
                 _io = tile_data.get("import_options") or {}

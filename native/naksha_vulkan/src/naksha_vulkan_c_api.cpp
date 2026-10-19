@@ -1833,6 +1833,8 @@ NKV_API int nkv_render(NkvHandle handle) {
             // surface is deliberately NOT recorded here - this mode draws no
             // mesh at all, which is the entire point of it.
             inst->renderer.RecordInstantShadedPass(cmd, slot, inst->pointCloud);
+            // Keep native overlay lines above the shaded fullscreen result.
+            inst->vector.Record(cmd, slot);
         } else {
             if (inst->pointCloud.IsLoaded() && inst->streamingSurface != 1) {
                 inst->pointCloud.Record(cmd, slot);

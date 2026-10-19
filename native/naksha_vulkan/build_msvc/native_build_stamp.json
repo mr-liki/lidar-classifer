@@ -1,10 +1,10 @@
 {
-  "created": "2026-10-17 18:27:58",
+  "created": "2026-10-19 16:36:39",
   "dll": "native/naksha_vulkan/build_msvc/naksha_vulkan.dll",
   "dll_exports": 140,
-  "dll_sha256": "982c4bfc39521e865e1311ca4f66beed073e1c8214376f1247252b42a69717e0",
+  "dll_sha256": "6f62e7c237ff495ae0f2fc01ebd53a9c94c8fd040bbc675f756447d867dfc2b8",
   "missing_exports": [],
-  "source_digest": "810e2b1de7e35c4857897cbdfbea9c3d6a99b06a71fdf3df67ea94b5d0ea449d",
+  "source_digest": "cb029748f26661eb58c47059a6c834e90abde813a14ae8d589b6a8fab58e4615",
   "source_files": 72,
-  "source_newest": "src/naksha_vulkan_c_api.cpp"
+  "source_newest": "src/Renderer.cpp"
 }

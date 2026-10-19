@@ -3588,6 +3588,26 @@ class _VulkanSurfaceWidget(_QWidget):
         self._panning = False
         self._right_press_pos = None
         self._right_dragged = False
+        self._left_press_pos = None
+        self._left_dragged = False
+        self._draw_pressed_button = None
+        # Native placement previews must update while the pointer moves with
+        # no mouse button down. The LNT event filter already does this itself.
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+
+    def _active_plan_draw(self):
+        """Ordinary Vulkan SNT/LAZ Draw, not the separate LNT input filter."""
+        owner = self._owner
+        if owner is None or not owner.owns_main_camera():
+            return None
+        app = getattr(owner, '_app', None)
+        if getattr(app, '_lnt_main_view', None) is not None:
+            return None
+        view = getattr(owner, '_plan_draw_view', None)
+        drawing = getattr(view, 'drawing', None)
+        return drawing if drawing is not None and drawing.active() else None
 
     _CLICK_SLOP_PX = 4.0
 
@@ -3622,11 +3642,32 @@ class _VulkanSurfaceWidget(_QWidget):
         except Exception:
             pass
         self._last_pos = self._event_pos(event)
+        drawing = self._active_plan_draw()
+        # A Draw gesture belongs to Draw, not the camera rig. Preserve middle
+        # and Shift+Left pan, which are the established navigation gestures.
+        selecting = bool(drawing is not None and drawing.tool == 'select'
+                         and getattr(drawing, '_selection_bridge', None) is not None)
+        is_navigation = (event.button() == Qt.MiddleButton or
+                         (event.button() == Qt.LeftButton and
+                          bool(event.modifiers() & Qt.ShiftModifier) and not selecting))
+        if drawing is not None and not is_navigation:
+            if drawing.press(self._last_pos, event.button()):
+                self._draw_pressed_button = event.button()
+                self._panning = False
+                self._right_press_pos = None
+                self._right_dragged = False
+                event.accept()
+                return
         # Right press is a click candidate (grid/block context menu) until the
         # cursor travels past _CLICK_SLOP_PX; see mouseReleaseEvent.
         self._right_press_pos = (
             self._last_pos if event.button() == Qt.MouseButton.RightButton else None)
         self._right_dragged = False
+        # A plain left press is a click candidate too (Identify Layer pick on
+        # the promoted viewport); drag cancels it.
+        self._left_press_pos = (
+            self._last_pos if event.button() == Qt.MouseButton.LeftButton else None)
+        self._left_dragged = False
         self._panning = event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton
             and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -3634,6 +3675,17 @@ class _VulkanSurfaceWidget(_QWidget):
 
     def mouseMoveEvent(self, event):
         pos = self._event_pos(event)
+        drawing = self._active_plan_draw()
+        selecting = bool(drawing is not None and drawing.tool == 'select'
+                         and getattr(drawing, '_selection_bridge', None) is not None)
+        navigation = (bool(event.buttons() & Qt.MiddleButton) or
+                      (bool(event.buttons() & Qt.LeftButton) and
+                       bool(event.modifiers() & Qt.ShiftModifier) and not selecting))
+        if drawing is not None and not navigation:
+            if drawing.move(pos, event.buttons()):
+                self._last_pos = pos
+                event.accept()
+                return
         last, self._last_pos = self._last_pos, pos
         if last is None:
             return
@@ -3648,6 +3700,11 @@ class _VulkanSurfaceWidget(_QWidget):
                 self._last_pos = last
                 return
             self._right_dragged = True
+        left_press = getattr(self, "_left_press_pos", None)
+        if left_press is not None and not self._left_dragged and (
+                abs(pos.x() - left_press.x()) > self._CLICK_SLOP_PX
+                or abs(pos.y() - left_press.y()) > self._CLICK_SLOP_PX):
+            self._left_dragged = True
         rig = self._rig()
         if rig is None:
             return
@@ -3677,17 +3734,42 @@ class _VulkanSurfaceWidget(_QWidget):
         self._owner._note_surface_interaction(True)
 
     def mouseReleaseEvent(self, event):
+        if self._draw_pressed_button == event.button():
+            drawing = self._active_plan_draw()
+            self._draw_pressed_button = None
+            self._last_pos = None
+            self._panning = False
+            self._right_press_pos = None
+            self._right_dragged = False
+            if drawing is not None:
+                drawing.release(self._event_pos(event), event.button())
+            event.accept()
+            return
         press = getattr(self, "_right_press_pos", None)
         is_right_click = (
             press is not None
             and event.button() == Qt.MouseButton.RightButton
             and not getattr(self, "_right_dragged", False)
         )
+        is_left_click = (
+            event.button() == Qt.MouseButton.LeftButton
+            and getattr(self, "_left_press_pos", None) is not None
+            and not getattr(self, "_left_dragged", False)
+        )
         self._last_pos = None
         self._panning = False
         self._right_press_pos = None
         self._right_dragged = False
+        self._left_press_pos = None
+        self._left_dragged = False
         event.accept()
+        if is_left_click and self._owner is not None:
+            pos = self._event_pos(event)
+            x, y = float(pos.x()), float(pos.y())
+            w, h = max(1, self.width()), max(1, self.height())
+            QTimer.singleShot(
+                0, lambda: self._owner.dispatch_surface_left_click(x, y, w, h))
+            return
         if is_right_click and self._owner is not None:
             pos = self._event_pos(event)
             x, y = float(pos.x()), float(pos.y())
@@ -3696,6 +3778,21 @@ class _VulkanSurfaceWidget(_QWidget):
             # opens its own loop.
             QTimer.singleShot(
                 0, lambda: self._owner.dispatch_surface_right_click(x, y, w, h))
+
+    def mouseDoubleClickEvent(self, event):
+        drawing = self._active_plan_draw()
+        if (drawing is not None and event.button() == Qt.LeftButton and
+                drawing.double_click(self._event_pos(event), event.button())):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        drawing = self._active_plan_draw()
+        if drawing is not None and drawing.key(event.key()):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         # Zoom has exactly ONE owner: the VTK main camera.
@@ -6969,6 +7066,25 @@ class AppRenderBackendOwner:
             self._log.exception("surface right-click dispatch failed (ignored)")
             return False
 
+    def dispatch_surface_left_click(self, x: float, y: float, w: float, h: float) -> bool:
+        """A plain left-click (no drag) on the Vulkan main viewport.
+
+        The VTK interactor never sees it, so click-to-identify tools are
+        routed natively: the active footer Identify Layer tool hits the GPU
+        vector arena in world coordinates. Returns True when consumed."""
+        try:
+            tool = getattr(self._app, "snt_layer_pick_tool", None)
+            if tool is None or not getattr(tool, "active", False) or not getattr(tool, "_surface_dispatch", False):
+                return False
+            hit = self.surface_to_world(x, y, w, h)
+            if hit is None:
+                return False
+            world_xy, upp = hit
+            return bool(tool.on_surface_click(world_xy, upp))
+        except Exception:
+            self._log.exception("surface left-click dispatch failed (ignored)")
+            return False
+
     def main_vtk_adoption_blocked(self) -> bool:
         """NAKSHA_DISABLE_MAIN_VTK_CAMERA=1: the VTK main camera must NOT feed
         MainCamera2D / Vulkan (validation switch for VTK independence)."""
@@ -7619,6 +7735,17 @@ class AppRenderBackendOwner:
                 self._log.exception("Vulkan resize failed (ignored)")
 
     def shutdown(self) -> None:
+        # The ordinary SNT/LAZ Draw overlay is a Qt tool window. Close it
+        # before destroying the Vulkan widget and native render backend.
+        plan_view = getattr(self, '_plan_draw_view', None)
+        if plan_view is not None:
+            drawing = getattr(plan_view, 'drawing', None)
+            if drawing is not None:
+                try:
+                    drawing.shutdown()
+                except Exception:
+                    self._log.exception('native Draw overlay shutdown failed')
+            self._plan_draw_view = None
         try:
             self._remove_camera_sync()
         except Exception:
