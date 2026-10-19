@@ -118,6 +118,8 @@ class NativeDraw:
         self.selected = None
         self._selected_native_ref = None
         self._selected_imported = None
+        self._hover_selected_native_ref = None
+        self._hover_pick_at = 0.0
         self._selection_scene_token = None
         self._parallel_source = None
         self._centerline_first = None
@@ -193,9 +195,16 @@ class NativeDraw:
             if getattr(self._selection_bridge,'_intersect_mode',False):
                 self._selection_bridge.exit_intersect_mode(commit=True)
         self.cancel(stand_down=False)
+        self._hover_selected_native_ref = None
+        self._hover_pick_at = 0.0
         if tool != 'select' and self._selection_bridge is not None:
             self._selection_bridge._active = False
             self._selection_bridge = None
+            # Tool switch must also clear stale cyan in the separate
+            # Measure Line/Path overlay (Draw's overlay was just reset).
+            repaint_measure = getattr(measurement, '_paint', None)
+            if callable(repaint_measure):
+                repaint_measure()
         self.tool = tool
         # A Select action can choose a native drawing or an imported SNT line.
         # Parallel may reuse that selection; Centerline chooses two sources.
@@ -1341,8 +1350,26 @@ class NativeDraw:
     def move(self, pos, buttons=Qt.NoButton):
         if not self.active() or buttons & Qt.MiddleButton:
             return False
-        if self.tool=='select' and self._selection_bridge is not None:
-            return self._selection_bridge.move(pos,buttons)
+        if self.tool == 'select':
+            if self._selection_bridge is not None:
+                return self._selection_bridge.move(pos, buttons)
+            # Draw > Select also has hover feedback without a selection panel.
+            # Limit expensive native-DRAW picks to 20 Hz; never scan the SNT or
+            # LiDAR entity stores just to color a hovered object.
+            now = time.monotonic()
+            if now - getattr(self, '_hover_pick_at', 0.) < .05:
+                return True
+            self._hover_pick_at = now
+            try:
+                p = self.canvas.section_at(pos.x(), pos.y())
+            except RuntimeError:
+                return True
+            hit = self._pick_editable_draw(p)
+            ref = hit['drawing'] if hit is not None else None
+            if ref is not getattr(self, '_hover_selected_native_ref', None):
+                self._hover_selected_native_ref = ref
+                self._paint()
+            return True
         if self._legacy_tool_dialog is not None and self.tool in ('parallel', 'centerline'):
             # Avoid repainting millions of points on every cursor move.
             return True
@@ -1601,6 +1628,7 @@ class NativeDraw:
         self._last_pointer_pos = None
         self._angle_sticky = False
         self._snap_target = None
+        self._hover_selected_native_ref = None
         self._freehand_before_drag = None
         self._freehand_undo_strokes.clear()
         self._freehand_redo_strokes.clear()
@@ -1679,6 +1707,12 @@ class NativeDraw:
         chosen = (bridge.selection_manager._selected if bridge is not None else {})
         hidden_in_intersect = (bridge._intersect_source_ids if bridge is not None
                                and bridge._intersect_mode else set())
+        hovered = (getattr(bridge, '_hover_feature', None) if bridge is not None
+                   else None)
+        hovered_ref = (hovered.get('drawing') if hovered is not None
+                       and hovered.get('source') == 'native' else
+                       getattr(self, '_hover_selected_native_ref', None)
+                       if bridge is None and self.tool == 'select' else None)
         for i, drawing in enumerate(self.drawings):
             if id(drawing) in hidden_in_intersect:
                 continue  # VTK-style overlay replaces original with split pieces.
@@ -1688,6 +1722,10 @@ class NativeDraw:
             data.update(drawing)
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
                                 else i == self.selected and drawing is self._selected_native_ref)
+            # Only editable native Draw objects get cyan. Block/cell geometry
+            # and imported SNT linework retain their existing special colors.
+            data['highlight_scope'] = 'draw' if editable_draw(drawing) else None
+            data['hovered'] = editable_draw(drawing) and drawing is hovered_ref
             data['show_vertices'] = bool(drawing.get('type') != 'circle' and (
                 self.tool in ('movevertex','vertex','deletevertex') or (
                 bridge is not None and getattr(bridge,'_vertex_display',False)
@@ -1752,7 +1790,9 @@ class NativeDraw:
                                 'selected':True,'width':3}))
         if self._selection_bridge is not None:
             for feat in self._selection_bridge.highlight_features():
-                if feat['source'] in ('snt','measure'):
+                if feat['source'] == 'snt':
+                    # SNT text has a separate read-only outline. Measure
+                    # Line/Path highlight in their own overlay, not here.
                     shapes.append(('drawing',feat['coords'],
                                    {'type':'point' if len(feat['coords'])==1 else 'polyline',
                                     'selected':True,'width':3}))

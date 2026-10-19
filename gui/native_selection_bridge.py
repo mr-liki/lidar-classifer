@@ -9,6 +9,7 @@ and never touches the VTK camera or LiDAR point buffers.
 from __future__ import annotations
 
 import math
+import time
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 from gui.native_selection_targets import editable_draw, text_anchor, text_bounds, box_overlap
@@ -80,9 +81,15 @@ class NativeSelectionManager(QObject):
     def count(self):
         return len(self._prune())
 
+    def _repaint(self):
+        self.controller.draw._paint()
+        # The Measure overlay is a different Qt window/layer. Trigger it as
+        # well so selected/unselected Line and Path strokes change in place.
+        self.controller._repaint_measure_overlay()
+
     def clear(self, emit=True):
         self._selected.clear()
-        self.controller.draw._paint()
+        self._repaint()
         if emit:self.selection_changed.emit(0)
 
     def apply(self, features, mode='new'):
@@ -109,7 +116,7 @@ class NativeSelectionManager(QObject):
             self.controller.message(f'Selection capped at {self.MAX_BULK:,} elements for responsiveness')
             old=dict(list(old.items())[:self.MAX_BULK])
         self._selected=old
-        self.controller.draw._paint()
+        self._repaint()
         self.selection_changed.emit(len(old))
 
     def select_all(self,predicate=None):
@@ -155,6 +162,8 @@ class NativeSelectionController(QObject):
         self._intersect_scene_token=None
         self._start=None
         self._hover=None
+        self._hover_feature=None
+        self._hover_pick_at=0.
         self._gesture=[]
         self._drag_origin=None
         self._offset_origin=None
@@ -202,11 +211,35 @@ class NativeSelectionController(QObject):
     def set_enclose_mode(self, mode):
         self._enclose_mode=mode
 
+    def _repaint_measure_overlay(self):
+        measurement = getattr(getattr(self.draw, 'view', None), 'measurement', None)
+        repaint = getattr(measurement, '_paint', None)
+        if callable(repaint):
+            repaint()
+
+    def _set_hover_feature(self, feature):
+        old = self._hover_feature
+        old_key = old.get('key') if old is not None else None
+        new_key = feature.get('key') if feature is not None else None
+        if old_key == new_key:
+            return
+        self._hover_feature = feature
+        if getattr(self.draw, '_selection_bridge', None) is self:
+            self.draw._paint()
+        if ((old is not None and old.get('source') == 'measure') or
+                (feature is not None and feature.get('source') == 'measure')):
+            self._repaint_measure_overlay()
+
     def _reset_gesture(self):
         self._start=self._hover=self._drag_origin=self._offset_origin=None
+        old_hover = self._hover_feature
+        self._hover_feature=None
+        self._hover_pick_at=0.
         self._gesture=[]
         if getattr(self.draw,'_selection_bridge',None) is self:
             self.draw._paint()
+        if old_hover is not None and old_hover.get('source') == 'measure':
+            self._repaint_measure_overlay()
 
     @staticmethod
     def _selection_modifier():
@@ -428,16 +461,20 @@ class NativeSelectionController(QObject):
             return True
         if self._method=='individual':
             hit=self._pick_editable(p)
+            self._set_hover_feature(hit)
             mode=self._selection_modifier()
             if self._intersect_mode and mode=='new':mode='add'
             self.selection_manager.apply([hit] if hit else [],mode)
         elif self._method=='snt_text':
+            self._set_hover_feature(None)
             # VTK SNT Text uses a *dragged rectangle*. A click without a
             # meaningful drag still picks the nearest visible text label.
             self._start=p
         elif self._method=='shape':
+            self._set_hover_feature(None)
             self._gesture.append(p)
         elif self._method in ('block','cline'):
+            self._set_hover_feature(None)
             if self._start is None:
                 self._start=p
             elif self._method=='cline':
@@ -456,8 +493,17 @@ class NativeSelectionController(QObject):
                     self._intersect_hovered_part=hovered
                     self.draw._paint()
             return True
-        # Idle hover does not need a Qt overlay repaint, which is important
-        # when a huge SNT is resident in GPU vector buffers.
+        if (self._method in ('individual', 'block', 'shape', 'cline')
+                and not (self._gesture or self._start is not None or
+                         self._offset_origin is not None or self._move_mode or self._copy_mode)):
+            # Hover picks target ONLY editable Draw + completed Measure objects,
+            # never the million-entity SNT/LiDAR GPU buffers. 20 Hz upper bound.
+            now = time.monotonic()
+            if now - self._hover_pick_at >= .05:
+                self._hover_pick_at = now
+                self._set_hover_feature(self._pick_editable(self._hover))
+        elif self._hover_feature is not None:
+            self._set_hover_feature(None)
         if self._gesture or self._start is not None or self._offset_origin is not None:
             self.draw._paint()
         return True
@@ -536,7 +582,9 @@ class NativeSelectionController(QObject):
                 if idx==self._intersect_selected_part:
                     color='#ff1717';width=max(width,5)
                 elif idx==self._intersect_hovered_part:
-                    color='#ff3866';width=max(width,4)
+                    # Hover is cyan; a chosen segment stays red as a deliberate
+                    # destructive Intersect operation warning.
+                    color='#00ffff';width=max(width,4)
                 shapes.append(('drawing',part['coords'],
                                {'type':'polyline','color':color,'width':width}))
             return shapes

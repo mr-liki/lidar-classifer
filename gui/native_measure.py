@@ -126,10 +126,23 @@ class NativeMeasure:
         return True
 
     def _paint(self):
+        # Highlight *the existing measurement stroke* in its own overlay,
+        # rather than drawing a second polygon into the Draw overlay (which
+        # could appear underneath the measurement layer on some Qt windows).
+        # No calls to selection_manager.get_features() here: that would prune
+        # and repaint recursively while Qt is rendering this overlay.
+        owner = getattr(self.canvas, 'owner', None)
+        draw = getattr(owner, 'drawing', None)
+        bridge = getattr(draw, '_selection_bridge', None)
+        selected = (bridge.selection_manager._selected if bridge is not None else {})
+        hovered = getattr(bridge, '_hover_feature', None) if bridge is not None else None
+        hovered_key = hovered.get('key') if hovered and hovered.get('source') == 'measure' else None
         shapes = [('measurement', points,
                    {'style': self._style(self.completed_modes[i] if i < len(self.completed_modes) else False),
                     'path': self.completed_modes[i] if i < len(self.completed_modes) else False,
-                    'complete': True})
+                    'complete': True, 'highlight_scope': 'measure',
+                    'selected': ('measure', id(self), id(points)) in selected,
+                    'hovered': ('measure', id(self), id(points)) == hovered_key})
                   for i, points in enumerate(self.completed)]
         for cell in self.grids:
             # Closed cell outline + centroid area label (see CanvasOverlay:

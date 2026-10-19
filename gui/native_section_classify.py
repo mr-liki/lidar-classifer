@@ -342,7 +342,12 @@ class CanvasOverlay(QWidget):
                 style = options.get('style', {})
                 rgb = style.get('color', (0., 1., .47))
                 color = QColor(*(max(0, min(255, round(float(v) * 255))) for v in rgb))
-                painter.setPen(QPen(color, max(1, int(style.get('width', 2)))))
+                # Selection is a transient overlay state: never mutate a
+                # user's configured stroke/label color or the measured values.
+                stroke_color = (QColor('#00ffff') if (options.get('highlight_scope') == 'measure'
+                                and options.get('area') is None
+                                and (options.get('selected') or options.get('hovered'))) else color)
+                painter.setPen(QPen(stroke_color, max(1, int(style.get('width', 2)))))
                 font = painter.font()
                 font.setPointSize(max(7, int(style.get('label_font_size', 16))))
                 painter.setFont(font)
@@ -372,16 +377,20 @@ class CanvasOverlay(QWidget):
                     # The measured segment(s) - and, while placing, the rubber band
                     # to the cursor - in the Measure Settings width and line style.
                     pen = painter.pen()
-                    painter.setPen(QPen(color, max(1, int(style.get('width', 2))), {
+                    painter.setPen(QPen(stroke_color, max(1, int(style.get('width', 2))), {
                         'dashed': Qt.DashLine, 'dotted': Qt.DotLine,
                         'dash-dot': Qt.DashDotLine, 'dash-dot-dot': Qt.DashDotDotLine,
                     }.get(str(style.get('line_style', 'solid')), Qt.SolidLine)))
                     painter.setBrush(Qt.NoBrush)
                     painter.drawPolyline(QPolygonF(qpts))
                     painter.setPen(pen)
-                    painter.setBrush(color)
+                    painter.setBrush(stroke_color)
                     for point in qpts:
                         painter.drawEllipse(point, 3., 3.)
+                    # QPainter.drawText uses the PEN color, not the brush.
+                    # Restore the configured measurement color for all labels.
+                    painter.setPen(QPen(color, max(1, int(style.get('width', 2)))))
+                    painter.setBrush(color)
                     # Line: a single sum at the final endpoint.
                     # Path: cumulative distances at P2, P3, ... final endpoint.
                     # Never label individual segment lengths as path totals.
@@ -397,7 +406,11 @@ class CanvasOverlay(QWidget):
                 dtype = str(data.get('type', 'polyline')).lower()
                 preview = kind == 'drawing_preview'
                 configured_color = QColor(str(data.get('color', '')))
-                color = (QColor(255, 80, 255) if data.get('selected') else
+                color = (QColor('#00ffff') if (data.get('highlight_scope') == 'draw'
+                         and data.get('source') not in ('snt', 'attachment', 'snt_readonly',
+                                                        'block_creation', 'cell_creation')
+                         and (data.get('selected') or data.get('hovered'))) else
+                         QColor(255, 80, 255) if data.get('selected') else
                          configured_color if configured_color.isValid() else
                          QColor(255, 255, 0) if preview else QColor(0, 220, 255))
                 line_style = {'solid': Qt.SolidLine, 'dashed': Qt.DashLine,
