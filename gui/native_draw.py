@@ -1358,11 +1358,73 @@ class NativeDraw:
             self.tool = None
         self._paint()
 
+    def _sync_block_vectors(self):
+        """Keep authored blocks in the same camera frame as attached linework."""
+        blocks = [d for d in self.drawings if d.get('source') == 'block_creation']
+        resident = getattr(self, '_block_vector_layer', None)
+        name = '__native_created_blocks__'
+        if not blocks:
+            if resident is not None:
+                resident.remove('drawing', name)
+                self._present_vector_frame(resident)
+            self._block_vector_layer = None
+            self._block_vector_signature = None
+            return False
+        from gui.native_vector_overlay import vector_layer_for
+        layer = vector_layer_for(self.app)
+        if layer is None:
+            return False
+        entities = []
+        for drawing in blocks:
+            color = drawing.get('color', (0, 179, 255))
+            if isinstance(color, str):
+                from PySide6.QtGui import QColor
+                color = QColor(color).getRgb()[:3]
+            entities.append({'type': 'polyline', 'layer': 'Created blocks',
+                             'points': drawing.get('coords', []), 'color': tuple(color),
+                             '_lineweight': max(0, (int(drawing.get('width', 3)) - 1) * 2)})
+        signature = (id(layer), tuple((tuple(tuple(p) for p in e['points']),
+                                      e['color'], e['_lineweight']) for e in entities))
+        if signature != getattr(self, '_block_vector_signature', None):
+            if layer.put_entities('drawing', name, entities) is None:
+                return False
+            self._block_vector_layer = layer
+            self._block_vector_signature = signature
+            self._present_vector_frame(layer)
+        return True
+
+    def _present_vector_frame(self, layer):
+        """Show changed block linework now, not at the next zoom/pan.
+
+        Uploading only updates the GPU draw ranges. An .lnt view presents every
+        tick (its vector backend's request_render is a no-op), but the promoted
+        Vulkan viewport of an SNT-only session renders on demand, so ask it for
+        one frame - coalesced, since Create/Clear may sync several times.
+        """
+        if getattr(self, '_vector_frame_pending', False):
+            return
+        self._vector_frame_pending = True
+
+        def present():
+            self._vector_frame_pending = False
+            backend = getattr(layer, '_backend', None)
+            try:
+                if backend is not None:
+                    backend.request_render()
+            except Exception as exc:  # noqa: BLE001 - a missed frame must not break editing
+                print(f'[native draw] block linework frame request failed: {exc}')
+
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, present)
+
     def _paint(self):
+        gpu_blocks = self._sync_block_vectors()
         shapes = []
         bridge = self._selection_bridge
         chosen = (bridge.selection_manager._selected if bridge is not None else {})
         for i, drawing in enumerate(self.drawings):
+            if gpu_blocks and drawing.get('source') == 'block_creation':
+                continue
             data = self._style(drawing.get('type'))
             data.update(drawing)
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
@@ -1437,41 +1499,65 @@ class NativeDraw:
                 dialog.close()
             except RuntimeError:
                 pass
+        layer = getattr(self, '_block_vector_layer', None)
+        if layer is not None:
+            layer.remove('drawing', '__native_created_blocks__')
         self.cancel()
         self.overlay._timer.stop()
         self.overlay.close()
 
 
-def get_native_draw(app, create=False):
-    """Return the draw layer owning the *visible* native viewport.
-
-    LNT's independent Vulkan widget/input filter retains its original path.
-    Otherwise a visible ordinary Vulkan plan viewport gets a separate Draw
-    overlay for SNT and LAZ (including mixed loads in either order). A VTK
-    viewport retains the existing legacy digitizer and is never hijacked.
-    """
+def native_plan_view(app, allow_snt=False):
+    """Return the native LNT or promoted SNT Vulkan plan view."""
     view = getattr(app, '_lnt_main_view', None)
+
+    if view is not None and getattr(view, 'native', None) is not None:
+        return view if getattr(view, 'mode_2d', False) else None
+
+    if allow_snt:
+        from gui.native_vector_overlay import _view_for, snt_viewport_active
+        if snt_viewport_active(app):
+            view = _view_for(app)
+            if (view is not None and
+                    getattr(getattr(view, 'owner', None),
+                            'vulkan_widget', None) is not None):
+                return view
+
+    return None
+
+
+def get_native_draw(app, create=False, allow_snt=False):
+    """Find Draw on the visible Vulkan viewport without hijacking VTK."""
+    view = getattr(app, '_lnt_main_view', None)
+
     if view is not None:
-        if getattr(view, 'native', None) is None or not getattr(view, 'mode_2d', False):
+        if (getattr(view, 'native', None) is None or
+                not getattr(view, 'mode_2d', False)):
             return None
     else:
         owner = getattr(app, 'render_backend', None)
-        if (owner is None or not getattr(owner, 'active', False)
-                or not owner.vulkan_viewport_is_visible()
-                or not owner.owns_main_camera()):
-            return None
-        view = getattr(owner, '_plan_draw_view', None)
-        if view is None and create:
-            # The SNT Vulkan vector layer already has an exact framebuffer
-            # mapping (_MvpScreenMapping) for its Qt text overlay. Reuse that
-            # view and MainCanvas instead of inventing a second camera mapping:
-            # new lines land on the same pixels as loaded SNT entities.
-            from gui.native_vector_overlay import _view_for
-            view = _view_for(app)
-            if view is None:
-                return None
-            view._surface_draw = True
-            owner._plan_draw_view = view
+        view = None
+
+        if (owner is not None and
+                getattr(owner, 'active', False) and
+                owner.vulkan_viewport_is_visible() and
+                owner.owns_main_camera()):
+
+            view = getattr(owner, '_plan_draw_view', None)
+
+            if view is None and create:
+                from gui.native_vector_overlay import _view_for
+                view = _view_for(app)
+
+                if view is not None:
+                    view._surface_draw = True
+                    owner._plan_draw_view = view
+
+        if view is None and allow_snt:
+            view = native_plan_view(app, allow_snt=True)
+            if view is not None:
+                view._surface_draw = True
+
         if view is None:
             return None
     draw = getattr(view, 'drawing', None)

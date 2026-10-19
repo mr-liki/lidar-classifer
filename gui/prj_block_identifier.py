@@ -9181,15 +9181,9 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 camera_distance = 1000.0
 
             target_z = float(start_focal[2])
-            try:
-                xyz = (getattr(self.app, "data", None) or {}).get("xyz")
-                if xyz is not None and len(xyz):
-                    # Mid-range is stable and avoids an O(N) mean during UI work.
-                    target_z = 0.5 * (
-                        float(xyz[:, 2].min()) + float(xyz[:, 2].max())
-                    )
-            except Exception:
-                pass
+            bounds = getattr(self.app, "data_bounds", None)
+            if bounds is not None and len(bounds) >= 6:
+                target_z = 0.5 * (float(bounds[4]) + float(bounds[5]))
 
             # ── Target values ──────────────────────────────────────────
             target_focal = [x, y, target_z]
@@ -9212,17 +9206,13 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             camera.SetViewUp(0.0, 1.0, 0.0)
 
             # ── Animation ─────────────────────────────────────────────
-            try:
-                loaded_count = len((getattr(self.app, "data", None) or {}).get("xyz", ()))
-            except Exception:
-                loaded_count = 0
-            # Forty full renders of a 13M-point actor make a nominal two-second
-            # animation take far longer and enlarge the input-race window.
-            # Large production clouds land on the target on the next event-loop
-            # turn; lightweight scenes retain the existing smooth animation.
-            STEPS = 1 if loaded_count >= 1_000_000 else 40
-            step_duration = 1 if STEPS == 1 else max(1, duration // STEPS)
-            current_step  = [0]
+            # Identify is navigation to a known block: land on the final
+            # camera immediately. SNT scenes can contain millions of vectors
+            # even with zero cloud points, so cloud size is not a useful test
+            # for whether forty intermediate renders would be inexpensive.
+            STEPS = 1
+            step_duration = 1
+            current_step = [STEPS]
 
             def _eased(t: float) -> float:
                 """Smooth-step (ease-in-out cubic)."""

@@ -321,8 +321,19 @@ class CanvasOverlay(QWidget):
         painter.setBrush(Qt.NoBrush)
         for a, b in self.marks:
             painter.drawLine(QPointF(*to_qt(*a)), QPointF(*to_qt(*b)))
+        base_to_qt = to_qt
+        world_planes = {}
         for kind, pts, extra in self.shapes:
-            qpts = [QPointF(*to_qt(h, z)) for h, z in pts]
+            to_qt = base_to_qt
+            world_z = extra.get("world_z") if kind == "drawing" and isinstance(extra, dict) else None
+            world_projection = getattr(self.canvas, "world_projection_snapshot", None)
+            if world_z is not None and world_projection is not None:
+                if world_z not in world_planes:
+                    world_planes[world_z] = world_projection(world_z)
+                snapshot = world_planes[world_z]
+                if snapshot is not None:
+                    to_qt = snapshot[1]
+            qpts = [QPointF(*to_qt(p[0], p[1])) for p in pts]
             painter.setPen(QPen(QColor(255, 255, 0), 1.5, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             if kind == 'measurement' and len(qpts) >= 2:
@@ -357,6 +368,16 @@ class CanvasOverlay(QWidget):
                                                       bounds.height() / 2. - 2.),
                                      text)
                 else:
+                    # The measured segment(s) - and, while placing, the rubber band
+                    # to the cursor - in the Measure Settings width and line style.
+                    pen = painter.pen()
+                    painter.setPen(QPen(color, max(1, int(style.get('width', 2))), {
+                        'dashed': Qt.DashLine, 'dotted': Qt.DotLine,
+                        'dash-dot': Qt.DashDotLine, 'dash-dot-dot': Qt.DashDotDotLine,
+                    }.get(str(style.get('line_style', 'solid')), Qt.SolidLine)))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPolyline(QPolygonF(qpts))
+                    painter.setPen(pen)
                     painter.setBrush(color)
                     for point in qpts:
                         painter.drawEllipse(point, 3., 3.)

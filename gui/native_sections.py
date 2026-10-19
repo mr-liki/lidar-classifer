@@ -416,10 +416,22 @@ class SectionCanvas(QWidget):
         super().leaveEvent(event)
 
     def wheelEvent(self, event):
-        self.scale = max(1e-5, self.scale * 1.15 ** (-event.angleDelta().y()/120.))
-        self._dirty = True
-        self.classifier._paint()
-        self.owner.sync_from(self.slot)
+        notch = event.angleDelta().y()/120.
+        if notch:
+            pos = event.position()
+            # Cursor-anchored zoom: remember the section point under the wheel,
+            # scale about the canvas centre, then re-centre so that point stays
+            # under the cursor - world_per_pixel() halves/doubles with scale.
+            anchor = self.section_at(pos.x(), pos.y())
+            s0 = max(self.scale, 1e-5)
+            self.scale = max(1e-5, s0 * 1.15 ** -notch)
+            if anchor is not None:
+                f1 = self.world_per_pixel()
+                self.centre[0] = anchor[0] - (pos.x()-self.width()*.5)*f1
+                self.centre[2] = anchor[1] + (pos.y()-self.height()*.5)*f1
+            self._dirty = True
+            self.classifier._paint()
+            self.owner.sync_from(self.slot)
         event.accept()
 
     def shutdown(self):
@@ -564,6 +576,9 @@ class NativeSections:
         dock.show()
         canvas.start()
         self._apply_theme_background(canvas)
+        if slot != CUT_SLOT and getattr(self.app, '_native_xs_active', False):
+            from gui.native_shortcuts import arm_section_measure
+            arm_section_measure(canvas, True)     # XS is on: new views measure too
         return canvas
 
     @staticmethod

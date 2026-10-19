@@ -441,6 +441,23 @@ def _point_list_from_geom(geom) -> list[tuple[float, float, float]]:
     return pts
 
 
+def _sanitize_line_points(points: list) -> list:
+    """Clean a line strip without removing its final closing segment.
+
+    Polygon triangulation omits the duplicate endpoint and closes by index.
+    A line strip must keep that endpoint to draw a complete circle or ring.
+    """
+    clean = []
+    for raw_point in points or []:
+        point = _finite_xyz(raw_point)
+        if point is None:
+            continue
+        if clean and all(abs(a - b) <= 1e-12 for a, b in zip(clean[-1], point)):
+            continue
+        clean.append(point)
+    return clean
+
+
 def _iter_line_parts(geom) -> list[list[tuple[float, float, float]]]:
     """Return independent line parts without connecting multipart features."""
     if geom is None or geom.IsEmpty():
@@ -454,7 +471,7 @@ def _iter_line_parts(geom) -> list[list[tuple[float, float, float]]]:
         getattr(ogr, "wkbCircularString", -1), getattr(ogr, "wkbCompoundCurve", -1),
     }
     if flat in line_types or ("line" in name and "multi" not in name) or "curve" in name:
-        pts = _sanitize_ring_points(_point_list_from_geom(geom))
+        pts = _sanitize_line_points(_point_list_from_geom(geom))
         return [pts] if len(pts) >= 2 else []
 
     if (flat in (ogr.wkbMultiLineString, ogr.wkbGeometryCollection)
@@ -470,7 +487,7 @@ def _iter_line_parts(geom) -> list[list[tuple[float, float, float]]]:
                 parts.extend(_iter_line_parts(sub))
         return parts
 
-    pts = _sanitize_ring_points(list(_iter_xyz(geom)))
+    pts = _sanitize_line_points(list(_iter_xyz(geom)))
     return [pts] if len(pts) >= 2 else []
 
 

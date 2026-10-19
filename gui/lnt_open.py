@@ -159,6 +159,7 @@ class _InputFilter(QObject):
             if t == E.KeyPress and creation.key(ev.key()):
                 return True
             if t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
+                creation.release(ev.position(), ev.button())
                 self._last = None; return True
         drawing = getattr(self.view, 'drawing', None)
         if drawing is not None and drawing.active():
@@ -286,7 +287,16 @@ class _InputFilter(QObject):
                 nv.pan(dx, dy)
             return True
         if t == E.Wheel:
-            nv.zoom(ev.angleDelta().y() / 120.0)
+            steps = ev.angleDelta().y() / 120.0
+            # Cursor-anchored zoom: the world point under the wheel stays put.
+            # Falls back to the engine's centre dolly in 3D orbit mode.
+            pos = ev.position()
+            try:
+                ratio = obj.devicePixelRatioF()
+            except (AttributeError, RuntimeError):   # noqa: BLE001 - Qt state
+                ratio = 1.0
+            if not nv.zoom_at(steps, pos.x() * ratio, pos.y() * ratio):
+                nv.zoom(steps)
             return True
         if t == E.KeyPress:
             k = ev.key()
@@ -442,7 +452,23 @@ class LntMainView(QObject):
         self._timer.start()
         print(f"[LNT] showing {self.lnt_path} in the main viewport ({pts:,} points)")
 
-    def stop(self, restore=True, flush_pending=True):
+    def stop(self, restore=True, flush_pending=True, keep_native_viewport=False):
+        """Tear the .lnt view down.
+
+        `keep_native_viewport`: the point cloud is gone but the CANVAS stays
+        native. The owner's renderer is re-bound to the live HWND and keeps
+        presenting (empty), `_viewport_installed` stays True and VTK's LiDAR
+        actors stay off, so native tools (measure, SNT/DXF linework, the next
+        .lnt open) never bounce through the VTK viewport and back - clearing
+        data must not change which viewport the session lives in.
+        """
+        try:
+            from gui.lnt_ai_bridge import active_bridge
+            bridge = active_bridge(self.app)
+            if bridge is not None and bridge.view is self:
+                bridge.end()             # write the AI result before the renderer goes
+        except Exception as exc:   # noqa: BLE001
+            print(f"[LNT] AI session close failed: {exc}")
         drawing = getattr(self, 'drawing', None)
         if drawing is not None:
             drawing.shutdown()
@@ -501,10 +527,20 @@ class LntMainView(QObject):
                     # Naksha's own routine: re-create ITS renderer on the live HWND.
                     owner._rebind_renderer_to_current_hwnd(w, h)
                     self._owner_renderer_down = False
-                if widget is not None:
-                    widget.hide()
-                owner._viewport_installed = False
-                owner.set_vtk_lidar_rendering(True)      # VTK shows its LiDAR again
+                if keep_native_viewport:
+                    # Stay on the native canvas: the surface keeps presenting
+                    # (empty) so the promoted-viewport toolchain keeps working
+                    # and the next .lnt open re-uses the installed viewport.
+                    owner._viewport_installed = True
+                    try:
+                        owner.resync_camera(present=True)
+                    except Exception:   # noqa: BLE001 - pose push is cosmetic
+                        pass
+                else:
+                    if widget is not None:
+                        widget.hide()
+                    owner._viewport_installed = False
+                    owner.set_vtk_lidar_rendering(True)      # VTK shows its LiDAR again
             except Exception as exc:   # noqa: BLE001
                 print(f"[LNT] could not restore Naksha's renderer cleanly: {exc}")
         self.owner = None
@@ -869,23 +905,112 @@ def _keep_vector_overlay(app):
         print(f"[LNT] attached linework could not follow the viewport: {exc}")
 
 
-def close_lnt_view(app, flush_pending=True, reopening=False):
+def close_lnt_view(app, flush_pending=True, reopening=False, keep_native_viewport=False):
     """Return the main viewport to VTK if an .lnt is currently shown.
 
     `reopening`: another .lnt is about to be shown, so attached linework moves
-    straight to that view instead of bouncing through Naksha's renderer."""
+    straight to that view instead of bouncing through Naksha's renderer.
+
+    `keep_native_viewport`: the point cloud was CLEARED (Clear Project / Clear
+    Data), not replaced - so the (now empty) native canvas stays installed
+    instead of handing the viewport back to VTK. Native tools therefore keep
+    routing to Vulkan after a clear. Falls back to the VTK hand-back when the
+    engine cannot serve the promoted viewport, which would otherwise leave the
+    tools drawing where nobody can see them.
+    """
     v = getattr(app, "_lnt_main_view", None)
     if v is not None:
         try:
-            v.stop(flush_pending=flush_pending)
+            v.stop(flush_pending=flush_pending, keep_native_viewport=keep_native_viewport)
         except TypeError:
-            v.stop()
+            try:
+                v.stop(flush_pending=flush_pending)
+            except TypeError:
+                v.stop()
         v.deleteLater()
         app._lnt_main_view = None
-        print("[LNT] closed the .lnt view; main viewport returned to VTK")
+        if keep_native_viewport and not _kept_viewport_usable(app):
+            keep_native_viewport = False
+            _return_viewport_to_vtk(app)
+        print("[LNT] closed the .lnt view"
+              + ("; native viewport kept (empty canvas)"
+                 if keep_native_viewport else "; main viewport returned to VTK"))
         if not reopening:
             _keep_vector_overlay(app)
             _refresh_total_points(app)
+
+
+def _kept_viewport_usable(app) -> bool:
+    """True when a kept native canvas can still serve the promoted-viewport
+    toolchain (measure, SNT/DXF linework).
+
+    Same gate as gui.native_vector_overlay.snt_viewport_active: the owner
+    renderer has just been re-bound by LntMainView.stop(), so the vector pass
+    answers against the live handle. Without it the Vulkan surface would cover
+    a viewport whose only working tools are VTK's - i.e. invisible.
+    """
+    try:
+        from gui.native_vector_overlay import engine_can_draw_vectors
+        owner = getattr(app, "render_backend", None)
+        widget = getattr(owner, "vulkan_widget", None) if owner is not None else None
+        return (widget is not None
+                and bool(getattr(owner, "_viewport_installed", False))
+                and engine_can_draw_vectors(app))
+    except Exception:   # noqa: BLE001 - a broken probe must not strand the canvas
+        return False
+
+
+def _return_viewport_to_vtk(app) -> None:
+    """Hand the main canvas back to VTK (the pre-keep behaviour)."""
+    owner = getattr(app, "render_backend", None)
+    if owner is None:
+        return
+    try:
+        app._snt_viewport_promoted = False     # §5 flag follows the canvas
+        widget = getattr(owner, "vulkan_widget", None)
+        if widget is not None:
+            widget.hide()
+        owner._viewport_installed = False
+        owner.set_vtk_lidar_rendering(True)
+    except Exception as exc:   # noqa: BLE001
+        print(f"[LNT] could not restore the VTK viewport: {exc}")
+
+
+def take_back_viewport_for_vtk_load(app) -> bool:
+    """A VTK-side load must own the visible canvas.
+
+    The native surface can be promoted while nothing is loaded (measure tools
+    on a freshly started app, an SNT-only attach). Once a VTK load populates
+    app.data with no .lnt session drawing the cloud, that opaque surface would
+    cover a cloud nobody can see - hand the viewport back to VTK. Left
+    untouched: an .lnt session (it owns the canvas), resident native linework
+    (its upload would be stranded), and sessions that were never promoted.
+    """
+    try:
+        from gui.native_vector_overlay import is_native_main, _owner
+        if is_native_main(app):
+            return False
+        owner = _owner(app)
+        if owner is None or not getattr(owner, "_viewport_installed", False):
+            return False
+        layer = getattr(app, "_native_vector_layer", None)
+        if layer is not None and getattr(layer, "documents", None):
+            return False                    # SNT/DXF linework is resident
+        data = getattr(app, "data", None)
+        xyz = data.get("xyz") if isinstance(data, dict) else None
+        if xyz is None:
+            return False
+        try:
+            if len(xyz) == 0:
+                return False
+        except Exception:   # noqa: BLE001 - exotic array: assume real data
+            pass
+        _return_viewport_to_vtk(app)
+        print("[LNT] VTK load owns the canvas again (native viewport handed back)")
+        return True
+    except Exception as exc:   # noqa: BLE001 - never block a load on this
+        print(f"[LNT] VTK-load viewport hand-back skipped: {exc}")
+        return False
 
 
 def _refresh_total_points(app):

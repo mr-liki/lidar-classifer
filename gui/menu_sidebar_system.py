@@ -3688,8 +3688,18 @@ class RibbonManager:
                     try: self.parent.measurement_tool.deactivate()
                     except Exception: pass
                 try:
-                    from gui.native_shortcuts import cancel_native_measurements
+                    from gui.native_shortcuts import (cancel_native_measurements,
+                                                      refresh_measure_ribbon, set_xs)
+                    # XS stands down with the rest and its button follows, so
+                    # returning to the tab never shows a checked XS that is
+                    # silently disarmed (and _native_xs_active can't re-arm
+                    # section windows behind another tab).
+                    set_xs(self.parent, False)
+                    xs_tool = getattr(self.parent, 'cross_section_measurement_tool', None)
+                    if xs_tool is not None and getattr(xs_tool, 'active', False):
+                        xs_tool.deactivate()      # VTK XS; idempotent backstop
                     cancel_native_measurements(self.parent)
+                    refresh_measure_ribbon(self.parent)
                 except Exception: pass
             
             # ◀◀◀ NEW: Deactivate Identify tools when leaving 'identify' tab
@@ -3857,10 +3867,12 @@ class MeasurementRibbon(QWidget):
     """Ribbon for Measurement tools with live distance display"""
     
     measure_tool_selected = Signal(str)
+    measure_tool_deactivated = Signal(str)
     clear_measurements = Signal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._measure_buttons = {}
         self.build_ribbon()
         
     def build_ribbon(self):
@@ -3870,13 +3882,13 @@ class MeasurementRibbon(QWidget):
         
         # 📏 Distance Tools
         distance = RibbonSection("Distance", self)
-        distance.add_button("Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
-        distance.add_button("Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
+        self._add_measure_button(distance, "Line", "📐", "measure_line")
+        self._add_measure_button(distance, "Path", "🛤️", "measure_path")
         layout.addWidget(distance)
 
         area = RibbonSection("Area", self)
-        area.add_button("Block", "▦", lambda: self.measure_tool_selected.emit("measure_block_area"))
-        area.add_button("Grid", "▦", lambda: self.measure_tool_selected.emit("measure_grid_area"))
+        self._add_measure_button(area, "Block", "▦", "measure_block_area")
+        self._add_measure_button(area, "Grid", "▦", "measure_grid_area")
         layout.addWidget(area)
     
         # 🗑️ Actions
@@ -3935,6 +3947,55 @@ class MeasurementRibbon(QWidget):
 
         layout.addStretch()
 
+    def _add_measure_button(self, section, text, icon_text, tool_id):
+        holder = {}
+
+        def on_click():
+            self._on_measure_clicked(holder["button"])
+
+        button = section.add_button(text, icon_text, on_click)
+        button.setProperty("measureToolId", tool_id)
+        holder["button"] = button
+        self._measure_buttons[tool_id] = (button, section)
+        return button
+
+    def _on_measure_clicked(self, button):
+        """Distance/Area click: checked arms that tool, unchecked stands it down."""
+        tool_id = button.property("measureToolId")
+        if button.isChecked():
+            self.measure_tool_selected.emit(tool_id)
+        else:
+            self.measure_tool_deactivated.emit(tool_id)
+
+    def sync_active_tool(self, tool_id=None, xs=None):
+        """Highlight exactly the armed Distance/Area tool, or none.
+
+        Programmatic counterpart of a ribbon click. Called whenever the tool
+        activates or deactivates from anywhere (shortcut, Esc, another tool
+        taking over), so the highlight lives exactly as long as the tool.
+        Never emits a click and never touches other ribbons.
+
+        `xs` mirrors the Cross Section button the same way; its signals are
+        blocked because that button's own handler drives the tool, and this
+        method only displays state - it must never toggle the tool.
+        """
+        for candidate, (button, section) in self._measure_buttons.items():
+            checked = candidate == tool_id
+            if button.isChecked() != checked:
+                button.setChecked(checked)
+            if checked:
+                section.active_button = button
+            elif section.active_button is button:
+                section.active_button = None
+        if xs is not None:
+            xs_button = self.cross_section_measure_btn
+            if xs_button.isChecked() != bool(xs):
+                blocked = xs_button.blockSignals(True)
+                try:
+                    xs_button.setChecked(bool(xs))
+                finally:
+                    xs_button.blockSignals(blocked)
+
     def _on_cross_section_measure_clicked(self):
         """add_button()'s clicked-driven callback — the button's checked
         state already reflects the click by the time this runs."""
@@ -3947,6 +4008,17 @@ class MeasurementRibbon(QWidget):
         button drives the tool through."""
         try:
             main_window = self.window()
+            # Native .lnt session: the section windows are Vulkan canvases the
+            # VTK tool's observers never see, so XS arms the native Line there.
+            from gui.native_shortcuts import native_section_measure
+            if native_section_measure(main_window, bool(checked)):
+                if hasattr(main_window, "statusBar"):
+                    main_window.statusBar().showMessage(
+                        "📏 Cross-section measurement enabled — click two points in a cross-section view"
+                        if checked else "📏 Cross-section measurement disabled",
+                        4000 if checked else 2000,
+                    )
+                return
             tool = getattr(main_window, "cross_section_measurement_tool", None)
             if tool is None:
                 return
@@ -13344,7 +13416,13 @@ class AIRibbon(QWidget):
                 app = getattr(self.parent(), 'app', None)
             if app is None:
                 app = self.parent().parent().parent()
-            
+
+            # Native .lnt session: AI runs on the source points, mapped onto the
+            # .lnt, and writes its classes back natively (gui/lnt_ai_bridge.py).
+            from gui.lnt_ai_bridge import start_lnt_ai
+            if start_lnt_ai(app):
+                return
+
             # Check if LAZ file is loaded
             if not hasattr(app, 'data') or app.data is None:
                 QMessageBox.warning(
