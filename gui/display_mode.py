@@ -3291,7 +3291,7 @@ class DisplayModeDialog(QDialog):
         if self.current_slot in range(1, 10) and getattr(app, '_native_sections', None) is not None:
             native_modes = {0: "class", 1: "shaded_class", 2: "depth",
                             3: "intensity", 4: "rgb", 5: "elevation",
-                            6: "class", 7: "class"}
+                            6: "surface", 7: "class"}
             app._native_sections.apply(self.current_slot, class_map,
                                        native_modes.get(idx, "class"))
             fast_path_handled = True

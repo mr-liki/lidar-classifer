@@ -967,6 +967,14 @@ NKV_API int nkv_set_surface(NkvHandle handle,
     return 1;
 }
 
+NKV_API int nkv_clear_surface(NkvHandle handle) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst) return 0;
+    inst->surface.Clear();
+    return 1;
+}
+
 NKV_API int nkv_set_dataset_revision(NkvHandle handle, uint64_t revision) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);

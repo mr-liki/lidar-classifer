@@ -114,6 +114,7 @@ public:
 
     bool Initialize(Renderer& renderer);
     void Shutdown();
+    void Clear();
     bool IsInitialized() const { return initialized_; }
 
     // Upload a single mesh. position/normal/color are N,3 C-contiguous

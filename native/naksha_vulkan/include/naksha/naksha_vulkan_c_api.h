@@ -350,6 +350,8 @@ NKV_API int nkv_set_surface(NkvHandle handle,
                              const int32_t* faces, uint64_t face_count,
                              const uint8_t* face_colors_rgb);
 
+NKV_API int nkv_clear_surface(NkvHandle handle);
+
 /* ---- Tiled surface, LOD, culling and atomic swap ---------------------------
  *
  * Everything below is ADDITIVE: the legacy nkv_set_surface entry point still

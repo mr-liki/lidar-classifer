@@ -1222,6 +1222,15 @@ std::size_t SurfaceRenderer::GetTriangleCount() const {
     if (active_) return active_->triangleCount;
     return triangleCount_;
 }
+void SurfaceRenderer::Clear() {
+    vertexCount_ = 0;
+    triangleCount_ = 0;
+    indexCount_ = 0;
+    overlayIndexCount_ = 0;
+    crispIndexedActive_ = false;
+    crispHybridActive_ = false;
+}
+
 bool SurfaceRenderer::IsLoaded() const {
     return (active_ && active_->IsValid()) || vertexCount_ > 0 || crispIndexedActive_;
 }

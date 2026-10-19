@@ -282,8 +282,33 @@ class SectionCanvas(QWidget):
         self.backend.set_class_visibility(visible)
         if hasattr(self.backend, 'set_class_weights'):
             self.backend.set_class_weights(weights)
+        # Surface mode is rendered as a Vulkan mesh (slab clip of the section),
+        # not as points. Clear any previous mesh when leaving it.
+        if mode != 'surface' and getattr(self, '_surface_loaded', False):
+            try:
+                self.backend.clear_surface()
+            except Exception:
+                pass
+            self._surface_loaded = False
+
+        if mode == 'surface':
+            self.backend.set_point_cloud_visible(False)
+            try:
+                ok = self._upload_surface_slab()
+            except Exception as exc:
+                print(f"SECTION_MESH view={self.slot} status=surface_exception reason={exc}")
+                ok = False
+            if not ok:
+                self.backend.set_point_cloud_visible(True)
+            self._dirty = True
+            if sync:
+                self.owner.sync_from(self.slot, display=True)
+            return
+
+        # Points are visible for all point-based modes.
+        self.backend.set_point_cloud_visible(True)
         modes = {'rgb': 0, 'class': 1, 'intensity': 2, 'elevation': 3,
-                 'shaded_class': 4, 'depth': 6}
+                 'shaded_class': 4, 'depth': 6, 'line': 1}
         # Sections are projected point views. Native instant lighting shades
         # these records without constructing a terrain TIN across vertical faces.
         self.backend.set_display_mode(modes.get(mode, 1))
@@ -294,6 +319,58 @@ class SectionCanvas(QWidget):
         self._dirty = True
         if sync:
             self.owner.sync_from(self.slot, display=True)
+
+    def _upload_surface_slab(self):
+        try:
+            from gui.cross_section.section_shaded_surface import (
+                _build_independent_surface_mesh, _slab_clip_and_transform,
+            )
+        except Exception as exc:
+            print(f"   section surface import failed ({exc})")
+            return False
+        app = self.owner.app
+        geom = getattr(self.owner, 'geometry', {}).get(self.slot)
+        if geom is None:
+            print(f"   section {self.slot}: no cutting line stored yet")
+            return False
+        p1, p2, half_width, _buffer = geom
+        p1 = np.asarray(p1, dtype=np.float64)
+        p2 = np.asarray(p2, dtype=np.float64)
+        hw = float(half_width) if half_width else 5.0
+        app.section_view_idx_tmp = self.slot - 1
+        view_idx = self.slot - 1
+        setattr(app, f"section_{view_idx}_P1", p1)
+        setattr(app, f"section_{view_idx}_P2", p2)
+        setattr(app, f"section_{view_idx}_half_width", hw)
+
+        # Ensure the section's own palette is available to the visibility mask.
+        if not hasattr(app, 'display_mode_dialog') or app.display_mode_dialog is None:
+            pass
+
+        mesh = _build_independent_surface_mesh(app, view_idx)
+        if mesh is None:
+            print(f"   section {self.slot}: could not build surface mesh")
+            return False
+        result = _slab_clip_and_transform(mesh, p1, p2, hw)
+        if result is None:
+            print(f"   section {self.slot}: slab does not intersect mesh")
+            return False
+        local_pts, faces, point_rgb, cell_rgb = result
+        positions = np.ascontiguousarray(local_pts, dtype=np.float64)
+        faces_i = np.ascontiguousarray(faces, dtype=np.int32)
+        if cell_rgb is not None:
+            face_colors = np.ascontiguousarray(cell_rgb, dtype=np.uint8)
+        elif point_rgb is not None:
+            prgb = np.asarray(point_rgb, dtype=np.uint8)
+            face_colors = np.ascontiguousarray(prgb[faces[:, 0]], dtype=np.uint8)
+        else:
+            face_colors = np.full((len(faces), 3), 200, dtype=np.uint8)
+        ok = self.backend.set_surface(positions, faces_i, face_colors)
+        if ok:
+            self._surface_loaded = True
+        else:
+            print(f"   section {self.slot}: backend surface upload failed")
+        return bool(ok)
 
     def fit(self, sync=True):
         if not len(self.local):
@@ -829,8 +906,6 @@ class NativeSections:
             self.finalize(p1, p2, width, slot-1, value)
 
     def apply(self, slot, palette, mode):
-        if mode in ('surface', 'line'):
-            raise ValueError('Native section views support Class, Shaded Class, Depth, Intensity, RGB and Elevation')
         self._pending_display[slot] = (dict(palette), mode)
         # Display Mode Apply is strictly per-view: never mirror the palette or
         # the color mode into synced peers (sync carries data and camera only).
