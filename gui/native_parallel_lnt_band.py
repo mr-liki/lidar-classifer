@@ -99,13 +99,21 @@ def classify_lnt_parallel_band(app, polyline_xy, left_tol, right_tol,
                                   'do not expose point_source_id. Enable all flight lines '
                                   'or classify through a source-aware workflow.')
 
-    to_class = int(to_class)
-    if not 0 <= to_class <= 255:
-        raise NativeBandError('Target class must be between 0 and 255.')
+    # User class numbers may exceed 255; points store a one-byte slot
+    # (gui/class_slots.py).
+    from gui.class_slots import NoFreeSlot, slot_for, stored_palette
+    to_code = to_class
+    try:
+        to_class = slot_for(app, to_code, allocate=True)
+    except (NoFreeSlot, OSError) as exc:
+        raise NativeBandError(str(exc)) from None
+    if to_class is None:
+        raise NativeBandError(f'Class {to_code} is not a valid class number.')
     if from_class is not None:
-        from_class = int(from_class)
-        if not 0 <= from_class <= 255:
-            raise NativeBandError('Source class must be between 0 and 255.')
+        from_code = from_class
+        from_class = slot_for(app, from_code)
+        if from_class is None:
+            return {'band_points': 0, 'changed_points': 0}   # nothing stored as that class
 
     rows = select_band_rows(store, polyline_xy, left_tol, right_tol)
     band_points = int(rows.size)
@@ -119,7 +127,7 @@ def classify_lnt_parallel_band(app, polyline_xy, left_tol, right_tol,
     if any(not shown for shown in line_visibility.values()):
         from gui.flight_line_filter import filter_visible_flight_line_indices
         rows = filter_visible_flight_line_indices(app, rows, length=len(classes), slot=0)
-    palette = getattr(app, 'class_palette', None) or {}
+    palette = stored_palette(app, getattr(app, 'class_palette', None) or {})
     if palette:
         shown = np.zeros(256, dtype=bool)
         for code, rule in palette.items():

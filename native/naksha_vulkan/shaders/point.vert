@@ -47,10 +47,12 @@ layout(push_constant) uniform PointParams {
     vec4 intensity;  // x=iLo, y=iHi, z=contrast, w=gamma
     vec4 view;       // x=px per metre at 1 m, y=edge softness 0..1, z=brightness, w=unused
     vec4 parity;     // x = colour-space byte-parity flag (see the output note below)
+    vec4 border; // x=fraction, y=mode, z=background-shell pass
 } pc;
 
 layout(location = 0) out vec4 vColor;
 layout(location = 1) out float v_point_px;   // gl_PointSize, for edge coverage
+layout(location = 2) out float v_core_px;
 
 // Mirror of NkvDisplayMode in include/naksha/naksha_vulkan_c_api.h - the value
 // travels through pc.shading.x unchanged, so a display-mode switch on the
@@ -204,7 +206,15 @@ void main() {
     float classWeight = clamp(ubo.elevationLut[classId].a, 0.1, 12.0);
     pixels *= classWeight;
 
-    gl_PointSize = clamp(pixels, 1.0, min(deviceMax, 64.0));
+    v_core_px = clamp(pixels, 1.0, min(deviceMax, 64.0));
+    float fraction = mode == MODE_SHADED_CLASS_INSTANT ? 0.0 : clamp(pc.border.x, 0.0, 1.0);
+    float growth = min(8.0, 4.0 * fraction + 8.0 * fraction * fraction * fraction);
+    // Structured outlines the union of the sprites. Hybrid also gives each
+    // return a thinner ring, while retaining the full outer silhouette.
+    if (pc.border.z < 0.5 && pc.border.y > 0.5) {
+        growth *= pc.border.y > 1.5 ? 0.5 : 0.0;
+    }
+    gl_PointSize = clamp(v_core_px + growth, 1.0, min(deviceMax, 64.0));
     v_point_px = gl_PointSize;
 
     // ---- shading -----------------------------------------------------------

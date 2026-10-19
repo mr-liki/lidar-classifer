@@ -599,9 +599,9 @@ class LntMainView(QObject):
             # weight never re-uploads a point.
             weights = np.ones(256, dtype=np.float32)
             weight = float(getattr(self.app, "class_weight", 1.0) or 1.0)
-            for code, entry in self.app.class_palette.items():
-                code = int(code)
-                if 0 <= code < 256:
+            from gui.class_slots import stored_palette
+            for code, entry in stored_palette(self.app, self.app.class_palette).items():
+                if 0 <= code < 256:      # stored slot (user numbers > 255 mapped)
                     packed[code, :3] = np.clip(
                         np.asarray(entry.get("color", (128, 128, 128)),
                                    dtype=np.float64) * weight, 0, 255).astype(np.uint8)
@@ -624,6 +624,8 @@ class LntMainView(QObject):
                           "predates lnt_view_set_class_weights)")
                 self._palette_baseline = self.app.class_palette
                 self.ptc_applied = True
+                from gui.native_border import apply_border
+                apply_border(self.app, 0)
                 self._refresh_point_statistics()
             print("[LNT] applied the palette from the Display dialog (Apply)")
             return ok
@@ -1052,6 +1054,8 @@ def _show(app, lnt_path, name):
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
     app._lnt_main_view = view
+    from gui.native_border import apply_border
+    apply_border(app, 0)
     _keep_vector_overlay(app)
     app.data = None   # full-cloud records are owned by the native file, not a VTK array
     app.loaded_file = getattr(app, "_lnt_source_path", lnt_path)

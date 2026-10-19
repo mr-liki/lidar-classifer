@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
     QFileDialog, QComboBox, QWidget, QFrame, QAbstractItemView, QToolButton, QMenu,
     QMessageBox
 )
-from gui.class_display import update_class_mode
+def update_class_mode(*args, **kwargs):
+    from gui.class_display import update_class_mode as legacy_update
+    return legacy_update(*args, **kwargs)
 from gui.theme_manager import get_dialog_stylesheet
 from gui.popup_guard import InputPopupMixin
 
@@ -79,7 +81,12 @@ def _resolve_uam():
         "Expected gui/unified_actor_manager.py or a legacy top-level copy."
     )
  
-_uam = _resolve_uam()
+class _LazyActorManager:
+    def __getattr__(self, name):
+        return getattr(_resolve_uam(), name)
+
+
+_uam = _LazyActorManager()
 
 # --- Helper Aliases at the top of display_mode.py ---
 
@@ -98,6 +105,8 @@ def _uam_fast_refresh(app, palette=None, border=0.0):
 
 def _uam_connect(app):
     """Wires the palette_changed signal to the GPU sync function."""
+    if getattr(app, '_lnt_main_view', None) is not None:
+        return True  # native Apply and per-view weight/border paths own their GPU updates
     return _uam.connect_palette_signal(app)
 
 def clone_palette(palette):
@@ -1343,6 +1352,9 @@ class DisplayModeDialog(QDialog):
         self.current_slot      = 0
         self.slot_shows        = {i: {} for i in range(10)}
         app_modes = getattr(parent, "_naksha_border_logic_modes", None)
+        if not isinstance(app_modes, dict):
+            saved_modes = settings.value('global_view_border_modes', {}) or {}
+            app_modes = {int(k): int(v) for k, v in saved_modes.items()}
         self.view_border_modes = {
             i: int(app_modes.get(i, 1)) if isinstance(app_modes, dict) else 1
             for i in range(10)
@@ -2193,8 +2205,13 @@ class DisplayModeDialog(QDialog):
                 # Loading a PTC through the explicit user action is a fresh
                 # display configuration.  Initialize every view consistently;
                 # later manual border choices remain per-slot as before.
-                from .unified_actor_manager import reset_border_logic_to_structured
-                reset_border_logic_to_structured(app)
+                if getattr(app, '_lnt_main_view', None) is not None:
+                    app._naksha_border_logic_modes = {i: 1 for i in range(10)}
+                    self.view_border_modes = dict(app._naksha_border_logic_modes)
+                    self._select_border_mode(1, push_gpu=False)
+                else:
+                    from .unified_actor_manager import reset_border_logic_to_structured
+                    reset_border_logic_to_structured(app)
             needs_class_0_fix = False
 
             if app and hasattr(app, 'data') and app.data is not None:
@@ -3942,6 +3959,8 @@ class DisplayModeDialog(QDialog):
             # 4. Save border values
             settings.setValue("global_view_borders",
                               {str(k): v for k, v in self.view_borders.items()})
+            settings.setValue("global_view_border_modes",
+                              {str(k): int(v) for k, v in self.view_border_modes.items()})
 
             # 5. Save PTC path
             if self.current_ptc_path and os.path.exists(self.current_ptc_path):
@@ -4143,6 +4162,11 @@ class DisplayModeDialog(QDialog):
         """Immediately push border change to GPU without needing Apply click."""
         try:
             float_border = float(border_value)
+
+            from gui.native_border import apply_border
+            if apply_border(app, slot_idx, float_border, int(self.get_border_mode())):
+                self._save_timer.start(2000)
+                return
 
             if slot_idx == 0:
                 app.point_border_percent = float_border
