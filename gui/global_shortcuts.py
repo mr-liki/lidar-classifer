@@ -866,7 +866,7 @@ class GlobalShortcutFilter(QObject):
 
             # ====================================================================
             # Native point-cloud shortcuts bypass the legacy inline VTK handlers.
-            from gui.native_shortcuts import execute_native_shortcut, focused_canvas
+            from gui.native_shortcuts import execute_native_shortcut, focused_canvas, TOOL_NAMES
             native_view = getattr(self.app_window, '_lnt_main_view', None)
             if native_view is not None and getattr(native_view, 'native', None) is not None:
                 native_canvas = focused_canvas(self.app_window)
@@ -887,6 +887,14 @@ class GlobalShortcutFilter(QObject):
                 if configured_shortcut:
                     if event.isAutoRepeat():
                         return True
+
+                    # Remember which class-bearing shortcut owns the live
+                    # ClassPicker. ShortcutManager.apply_shortcuts_from_settings()
+                    # uses this identity to refresh From/To immediately when the
+                    # user edits and reapplies the currently active shortcut.
+                    if configured_shortcut.get('tool') in TOOL_NAMES:
+                        self.app_window._last_classification_shortcut_combo = combo
+
                     if execute_native_shortcut(self.app_window, configured_shortcut.get('tool'),
                             configured_shortcut.get('from'), configured_shortcut.get('to'),
                             configured_shortcut.get('preset'), key_label,
