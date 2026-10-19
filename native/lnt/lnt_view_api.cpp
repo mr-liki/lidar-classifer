@@ -1447,12 +1447,30 @@ __declspec(dllexport) int lnt_view_world_to_screen(void* h, double x, double y, 
 // Centre the 2D view on (x, y) and show `width_m` metres across the window width.
 __declspec(dllexport) void lnt_view_frame_region(void* h, double cx, double cy, double width_m) {
     View* v = static_cast<View*>(h);
-    if (!v) return;
+    if (!v || !std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(width_m) || width_m <= 0.0) return;
     const double* t = v->ctl.target();
     v->ctl.set_target(cx, cy, t[2]);
     const double tn = std::tan(v->ctl.fov_y_deg() * 3.14159265358979323846 / 360.0);
     const double aspect = double(std::max<uint32_t>(v->w, 1)) / double(std::max<uint32_t>(v->h, 1));
-    v->ctl.set_distance(std::max(width_m / (2.0 * tn * aspect), 1.0));
+    v->ctl.set_distance(width_m / (2.0 * tn * aspect));
+}
+
+// Clamp the scale BEFORE moving the target, so the cursor anchor stays fixed
+// even at the closest zoom. Python's requested-scale recentering drifted there.
+__declspec(dllexport) int lnt_view_zoom_at(void* h, double steps, double px, double py) {
+    View* v = static_cast<View*>(h);
+    if (!v || !v->ctl.ortho2d() || !std::isfinite(steps) ||
+        !std::isfinite(px) || !std::isfinite(py)) return 0;
+    const double tn = std::tan(v->ctl.fov_y_deg() * 3.14159265358979323846 / 360.0);
+    const double height = double(std::max<uint32_t>(v->h, 1));
+    const double before = 2.0 * std::max(v->ctl.distance() * tn, 1e-6) / height;
+    const double dx = px - 0.5 * double(v->w), dy = py - 0.5 * double(v->h);
+    const double* t = v->ctl.target();
+    const double ax = t[0] + dx * before, ay = t[1] - dy * before, z = t[2];
+    v->ctl.set_distance(v->ctl.distance() * std::max(0.05, 1.0 - 0.12 * steps));
+    const double after = 2.0 * std::max(v->ctl.distance() * tn, 1e-6) / height;
+    v->ctl.set_target(ax - dx * after, ay + dy * after, z);
+    return 1;
 }
 
 // ---- cross-section: GPU clip volume + streamer corridor -------------------------

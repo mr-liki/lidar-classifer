@@ -9,7 +9,7 @@
 //
 // ORBIT moves the angles; PAN moves target AND eye together along the view's
 // right and up axes (so the orientation and distance are unchanged); ZOOM sets a
-// goal distance, clamped to [1, 10000] at the moment it is requested, and
+// goal distance, clamped to [0.0001, 10000] at the moment it is requested, and
 // update(dt) approaches that goal exponentially - a smooth glide, with the
 // clamp applied to the goal so the glide can never overshoot the range.
 //
@@ -27,7 +27,8 @@ namespace lnt {
 
 class LntCameraController {
 public:
-    static constexpr double kMinDistance = 1.0;
+    // Sub-millimetre plan extents allow individual returns to be isolated.
+    static constexpr double kMinDistance = 1e-4;
     static constexpr double kMaxDistance = 10000.0;
     static constexpr double kMinSse = 0.0;
     static constexpr double kMaxSse = 50.0;

@@ -97,7 +97,7 @@ bool LntCameraController::update(float dt) {
     if (dt <= 0.0f) return dist_ != goal_dist_;
     const double a = 1.0 - std::exp(-kZoomRate * double(dt));
     dist_ += (goal_dist_ - dist_) * a;
-    if (std::fabs(goal_dist_ - dist_) < 1e-4) dist_ = goal_dist_;
+    if (std::fabs(goal_dist_ - dist_) < std::max(1e-10, goal_dist_ * 1e-6)) dist_ = goal_dist_;
     dist_ = clampd(dist_, kMinDistance, kMaxDistance);
     return dist_ != goal_dist_;
 }
@@ -113,7 +113,9 @@ bool LntCameraController::apply_to(LNTCamera& cam, const double origin[3], doubl
     cam.up[1] = view_preset_ == 1 ? 1.0 : 0.0;
     cam.up[2] = view_preset_ == 1 ? 0.0 : 1.0;
     cam.fov_y_deg = fov_;
-    cam.near_clip = near_;
+    // Perspective close-ups must not clip the target with the overview's
+    // one-metre near plane. Orthographic depth is independent of zoom scale.
+    cam.near_clip = ortho2d_ ? near_ : std::min(near_, std::max(1e-8, dist_ * 0.01));
     cam.far_clip = far_;
     cam.ortho = ortho2d_;
     if (ortho2d_) {
