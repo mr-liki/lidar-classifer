@@ -327,6 +327,7 @@ class NativeDraw:
         if not blocks:
             if resident is not None:
                 resident.remove('drawing', name)
+                self._present_vector_frame(resident)
             self._block_vector_layer = None
             self._block_vector_signature = None
             return False
@@ -350,7 +351,32 @@ class NativeDraw:
                 return False
             self._block_vector_layer = layer
             self._block_vector_signature = signature
+            self._present_vector_frame(layer)
         return True
+
+    def _present_vector_frame(self, layer):
+        """Show changed block linework now, not at the next zoom/pan.
+
+        Uploading only updates the GPU draw ranges. An .lnt view presents every
+        tick (its vector backend's request_render is a no-op), but the promoted
+        Vulkan viewport of an SNT-only session renders on demand, so ask it for
+        one frame - coalesced, since Create/Clear may sync several times.
+        """
+        if getattr(self, '_vector_frame_pending', False):
+            return
+        self._vector_frame_pending = True
+
+        def present():
+            self._vector_frame_pending = False
+            backend = getattr(layer, '_backend', None)
+            try:
+                if backend is not None:
+                    backend.request_render()
+            except Exception as exc:  # noqa: BLE001 - a missed frame must not break editing
+                print(f'[native draw] block linework frame request failed: {exc}')
+
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, present)
 
     def _paint(self):
         gpu_blocks = self._sync_block_vectors()

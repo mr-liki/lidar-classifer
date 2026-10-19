@@ -4,6 +4,7 @@ The splitting, offsets, end caps, priority clipping and small-fragment rules are
 copied from gui/block_creation_settings_dialog.py. Only presentation is adapted:
 return authored drawing dictionaries for the native viewport, without Qt/VTK.
 """
+import math
 from types import SimpleNamespace
 import numpy as np
 
@@ -752,7 +753,12 @@ class NativeBlockGeometry:
 
     def _tag_block_vertex_groups(self, drawings):
         """Remember which preview vertices are one logical block corner."""
+        tolerance = 1e-6
         groups = []
+        # Spatial hash on tolerance-sized cells: a match lies in the 3x3 cells
+        # around the vertex.  Taking the earliest such group keeps the result of
+        # the old linear scan over every group without its quadratic cost.
+        cells = {}
         for drawing in list(drawings or []):
             original = self._clean_block_edit_chain(drawing.get("coords"))
             drawing["block_creation_original_coords"] = [tuple(point) for point in original]
@@ -760,17 +766,20 @@ class NativeBlockGeometry:
             drawing["block_creation_vertex_groups"] = vertex_groups
 
             for vertex_index, point in enumerate(original):
-                group = next(
-                    (
-                        candidate
-                        for candidate in groups
-                        if np.hypot(point[0] - candidate["point"][0], point[1] - candidate["point"][1])
-                        <= 1e-6
-                    ),
-                    None,
-                )
+                cx = math.floor(point[0] / tolerance)
+                cy = math.floor(point[1] / tolerance)
+                group = None
+                for gx in (cx - 1, cx, cx + 1):
+                    for gy in (cy - 1, cy, cy + 1):
+                        for index in cells.get((gx, gy), ()):
+                            candidate = groups[index]
+                            if (group is None or index < group["index"]) and math.hypot(
+                                    point[0] - candidate["point"][0],
+                                    point[1] - candidate["point"][1]) <= tolerance:
+                                group = candidate
                 if group is None:
-                    group = {"point": point, "members": []}
+                    group = {"point": point, "members": [], "index": len(groups)}
+                    cells.setdefault((cx, cy), []).append(len(groups))
                     groups.append(group)
                 group["members"].append((drawing, vertex_index))
 
@@ -1665,6 +1674,12 @@ class NativeBlockGeometry:
         """
         Clip polyline_pts retaining only the portions that lie OUTSIDE the polygon.
         Returns a list of sub-chains (each is a list of (x,y,z) tuples).
+
+        Same result as testing every segment against every polygon edge with
+        _segment_polygon_intersections/_point_in_polygon_2d, but vectorised over
+        the polygon edges, and segments whose bounding box misses the polygon's
+        are kept without any test - most outlines are nowhere near most of the
+        earlier blocks they are clipped against.
         """
         if polygon is None or len(polygon) < 3 or len(polyline_pts) < 2:
             return [polyline_pts]
@@ -1678,6 +1693,37 @@ class NativeBlockGeometry:
             z = z_of(p1) + t * (z_of(p2) - z_of(p1))
             return (x, y, z)
 
+        poly = np.asarray(polygon, dtype=np.float64)[:, :2]
+        xmin, ymin = poly.min(axis=0)
+        xmax, ymax = poly.max(axis=0)
+        margin = 1e-9
+
+        def disjoint(p1, p2):
+            x1, y1, x2, y2 = float(p1[0]), float(p1[1]), float(p2[0]), float(p2[1])
+            return (max(x1, x2) < xmin - margin or min(x1, x2) > xmax + margin
+                    or max(y1, y2) < ymin - margin or min(y1, y2) > ymax + margin)
+
+        xs = [float(p[0]) for p in polyline_pts]
+        ys = [float(p[1]) for p in polyline_pts]
+        if disjoint((min(xs), min(ys)), (max(xs), max(ys))):
+            # Whole chain clear of the polygon: every segment is kept and the
+            # pieces join back into the one chain.
+            pairs = list(zip(polyline_pts, polyline_pts[1:]))
+            return [[get_pt(*pairs[0], 0.0)] + [get_pt(a, b, 1.0) for a, b in pairs]]
+
+        # Polygon edges i -> i+1 (wrapping) for the crossings, and the ray-cast
+        # pairs (i, j=i-1) for the inside test - same arithmetic as the helpers.
+        ax, ay = poly[:, 0], poly[:, 1]
+        nxt = np.roll(poly, -1, axis=0)
+        ex, ey = nxt[:, 0] - ax, nxt[:, 1] - ay
+        prv = np.roll(poly, 1, axis=0)
+        xj, yj = prv[:, 0], prv[:, 1]
+        ray_slope = (xj - ax) / (yj - ay + 1e-300)
+
+        def inside(px, py):
+            crosses = ((ay > py) != (yj > py)) & (px < ray_slope * (py - ay) + ax)
+            return bool(np.count_nonzero(crosses) & 1)
+
         # Collect all kept sub-segments
         kept_segments = []
 
@@ -1685,14 +1731,19 @@ class NativeBlockGeometry:
             p1 = polyline_pts[seg_idx]
             p2 = polyline_pts[seg_idx + 1]
 
-            # Find intersections in (0, 1)
-            hits = self._segment_polygon_intersections(p1, p2, polygon)
-            t_vals = [0.0]
-            for t, _ in hits:
-                if t > 1e-9 and t < 1.0 - 1e-9:
-                    t_vals.append(t)
-            t_vals.append(1.0)
-            t_vals.sort()
+            if disjoint(p1, p2):
+                kept_segments.append((get_pt(p1, p2, 0.0), get_pt(p1, p2, 1.0)))
+                continue
+
+            x1, y1 = float(p1[0]), float(p1[1])
+            dx, dy = float(p2[0]) - x1, float(p2[1]) - y1
+            denom = dx * ey - dy * ex
+            valid = np.abs(denom) >= 1e-12
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = ((ax - x1) * ey - (ay - y1) * ex) / denom
+                u = ((ax - x1) * dy - (ay - y1) * dx) / denom
+            hit = valid & (t > 1e-9) & (t < 1.0 - 1e-9) & (u >= 0.0) & (u <= 1.0)
+            t_vals = sorted([0.0, *t[hit].tolist(), 1.0])
 
             for idx in range(len(t_vals) - 1):
                 ta = t_vals[idx]
@@ -1704,7 +1755,7 @@ class NativeBlockGeometry:
                 t_mid = (ta + tb) * 0.5
                 mid_pt = get_pt(p1, p2, t_mid)
 
-                if not self._point_in_polygon_2d(mid_pt[0], mid_pt[1], polygon):
+                if not inside(mid_pt[0], mid_pt[1]):
                     # Outside! Keep this sub-segment
                     sub_start = get_pt(p1, p2, ta)
                     sub_end = get_pt(p1, p2, tb)
@@ -1713,11 +1764,9 @@ class NativeBlockGeometry:
         # Assemble the kept segments into continuous chains
         chains = []
         for start_pt, end_pt in kept_segments:
-            if chains and np.hypot(chains[-1][-1][0] - start_pt[0], chains[-1][-1][1] - start_pt[1]) < 1e-6:
+            if chains and math.hypot(chains[-1][-1][0] - start_pt[0], chains[-1][-1][1] - start_pt[1]) < 1e-6:
                 chains[-1].append(end_pt)
             else:
                 chains.append([start_pt, end_pt])
 
         return [c for c in chains if len(c) >= 2]
-
-
