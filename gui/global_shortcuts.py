@@ -206,19 +206,41 @@ class GlobalShortcutFilter(QObject):
         event = QKeyEvent(QEvent.KeyPress, key, modifiers, keyname)
         self.eventFilter(self.app_window, event)
 
-    def _set_pan_shortcut_active(self, active):
-        """Publish the latched left-pan tool state used by every viewport."""
+    def _set_pan_shortcut_active(self, active, pan_mode=None):
+        """Publish the latched left-pan tool state used by every viewport.
+
+        ``pan_mode`` ("left" / "tap") comes from the Pan shortcut's required
+        Classes-cell configuration in the Shortcut Manager. While the Pan
+        tool is armed it temporarily overrides the persistent Panning-button
+        setting; disarming (Esc / another tool) restores the original one so
+        section/cut viewports react to "Tap - Tap Pan" without abandoning the
+        user's own Global Settings choice.
+        """
         active = bool(active)
-        self.app_window._left_pan_shortcut_active = active
+        app = self.app_window
+        app._left_pan_shortcut_active = active
         if active:
-            # Arming the Pan tool also re-arms a Left / Tap-Tap pan that a
-            # previous Escape suspended (tool-like off/on behaviour).
-            restore = getattr(self.app_window, "_restore_pan_nav", None)
+            # Re-arm any pan suspended by Escape first, so the value saved
+            # below is the persistent preference before the shortcut's own
+            # mode overrides it.
+            restore = getattr(app, "_restore_pan_nav", None)
             if callable(restore):
                 restore()
+            if pan_mode in ("left", "tap"):
+                if getattr(app, "_pan_nav_suspended_button", None) is None:
+                    app._pan_nav_suspended_button = getattr(
+                        app, "panning_button", "scroll"
+                    )
+                app.panning_button = pan_mode
         if not active:
-            release = getattr(self.app_window, "_handle_fast_main_pan_release", None)
-            if callable(release) and getattr(self.app_window, "_qt_main_pan_active", False):
+            # Restore the persistent navigation preference the shortcut may
+            # have temporarily overridden while it was armed.
+            saved = getattr(app, "_pan_nav_suspended_button", None)
+            if saved is not None:
+                app._pan_nav_suspended_button = None
+                app.panning_button = saved
+            release = getattr(app, "_handle_fast_main_pan_release", None)
+            if callable(release) and getattr(app, "_qt_main_pan_active", False):
                 release()
 
     def _get_live_qt_attr(self, attr_name):
@@ -867,7 +889,8 @@ class GlobalShortcutFilter(QObject):
                         return True
                     if execute_native_shortcut(self.app_window, configured_shortcut.get('tool'),
                             configured_shortcut.get('from'), configured_shortcut.get('to'),
-                            configured_shortcut.get('preset'), key_label):
+                            configured_shortcut.get('preset'), key_label,
+                            pan_mode=configured_shortcut.get('pan_mode')):
                         return True
                 elif combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
                     redo = event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift'
@@ -1735,13 +1758,24 @@ class GlobalShortcutFilter(QObject):
                         "Pan",
                         key_label=key_label,
                     )
-                    self._set_pan_shortcut_active(True)
-                    print(f"Pan shortcut activated: {combo} (left-drag to pan)")
+                    pan_mode = (
+                        shortcut.get("pan_mode")
+                        if shortcut.get("pan_mode") in ("left", "tap")
+                        else None
+                    )
+                    self._set_pan_shortcut_active(True, pan_mode=pan_mode)
+                    if pan_mode == "tap":
+                        print(f"Pan shortcut activated: {combo} (tap-tap to pan)")
+                        status_msg = (
+                            f"[{key_label}] Pan active - "
+                            "tap-tap to pan (tap again / Esc to stop)"
+                        )
+                    else:
+                        print(f"Pan shortcut activated: {combo} (left-drag to pan)")
+                        status_msg = f"[{key_label}] Pan active - left-drag to pan"
                     status_bar = getattr(self.app_window, "statusBar", None)
                     if callable(status_bar):
-                        status_bar().showMessage(
-                            f"[{key_label}] Pan active - left-drag to pan", 2500
-                        )
+                        status_bar().showMessage(status_msg, 2500)
                 return True
 
             if shortcut and tool not in (

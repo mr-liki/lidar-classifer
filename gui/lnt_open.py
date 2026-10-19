@@ -14,6 +14,7 @@ from PySide6.QtCore import QEvent, QObject, QThread, Qt, QTimer, Slot, Signal
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
 
 from gui import lnt_native as nat
+from gui.native_pan import NativePanGesture
 
 LNT_SUFFIXES = (".las", ".laz", ".lnt")
 
@@ -141,6 +142,12 @@ class _InputFilter(QObject):
         super().__init__(view)
         self.view = view
         self._last = None
+        self._pan = NativePanGesture(self._pan_main)
+
+    def _pan_main(self, dx, dy):
+        nv = self.view.native
+        if nv is not None:
+            nv.pan(dx, dy)
 
     def eventFilter(self, obj, ev):   # noqa: N802 (Qt API)
         t = ev.type()
@@ -245,6 +252,13 @@ class _InputFilter(QObject):
             elif t == E.KeyPress:
                 if _tool.key(ev.key()):
                     return True
+        # Armed Pan shortcut (Left - Click / Tap - Tap): every tool above
+        # keeps its own clicks, so this only sees otherwise free left input.
+        if self._pan.handle(getattr(self.view, "app", None), ev):
+            if t == E.MouseButtonPress:
+                obj.setFocus()
+            self._last = None
+            return True
         if t == E.MouseButtonPress:
             picker = getattr(self.view, "picker", None)
             if picker is not None and ev.button() == Qt.LeftButton:

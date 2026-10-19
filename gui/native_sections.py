@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QComboBox, QDialog
 from gui.render_backend import VulkanRenderBackend
 from gui.lnt_section_bridge import get_store, LntCrossPicker
 from gui.native_section_classify import SectionClassifier
+from gui.native_pan import NativePanGesture, disarm_pan
 
 CROSS_SECTION_COUNT = 8
 CUT_SLOT = 9
@@ -167,6 +168,7 @@ class SectionCanvas(QWidget):
         self._lo = self._hi = np.zeros(3, dtype=np.float64)
         self.axis = 0
         self.drag = None
+        self.pan_gesture = NativePanGesture(self._pan_by)
         self.cut_armed = False
         self.cut_centre = None
         self.cut_source = None
@@ -175,6 +177,8 @@ class SectionCanvas(QWidget):
         self.shading_parameters = (45., 45., .25)
         self._dirty = True
         self._closed = False
+        self._cut_preview = None
+        self._bound_hwnd = 0               # native window the engine renders into
         self.setMouseTracking(True)
         self.timer = QTimer(self)
         self.timer.setInterval(16)
@@ -190,6 +194,10 @@ class SectionCanvas(QWidget):
             self.shortcuts.append(shortcut)
 
     def escape(self):
+        # This QShortcut consumes Esc before any key filter sees it, so the
+        # armed Pan tool must be disarmed here too.
+        self.pan_gesture.finish()
+        disarm_pan(self.owner.app)
         if self.classifier.busy():
             self.classifier.cancel()
         else:
@@ -204,11 +212,28 @@ class SectionCanvas(QWidget):
     def start(self):
         if self._closed:
             return False
+        hwnd = int(self.winId())
+        rebind = bool(self.backend._handle) and hwnd != self._bound_hwnd
+        if rebind:
+            # Closing a section dock and taking the section again reparents
+            # this canvas, which gives it a NEW native window. The engine's
+            # swapchain is still bound to the destroyed one, so it renders but
+            # never presents (blank window). Rebuild it on the current window.
+            self.backend.shutdown()
         if not self.backend._handle:
             ratio = self.devicePixelRatioF()
-            if not self.backend.initialize(int(self.winId()),
+            if not self.backend.initialize(hwnd,
                     max(1, round(self.width() * ratio)), max(1, round(self.height() * ratio))):
                 raise RuntimeError('Could not create native section viewport: ' + self.backend.last_error())
+            self._bound_hwnd = hwnd
+            if rebind and len(self.local):
+                # New engine instance: upload the same records, palette and
+                # display mode again (set_points re-enters start(), now bound).
+                self.set_points(self.local, self.indices, self.axis, fit=False,
+                                bounds=(self._lo, self._hi))
+            if self._cut_preview is not None:   # reopened window: redraw the preview
+                self._draw_cut_preview()
+            self._dirty = True
         return True
 
     def resizeEvent(self, event):
@@ -344,9 +369,77 @@ class SectionCanvas(QWidget):
         return (self.centre[0]-half_w, self.centre[0]+half_w,
                 self.centre[2]-self.scale, self.centre[2]+self.scale)
 
+    # ---- cut preview (engine line pass, naksha-lidar cut tool look) --------
+    # Before the centre click a white centre line follows the cursor; after
+    # it, the white line stays at the centre and two orange depth lines follow
+    # the cursor at centre +/- depth. All lines span far past the view height.
+    def show_cut_preview(self, centre, half=None):
+        self._cut_preview = (float(centre), None if half is None else float(half))
+        overlay = self.classifier.overlay
+        shapes = [shape for shape in overlay.shapes if shape[0] != 'cut_preview']
+        if not self._draw_cut_preview():
+            # DLL without the vector pass: same lines through the Qt overlay.
+            shapes.append(('cut_preview', [(self._cut_preview[0], self.centre[2])],
+                           (self._cut_preview[1], self.slot == CUT_SLOT)))
+        overlay.set_shapes(shapes)
+        self._dirty = True
+
+    def _draw_cut_preview(self):
+        preview = getattr(self, '_cut_preview', None)
+        backend = self.backend
+        if preview is None or not backend._handle or not backend.supports_vector_overlay():
+            return False
+        centre, half = preview
+        edge = 0. if half is None else half
+        reach = max(1e4, self.scale*1e3)
+        y, z0, z1 = float(self.centre[1]), self.centre[2]-reach, self.centre[2]+reach
+        xs = (centre, centre, centre-edge, centre-edge, centre+edge, centre+edge)
+        xyz = np.array([(x, y, z) for x, z in zip(xs, (z0, z1)*3)], dtype=np.float64)
+        rgb = np.array([(255, 255, 255)]*2 + [(255, 165, 0)]*4, dtype=np.uint8)
+        restart = 0xFFFFFFFF
+        indices = np.array([0, 1, restart, 2, 3, restart, 4, 5], dtype=np.uint32)
+        if not backend.vector_reserve(6, 8):
+            return False
+        if not backend.vector_upload_strip(0, 6, xyz, rgb, 0, 8, indices):
+            return False
+        centre_px = 2. if self.slot == CUT_SLOT else 1.
+        if half is None:
+            return backend.vector_set_draw_ranges([0], [2], [centre_px])
+        # The depth edges coincide with the centre at zero/small depth. Draw
+        # the white centre last so orange cannot paint over it.
+        return backend.vector_set_draw_ranges([3, 0], [5, 2], [2., centre_px])
+
+    def clear_cut_preview(self):
+        if getattr(self, '_cut_preview', None) is None:
+            return
+        self._cut_preview = None
+        if self.backend._handle:
+            self.backend.vector_clear_draw_ranges()
+        overlay = self.classifier.overlay
+        overlay.set_shapes([shape for shape in overlay.shapes if shape[0] != 'cut_preview'])
+        self._dirty = True
+
+    def _pan_by(self, dx, dy):
+        factor = 2*self.scale/max(1, self.height())
+        self.centre[0] -= dx*factor
+        self.centre[2] += dy*factor
+        self._dirty = True
+        self.owner.sync_from(self.slot)
+
+    def _pan_tool_input(self, event):
+        """Armed Pan shortcut (Left - Click / Tap - Tap); tools keep their clicks."""
+        measurement = getattr(self, 'measurement', None)
+        if (self.cut_armed or self.classifier.active()
+                or (measurement is not None and measurement.active)):
+            self.pan_gesture.finish()
+            return False
+        return self.pan_gesture.handle(self.owner.app, event)
+
     def mousePressEvent(self, event):
         self.setFocus()
         self.owner.active_slot = self.slot
+        if self._pan_tool_input(event):
+            return
         measurement = getattr(self, 'measurement', None)
         if measurement is not None and measurement.press(event.position(), event.button()):
             return
@@ -361,13 +454,18 @@ class SectionCanvas(QWidget):
             x = self.horizontal_at(event.position().x())
             if self.cut_centre is None:
                 self.cut_centre = x
+                self.show_cut_preview(x)
                 self.owner.app.statusBar().showMessage('Click to set cut depth; right-click cancels', 5000)
             else:
                 self.owner.finish_cut(self, x)
-        elif event.button() in (Qt.LeftButton, Qt.MiddleButton):
+        elif event.button() == Qt.MiddleButton:
+            # Middle-drag always pans. Left-drag pans only while the Pan
+            # shortcut is armed (handled by _pan_tool_input above).
             self.drag = event.position()
 
     def mouseMoveEvent(self, event):
+        if self._pan_tool_input(event):
+            return
         measurement = getattr(self, 'measurement', None)
         # A measurement gesture does not capture the middle button: section
         # panning remains available while Line/Path is active.
@@ -376,27 +474,27 @@ class SectionCanvas(QWidget):
             return
         if not self.cut_armed and self.drag is None and self.classifier.move(event.position()):
             return
-        if self.cut_armed and self.cut_centre is not None:
-            edge = self.horizontal_at(event.position().x())
-            half_width = abs(edge-self.cut_centre)
-            self.classifier.overlay.set_shapes([('cut_preview',
-                [(self.cut_centre-half_width, self.centre[2]-self.scale),
-                 (self.cut_centre+half_width, self.centre[2]+self.scale)], None)])
+        if self.cut_armed:
+            x = self.horizontal_at(event.position().x())
+            if self.cut_centre is None:
+                self.show_cut_preview(x)
+            else:
+                self.show_cut_preview(self.cut_centre, abs(x-self.cut_centre))
         if self.drag is not None:
             delta = event.position()-self.drag
-            factor = 2*self.scale/max(1, self.height())
-            self.centre[0] -= delta.x()*factor
-            self.centre[2] += delta.y()*factor
             self.drag = event.position()
-            self._dirty = True
-            self.owner.sync_from(self.slot)
+            self._pan_by(delta.x(), delta.y())
 
     def mouseReleaseEvent(self, event):
+        if self._pan_tool_input(event):
+            return
         if self.drag is None and not self.cut_armed:
             self.classifier.release(event.position(), event.button())
         self.drag = None
 
     def mouseDoubleClickEvent(self, event):
+        if self._pan_tool_input(event):
+            return
         measurement = getattr(self, 'measurement', None)
         if measurement is not None and measurement.double_click(event.position(), event.button()):
             return
@@ -404,6 +502,7 @@ class SectionCanvas(QWidget):
             super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
+        self._pan_tool_input(event)
         measurement = getattr(self, 'measurement', None)
         if measurement is not None and measurement.key(event.key()):
             return
@@ -452,6 +551,8 @@ class NativeSections:
         self.geometry = {}
         self.active_slot = 1
         self._cut_recipe = None
+        self._cut_recipe_nested = False
+        self._nested_cut_active = False
         self._cut_depth = 1.
         self._refresh = QTimer(app)
         self._refresh.setInterval(500)
@@ -882,6 +983,9 @@ class NativeSections:
                 measurement.cancel()
 
     def arm_cut(self, nested=False, source_slot=None):
+        if (nested and self._nested_cut_active and self.views.get(CUT_SLOT) is not None
+                and self.views[CUT_SLOT].cut_armed):
+            return True                      # already armed: keep a placed centre
         self.cancel_point_actions()
         self.cancel_cross()
         self.cancel_cut()
@@ -893,8 +997,11 @@ class NativeSections:
             slot = next((s for s in self.views if s != CUT_SLOT), 0)
         canvas = self.views.get(slot)
         if canvas is None or not len(canvas.indices):
-            self.app.statusBar().showMessage('Draw a cross section before creating a cut', 5000)
+            self.app.statusBar().showMessage(
+                'Create a cut section before using Cut-in-Cut' if nested else
+                'Draw a cross section before creating a cut', 5000)
             return False
+        self._nested_cut_active = bool(nested)
         canvas.cut_armed = True
         self.app.cut_section_mode_on = True
         if hasattr(self.app, 'set_cross_cursor_active'):
@@ -904,27 +1011,45 @@ class NativeSections:
         return True
 
     def cancel_cut(self):
+        self._nested_cut_active = False
         self.app.cut_section_mode_on = False
         if hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(False, 'cut_section')
         for canvas in self.views.values():
             canvas.cut_armed = False
             canvas.cut_centre = None
-            overlay = canvas.classifier.overlay
-            overlay.set_shapes([shape for shape in overlay.shapes if shape[0] != 'cut_preview'])
-            overlay.set_marks([])
+            canvas.clear_cut_preview()
+            canvas.classifier.overlay.set_marks([])
         return True
 
     def finish_cut(self, source, edge):
         centre, depth = source.cut_centre, abs(edge-source.cut_centre)*2
         if depth < 1e-6:
             return
+        nested = self._nested_cut_active and source.slot == CUT_SLOT
+        if nested and not np.any(np.abs(source.local[:, source.axis]-centre) <= depth*.5):
+            source.cut_centre = None
+            source.clear_cut_preview()
+            self.app.statusBar().showMessage('No points in cut range; click a new centre', 5000)
+            return
         # Snapshot the source when taking a nested cut; replacing the cut slot
         # must not change the input of subsequent depth adjustments.
         self._cut_recipe = (source.slot, source.local.copy(), source.indices.copy(),
                             source.axis, centre)
+        self._cut_recipe_nested = nested
         self.cancel_cut()
         self.update_cut_depth(depth)
+        if nested:
+            # Cut-in-Cut stays armed on the result (naksha-lidar behaviour):
+            # each next placement starts from the latest result, not its parent.
+            self._nested_cut_active = True
+            source.cut_armed = True
+            self.app.cut_section_mode_on = True
+            if hasattr(self.app, 'set_cross_cursor_active'):
+                self.app.set_cross_cursor_active(True, 'cut_section')
+            source.setFocus()
+            self.app.statusBar().showMessage(
+                'Cut-in-Cut ready: click next centre, then depth; Escape exits', 0)
 
     def update_cut_depth(self, depth):
         if self._cut_recipe is None:
@@ -933,7 +1058,16 @@ class NativeSections:
         _, local, indices, axis, centre = self._cut_recipe
         selected = np.abs(local[:, axis]-centre) <= depth*.5
         canvas = self.ensure_dock(CUT_SLOT)
-        canvas.set_points(local[selected], indices[selected], 1-axis)
+        output, output_axis = local[selected], 1-axis
+        if self._cut_recipe_nested:
+            # Rotate the displayed section coordinates clockwise by 90 degrees,
+            # as the reference does, without touching store/world records.
+            rotated = np.empty_like(output)
+            rotated[:, 0] = output[:, 1-axis]
+            rotated[:, 1] = -output[:, axis]
+            rotated[:, 2] = output[:, 2]
+            output, output_axis = rotated, 0
+        canvas.set_points(output, indices[selected], output_axis)
         store = get_store(self.app)
         self._classes[CUT_SLOT] = store.data['classification'][canvas.indices].copy()
         controller = getattr(self.app, 'cut_section_controller', None)
