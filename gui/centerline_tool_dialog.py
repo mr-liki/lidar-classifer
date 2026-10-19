@@ -144,6 +144,8 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         self._hover_highlight_actor = None
         self._hover_orig_color = None
         self._hover_orig_width = None
+        # Vulkan path only: original dialog/algorithm kept intact.
+        self._native_draw = None
 
         self.setWindowTitle("Centerline Tool")
         self.setWindowFlags(
@@ -248,6 +250,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         if not self._select_mode:
             return
         self._remove_selection_observer()
+        if self._native_draw is not None:
+            self._native_draw.canvas.setFocus()
+            return
         interactor = self.digitizer.interactor
         self._old_left_press = interactor.AddObserver(
             "LeftButtonPressEvent", self._on_line_picked, 1.0
@@ -268,6 +273,27 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         self._update_lines_label()
         self.raise_()
         self.activateWindow()
+
+    def _on_native_feature_picked(self, feature):
+        """Pick two actual SNT/native open lines for original interpolation."""
+        draw = self._native_draw
+        if draw is None or not self._select_mode:
+            return
+        if feature is None or not self._is_open_line_feature(feature):
+            self._show_message('Choose an open line or polyline (not a polygon).')
+            return
+        if not draw._valid_source(feature):
+            self._show_message('Line is no longer visible or attached.')
+            return
+        if any(d['key'] == feature['key'] for d in self._selected_drawings):
+            self._show_message('Select a different second line.')
+            return
+        self._selected_drawings.append(feature)
+        draw.set_legacy_dialog_highlights(self, self._selected_drawings)
+        self._update_lines_label()
+        self.apply_btn.setEnabled(len(self._selected_drawings) == 2)
+        if len(self._selected_drawings) == 2:
+            self._on_finish_selection()
 
     def _on_line_picked(self, obj, evt):
         interactor = self.digitizer.interactor
@@ -332,6 +358,8 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
             return None
 
     def _drawing_coords(self, drawing):
+        if self._native_draw is not None:
+            return drawing.get('coords', []) if isinstance(drawing, dict) else []
         if hasattr(self.digitizer, "_get_drawing_coords"):
             return self.digitizer._get_drawing_coords(drawing)
         if isinstance(drawing, dict):
@@ -417,6 +445,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         self._render()
 
     def _clear_highlight(self):
+        if self._native_draw is not None:
+            self._native_draw.set_legacy_dialog_highlights(self, [])
+            return
         self._clear_hover_highlight()
         for actor, (color, width) in list(self._selection_saved_props.items()):
             try:
@@ -480,6 +511,11 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
             return
 
         first, second = self._selected_drawings[:2]
+        if self._native_draw is not None and not all(
+                self._native_draw._valid_source(f) for f in (first, second)):
+            self._show_message('Source changed or was hidden. Select two visible lines again.')
+            self.apply_btn.setEnabled(False)
+            return
         center_coords = self._compute_centerline_coords(
             self._drawing_coords(first),
             self._drawing_coords(second),
@@ -489,7 +525,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
             self.lines_label.setText("Could not generate centerline - check geometry.")
             return
 
-        self._create_centerline_drawing(center_coords, first, second)
+        outcome = self._create_centerline_drawing(center_coords, first, second)
+        if self._native_draw is not None and outcome is False:
+            return
         self._remove_selection_observer()
         self._clear_highlight()
         self._selected_drawings.clear()
@@ -649,6 +687,21 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
 
     def _create_centerline_drawing(self, coords, first, second):
         color, width, line_style = self._get_centerline_style()
+        if self._native_draw is not None:
+            from PySide6.QtGui import QColor
+            if not all(self._native_draw._valid_source(f) for f in (first, second)):
+                self._show_message('Source lines are no longer visible or attached.')
+                return False
+            self._native_draw._commit(
+                'centerline', [(float(p[0]), float(p[1])) for p in coords],
+                xyz_coords=list(coords),
+                color=QColor.fromRgbF(*color).name(), width=width,
+                line_style=line_style,
+                source_keys=(first['key'],second['key']),
+                source_types=[first.get('type','line'),second.get('type','line')],
+                generated_from='centerline_tool',
+                source_layers=[first.get('layer'),second.get('layer')])
+            return True
         source_layers = {
             str(first.get("layer", "") or "").strip(),
             str(second.get("layer", "") or "").strip(),
@@ -725,6 +778,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         super().reject()
 
     def _remove_selection_observer(self):
+        if self._native_draw is not None:
+            self._old_left_press = self._old_mouse_move = None
+            return
         interactor = self.digitizer.interactor
         if self._old_left_press is not None:
             try:

@@ -1577,6 +1577,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
         self._hover_orig_width = None
         self._selected_side = "left"   # default offset side
         self._selected_drawing = None
+        # Assigned only while the REAL Parallel dialog is opened over Vulkan.
+        # None means retain the untouched original VTK observer/output path.
+        self._native_draw = None
         self._parallel_left_tolerance = 0.20
         self._parallel_right_tolerance = 0.20
 
@@ -1887,10 +1890,13 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
         QTimer.singleShot(150, self._install_selection_observer)
 
     def _install_selection_observer(self):
-        """Install a one-shot LeftButtonPress observer for figure picking."""
+        """VTK observer only; Vulkan clicks are routed via NativeDraw.press."""
         if not self._select_mode:
             return
         self._remove_selection_observer()
+        if self._native_draw is not None:
+            self._native_draw.canvas.setFocus()
+            return
         interactor = self.digitizer.interactor
         self._old_left_press = interactor.AddObserver(
             "LeftButtonPressEvent", self._on_figure_picked, 1.0
@@ -1914,6 +1920,26 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
         self._update_figure_label()
         self.raise_()
         self.activateWindow()
+
+    def _on_native_feature_picked(self, feature):
+        """Pick a Vulkan-visible native/SNT figure using the original dialog."""
+        draw = self._native_draw
+        if draw is None or not self._select_mode:
+            return
+        if feature is None or feature.get('type') == 'text':
+            self._set_status('Click a visible line, polyline or closed figure.')
+            return
+        if not draw._valid_source(feature):
+            self._set_status('Source is no longer attached or visible; select again.')
+            return
+        if any(d['key'] == feature['key'] for d in self._selected_drawings):
+            return
+        self._selected_drawings.append(feature)
+        self._selected_drawing = feature
+        draw.set_legacy_dialog_highlights(self, self._selected_drawings)
+        self._update_figure_label()
+        self.apply_btn.setEnabled(True)
+        self.classify_btn.setEnabled(True)
 
     def _on_figure_picked(self, obj, evt):
         """Add the clicked figure to the selection; stay in selection mode."""
@@ -1968,6 +1994,8 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             return None
 
     def _drawing_coords(self, drawing):
+        if self._native_draw is not None:
+            return drawing.get('coords', []) if isinstance(drawing, dict) else []
         if hasattr(self.digitizer, "_get_drawing_coords"):
             return self.digitizer._get_drawing_coords(drawing)
         if isinstance(drawing, dict):
@@ -2054,6 +2082,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
 
     def _clear_highlight(self):
         """Restore original appearance for every highlighted drawing."""
+        if self._native_draw is not None:
+            self._native_draw.set_legacy_dialog_highlights(self, [])
+            return
         self._clear_hover_highlight()
         for actor, (color, width) in list(self._selection_saved_props.items()):
             try:
@@ -2284,9 +2315,44 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             self._selected_drawing = self._selected_drawings[-1]
 
         drawing = self._selected_drawing
+        if self._native_draw is not None and not self._native_draw._valid_source(drawing):
+            self._set_status('Selected geometry is no longer visible or attached. Reselect it.')
+            return
         coords = np.asarray(self._drawing_coords(drawing), dtype=np.float64)
         if coords.ndim != 2 or coords.shape[0] < 2:
             self._set_status("Selected drawing has no usable coordinates.")
+            return
+
+        # The native LNT view intentionally holds only file-backed point records,
+        # not app.data's full LAS/LAZ arrays.  Classify by exact leaf node/local
+        # identities through the already-used native section writeback path.
+        # This branch only runs when Vulkan owns a native cloud; VTK unchanged.
+        _native_view = getattr(self.app, '_lnt_main_view', None)
+        if self._native_draw is not None and getattr(_native_view, 'native', None) is not None:
+            if self._band_mode() == 'symmetric':
+                _left = _right = max(0., float(self.left_tol_spin.value()) * .5)
+            else:
+                _left = max(0., float(self.left_tol_spin.value()))
+                _right = max(0., float(self.right_tol_spin.value()))
+            _from = self.from_class_combo.currentData()
+            _to = self.to_class_combo.currentData()
+            if _to is None:
+                self._set_status('Choose a target class.')
+                return
+            try:
+                from gui.native_parallel_lnt_band import classify_lnt_parallel_band
+                _result = classify_lnt_parallel_band(
+                    self.app, coords[:, :2], _left, _right, _from, _to)
+            except (RuntimeError, ValueError, TypeError) as _error:
+                self._set_status(f'Native Classify Band failed: {_error}')
+                return
+            _changed = _result['changed_points']
+            if _changed == 0:
+                self._set_status(f"No eligible points (inside band: {_result['band_points']:,}).")
+                return
+            self._save_parallel_settings()
+            self._set_status(f"Classified {_changed:,} native LNT records "
+                             f"(inside band: {_result['band_points']:,}).")
             return
 
         xyz = getattr(self.app, "data", {}).get("xyz") if getattr(self.app, "data", None) else None
@@ -2307,7 +2373,13 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             self._set_status("Choose a target class.")
             return
 
-        band_mask = self._build_parallel_band_mask_xy(xyz, coords[:, :2], left_tol, right_tol)
+        if self._native_draw is not None and len(xyz) >= 50000:
+            # Vulkan path: crop candidates before exact float64 mask testing.
+            # Use the same classification engine/palette/Undo as VTK.
+            from gui.native_parallel_band import native_parallel_band_mask_xy
+            band_mask = native_parallel_band_mask_xy(xyz, coords[:, :2], left_tol, right_tol)
+        else:
+            band_mask = self._build_parallel_band_mask_xy(xyz, coords[:, :2], left_tol, right_tol)
         band_points = int(np.count_nonzero(band_mask))
         if band_points == 0:
             self._set_status("No points found inside selected parallel band.")
@@ -2485,6 +2557,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
 
         failed = 0
         for drawing in list(self._selected_drawings):
+            if self._native_draw is not None and not self._native_draw._valid_source(drawing):
+                failed += 1
+                continue
             coords = list(self._drawing_coords(drawing))
             dtype = drawing.get("type", "")
 
@@ -2503,6 +2578,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             self.figure_label.setText(
                 f"{failed} figure(s) could not be offset — check geometry."
             )
+            if self._native_draw is not None and failed == len(self._selected_drawings):
+                # No successful edit: keep dialog open, do not claim completion.
+                return
 
         # Clean up and close
         self._remove_selection_observer()
@@ -2559,6 +2637,21 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
     def _resolve_source_style(self, drawing):
         """Use the source drawing's persisted style so generated geometry restores correctly."""
         style = dict(self.digitizer._get_draw_style("line") or {})
+        if self._native_draw is not None:
+            from PySide6.QtGui import QColor
+            origin = drawing.get('drawing') or drawing
+            raw = origin.get('color', origin.get('original_color'))
+            if isinstance(raw, str):
+                qc = QColor(raw)
+                if qc.isValid():
+                    raw = (qc.redF(), qc.greenF(), qc.blueF())
+                else:
+                    raw = None
+            if raw is None:
+                raw = style.get('color', (1., 0., 0.))
+            return (tuple(float(v) for v in raw[:3]),
+                    max(1., float(origin.get('width', style.get('width', 2)))),
+                    origin.get('line_style', style.get('style', 'solid')))
         color = drawing.get("original_color")
         width = drawing.get("original_width")
         line_style = drawing.get("original_style")
@@ -2774,6 +2867,27 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
 
     def _create_parallel_drawing(self, new_coords, orig_dtype, orig_drawing):
         """Create a new drawing entry for the parallel figure."""
+        if self._native_draw is not None:
+            from PySide6.QtGui import QColor
+            source = orig_drawing
+            if not self._native_draw._valid_source(source):
+                self._set_status('Source changed or became hidden; please select again.')
+                return False
+            color, width, line_style = self._resolve_source_style(source)
+            # Persist the full XY geometry in native Draw history; the original
+            # SNT source and the original VTK digitizer remain untouched.
+            xy = [(float(p[0]),float(p[1])) for p in new_coords]
+            if len(xy) < 2:
+                return False
+            self._native_draw._commit(
+                'parallel', xy,
+                color=QColor.fromRgbF(*color).name(), width=width,
+                line_style=line_style, source_type=orig_dtype,
+                source_key=source['key'],
+                source_layer=source.get('layer'),
+                offset_distance=float(self.distance_spin.value()),
+                offset_side=str(self._selected_side))
+            return True
         import vtk
 
         color, width, line_style = self._resolve_source_style(orig_drawing)
@@ -2838,6 +2952,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
         super().reject()
 
     def _remove_selection_observer(self):
+        if self._native_draw is not None:
+            self._old_left_press = self._old_mouse_move = None
+            return
         interactor = self.digitizer.interactor
         if self._old_left_press is not None:
             try:

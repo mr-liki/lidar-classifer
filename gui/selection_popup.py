@@ -373,6 +373,17 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self._active_tool_timer.setInterval(250)
         self._active_tool_timer.timeout.connect(self._refresh_active_tool)
 
+        # Active Vulkan uses a dedicated selection controller attached to the
+        # visible native Draw overlay; VTK keeps the existing ElementSelectTool.
+        self._native_selection = None
+        try:
+            from gui.native_draw import get_native_draw
+            draw = get_native_draw(app, create=True)
+            if draw is not None:
+                from gui.native_selection_bridge import NativeSelectionController
+                self._native_selection = NativeSelectionController(draw)
+        except Exception as exc:
+            print(f"Native Selection controller unavailable, retaining VTK path: {exc}")
         self._build_ui()
         self._install_undo_redo_shortcuts()
         self._connect_selection_signal()
@@ -615,6 +626,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     def _on_shortcut_undo(self):
         if self._shortcut_should_skip_text_edit():
             return
+        if self._native_selection is not None:
+            self._native_selection.draw.history(redo=False)
+            return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
         try:
@@ -627,6 +641,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _on_shortcut_redo(self):
         if self._shortcut_should_skip_text_edit():
+            return
+        if self._native_selection is not None:
+            self._native_selection.draw.history(redo=True)
             return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
@@ -685,7 +702,19 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     # ------------------------------------------------------------------
     # Signal wiring
     # ------------------------------------------------------------------
+    def _selection_manager(self):
+        if self._native_selection is not None:
+            return self._native_selection.selection_manager
+        digitizer = getattr(self.app, "digitizer", None)
+        return getattr(digitizer, "selection_manager", None)
+
     def _connect_selection_signal(self):
+        if self._native_selection is not None:
+            mgr = self._selection_manager()
+            mgr.selection_changed.connect(self._on_selection_count)
+            mgr.selection_changed.connect(self._on_drawings_changed)
+            self._on_selection_count(mgr.count())
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -749,6 +778,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     # Tool plumbing
     # ------------------------------------------------------------------
     def _get_tool(self):
+        if self._native_selection is not None:
+            return self._native_selection
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return None
@@ -756,6 +787,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _activate_tool(self):
         if not self._pick_enabled:
+            return
+        if self._native_selection is not None:
+            self._native_selection.activate(self._method)
             return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
@@ -779,6 +813,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         """Temporarily stand down live pick observers while keeping the dialog open."""
         self._poll_generation += 1
         self.btn_move.setChecked(False)
+        if self._native_selection is not None:
+            self._native_selection.deactivate()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -815,6 +852,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         # cannot continue handling canvas input.
         if not btn.isChecked():
             self._pick_enabled = False
+            if self._native_selection is not None:
+                self._native_selection.deactivate()
+                return
             digitizer = getattr(self.app, "digitizer", None)
             if digitizer is not None:
                 try:
@@ -834,7 +874,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         # clear old selection. Otherwise Block-selected items remain selected
         # and Extend can grow previous selections also.
         if key != self._method:
-            digitizer = getattr(self.app, "digitizer", None)
+            if self._native_selection is not None:
+                self._selection_manager().clear()
+            digitizer = (None if self._native_selection is not None
+                         else getattr(self.app, "digitizer", None))
             if digitizer is not None:
                 try:
                     digitizer.selection_manager.clear()
@@ -885,16 +928,26 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _refresh_tool_counts(self):
         """Update All row text and each _ToolRow count badge."""
-        digitizer = getattr(self.app, "digitizer", None)
-        all_drawings = list(getattr(digitizer, "drawings", None) or []) if digitizer else []
+        if self._native_selection is not None:
+            all_drawings = list(self._native_selection.draw.drawings)
+        else:
+            digitizer = getattr(self.app, "digitizer", None)
+            all_drawings = list(getattr(digitizer, "drawings", None) or []) if digitizer else []
 
         total = len(all_drawings)
+        native_type_aliases = {
+            'line_segment': {'line'}, 'polygon': {'ortho', 'polygon'},
+            'polyline': {'polyline'},
+        } if self._native_selection is not None else {}
         if self._tool_chips:
             self._tool_chips[0].setText(f"All  {total}")
 
         all_mode = (0 in self._active_chip_indices)
         for i, (_, types) in enumerate(self.TOOL_FILTERS):
-            count = sum(1 for d in all_drawings if d.get("type") in types)
+            valid_types = set(types)
+            for kind in types:
+                valid_types.update(native_type_aliases.get(kind, ()))
+            count = sum(1 for d in all_drawings if d.get("type") in valid_types)
             chip_idx = i + 1
             if chip_idx < len(self._tool_chips):
                 chip = self._tool_chips[chip_idx]
@@ -928,8 +981,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _apply_tool_filter(self):
         """Apply or clear the tool filter based on the active row selections."""
-        digitizer = getattr(self.app, "digitizer", None)
-        mgr = getattr(digitizer, "selection_manager", None) if digitizer is not None else None
+        mgr = self._selection_manager()
         if mgr is None:
             return
 
@@ -947,6 +999,13 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             if 0 <= fi < len(self.TOOL_FILTERS):
                 active_types |= self.TOOL_FILTERS[fi][1]
 
+        if self._native_selection is not None:
+            native_aliases = {
+                'line_segment': {'line'}, 'polygon': {'ortho', 'polygon'},
+            }
+            for kind in tuple(active_types):
+                active_types.update(native_aliases.get(kind, ()))
+
         if not active_types:
             try:
                 mgr.clear()
@@ -963,6 +1022,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Tool filter select failed: {e}")
 
     def _selected_vertex_points(self):
+        if self._native_selection is not None:
+            return [point for d in self._selection_manager().get()
+                    for point in d.get('coords', [])]
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return []
@@ -1012,6 +1074,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         return points
 
     def _on_vertex_display(self):
+        if self._native_selection is not None:
+            self._native_selection._vertex_display=True
+            self._native_selection.draw._paint()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1037,6 +1103,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"Vertex display failed: {e}")
 
     def _on_vertex_clear(self):
+        if self._native_selection is not None:
+            self._native_selection._vertex_display=False
+            self._native_selection.draw._paint()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1052,6 +1122,12 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     # Quick-action handlers
     # ------------------------------------------------------------------
     def _on_select_all(self):
+        if self._native_selection is not None:
+            if self._native_selection._method=='snt_text':
+                self._native_selection.select_all_snt_text()
+            else:
+                self._selection_manager().select_all()
+            return
         tool = self._get_tool()
         if tool is not None and getattr(tool, "_method", None) == "snt_text":
             tool.select_all_snt_text()
@@ -1067,6 +1143,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Select All failed: {e}")
 
     def _on_deselect(self):
+        if self._native_selection is not None:
+            self._selection_manager().clear()
+            return
         tool = self._get_tool()
         if tool is not None and getattr(tool, "_method", None) == "snt_text":
             tool.clear_snt_text_selection()
@@ -1087,6 +1166,12 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Deselect failed: {e}")
 
     def _on_invert(self):
+        if self._native_selection is not None:
+            if self._native_selection._method=='snt_text':
+                self._native_selection.invert_snt_text_selection()
+            else:
+                self._selection_manager().invert_all()
+            return
         tool = self._get_tool()
         if tool is not None and getattr(tool, "_method", None) == "snt_text":
             tool.invert_snt_text_selection()
@@ -1100,6 +1185,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Invert failed: {e}")
 
     def _on_delete(self):
+        if self._native_selection is not None:
+            self._native_selection.delete_selected()
+            return
         tool = self._get_tool()
         if tool is not None and getattr(tool, "_method", None) == "snt_text":
             try:
@@ -1171,6 +1259,15 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         tool.enter_copy_mode()
 
     def _on_intersect(self):
+        if self._native_selection is not None:
+            tool=self._native_selection
+            if tool._intersect_mode:
+                tool.exit_intersect_mode(commit=True)
+                self.btn_intersect.setChecked(False)
+            else:
+                tool.enter_intersect_mode()
+                self.btn_intersect.setChecked(True)
+            return
         tool = self._get_tool()
         if tool is None or not tool.is_active():
             self.btn_intersect.setChecked(False)
@@ -1193,6 +1290,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             self.btn_intersect.setChecked(False)
 
     def _current_selection_count(self):
+        if self._native_selection is not None:
+            return self._selection_manager().count()
         try:
             return self.app.digitizer.selection_manager.count()
         except Exception:
@@ -1203,6 +1302,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         Simple Extend:
         Select Line / SmartLine first, then enter distance.
         """
+        if self._native_selection is not None:
+            self._native_selection.extend()
+            return
         self._deactivate_intersect_if_needed()
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
@@ -1242,7 +1344,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             self.app.statusBar().showMessage("Digitizer not available", 2500)
             return
 
-        mgr = getattr(digitizer, "selection_manager", None)
+        mgr = self._selection_manager()
         if mgr is None:
             self.app.statusBar().showMessage("Selection manager not available", 2500)
             return
@@ -1363,7 +1465,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
                 pass
             return
 
-        mgr = getattr(digitizer, "selection_manager", None)
+        mgr = self._selection_manager()
         if mgr is None:
             try:
                 self.app.statusBar().showMessage("Selection manager not available", 2500)
@@ -1489,7 +1591,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
                 pass
             return
 
-        mgr = getattr(digitizer, "selection_manager", None)
+        mgr = self._selection_manager()
         if mgr is None:
             try:
                 self.app.statusBar().showMessage("Selection manager not available", 2500)
@@ -1572,6 +1674,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Failed to pre-load fences into LiDAR dialog: {e}")
 
     def _on_rotate(self):
+        if self._native_selection is not None:
+            self._native_selection.rotate_selected()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1581,6 +1686,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Rotate selection failed: {e}")
 
     def _on_mirror(self):
+        if self._native_selection is not None:
+            self._native_selection.mirror_selected()
+            return
         digitizer = getattr(self.app, "digitizer", None)
         if digitizer is None:
             return
@@ -1637,8 +1745,11 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _refresh_active_tool(self):
         """Highlight the row matching the currently active draw tool."""
-        digitizer = getattr(self.app, "digitizer", None)
-        active = getattr(digitizer, "active_tool", None) or ""
+        if self._native_selection is not None:
+            active = self._native_selection.draw.tool or ''
+        else:
+            digitizer = getattr(self.app, "digitizer", None)
+            active = getattr(digitizer, "active_tool", None) or ""
         new_idx = -1
         for i, (_, types) in enumerate(self.TOOL_FILTERS):
             if active in types:
@@ -1664,6 +1775,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     def closeEvent(self, event):
         self._active_tool_timer.stop()
         self._cleanup_chip()
+        if self._native_selection is not None:
+            self._native_selection.deactivate()
+            super().closeEvent(event)
+            return
         # Deactivate intersect before teardown
         tool = self._get_tool()
         if tool is not None and getattr(tool, "_intersect_mode", False):

@@ -3125,12 +3125,14 @@ class DrawRibbon(QWidget):
         """
         main_window = self.window()
 
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'select'):
-            main_window.statusBar().showMessage('Native Vulkan Select: click a drawing', 3000)
-            return
-
+        # Both renderers use the SAME selection panel. When Vulkan owns the
+        # visible viewport, SelectionModeDialog binds to native selection;
+        # otherwise its original VTK ElementSelectTool stays unchanged.
         self._deactivate_accudraw_before_other_tool("Select Drawing")
+        from gui.native_draw import activate_native_draw
+        native_selection = activate_native_draw(main_window, 'select')
+        if native_selection:
+            main_window.statusBar().showMessage('Vulkan Element Selection: choose a method in the panel', 3500)
 
         # Stand down draw tool — ElementSelectTool will also do this defensively
         if hasattr(main_window, 'digitizer') and main_window.digitizer:
@@ -3160,11 +3162,24 @@ class DrawRibbon(QWidget):
         try:
             existing = getattr(main_window, "_element_selection_dialog", None)
             if existing is not None:
-                try:
-                    self._restore_tool_dialog(existing)
-                    return
-                except Exception:
-                    pass
+                # The user can load/unload SNT between clicks: a dialog bound
+                # to VTK must not be reused after Vulkan takes ownership (or
+                # vice versa). Recreate only the panel, never the renderer.
+                old_native = getattr(existing, '_native_selection', None) is not None
+                if old_native != bool(native_selection):
+                    try:
+                        existing.close()
+                    except Exception:
+                        pass
+                    existing = None
+                    main_window._element_selection_dialog = None
+                else:
+                    try:
+                        existing.restore_pick_interaction()
+                        self._restore_tool_dialog(existing)
+                        return
+                    except Exception:
+                        pass
 
             from gui.selection_popup import SelectionModeDialog
             dlg = SelectionModeDialog(main_window)
@@ -3376,11 +3391,8 @@ class DrawRibbon(QWidget):
     def _handle_parallel_click(self):
         """Handle Parallel button click — open the Parallel Figure dialog."""
         main_window = self.window()
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'parallel'):
-            main_window.statusBar().showMessage(
-                'Native Parallel: select a drawing first, then click the offset position', 4000)
-            return
+        from gui.native_draw import get_native_draw
+        native_draw = get_native_draw(main_window, create=True)
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Parallel tool: digitizer not available")
@@ -3404,7 +3416,13 @@ class DrawRibbon(QWidget):
                 main_window._parallel_tool_dialog = None
 
         from gui.parallel_tool_dialog import ParallelToolDialog
+        if native_draw is not None:
+            native_draw.activate('parallel')
         dialog = ParallelToolDialog(digitizer, parent=main_window)
+        if native_draw is not None:
+            dialog._native_draw = native_draw
+            native_draw.bind_legacy_dialog(dialog)
+            dialog.finished.connect(lambda _=0, d=native_draw, dlg=dialog: d.unbind_legacy_dialog(dlg))
         main_window._parallel_tool_dialog = dialog
         dialog.finished.connect(
             lambda _=0, mw=main_window, dlg=dialog: self._clear_parallel_dialog_ref(mw, dlg)
@@ -3458,11 +3476,8 @@ class DrawRibbon(QWidget):
     def _handle_centerline_click(self):
         """Handle Centerline button click — open the Centerline dialog."""
         main_window = self.window()
-        from gui.native_draw import activate_native_draw
-        if activate_native_draw(main_window, 'centerline'):
-            main_window.statusBar().showMessage(
-                'Native Centerline: select the first drawing, then click the second', 4000)
-            return
+        from gui.native_draw import get_native_draw
+        native_draw = get_native_draw(main_window, create=True)
         digitizer = getattr(main_window, "digitizer", None)
         if not digitizer:
             print("⚠️ Centerline tool: digitizer not available")
@@ -3487,7 +3502,13 @@ class DrawRibbon(QWidget):
                 main_window._centerline_tool_dialog = None
 
         from gui.centerline_tool_dialog import CenterlineToolDialog
+        if native_draw is not None:
+            native_draw.activate('centerline')
         dialog = CenterlineToolDialog(digitizer, parent=main_window)
+        if native_draw is not None:
+            dialog._native_draw = native_draw
+            native_draw.bind_legacy_dialog(dialog)
+            dialog.finished.connect(lambda _=0, d=native_draw, dlg=dialog: d.unbind_legacy_dialog(dlg))
         main_window._centerline_tool_dialog = dialog
         dialog.finished.connect(
             lambda _=0, mw=main_window, dlg=dialog: self._clear_centerline_dialog_ref(mw, dlg)

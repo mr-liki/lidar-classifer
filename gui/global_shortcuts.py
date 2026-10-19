@@ -816,6 +816,33 @@ class GlobalShortcutFilter(QObject):
                 pass
 
             # ====================================================================
+            # Ordinary Vulkan SNT/LAZ Draw uses its own overlay, not the
+            # legacy digitizer history. Active native placement must own
+            # Ctrl+Z/Y (even if a custom shortcut is mapped) and Escape;
+            # unrelated tools and LNT retain their existing dispatch paths.
+            _native_plan_history = (
+                combo[0] in ('ctrl', 'ctrl+shift')
+                and event.key() in (Qt.Key_Z, Qt.Key_Y)
+            )
+            _native_plan_escape = (
+                event.key() == Qt.Key_Escape
+                and event.modifiers() == Qt.NoModifier
+            )
+            if _native_plan_history or _native_plan_escape:
+                from gui.native_draw import get_native_draw
+                _native_plan_draw = get_native_draw(self.app_window)
+                if (_native_plan_draw is not None
+                        and getattr(_native_plan_draw.view, '_surface_draw', False)
+                        and _native_plan_draw.active()):
+                    if _native_plan_escape:
+                        _native_plan_draw.cancel()
+                    elif not event.isAutoRepeat():
+                        _native_plan_draw.history(
+                            redo=event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift')
+                    event.accept()
+                    return True
+
+            # ====================================================================
             # Native point-cloud shortcuts bypass the legacy inline VTK handlers.
             from gui.native_shortcuts import execute_native_shortcut, focused_canvas
             native_view = getattr(self.app_window, '_lnt_main_view', None)
@@ -845,7 +872,9 @@ class GlobalShortcutFilter(QObject):
                 elif combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
                     redo = event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift'
                     if drawing is not None and drawing.active():
-                        return drawing.history(redo)
+                        if not event.isAutoRepeat():
+                            drawing.history(redo)
+                        return True
                     if measurement is not None and measurement.active:
                         return measurement.history(redo)
                     digitizer = getattr(self.app_window, 'digitizer', None)
