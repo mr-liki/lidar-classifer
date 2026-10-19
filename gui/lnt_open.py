@@ -221,7 +221,8 @@ class _InputFilter(QObject):
                 self._last = None
                 _armed_picker.on_press(ev.position())
                 return True
-        for _attr in ("native_identify", "native_zoom", "native_select"):
+        for _attr in ("native_identify", "native_zoom", "native_select",
+                      "native_layer_pick"):
             _tool = getattr(self.view, _attr, None)
             if _tool is None or not getattr(_tool, "active", False):
                 continue
@@ -355,6 +356,7 @@ class LntMainView(QObject):
         self.native_identify = None  # NativeIdentify while the Identify tool is armed
         self.native_zoom = None      # NativeZoomRect while the Zoom tool is armed
         self.native_select = None    # NativeSelectRect while the Select tool is armed
+        self.native_layer_pick = None  # NativeLayerPick while Identify Layer is armed
         self.owner = None
         self.sse = 8.0
         self._palette_baseline = None
@@ -482,7 +484,8 @@ class LntMainView(QObject):
             classifier.canvas._closed = True
             classifier.shutdown()
             self.classifier = None
-        for _attr in ("native_identify", "native_zoom", "native_select"):
+        for _attr in ("native_identify", "native_zoom", "native_select",
+                      "native_layer_pick"):
             try:
                 _tool = getattr(self, _attr, None)
                 if _tool is not None and hasattr(_tool, "cancel"):
