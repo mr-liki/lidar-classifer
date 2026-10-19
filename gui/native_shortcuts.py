@@ -116,7 +116,7 @@ def snt_viewport_measure(app, name, key_label=''):
 
 
 _MEASURE_HINTS = {
-    'MeasureLine': 'Click 2 points to measure.',
+    'MeasureLine': 'Click connected points; right-click finishes the total length.',
     'MeasurePath': 'Click points; right-click finishes the path.',
     'MeasureGridArea': 'Click inside a grid cell to measure its area.',
     'MeasureBlockArea': 'Click inside a block to measure its area.',

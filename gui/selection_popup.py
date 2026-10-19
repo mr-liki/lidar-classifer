@@ -734,10 +734,27 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self._refresh_measurement_total()
 
     def _on_selection_count(self, count):
-        self.lbl_count.setText(f"Selection: {count}")
+        if self._native_selection is not None and self._method=='snt_text':
+            self.lbl_count.setText(f'SNT Text Selection: {count}')
+        else:
+            self.lbl_count.setText(f"Selection: {count}")
         self._refresh_measurement_total()
 
     def _refresh_measurement_total(self):
+        # The Vulkan Measure Line/Path overlay has no VTK measurement actors;
+        # report selected native measurements from its world-space vertices.
+        native=getattr(self,'_native_selection',None)
+        if native is not None:
+            import math
+            selected=[f for f in native.selection_manager.get_features()
+                      if f.get('source')=='measure']
+            if selected:
+                length=sum(math.hypot(b[0]-a[0],b[1]-a[1])
+                           for feat in selected
+                           for a,b in zip(feat['coords'],feat['coords'][1:]))
+                if hasattr(self,'lbl_measure_total'):
+                    self.lbl_measure_total.setText(f'Measured Total: {length:.3f} m')
+                return
         tool = getattr(self.app, "measurement_tool", None)
         total = 0.0
         unit = "m"
@@ -1263,10 +1280,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             tool=self._native_selection
             if tool._intersect_mode:
                 tool.exit_intersect_mode(commit=True)
-                self.btn_intersect.setChecked(False)
             else:
-                tool.enter_intersect_mode()
-                self.btn_intersect.setChecked(True)
+                # Only arm the toggle if eligible crossing pieces exist.
+                armed=tool.enter_intersect_mode()
+                self.btn_intersect.setChecked(bool(armed))
             return
         tool = self._get_tool()
         if tool is None or not tool.is_active():
