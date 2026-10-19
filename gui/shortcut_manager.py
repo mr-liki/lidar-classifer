@@ -3884,9 +3884,17 @@ class ShortcutManager(QWidget):
         except Exception:
             return False
 
-        app_window.from_classes = shortcut.get("from")
+        shortcut_from = shortcut.get("from")
+        clone_filter = getattr(app_window, "_clone_classification_filter", None)
+        app_window.from_classes = (
+            clone_filter(shortcut_from) if callable(clone_filter) else shortcut_from
+        )
         app_window.to_class = shortcut.get("to")
-        app_window.last_classify_from_classes = shortcut.get("from")
+        app_window.last_classify_from_classes = (
+            clone_filter(shortcut_from) if callable(clone_filter)
+            else list(shortcut_from) if isinstance(shortcut_from, (list, tuple))
+            else shortcut_from
+        )
         app_window.last_classify_to_class = shortcut.get("to")
 
         picker = getattr(app_window, "class_picker", None)

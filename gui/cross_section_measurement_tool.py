@@ -340,16 +340,15 @@ class CrossSectionMeasurementTool:
         # the standard general-purpose classifier and opens the Class Picker,
         # so right-click still has a useful, deterministic handoff.
         last_tool = getattr(self.app, "last_classify_tool", None) or "rectangle"
-        if hasattr(self.app, "set_classify_tool"):
+        helper = getattr(self.app, "reactivate_last_classification_from_right_click", None)
+        if callable(helper):
             try:
-                self.app.from_classes = getattr(self.app, "last_classify_from_classes", None)
-                self.app.to_class = getattr(self.app, "last_classify_to_class", None)
-                self.app._right_click_reactivating = True
-                try:
-                    self.app.set_classify_tool(last_tool)
+                if helper(
+                    "cross", focus_widget=section_vtk_widget, native=False,
+                    fallback_tool="rectangle"
+                ):
                     print(f"✅ Cross-section measurement handed off to classification: {last_tool}")
-                finally:
-                    self.app._right_click_reactivating = False
+                    self.app._abort_vtk_right_click(obj)
             except Exception as e:
                 print(f"⚠️ Cross-section measurement classification handoff failed: {e}")
         try:

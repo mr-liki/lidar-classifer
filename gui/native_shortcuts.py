@@ -65,7 +65,12 @@ def _sync_class_picker_for_native_shortcut(app, tool_name, from_cls, to_cls):
     # Keep right-click reactivation/history helpers aligned with the shortcut
     # that was just armed instead of retaining the previous manual tool state.
     app.last_classify_tool = tool_name
-    app.last_classify_from_classes = normalized_from
+    clone_filter = getattr(app, "_clone_classification_filter", None)
+    app.last_classify_from_classes = (
+        clone_filter(normalized_from) if callable(clone_filter)
+        else list(normalized_from) if isinstance(normalized_from, (list, tuple))
+        else normalized_from
+    )
     app.last_classify_to_class = to_cls
 
     try:

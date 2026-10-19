@@ -451,6 +451,21 @@ class SectionCanvas(QWidget):
                 and self.owner.locate(self, event.position())):
             return
         if event.button() == Qt.RightButton:
+            # An armed cut owns right-click as Cancel. Otherwise an idle native
+            # cross/cut canvas resumes the last classifier, matching VTK views.
+            if self.cut_armed:
+                self.owner.cancel_cut()
+                event.accept()
+                return
+            helper = getattr(
+                self.owner.app, "reactivate_last_classification_from_right_click", None
+            )
+            target = "cut" if self.slot == CUT_SLOT else "cross"
+            if callable(helper) and helper(
+                target, focus_widget=self, native=True
+            ):
+                event.accept()
+                return
             self.owner.cancel_cut()
         elif event.button() == Qt.LeftButton and self.cut_armed:
             x = self.horizontal_at(event.position().x())

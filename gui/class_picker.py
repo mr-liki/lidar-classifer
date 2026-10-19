@@ -568,7 +568,7 @@ class ClassPicker(QWidget):
         else:
             selected_codes = [item.data(Qt.UserRole) for item in selected_items]
             self.app.from_classes = selected_codes
-            self.app.last_classify_from_classes = selected_codes
+            self.app.last_classify_from_classes = list(selected_codes)
             print(f"👉 From classes: {selected_codes}")
 
     def _on_to_changed(self, idx):
