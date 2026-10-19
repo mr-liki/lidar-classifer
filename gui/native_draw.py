@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import math
+import time
+from functools import lru_cache
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QInputDialog
 
+from gui.native_selection_targets import close_freehand, snap_draft_closure, editable_draw
+from gui.native_stroke_geometry import (
+    catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
+)
 from gui.native_main_classify import MainCanvas
 from gui.native_section_classify import CanvasOverlay
 from gui.native_vector_pick import (
@@ -29,22 +35,23 @@ TOOL_MAP = {
 }
 
 
-def _catmull_rom(points, steps=16):
-    """Interpolate an open smooth curve without replacing its editable control points."""
-    pts = list(points)
-    if len(pts) < 3:
-        return pts
-    out = [pts[0]]
-    for i in range(len(pts) - 1):
-        p0, p1 = pts[max(0, i-1)], pts[i]
-        p2, p3 = pts[i+1], pts[min(len(pts)-1, i+2)]
-        for k in range(1, steps+1):
-            t = k / steps
-            t2, t3 = t*t, t*t*t
-            out.append(tuple(.5 * ((2*b) + (-a+c)*t + (2*a-5*b+4*c-d)*t2
-                                    + (-a+3*b-3*c+d)*t3)
-                             for a,b,c,d in zip(p0,p1,p2,p3)))
-    return out
+@lru_cache(maxsize=16)
+def _catmull_rom_cached(controls):
+    """Reuse recent static splines without caching cursor-dependent geometry."""
+    return tuple(catmull_rom_vtk(controls))
+
+
+def _catmull_rom(points, steps=20):
+    """Sample the same Catmull-Rom interpolation as original VTK CurveTool."""
+    if steps == 20:
+        controls = tuple(tuple(p) for p in points)
+        # Never retain huge sampled curves in the LRU. Large strokes are
+        # rendered on demand, preventing preview caches from growing with
+        # LiDAR-scene working sets or very long user-created Curves.
+        if len(controls) <= 128:
+            return list(_catmull_rom_cached(controls))
+        return catmull_rom_vtk(controls)
+    return catmull_rom_vtk(points, steps=steps)
 
 
 def _inside_polygon(p, poly):
@@ -117,6 +124,13 @@ class NativeDraw:
         self._snt_pick_index = None
         self._snt_pick_token = None
         self._snap_target = None
+        # VTK Freehand: left release pauses, another drag resumes, right-click
+        # commits. Keep per-drag checkpoints so Undo never deletes a finished
+        # figure while a Freehand draft remains pending.
+        self._freehand_before_drag = None
+        self._freehand_undo_strokes = []
+        self._freehand_redo_strokes = []
+        self._freehand_last_snap_at = 0.0
         self.vertex_target = None
         # Pending Move Vertex keeps its BEFORE object immutable until commit.
         # Live mouse-drag previews replace only an editable native drawing.
@@ -134,6 +148,7 @@ class NativeDraw:
         self._legacy_dialog_highlights = []
         self._object_actions = []
         self._object_redo = []
+        self._shutting_down = False
         self.reload_styles()
 
     def reload_styles(self):
@@ -174,6 +189,9 @@ class NativeDraw:
         sections = getattr(self.app, '_native_sections', None)
         if sections is not None:
             sections.cancel_cross(); sections.cancel_cut()
+        if tool != 'select' and self._selection_bridge is not None:
+            if getattr(self._selection_bridge,'_intersect_mode',False):
+                self._selection_bridge.exit_intersect_mode(commit=True)
         self.cancel(stand_down=False)
         if tool != 'select' and self._selection_bridge is not None:
             self._selection_bridge._active = False
@@ -246,7 +264,8 @@ class NativeDraw:
         if self.tool == 'centerline':
             return 'Native Centerline: click two different open line features'
         if self.tool == 'freehand':
-            return 'Native Freehand: hold and drag the left button'
+            return ('Native Freehand: left-drag to draw, release to pause, '
+                    'drag to resume, right-click to finish')
         return f'Native {self.tool}: click a position'
 
     def active(self):
@@ -336,7 +355,7 @@ class NativeDraw:
 
     def _near_scene(self, p, tolerance):
         # Native objects are typically few: no scene index needed for them.
-        for i,drawing in enumerate(self.drawings):
+        for i,drawing in enumerate(getattr(self, 'drawings', ())):
             coords=self._native_coords(drawing)
             if not coords:continue
             lo_x=min(q[0] for q in coords);hi_x=max(q[0] for q in coords)
@@ -346,8 +365,35 @@ class NativeDraw:
                 yield {'source':'native', 'index':i, 'coords':coords,
                        'type':drawing.get('type','line'), 'key':('native',id(drawing)),
                        'drawing':drawing}
+        # Avoid creating/scanning an SNT index for an empty attachment list;
+        # native drawings and raw Freehand moves never need a LiDAR pass.
+        if not getattr(self.app, 'snt_attachments', None):
+            return
         index = self._snt_index()
         yield from index.nearby(p, tolerance, visible=self._snt_visible)
+
+    def _pick_editable_draw(self, p, tolerance=None):
+        """Standalone Draw > Select cannot pick imported SNT reference blocks.
+
+        The Parallel/Centerline/Hatch pickers retain their separate SNT inputs.
+        The Element Selection panel additionally supports measured Line/Path.
+        """
+        if tolerance is None:
+            tolerance=max(self.canvas.world_per_pixel()*12.,1e-9)
+        best=(tolerance,None)
+        for i,d in enumerate(self.drawings):
+            if not editable_draw(d):continue
+            coords=self._native_coords(d)
+            if not coords:continue
+            feat={'source':'native','index':i,'coords':coords,
+                  'type':d.get('type','line'),'key':('native',id(d)),
+                  'drawing':d}
+            if len(coords)>2 and coords[0]==coords[-1] and _inside_polygon(p,coords):
+                distance=0.
+            else:
+                distance=self._feature_distance(p,feat)
+            if distance<=best[0]:best=(distance,feat)
+        return best[1]
 
     @staticmethod
     def _feature_distance(p, feature):
@@ -484,11 +530,20 @@ class NativeDraw:
                                and bool(self.points) and bool(self._line_session_refs)
                                and feature.get('source') == 'native'
                                and feature.get('drawing') is self._line_session_refs[-1])
-                if mode in ('nearby','keypoint'):
-                    for q in coords:
+                if mode in ('nearby','keypoint') and feature.get('type') != 'circle':
+                    # Only a native Curve's original control endpoints can be
+                    # CAD endpoint targets: its spline tessellation must not
+                    # create artificial editable/snappable vertices.
+                    vertex_coords = coords
+                    if (feature.get('type') == 'curve' and
+                            feature.get('source') == 'native'):
+                        controls = feature.get('drawing', {}).get('coords', ())
+                        vertex_coords = ([controls[0], controls[-1]] if controls
+                                         else ())
+                    for q in vertex_coords:
                         if recent_line and tuple(q[:2]) == self.points[-1]:
                             continue
-                        offer(q,vertex=True)
+                        offer(tuple(q[:2]), vertex=True)
                 if mode == 'center':
                     if feature.get('type')=='circle' and feature['source']=='native':
                         offer(feature['drawing']['coords'][0][:2])
@@ -503,23 +558,34 @@ class NativeDraw:
                     if mode == 'midpoint':offer(((a[0]+b[0])*.5,(a[1]+b[1])*.5))
             # A draft may snap back to its own earlier points, not the most
             # recent vertex (which would prevent drawing the next segment).
-            if mode in ('nearby','keypoint'):
+            if mode in ('nearby','keypoint') and self.tool not in ('freehand', 'curve'):
                 for q in self.points[:-1]:offer(q,vertex=True)
         if mode=='nearby' and endpoint is not None:
             return endpoint[1]
         return best[1] if best else None
 
-    def _point(self, pos):
+    def _point(self, pos, snap=True):
         p=self.canvas.section_at(pos.x(),pos.y())
+        raw_p=p  # Curve closure is based on cursor position, before scene snapping.
         did_snap=False
         self._snap_target=None
         digitizer=getattr(self.app,'digitizer',None)
         # Both Smart Line AND Line snap automatically in the VTK digitizer.
         # Text placement and Vertex insertion also need endpoint magnetism.
         # Explicit Snap mode takes priority over this nearby default.
-        smart_auto = self.tool in ('smartline', 'line', 'text', 'vertex')
+        # Freehand snaps at start/end only; raw drag samples remain untouched.
+        # Exact closure of the CURVE's first control point takes priority over
+        # unrelated SNT or linework geometry, using VTK's 14px snap radius.
+        if snap and self.tool == 'curve' and len(self.points) >= 3:
+            tolerance = max(self.canvas.world_per_pixel() * 14., 1e-9)
+            closure = snap_draft_closure(self.points, raw_p, tolerance)
+            if closure != raw_p:
+                self._snap_target = tuple(closure[:2])
+                return self._snap_target
+        smart_auto = self.tool in ('smartline', 'line', 'text', 'vertex', 'freehand', 'curve')
         explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
-        if self.tool not in ('select','parallel','centerline') and (smart_auto or explicit_snap):
+        if (snap and self.tool not in ('select','parallel','centerline')
+                and (smart_auto or explicit_snap)):
             mode=(getattr(digitizer,'snap_mode',None) or 'nearby') if explicit_snap else 'nearby'
             if mode in ('nearby','keypoint','midpoint','center','intercept'):
                 candidate=self._snap_at(p,mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
@@ -714,6 +780,11 @@ class NativeDraw:
         self._z_points.clear()
         self._angle_sticky = False
         self.points, self.hover, self.dragging = [], None, False
+        if (kind or self.tool) == 'freehand':
+            self._freehand_before_drag = None
+            self._freehand_undo_strokes.clear()
+            self._freehand_redo_strokes.clear()
+            self._freehand_last_snap_at = 0.0
         # Hide any green snap indicator when a drawing finishes. The current
         # vertex still exists in the saved geometry and remains snappable.
         self._snap_target = None
@@ -802,7 +873,13 @@ class NativeDraw:
     def _nearest_vertex(self, point):
         best = None
         for di, drawing in enumerate(self.drawings):
-            for vi, vertex in enumerate(drawing.get('coords', [])):
+            if drawing.get('type') == 'circle' or drawing.get('source') in ('block_creation','cell_creation'):
+                continue  # No perimeter tessellation or protected source vertices.
+            if drawing.get('type') == 'rectangle':
+                vertices = self._native_coords(drawing)[:4]
+            else:
+                vertices = drawing.get('coords', [])
+            for vi, vertex in enumerate(vertices):
                 distance = math.hypot(point[0]-vertex[0], point[1]-vertex[1])
                 if best is None or distance < best[0]:
                     best = distance, di, vi
@@ -818,14 +895,22 @@ class NativeDraw:
             return False
         original = self._vertex_move_original
         coords = list(original['coords'])
-        if not coords or vi >= len(coords):
-            return False
         destination = tuple(destination[:2])
-        closed = len(coords) > 2 and coords[0] == coords[-1]
-        if closed and vi in (0, len(coords)-1):
-            coords[0] = coords[-1] = destination
+        if original.get('type') == 'rectangle':
+            corners = self._native_coords(original)[:4]
+            if len(corners) != 4 or vi >= 4:
+                return False
+            # Drag any of four visible corners against its opposite corner.
+            # The rectangle remains a true two-control-point rectangle.
+            coords = [destination, corners[(vi + 2) % 4]]
         else:
-            coords[vi] = destination
+            if not coords or vi >= len(coords):
+                return False
+            closed = len(coords) > 2 and coords[0] == coords[-1]
+            if closed and vi in (0, len(coords)-1):
+                coords[0] = coords[-1] = destination
+            else:
+                coords[vi] = destination
         new_obj = dict(original, coords=coords)
         self.drawings[di] = new_obj
         self._paint()
@@ -840,7 +925,10 @@ class NativeDraw:
         self._vertex_move_preview(destination)
         di, vi = self.vertex_target
         new_obj = self.drawings[di]
-        moved = new_obj['coords'][vi] != original['coords'][vi]
+        if original.get('type') == 'rectangle':
+            moved = tuple(destination[:2]) != self._native_coords(original)[vi]
+        else:
+            moved = new_obj['coords'][vi] != original['coords'][vi]
         if moved:
             self.record_object_change(before)
         else:
@@ -856,7 +944,10 @@ class NativeDraw:
     def _nearest_segment(self, point):
         best = None
         for di, drawing in enumerate(self.drawings):
-            coords = drawing.get('coords', [])
+            if drawing.get('type') == 'circle' or drawing.get('source') in ('block_creation','cell_creation'):
+                continue
+            coords = (self._native_coords(drawing) if drawing.get('type') == 'rectangle'
+                      else drawing.get('coords', []))
             for si, (a, b) in enumerate(zip(coords, coords[1:])):
                 dx, dy = b[0]-a[0], b[1]-a[1]
                 d2 = dx*dx + dy*dy
@@ -868,6 +959,61 @@ class NativeDraw:
         tolerance = max(self.canvas.world_per_pixel() * 12., 1e-9)
         return best if best is not None and best[0] <= tolerance else None
 
+    def _freehand_end_snap(self, force=False):
+        """Preview a magnetic LAST point without changing any raw samples.
+
+        Completed native/SNT geometry is queried at most every 50 ms while
+        dragging; the final right-click always recomputes exact world coords.
+        """
+        if len(self.points) < 2:
+            self._snap_target = None
+            return None
+        endpoint = self.points[-1]
+        tolerance = max(self.canvas.world_per_pixel() * 14., 1e-9)
+        own_start = snap_endpoint_near_start(self.points, endpoint, tolerance)
+        if own_start != endpoint:
+            self._snap_target = tuple(own_start[:2])
+            return self._snap_target
+        now = time.monotonic()
+        if not force and now - self._freehand_last_snap_at < .05:
+            return self._snap_target
+        self._freehand_last_snap_at = now
+        digitizer = getattr(self.app, 'digitizer', None)
+        explicit = bool(digitizer is not None and getattr(digitizer, 'snap_enabled', False))
+        mode = (getattr(digitizer, 'snap_mode', None) or 'nearby') if explicit else 'nearby'
+        candidate = self._snap_at(endpoint, mode, tolerance) if mode in (
+            'nearby', 'keypoint', 'midpoint', 'center', 'intercept') else None
+        self._snap_target = (tuple(candidate) if candidate is not None and
+                             tuple(candidate) != tuple(endpoint) else None)
+        return self._snap_target
+
+    def _finish_freehand(self):
+        """VTK parity: commit only on right-click, after any paused drag(s)."""
+        self.dragging = False
+        if len(self.points) < 2:
+            self.points.clear()
+            self.hover = None
+            self._snap_target = None
+            self._freehand_before_drag = None
+            self._freehand_undo_strokes.clear()
+            self._freehand_redo_strokes.clear()
+            self._paint()
+            return False
+        pts = drop_consecutive_duplicates(self.points)
+        # At commit: bypass the preview throttle, magnetize only final sample.
+        self.points = pts
+        endpoint = self._freehand_end_snap(force=True)
+        if endpoint is not None and endpoint != pts[-1]:
+            # Two-point strokes are permitted as open lines. Do not snap the
+            # endpoint onto their own start and create a zero-length feature.
+            if len(pts) > 2 or endpoint != pts[0]:
+                pts[-1] = endpoint
+        pts = drop_consecutive_duplicates(pts)
+        if len(pts) < 2:
+            return False
+        pts = close_freehand(pts, max(self.canvas.world_per_pixel() * 14., 1e-9))
+        return self._commit('freehand', pts)
+
     def _finish(self):
         minimum = 3 if self.tool in ('polyline', 'hatch') else 2
         if len(self.points) < minimum:
@@ -876,6 +1022,13 @@ class NativeDraw:
             self._paint()
             return False
         pts = list(self.points)
+        if self.tool == 'curve':
+            # Never serialize duplicate adjacent controls as zero-length spans.
+            pts = drop_consecutive_duplicates(pts)
+            if len(pts) < 2:
+                return False
+            pts[-1] = snap_draft_closure(pts[:-1], pts[-1],
+                                        max(self.canvas.world_per_pixel()*14.,1e-9))
         if self.tool in ('polyline', 'hatch', 'ortho') and pts[0] != pts[-1]:
             pts.append(pts[0])
         if self.tool == 'hatch':
@@ -912,7 +1065,9 @@ class NativeDraw:
                 dialog._on_native_feature_picked(feature)
             return True
         if button == Qt.RightButton:
-            if self.tool == 'line':
+            if self.tool == 'freehand':
+                self._finish_freehand()
+            elif self.tool == 'line':
                 self._finish_line()
             elif self.tool in ('smartline', 'polyline', 'ortho', 'curve', 'hatch', 'accudraw'):
                 self._finish()
@@ -925,6 +1080,26 @@ class NativeDraw:
             return True
         if button != Qt.LeftButton:
             return False
+        if self.tool == 'freehand':
+            # A second drag RESUMES this pending stroke, as in original VTK.
+            # Scene snapping is applied only to the very first sample.
+            try:
+                p = (self._point(pos) if not self.points else
+                     self.canvas.section_at(pos.x(), pos.y()))
+            except RuntimeError as exc:
+                self.app.statusBar().showMessage(str(exc), 4000)
+                return True
+            self._freehand_before_drag = list(self.points)
+            self._freehand_redo_strokes.clear()
+            if not self.points or math.dist(p, self.points[-1]) >= max(
+                    self.canvas.world_per_pixel() * 2., 1e-10):
+                self.points.append(tuple(p))
+            self.dragging = True
+            self.hover = None
+            self._freehand_last_snap_at = 0.0
+            self._snap_target = None
+            self._paint()
+            return True
         try:
             p = self._point(pos)
         except RuntimeError as exc:
@@ -941,7 +1116,7 @@ class NativeDraw:
                                                   'Choose Points / Element / Rectangle.')
                 return True
         if self.tool == 'select':
-            feature=self._pick_feature(p)
+            feature=self._pick_editable_draw(p)
             self._store_selection(feature)
             if feature is not None:
                 label=('SNT' if feature['source']=='snt' else 'native Draw')
@@ -1005,7 +1180,12 @@ class NativeDraw:
             if hit:
                 _, di, vi = hit
                 drawing = self.drawings[di]
-                coords = list(drawing.get('coords', []))
+                is_rectangle = drawing.get('type') == 'rectangle'
+                # Removing a rectangle corner creates a triangle. Convert to
+                # a closed editable polyline instead of retaining a malformed
+                # two-point rectangle primitive.
+                coords = (self._native_coords(drawing) if is_rectangle
+                          else list(drawing.get('coords', [])))
                 closed = len(coords) >= 4 and coords[0] == coords[-1]
                 if closed:
                     unique = coords[:-1]
@@ -1024,7 +1204,10 @@ class NativeDraw:
                 # Never mutate the source object in an Undo snapshot in-place;
                 # every editable point deletion is one reversible native action.
                 before = list(self.drawings)
-                self.drawings[di] = dict(drawing, coords=coords)
+                new_drawing = dict(drawing, coords=coords)
+                if is_rectangle:
+                    new_drawing['type'] = 'polyline'
+                self.drawings[di] = new_drawing
                 self.record_object_change(before)
                 self._paint()
             return True
@@ -1051,12 +1234,21 @@ class NativeDraw:
                 return True
             hit = self._nearest_segment(p)
             if hit:
-                _, di, si, _ = hit
+                _, di, si, foot = hit
                 before = list(self.drawings)
                 original = self.drawings[di]
-                coords = list(original['coords'])
-                coords.insert(si + 1, p)
-                self.drawings[di] = dict(original, coords=coords)
+                is_rectangle = original.get('type') == 'rectangle'
+                # An inserted point breaks four-corner rectangle topology.
+                # Preserve its full outline as a closed polyline with the new
+                # editable vertex, never as invalid rectangle control points.
+                coords = (self._native_coords(original) if is_rectangle
+                          else list(original['coords']))
+                vertex = foot if is_rectangle else p
+                coords.insert(si + 1, vertex)
+                new_drawing = dict(original, coords=coords)
+                if is_rectangle:
+                    new_drawing['type'] = 'polyline'
+                self.drawings[di] = new_drawing
                 self.record_object_change(before)
                 if getattr(getattr(self.app, 'digitizer', None), 'vertex_auto_drag', False):
                     self.vertex_target = (di, si+1)
@@ -1125,6 +1317,8 @@ class NativeDraw:
             if self._precision_dialog is not None:
                 self._precision_dialog.set_status('Duplicate point ignored. Move cursor or enter new XYZ.')
             return True
+        if self.tool == 'curve' and self.points and p == self.points[-1]:
+            return True  # Ignore duplicate adjacent curve controls, including snaps.
         if self.tool in self._POINT_TOOLS:
             # Any fresh click after Undo creates a new branch of the shape.
             self.point_redo.clear(); self._z_redo.clear()
@@ -1152,6 +1346,25 @@ class NativeDraw:
         if self._legacy_tool_dialog is not None and self.tool in ('parallel', 'centerline'):
             # Avoid repainting millions of points on every cursor move.
             return True
+        if self.tool == 'curve' and not self.points:
+            # VTK only previews Curve after the first placed control point;
+            # do not run SNT picking against every idle cursor movement.
+            return True
+        if self.tool == 'freehand':
+            if self.dragging and buttons & Qt.LeftButton:
+                try:
+                    p = self.canvas.section_at(pos.x(), pos.y())
+                except RuntimeError:
+                    return True
+                self._last_pointer_pos = pos
+                # VTK filters jitter at 2 screen pixels, not 0.5 pixels.
+                if (not self.points or math.dist(p, self.points[-1]) >= max(
+                        self.canvas.world_per_pixel() * 2., 1e-10)):
+                    self.points.append(tuple(p))
+                    self._freehand_end_snap()
+                    self._paint()
+            # Paused Freehand never draws a moving cursor rubber-band line.
+            return True
         try:
             p = self._point(pos)
         except RuntimeError:
@@ -1162,7 +1375,10 @@ class NativeDraw:
         if self.tool in ('movevertex','vertex') and self.vertex_target is not None:
             if buttons & Qt.LeftButton:
                 _, vi = self.vertex_target
-                origin = self._vertex_move_original['coords'][vi]
+                original = self._vertex_move_original
+                origin = (self._native_coords(original)[vi]
+                          if original.get('type') == 'rectangle'
+                          else original['coords'][vi])
                 if math.dist(p, origin) > max(2.*self.canvas.world_per_pixel(), 1.e-10):
                     self._vertex_move_dragged = True
                     self.dragging = True
@@ -1174,10 +1390,7 @@ class NativeDraw:
         if self.tool == 'parallel' and self._parallel_source is not None:
             self._paint()
             return True
-        if self.tool == 'freehand' and self.dragging and buttons & Qt.LeftButton:
-            self.points.append(p)
-        else:
-            self.hover = p if self.points else None
+        self.hover = p if self.points else None
         self._paint()
         return True
 
@@ -1191,17 +1404,30 @@ class NativeDraw:
                 try:
                     destination=self._point(pos)
                 except RuntimeError:
-                    destination=self._vertex_move_original['coords'][self.vertex_target[1]]
+                    original=self._vertex_move_original
+                    vi=self.vertex_target[1]
+                    destination=(self._native_coords(original)[vi]
+                                 if original.get('type') == 'rectangle'
+                                 else original['coords'][vi])
                 self._vertex_move_finish(destination)
                 self._vertex_insert_pending = False
             return True
         if self.tool == 'freehand' and self.dragging:
             try:
-                self.points.append(self._point(pos))
+                p = self.canvas.section_at(pos.x(), pos.y())
+                if not self.points or math.dist(p, self.points[-1]) >= max(
+                        self.canvas.world_per_pixel() * 2., 1e-10):
+                    self.points.append(tuple(p))
             except RuntimeError:
-                self.cancel(stand_down=False)
-                return True
-            self._commit()
+                pass  # Keep existing samples if the viewport is unavailable.
+            self.dragging = False
+            self.hover = None
+            self._freehand_undo_strokes.append(self._freehand_before_drag or [])
+            self._freehand_before_drag = None
+            self._freehand_end_snap(force=True)
+            self._paint()
+            self.app.statusBar().showMessage(
+                'Freehand paused: left-drag to resume; right-click to close/finish', 4000)
             return True
         return self.tool in ('line', 'rectangle', 'circle')
 
@@ -1266,9 +1492,32 @@ class NativeDraw:
         return False
 
     def history(self, redo=False):
+        if (self._selection_bridge is not None and
+                getattr(self._selection_bridge,'_intersect_mode',False)):
+            return self._selection_bridge.intersect_history(redo=redo)
         if self.tool == 'line' and (self.points or self.point_redo or
                                     self._line_session_refs or self._line_session_undone):
             return self._line_history(redo=redo)
+        if self.tool == 'freehand' and (self.points or self.dragging or
+                                        self._freehand_undo_strokes or
+                                        self._freehand_redo_strokes):
+            if self.dragging and not redo:
+                # Undo an unfinished drag, not a previously committed object.
+                self.points[:] = self._freehand_before_drag or []
+                self.dragging = False
+                self._freehand_before_drag = None
+            elif redo and self._freehand_redo_strokes:
+                self._freehand_undo_strokes.append(list(self.points))
+                self.points[:] = self._freehand_redo_strokes.pop()
+            elif not redo and self._freehand_undo_strokes:
+                self._freehand_redo_strokes.append(list(self.points))
+                self.points[:] = self._freehand_undo_strokes.pop()
+            else:
+                return True  # No document Undo while a stroke is pending.
+            self._snap_target = None
+            self.hover = None
+            self._paint()
+            return True
         # While a multi-click placement is in progress, document/object Undo
         # must never delete a *completed* drawing. The point redo list remains
         # populated even after Undo removes the first and final pending vertex.
@@ -1352,6 +1601,10 @@ class NativeDraw:
         self._last_pointer_pos = None
         self._angle_sticky = False
         self._snap_target = None
+        self._freehand_before_drag = None
+        self._freehand_undo_strokes.clear()
+        self._freehand_redo_strokes.clear()
+        self._freehand_last_snap_at = 0.0
         self._parallel_source = None
         self._centerline_first = None
         if stand_down:
@@ -1418,20 +1671,27 @@ class NativeDraw:
         QTimer.singleShot(0, present)
 
     def _paint(self):
+        if getattr(self,'_shutting_down',False):
+            return  # Closing must not re-upload native block GPU vectors.
         gpu_blocks = self._sync_block_vectors()
         shapes = []
         bridge = self._selection_bridge
         chosen = (bridge.selection_manager._selected if bridge is not None else {})
+        hidden_in_intersect = (bridge._intersect_source_ids if bridge is not None
+                               and bridge._intersect_mode else set())
         for i, drawing in enumerate(self.drawings):
+            if id(drawing) in hidden_in_intersect:
+                continue  # VTK-style overlay replaces original with split pieces.
             if gpu_blocks and drawing.get('source') == 'block_creation':
                 continue
             data = self._style(drawing.get('type'))
             data.update(drawing)
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
                                 else i == self.selected and drawing is self._selected_native_ref)
-            data['show_vertices'] = bool(self.tool in ('movevertex','vertex','deletevertex') or (
+            data['show_vertices'] = bool(drawing.get('type') != 'circle' and (
+                self.tool in ('movevertex','vertex','deletevertex') or (
                 bridge is not None and getattr(bridge,'_vertex_display',False)
-                and data['selected']))
+                and data['selected'])))
             coords = drawing.get('coords', [])
             if drawing.get('type') == 'curve':
                 data['control_points'] = list(coords)
@@ -1448,8 +1708,18 @@ class NativeDraw:
             if self.tool == 'accudraw' and self._angle_sticky:
                 data['color'] = '#22ffd7'  # angle-match preview
             if self.tool == 'curve':
+                # Original VTK: stationary smooth curve through placed controls,
+                # plus a straight grey/yellow rubber band to the mouse. The
+                # moving cursor must not bend already completed segments.
                 data['control_points'] = list(self.points)
-                preview = _catmull_rom(preview)
+                data['show_vertices'] = False
+                preview = _catmull_rom(self.points)
+                if self.hover is not None and self.hover != self.points[-1]:
+                    shapes.append(('drawing', [self.points[-1], self.hover],
+                                   {'type': 'polyline',
+                                    'color': '#ffdf4a' if self._snap_target is not None
+                                             else '#a8adb7',
+                                    'width': 1, 'show_vertices': False}))
             shapes.append(('drawing_preview', preview, data))
         # Show an imported SNT selection without modifying/rendering its GPU
         # buffers. The selected line is highlighted on the same MVP overlay.
@@ -1482,7 +1752,7 @@ class NativeDraw:
                                 'selected':True,'width':3}))
         if self._selection_bridge is not None:
             for feat in self._selection_bridge.highlight_features():
-                if feat['source']=='snt':
+                if feat['source'] in ('snt','measure'):
                     shapes.append(('drawing',feat['coords'],
                                    {'type':'point' if len(feat['coords'])==1 else 'polyline',
                                     'selected':True,'width':3}))
@@ -1491,6 +1761,9 @@ class NativeDraw:
         self.overlay.set_shapes(shapes)
 
     def shutdown(self):
+        # Prevent cancel()/dialog close from repainting and repopulating the
+        # block GPU vector layer after shutdown removed it.
+        self._shutting_down = True
         dialog = self._legacy_tool_dialog
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
@@ -1499,10 +1772,12 @@ class NativeDraw:
                 dialog.close()
             except RuntimeError:
                 pass
+        self.cancel()
         layer = getattr(self, '_block_vector_layer', None)
         if layer is not None:
             layer.remove('drawing', '__native_created_blocks__')
-        self.cancel()
+        self._block_vector_layer = None
+        self._block_vector_signature = None
         self.overlay._timer.stop()
         self.overlay.close()
 

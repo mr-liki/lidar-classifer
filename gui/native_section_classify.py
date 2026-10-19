@@ -21,6 +21,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
+from gui.native_measure_geometry import measurement_labels, measurement_text
 
 DRAWABLE_TOOLS = ("rectangle", "circle", "polygon", "freehand", "brush", "point",
                   "above_line", "below_line", "parallel_line")
@@ -225,7 +226,7 @@ def _drawing_vertex_markers_visible(kind, data):
     other callers that do not go through NativeDraw._paint().
     """
     dtype = str(data.get('type', 'polyline')).lower()
-    if dtype in ('text', 'freehand', 'point') or data.get('source') in (
+    if dtype in ('text', 'freehand', 'point', 'circle') or data.get('source') in (
             'block_creation', 'cell_creation'):
         return False
     if 'show_vertices' in data:
@@ -381,19 +382,16 @@ class CanvasOverlay(QWidget):
                     painter.setBrush(color)
                     for point in qpts:
                         painter.drawEllipse(point, 3., 3.)
-                    distances = np.linalg.norm(np.diff(np.asarray(pts), axis=0), axis=1)
+                    # Line: a single sum at the final endpoint.
+                    # Path: cumulative distances at P2, P3, ... final endpoint.
+                    # Never label individual segment lengths as path totals.
+                    is_path = bool(options.get('path'))
                     unit = style.get('unit', 'm')
-                    convert = (lambda d: (d / 1000., 'km')) if unit == 'km' else (lambda d: (d, 'm'))
-                    # Path segments show their own length; the final label shows
-                    # the accumulated length. A line needs only its total label.
-                    if options.get('path'):
-                        for i, distance in enumerate(distances):
-                            value, suffix = convert(float(distance))
-                            mid = (qpts[i] + qpts[i + 1]) * .5
-                            painter.drawText(mid + QPointF(6., -6.), f'{value:.3f} {suffix}')
-                    total, suffix = convert(float(distances.sum()))
-                    painter.drawText(qpts[-1] + QPointF(8., -8.), f'Total {total:.3f} {suffix}'
-                                     if options.get('path') else f'{total:.3f} {suffix}')
+                    for index, total in measurement_labels(pts, path=is_path):
+                        label = measurement_text(total, unit)
+                        if is_path and index == len(qpts) - 1:
+                            label = f'Total {label}'
+                        painter.drawText(qpts[index] + QPointF(8., -8.), label)
             elif kind in ('drawing', 'drawing_preview') and qpts:
                 data = extra or {}
                 dtype = str(data.get('type', 'polyline')).lower()
@@ -481,11 +479,17 @@ class CanvasOverlay(QWidget):
                 # points rather than their interpolated samples. Avoid even
                 # building the handle list when hidden (large CAD polylines).
                 if _drawing_vertex_markers_visible(kind, data):
-                    vertex_points = (
-                        [QPointF(*to_qt(*p)) for p in data['control_points']]
-                        if dtype == 'curve' and data.get('control_points')
-                        else qpts
-                    )
+                    if dtype == 'rectangle' and len(qpts) >= 2:
+                        a,b=qpts[0],qpts[1]
+                        # The four visible rectangle corners are editable;
+                        # the drawing record stores only two diagonal points.
+                        vertex_points=[a,QPointF(b.x(),a.y()),b,QPointF(a.x(),b.y())]
+                    elif dtype == 'curve' and data.get('control_points'):
+                        vertex_points=[QPointF(*to_qt(*p)) for p in data['control_points']]
+                    else:
+                        vertex_points=qpts
+                        if len(qpts)>2 and qpts[0]==qpts[-1]:
+                            vertex_points=qpts[:-1]
                     for point in vertex_points:
                         painter.drawEllipse(point, 2.5, 2.5)
             elif kind == "cut_preview" and qpts:

@@ -9,13 +9,17 @@ and never touches the VTK camera or LiDAR point buffers.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
+from pathlib import Path
+from gui.native_selection_targets import editable_draw, text_anchor, text_bounds, box_overlap
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QApplication, QInputDialog
 
 from gui.native_selection_geometry import (
     rect_selects, polygon_selects, line_selects, translate, rotate, mirror,
 )
-from gui.native_vector_pick import segment_intersection
+from gui.native_vector_pick import nearest_segment
+from gui.native_intersect_geometry import split_selected_features
 
 
 class NativeSelectionManager(QObject):
@@ -36,9 +40,17 @@ class NativeSelectionManager(QObject):
         valid={}
         for key,feat in self._selected.items():
             if feat['source']=='native':
-                live=id(feat.get('drawing')) in native_ids
+                live=(id(feat.get('drawing')) in native_ids
+                      and editable_draw(feat.get('drawing')))
+            elif feat['source']=='measure':
+                measure=feat.get('measure')
+                live=(measure is not None and
+                      measure is getattr(getattr(draw,'view',None),'measurement',None) and
+                      any(points is feat.get('points')
+                          for points in getattr(measure,'completed',())))
             else:
                 live=(feat.get('scene_token')==scene
+                      and feat.get('type') in ('text','mtext')
                       and draw._snt_visible(feat['doc_key'],feat['layer']))
             if live:valid[key]=feat
         if len(valid) != len(self._selected):
@@ -56,6 +68,9 @@ class NativeSelectionManager(QObject):
         for f in self.get_features():
             if f['source']=='native':
                 result.append(f['drawing'])
+            elif f['source']=='measure':
+                result.append({'type':f['type'],'coords':list(f['coords']),
+                               'source':'measure_selection'})
             else:
                 result.append({'type':f['type'],'coords':list(f['coords']),
                                'source':'snt_readonly','layer':f['layer'],
@@ -76,7 +91,14 @@ class NativeSelectionManager(QObject):
         for feat in features:
             if feat is None:continue
             if feat['source']=='snt':
+                # Selection dialog is NOT the grid/block picker. Imported SNT
+                # linework is outside the editing scope; only SNT Text mode
+                # exposes read-only label selections for clipboard copying.
+                if (self.controller._method!='snt_text' or
+                        feat.get('type') not in ('text','mtext')):continue
                 feat=dict(feat,scene_token=self.controller.draw._scene_token())
+            elif feat['source']=='native' and not editable_draw(feat.get('drawing')):
+                continue
             key=feat['key']
             if mode=='subtract':old.pop(key,None)
             elif mode=='invert':
@@ -91,30 +113,24 @@ class NativeSelectionManager(QObject):
         self.selection_changed.emit(len(old))
 
     def select_all(self,predicate=None):
-        # For safety don't select every SNT feature: on a large map that could
-        # imply millions of CPU QPainter highlights. All means editable Draw
-        # objects here; users still pick imported SNT by click/fence.
-        features=[]
-        for i,d in enumerate(self.controller.draw.drawings):
-            if predicate is not None and not predicate(d):continue
-            features.append(self.controller._native_feature(i,d))
-        index=self.controller.draw._snt_index()
-        if predicate is None and len(index.records)+len(features)<=self.MAX_BULK:
-            features.extend(index.query_bbox(-math.inf,math.inf,-math.inf,math.inf,
-                                             visible=self.controller.draw._snt_visible))
-        elif index.records:
-            self.controller.message('Large SNT: Select All includes native drawings only. Use a selection fence for SNT.')
+        # Element Selection = editable Draw + completed Measure Line/Path,
+        # NEVER arbitrary imported SNT block boundaries or point-cloud data.
+        features=[self.controller._native_feature(i,d)
+                  for i,d in enumerate(self.controller.draw.drawings)
+                  if editable_draw(d) and (predicate is None or predicate(d))]
+        if predicate is None:
+            features.extend(self.controller._measure_features())
         self.apply(features,'new')
 
     def invert_all(self):
-        features=[self.controller._native_feature(i,d)
-                  for i,d in enumerate(self.controller.draw.drawings)]
-        previous={f['key']:f for f in self.get_features() if f['source']=='snt'}
-        for f in features:
-            if f['key'] not in self._selected:previous[f['key']]=f
-        self._selected=dict(list(previous.items())[:self.MAX_BULK])
-        self.controller.draw._paint()
-        self.selection_changed.emit(len(self._selected))
+        candidates=[self.controller._native_feature(i,d)
+                    for i,d in enumerate(self.controller.draw.drawings)
+                    if editable_draw(d)]
+        candidates.extend(self.controller._measure_features())
+        chosen=self._prune()
+        # Toggle only eligible drawing/measurement objects. SNT text keeps its
+        # own dedicated mode; the block boundary must never be inverted in.
+        self.apply([f for f in candidates if f['key'] not in chosen], 'new')
 
 
 class NativeSelectionController(QObject):
@@ -130,6 +146,13 @@ class NativeSelectionController(QObject):
         self._move_mode=False
         self._copy_mode=False
         self._intersect_mode=False
+        self._intersect_parts=[]
+        self._intersect_source_ids=set()
+        self._intersect_selected_part=None
+        self._intersect_hovered_part=None
+        self._intersect_delete_history=[]
+        self._intersect_redo_history=[]
+        self._intersect_scene_token=None
         self._start=None
         self._hover=None
         self._gesture=[]
@@ -138,6 +161,8 @@ class NativeSelectionController(QObject):
         self._vertex_display=False
         self._text_index_token=None
         self._text_index=[]
+        self._text_min_x=[]
+        self._text_prefix_max_x=[]
 
     def message(self, msg, timeout=3500):
         bar=getattr(self.app,'statusBar',lambda:None)()
@@ -156,6 +181,8 @@ class NativeSelectionController(QObject):
         return True
 
     def deactivate(self):
+        if self._intersect_mode:
+            self.exit_intersect_mode(commit=True)
         self._active=False
         self._reset_gesture()
         self._move_mode=self._copy_mode=self._intersect_mode=False
@@ -165,6 +192,8 @@ class NativeSelectionController(QObject):
         if self.draw.tool=='select':self.draw.cancel()
 
     def set_method(self, method):
+        if self._intersect_mode:
+            self.exit_intersect_mode(commit=True)
         self._method=method
         self._reset_gesture()
         self.selection_manager.clear()
@@ -182,6 +211,7 @@ class NativeSelectionController(QObject):
     @staticmethod
     def _selection_modifier():
         mods=QApplication.keyboardModifiers()
+        if mods & Qt.ControlModifier and mods & Qt.ShiftModifier:return 'invert'
         if mods & Qt.ControlModifier:return 'add'
         if mods & Qt.ShiftModifier:return 'subtract'
         return 'new'
@@ -192,19 +222,54 @@ class NativeSelectionController(QObject):
                 'type':drawing.get('type','line'),
                 'key':('native',id(drawing))}
 
+    def _measure_features(self):
+        """Completed main-viewport Line/Path measurements, never grid areas."""
+        measure=getattr(getattr(self.draw,'view',None),'measurement',None)
+        if measure is None:return []
+        result=[]
+        modes=getattr(measure,'completed_modes',())
+        for i,points in enumerate(getattr(measure,'completed',())):
+            if len(points)<2:continue
+            coords=[tuple(p[:2]) for p in points]
+            if not all(math.isfinite(v) for p in coords for v in p):continue
+            result.append({'source':'measure','measure':measure,'points':points,
+                           'index':i,'coords':coords,
+                           'type':'measure_path' if i<len(modes) and modes[i] else 'measure_line',
+                           'key':('measure',id(measure),id(points))})
+        return result
+
+    def _pick_editable(self,p):
+        """Pick only Draw and Measure Line/Path, never imported SNT blocks."""
+        from gui.native_draw import _inside_polygon
+        tol=max(self.draw.canvas.world_per_pixel()*12.,1.e-9)
+        best=(tol,None)
+        lo=(p[0]-tol,p[1]-tol);hi=(p[0]+tol,p[1]+tol)
+        for feat in self._features_bbox(lo,hi):
+            coords=feat['coords']
+            if len(coords)>2 and coords[0]==coords[-1] and _inside_polygon(p,coords):
+                dist=0.
+            else:
+                dist=self.draw._feature_distance(p,feat)
+            if dist<=best[0]:best=(dist,feat)
+        return best[1]
+
     def _features_bbox(self, lower, upper):
         a,b=lower,upper
         minx,maxx=sorted((a[0],b[0]));miny,maxy=sorted((a[1],b[1]))
         count=0
         for i,d in enumerate(self.draw.drawings):
+            if not editable_draw(d):continue
             coords=self.draw._native_coords(d)
             if not coords:continue
             if not (max(p[0] for p in coords)<minx or min(p[0] for p in coords)>maxx or
                     max(p[1] for p in coords)<miny or min(p[1] for p in coords)>maxy):
                 yield self._native_feature(i,d);count+=1
                 if count>=self.selection_manager.MAX_BULK:return
-        for feat in self.draw._snt_index().query_bbox(minx,maxx,miny,maxy,
-                                                      visible=self.draw._snt_visible):
+        for feat in self._measure_features():
+            coords=feat['coords']
+            if (max(p[0] for p in coords)<minx or min(p[0] for p in coords)>maxx or
+                    max(p[1] for p in coords)<miny or min(p[1] for p in coords)>maxy):
+                continue
             yield feat;count+=1
             if count>=self.selection_manager.MAX_BULK:return
 
@@ -230,64 +295,89 @@ class NativeSelectionController(QObject):
         self.message(f'Selected {self.selection_manager.count()} element(s)')
         self._reset_gesture()
 
-    def _text_pick(self,p):
-        """SNT text is read-only; index label anchors once per attachment set."""
-        from bisect import bisect_left, bisect_right
-        from pathlib import Path
+    def _ensure_text_index(self):
+        """Cache world-space SNT text bounds, not legacy VTK actors.
+
+        Text has a separate user-facing pick method. Native GPU layer linework
+        and the transparent text overlay both originate from _render_entities.
+        """
         token=self.draw._scene_token()
-        if token!=self._text_index_token:
-            anchors=[]
-            for attachment in getattr(self.app,'snt_attachments',()) or ():
-                records=attachment.get('_render_entities')
-                if records is None:records=attachment.get('entities') or ()
-                name=attachment.get('full_path') or attachment.get('filename') or ''
-                doc_key=('snt',str(Path(str(name))))
-                for idx,entity in enumerate(records):
-                    if not isinstance(entity,dict):continue
-                    if str(entity.get('type','')).lower() not in ('text','mtext'):continue
-                    layer=str(entity.get('layer','0') or '0')
-                    anchor=next((entity[key] for key in
-                                 ('position','insertion_point','insert','points')
-                                 if entity.get(key) is not None),None)
-                    try:
-                        if anchor is None:continue
-                        if len(anchor) and isinstance(anchor[0],(list,tuple)):
-                            anchor=anchor[0]
-                        q=(float(anchor[0]),float(anchor[1]))
-                    except (ValueError,IndexError,TypeError):continue
-                    if not all(math.isfinite(v) for v in q):continue
-                    anchors.append((q[0],q[1],doc_key,layer,idx,entity))
-            anchors.sort(key=lambda row:row[0])
-            self._text_index=anchors
-            self._text_index_token=token
-        tol=max(self.draw.canvas.world_per_pixel()*15,1e-9)
-        xs=[row[0] for row in self._text_index]
-        lower=bisect_left(xs,p[0]-tol)
-        upper=bisect_right(xs,p[0]+tol)
-        best=None
-        for x,y,doc_key,layer,idx,entity in self._text_index[lower:upper]:
+        if token==self._text_index_token:return
+        records=[]
+        for attachment in getattr(self.app,'snt_attachments',()) or ():
+            entities=attachment.get('_render_entities')
+            if entities is None:entities=attachment.get('entities') or ()
+            name=attachment.get('full_path') or attachment.get('filename') or ''
+            doc_key=('snt',str(Path(str(name))))
+            for idx,entity in enumerate(entities):
+                if not isinstance(entity,dict):continue
+                if str(entity.get('type','')).strip().lower() not in ('text','mtext'):
+                    continue
+                anchor=text_anchor(entity)
+                if anchor is None:continue
+                bounds=text_bounds(entity,anchor)
+                layer=str(entity.get('layer','0') or '0')
+                records.append((*bounds,anchor,doc_key,layer,idx,entity))
+        records.sort(key=lambda row:row[0])
+        self._text_index=records
+        self._text_min_x=[row[0] for row in records]
+        self._text_prefix_max_x=[]
+        xmax=-math.inf
+        for row in records:
+            xmax=max(xmax,row[1]);self._text_prefix_max_x.append(xmax)
+        self._text_index_token=token
+
+    def _query_text(self,bounds,inside=False):
+        self._ensure_text_index()
+        minx,maxx,miny,maxy=bounds
+        lower=bisect_left(self._text_prefix_max_x,minx)
+        upper=bisect_right(self._text_min_x,maxx)
+        token=self.draw._scene_token()
+        result=[]
+        for x0,x1,y0,y1,anchor,doc_key,layer,idx,entity in self._text_index[lower:upper]:
+            if not box_overlap((x0,x1,y0,y1),bounds,inside=inside):continue
             if not self.draw._snt_visible(doc_key,layer):continue
-            dist=math.hypot(x-p[0],y-p[1])
+            result.append({'source':'snt','coords':[anchor], 'type':'text',
+                           'doc_key':doc_key,'layer':layer,'entity':entity,
+                           'bbox':(x0,x1,y0,y1),
+                           'key':(doc_key,idx),'scene_token':token})
+            if len(result)>=self.selection_manager.MAX_BULK:break
+        return result
+
+    def _text_pick(self,p):
+        tol=max(self.draw.canvas.world_per_pixel()*15.,1.e-9)
+        near=self._query_text((p[0]-tol,p[0]+tol,p[1]-tol,p[1]+tol))
+        best=None
+        for feat in near:
+            x0,x1,y0,y1=feat['bbox']
+            # Distance to the LABEL BOX, not only its insertion anchor.
+            dist=math.hypot(max(x0-p[0],0.,p[0]-x1),
+                            max(y0-p[1],0.,p[1]-y1))
             if dist<=tol and (best is None or dist<best[0]):
-                feat={'source':'snt','coords':[(x,y)], 'type':'text',
-                      'doc_key':doc_key,'layer':layer,'entity':entity,
-                      'key':(doc_key,idx),'scene_token':token}
                 best=(dist,feat)
         return best[1] if best else None
 
+    def _select_text_rectangle(self,start,end):
+        minx,maxx=sorted((start[0],end[0]))
+        miny,maxy=sorted((start[1],end[1]))
+        hits=self._query_text((minx,maxx,miny,maxy))
+        self.selection_manager.apply(hits,self._selection_modifier())
+        self.message(f'SNT Text: {len(hits)} label(s) matched; '
+                     f'{self.selection_manager.count()} selected')
+        self._reset_gesture()
+
     def _visible_text_features(self):
-        # Build/cache the label index once; it does not draw a pick marker.
-        self._text_pick((0.,0.))
-        features=[]
-        for x,y,doc_key,layer,idx,entity in self._text_index:
+        self._ensure_text_index()
+        hits=[]
+        token=self.draw._scene_token()
+        for x0,x1,y0,y1,anchor,doc_key,layer,idx,entity in self._text_index:
             if not self.draw._snt_visible(doc_key,layer):continue
-            features.append({'source':'snt','coords':[(x,y)],'type':'text',
-                             'doc_key':doc_key,'layer':layer,'entity':entity,
-                             'key':(doc_key,idx),'scene_token':self.draw._scene_token()})
-            if len(features)>=self.selection_manager.MAX_BULK:
-                self.message('Text selection capped for responsiveness')
-                break
-        return features
+            hits.append({'source':'snt','coords':[anchor], 'type':'text',
+                         'doc_key':doc_key,'layer':layer,'entity':entity,
+                         'bbox':(x0,x1,y0,y1),
+                         'key':(doc_key,idx),'scene_token':token})
+            if len(hits)>=self.selection_manager.MAX_BULK:break
+        return hits
 
     def select_all_snt_text(self):
         self.selection_manager.apply(self._visible_text_features(),'new')
@@ -299,6 +389,20 @@ class NativeSelectionController(QObject):
 
     def press(self,pos,button):
         if not self.is_active():return False
+        if self._intersect_mode:
+            if button==Qt.RightButton:
+                self._intersect_delete_part()
+            elif button==Qt.LeftButton:
+                try:p=self.draw.canvas.section_at(pos.x(),pos.y())
+                except RuntimeError:return True
+                self._intersect_selected_part=self._intersect_nearest_part(p,20.)
+                self._intersect_hovered_part=None
+                self.draw._paint()
+                if self._intersect_selected_part is None:
+                    self.message('Intersect: click a highlighted segment to select')
+                else:
+                    self.message('Intersect: segment selected (red). Right-click to remove it')
+            return True
         if button==Qt.RightButton:
             if self._method=='shape' and len(self._gesture)>=3:
                 self._select_area('shape',list(self._gesture))
@@ -309,7 +413,8 @@ class NativeSelectionController(QObject):
         except RuntimeError:return True
         if self._move_mode or self._copy_mode:
             if not self.selection_manager.count():
-                feat=self.draw._pick_feature(p)
+                feat=(self._text_pick(p) if self._method=='snt_text'
+                      else self._pick_editable(p))
                 if feat:self.selection_manager.apply([feat]);self.message('Click start point, then target')
                 else:self.message('Select an element first')
                 return True
@@ -322,13 +427,14 @@ class NativeSelectionController(QObject):
                 self._offset_origin=None
             return True
         if self._method=='individual':
-            hit=self.draw._pick_feature(p)
+            hit=self._pick_editable(p)
             mode=self._selection_modifier()
             if self._intersect_mode and mode=='new':mode='add'
             self.selection_manager.apply([hit] if hit else [],mode)
         elif self._method=='snt_text':
-            hit=self._text_pick(p)
-            self.selection_manager.apply([hit] if hit else [],self._selection_modifier())
+            # VTK SNT Text uses a *dragged rectangle*. A click without a
+            # meaningful drag still picks the nearest visible text label.
+            self._start=p
         elif self._method=='shape':
             self._gesture.append(p)
         elif self._method in ('block','cline'):
@@ -343,6 +449,13 @@ class NativeSelectionController(QObject):
         if not self.is_active():return False
         try:self._hover=self.draw.canvas.section_at(pos.x(),pos.y())
         except RuntimeError:return True
+        if self._intersect_mode:
+            if self._intersect_selected_part is None:
+                hovered=self._intersect_nearest_part(self._hover,15.)
+                if hovered!=self._intersect_hovered_part:
+                    self._intersect_hovered_part=hovered
+                    self.draw._paint()
+            return True
         # Idle hover does not need a Qt overlay repaint, which is important
         # when a huge SNT is resident in GPU vector buffers.
         if self._gesture or self._start is not None or self._offset_origin is not None:
@@ -351,6 +464,7 @@ class NativeSelectionController(QObject):
 
     def release(self,pos,button):
         if not self.is_active():return False
+        if self._intersect_mode:return True
         if button!=Qt.LeftButton:return False
         if (self._move_mode or self._copy_mode) and self._offset_origin is not None:
             try:p=self.draw.canvas.section_at(pos.x(),pos.y())
@@ -361,9 +475,19 @@ class NativeSelectionController(QObject):
                                          copy=self._copy_mode)
                 self._offset_origin=None
             return True
-        if self._method=='block' and self._start is not None:
+        if self._method in ('block','snt_text') and self._start is not None:
             try:p=self.draw.canvas.section_at(pos.x(),pos.y())
             except RuntimeError:self._reset_gesture();return True
+            if self._method=='snt_text':
+                if math.dist(self._start,p)>self.draw.canvas.world_per_pixel()*3.:
+                    self._select_text_rectangle(self._start,p)
+                else:
+                    hit=self._text_pick(p)
+                    self.selection_manager.apply([hit] if hit else [],
+                                                 self._selection_modifier())
+                    self.message(f'SNT Text: {self.selection_manager.count()} selected')
+                    self._reset_gesture()
+                return True
             if math.dist(self._start,p)>self.draw.canvas.world_per_pixel()*3.:
                 self._select_area('block',[self._start,p])
             # A click followed by no drag allows another click to set corner.
@@ -371,6 +495,7 @@ class NativeSelectionController(QObject):
         return True
 
     def double_click(self,pos,button):
+        if self._intersect_mode:return True
         if not self.is_active() or button!=Qt.LeftButton:return False
         if self._method=='shape' and len(self._gesture)>=3:
             self._select_area('shape',list(self._gesture))
@@ -384,6 +509,13 @@ class NativeSelectionController(QObject):
 
     def key(self,key):
         if not self.is_active():return False
+        if self._intersect_mode and key==Qt.Key_Escape:
+            self.exit_intersect_mode(commit=False)
+            self.message('Intersect cancelled; no drawings changed')
+            return True
+        if self._intersect_mode and key in (Qt.Key_Enter,Qt.Key_Return):
+            self.exit_intersect_mode(commit=True)
+            return True
         if key==Qt.Key_Escape:
             self._reset_gesture()
             self._move_mode=self._copy_mode=False
@@ -394,6 +526,20 @@ class NativeSelectionController(QObject):
         return False
 
     def preview_shapes(self):
+        if self._intersect_mode:
+            shapes=[]
+            for idx,part in enumerate(self._intersect_parts):
+                if part['deleted']:continue
+                source=part['source'].get('drawing',{})
+                color=str(source.get('color','#00dcff'))
+                width=max(1,int(source.get('width',2)))
+                if idx==self._intersect_selected_part:
+                    color='#ff1717';width=max(width,5)
+                elif idx==self._intersect_hovered_part:
+                    color='#ff3866';width=max(width,4)
+                shapes.append(('drawing',part['coords'],
+                               {'type':'polyline','color':color,'width':width}))
+            return shapes
         pts=[]
         if self._method=='shape':pts=list(self._gesture)
         elif self._start is not None:pts=[self._start]
@@ -406,25 +552,56 @@ class NativeSelectionController(QObject):
                 shapes.append(('drawing_preview',translate(feat['coords'],dx,dy),
                                {'type':'polyline','color':'#79d6ff','width':2}))
         if pts:
-            if self._method=='block' and len(pts)>=2:
+            if self._method in ('block','snt_text') and len(pts)>=2:
                 a,b=pts[0],pts[-1]
                 pts=[a,(b[0],a[1]),b,(a[0],b[1]),a]
             shapes.append(('drawing_preview',pts,
                            {'type':'polyline','color':'#ffd54f','width':2}))
+        if self._method=='snt_text':
+            # Outline true/approximated label bounds, so a selected label is
+            # visibly highlighted even though imported SNT text stays read-only.
+            for feat in self.selection_manager.get_features()[:200]:
+                if feat['source']!='snt' or 'bbox' not in feat:continue
+                x0,x1,y0,y1=feat['bbox']
+                # Degenerate-height text anchors still get a visible marker.
+                pad=self.draw.canvas.world_per_pixel()*2.
+                if x0==x1:x0-=pad;x1+=pad
+                if y0==y1:y0-=pad;y1+=pad
+                shapes.append(('drawing_preview',[(x0,y0),(x1,y0),(x1,y1),
+                                                   (x0,y1),(x0,y0)],
+                               {'type':'polyline','color':'#ffbb32','width':2}))
         if self._vertex_display:
             for feat in self.selection_manager.get_features()[:200]:
-                for point in feat['coords'][:200]:
+                # Circle perimeter samples are rendering detail, not CAD vertices.
+                if feat['type'] in ('circle', 'text'):
+                    continue
+                coords = feat['coords']
+                if feat['type'] == 'curve' and feat['source'] == 'native':
+                    coords = feat['drawing'].get('coords', [])
+                if len(coords) > 2 and coords[0] == coords[-1]:
+                    coords = coords[:-1]  # don't show the first/last corner twice
+                for point in coords[:200]:
                     shapes.append(('drawing_preview',[point],
                                    {'type':'point','color':'#f6bd60','width':3}))
         return shapes
 
     def highlight_features(self):
-        # Don't re-stroke million-element SNT: only the actual selection.
+        # The Intersect preview replaces its sources with selectable pieces.
+        if self._intersect_mode:return []
         return self.selection_manager.get_features()[:500]
 
     def _transform_selected(self,transform,copy=False):
         selected=self.selection_manager.get_features()
         if not selected:return self.message('Select at least one element')
+        if self._method=='snt_text':
+            return self.message('Imported SNT Text is read-only; Copy copies label text')
+        # Measurement line/path is a selectable overlay, not an editable Draw
+        # document. Never silently turn a Move/Delete of a measurement into a
+        # new drawing, which would leave the original measurement in place.
+        non_draw=[f for f in selected if f['source']=='measure']
+        if non_draw and not copy:
+            return self.message('Measure Line/Path selection is read-only for Move/Rotate/Extend; '
+                                'the Measure tab still owns measurement edits')
         before=list(self.draw.drawings)
         replaced=[];created=[];imported=0
         for feat in selected:
@@ -443,6 +620,11 @@ class NativeSelectionController(QObject):
                     new['type']='polyline'
                     new.pop('hatch_segments',None)
                 if not copy:replaced.append(orig)
+            elif feat['source']=='measure':
+                # Copying a measurement yields an independent Draw overlay;
+                # the original measurement and its units remain unchanged.
+                new={'type':'polyline' if len(coords)>1 else 'point',
+                     'coords':list(result),'derived_from_measure':True}
             else:
                 imported+=1
                 new={'type':'polyline' if len(coords)>1 else 'point',
@@ -462,6 +644,10 @@ class NativeSelectionController(QObject):
 
     def enter_move_mode(self):
         if not self.selection_manager.count():return self.message('Select geometry before Move')
+        if self._method=='snt_text':
+            return self.message('SNT Text labels are read-only. Use Copy to copy their text.')
+        if any(f['source']=='measure' for f in self.selection_manager.get_features()):
+            return self.message('Measure Line/Path is selection-only; use Measure tab for edits')
         self._move_mode=True;self._copy_mode=False;self._offset_origin=None
         self.message('Move: click anchor, then target; Escape cancels')
 
@@ -477,35 +663,151 @@ class NativeSelectionController(QObject):
     def exit_copy_mode(self):
         self._copy_mode=False;self._offset_origin=None
 
-    def enter_intersect_mode(self):
-        self._intersect_mode=True
-        self.message('Intersect: select two crossing open lines, then press Intersect again to split the first')
+    def _notify_intersect_button(self, active):
+        popup=getattr(self.app,'_element_selection_dialog',None)
+        if popup is not None:
+            button=getattr(popup,'btn_intersect',None)
+            if button is not None:button.setChecked(active)
+            label=getattr(popup,'lbl_count',None)
+            if label is not None:
+                label.setText('Intersect Active' if active else
+                              f'Selection: {self.selection_manager.count()}')
 
-    def exit_intersect_mode(self,commit=False):
-        self._intersect_mode=False
-        if not commit:
+    def _intersect_nearest_part(self, point, tolerance_px):
+        tol=max(1e-10,self.draw.canvas.world_per_pixel()*tolerance_px)
+        best=(tol,None)
+        for index,part in enumerate(self._intersect_parts):
+            if part['deleted']:continue
+            nearest=nearest_segment(point,part['coords'])
+            if nearest is not None and nearest[0] <= best[0]:
+                best=(nearest[0],index)
+        return best[1]
+
+    def enter_intersect_mode(self):
+        """VTK Intersect: preview all pieces; select left, remove right, commit on exit."""
+        if not self.is_active():return False
+        if self._intersect_mode:return True
+        selection=self.selection_manager.get_features()
+        if not any(f['source']=='native' and
+                   f['drawing'].get('source') not in ('block_creation','cell_creation')
+                   for f in selection):
+            self.message('Intersect needs editable native Draw elements; SNT remains read-only')
+            return False
+        # Protected GPU-rendered creation blocks must not be modified here.
+        selection=[f for f in selection if f['source']!='native' or
+                   f['drawing'].get('source') not in ('block_creation','cell_creation')]
+        try:
+            parts,crossings=split_selected_features(selection)
+        except ValueError as exc:
+            self.message(str(exc));return False
+        if not parts:
+            self.message('Intersect: select editable lines or polygons')
+            return False
+        self._intersect_parts=parts
+        self._intersect_source_ids={id(p['source']['drawing']) for p in parts}
+        self._intersect_selected_part=None
+        self._intersect_hovered_part=None
+        self._intersect_delete_history=[]
+        self._intersect_redo_history=[]
+        self._intersect_scene_token=self.draw._scene_token()
+        self._intersect_mode=True
+        self._move_mode=self._copy_mode=False
+        self._offset_origin=None
+        self.selection_manager.clear()
+        self._notify_intersect_button(True)
+        self.message(f'Intersect: {crossings} crossing(s), {len(parts)} pieces. '
+                     'Left-click piece, right-click remove; click Intersect to finish',0)
+        return True
+
+    def _intersect_delete_part(self):
+        index=self._intersect_selected_part
+        if index is None or self._intersect_parts[index]['deleted']:
+            self.message('Intersect: first left-click the piece to remove')
             return
-        selected=self.selection_manager.get_features()
-        if len(selected)<2:return self.message('Intersect needs two selected lines')
-        one,two=selected[:2]
-        ca,cb=one['coords'],two['coords']
-        for i,(a,b) in enumerate(zip(ca,ca[1:])):
-            for c,d in zip(cb,cb[1:]):
-                p=segment_intersection(a,b,c,d)
-                if p is None:continue
-                before=list(self.draw.drawings)
-                left=ca[:i+1]+[p];right=[p]+ca[i+1:]
-                if one['source']=='native':
-                    self.draw.drawings.remove(one['drawing'])
-                for part in (left,right):
-                    self.draw.drawings.append({'type':'polyline','coords':part,
-                                               'derived_from_snt':one['source']=='snt'})
-                self.draw.record_object_change(before)
-                self.selection_manager.clear()
-                return self.message('Intersection: split first line into two editable parts')
-        self.message('No interior segment intersection found')
+        self._intersect_parts[index]['deleted']=True
+        self._intersect_delete_history.append(index)
+        self._intersect_redo_history=[]
+        self._intersect_selected_part=None
+        self._intersect_hovered_part=None
+        self.draw._paint()
+        self.message('Intersect: piece marked for removal; click Intersect to commit')
+
+    def intersect_history(self, redo=False):
+        """Ctrl+Z/Y restores a piece during the preview, without editing the document."""
+        if not self._intersect_mode:return False
+        stack=self._intersect_redo_history if redo else self._intersect_delete_history
+        if not stack:
+            self.message('Intersect: no pending piece deletions to undo/redo')
+            return True
+        index=stack.pop()
+        self._intersect_parts[index]['deleted']=bool(redo)
+        target=self._intersect_delete_history if redo else self._intersect_redo_history
+        target.append(index)
+        self._intersect_selected_part=self._intersect_hovered_part=None
+        self.draw._paint()
+        return True
+
+    def exit_intersect_mode(self,commit=True):
+        """Commit only explicitly removed native parts, atomically and Undo-safe."""
+        if not self._intersect_mode:return False
+        parts=self._intersect_parts
+        source_ids=set(self._intersect_source_ids)
+        scene_token=self._intersect_scene_token
+        self._intersect_mode=False
+        self._intersect_parts=[]
+        self._intersect_source_ids=set()
+        self._intersect_selected_part=None
+        self._intersect_hovered_part=None
+        self._intersect_delete_history=[]
+        self._intersect_redo_history=[]
+        self._intersect_scene_token=None
+        self._notify_intersect_button(False)
+        if not commit:
+            self.draw._paint()
+            return True
+        if scene_token!=self.draw._scene_token():
+            self.draw._paint()
+            self.message('Intersect discarded because attached SNT scene changed')
+            return False
+        deleted_ids={id(part['source']['drawing']) for part in parts if part['deleted']}
+        if not deleted_ids:
+            self.draw._paint()
+            self.message('Intersect ended; no geometry changed')
+            return True
+        # A source is only replaced if the user actually removed one of its
+        # pieces. All unaffected drawings preserve their identity and metadata.
+        before=list(self.draw.drawings)
+        replacements={}
+        for original in before:
+            if id(original) not in deleted_ids or id(original) not in source_ids:
+                continue
+            surviving=[p['coords'] for p in parts
+                       if p['source'].get('drawing') is original and not p['deleted']]
+            pieces=[]
+            for coords in surviving:
+                derived=dict(original)
+                derived['coords']=list(coords)
+                if (original.get('type') in ('rectangle','curve','circle','hatch') or
+                        len(coords)<4 and coords[0]!=coords[-1] and
+                        original.get('type') in ('polyline','ortho')):
+                    derived['type']='polyline'
+                for stale in ('hatch_segments','control_points','interpolated'):
+                    derived.pop(stale,None)
+                pieces.append(derived)
+            replacements[id(original)]=pieces
+        updated=[]
+        for original in before:
+            if id(original) in replacements:updated.extend(replacements[id(original)])
+            else:updated.append(original)
+        self.draw.drawings[:]=updated
+        self.draw.record_object_change(before)
+        self.selection_manager.clear()
+        self.message(f'Intersect committed: {sum(p["deleted"] for p in parts)} piece(s) removed')
+        return True
 
     def extend(self):
+        if self._method=='snt_text':
+            return self.message('Imported SNT Text is read-only')
         selected=self.selection_manager.get_features()
         if not selected:return self.message('Select an open line to extend')
         value,ok=QInputDialog.getDouble(self.app,'Extend','Extend end by (world units):',1.,0.,1e9,3)
@@ -519,12 +821,16 @@ class NativeSelectionController(QObject):
         self._transform_selected(extension,copy=False)
 
     def rotate_selected(self):
+        if self._method=='snt_text':
+            return self.message('Imported SNT Text is read-only')
         angle,ok=QInputDialog.getDouble(self.app,'Rotate','Degrees counter-clockwise:',90.,-360.,360.,3)
         if not ok:return
         pivot=self._pivot()
         if pivot is not None:self._transform_selected(lambda coords:rotate(coords,angle,pivot))
 
     def mirror_selected(self):
+        if self._method=='snt_text':
+            return self.message('Imported SNT Text is read-only')
         axis,ok=QInputDialog.getItem(self.app,'Mirror','Axis:',
                                      ['horizontal','vertical'],0,False)
         if not ok:return
@@ -540,12 +846,15 @@ class NativeSelectionController(QObject):
         selected=self.selection_manager.get_features()
         target={id(f['drawing']) for f in selected if f['source']=='native'}
         imported=sum(f['source']=='snt' for f in selected)
+        measured=sum(f['source']=='measure' for f in selected)
         if target:
             old=list(self.draw.drawings)
             self.draw.drawings[:]=[d for d in self.draw.drawings if id(d) not in target]
             self.draw.record_object_change(old)
         self.selection_manager.clear()
-        if imported:self.message(f'{len(target)} drawings deleted; {imported} imported SNT entities protected')
+        if imported or measured:
+            self.message(f'{len(target)} drawings deleted; {imported} imported SNT text and '
+                         f'{measured} measurements protected')
         else:self.message(f'{len(target)} drawing(s) deleted')
 
     def copy_selected_snt_text_to_clipboard(self):
