@@ -217,6 +217,24 @@ def _convex_hull(points):
     return QPolygonF([QPointF(x, y) for x, y in lower[:-1] + upper[:-1]])
 
 
+def _drawing_vertex_markers_visible(kind, data):
+    """Draw vertex handles only while placing or explicitly editing a drawing.
+
+    Completed CAD elements are strokes, not permanent point-marker overlays.
+    Keeping this policy in the Qt overlay also covers imported selections and
+    other callers that do not go through NativeDraw._paint().
+    """
+    dtype = str(data.get('type', 'polyline')).lower()
+    if dtype in ('text', 'freehand', 'point') or data.get('source') in (
+            'block_creation', 'cell_creation'):
+        return False
+    if 'show_vertices' in data:
+        return bool(data['show_vertices'])
+    # Drawing previews contain control vertices. Finished drawings are clean,
+    # even when their geometry has many tessellation or interpolation points.
+    return kind == 'drawing_preview' and dtype not in ('centerline', 'parallel')
+
+
 class CanvasOverlay(QWidget):
     """Click-through tool window over one native canvas (a Qt widget cannot paint
     over the native Vulkan child window). Shapes are kept in section coordinates
@@ -404,7 +422,15 @@ class CanvasOverlay(QWidget):
                     text = str(data.get('text', ''))
                     angle = -float(data.get('rotation', 0.) or 0.)
                     transform = QTransform().translate(qpts[0].x(), qpts[0].y()).rotate(angle)
-                    font = painter.font()
+                    font = QFont(painter.font())
+                    # Native Text uses the VTK text palette's font settings;
+                    # imported world-height SNT labels retain their own sizing.
+                    if data.get('source') != 'attachment':
+                        font.setFamily(str(data.get('font_family',font.family())))
+                        if data.get('font_size') is not None:
+                            font.setPixelSize(max(6, min(512, int(data['font_size']))))
+                        font.setBold(bool(data.get('bold',False)))
+                        font.setItalic(bool(data.get('italic',False)))
                     world_sized = data.get('source') == 'attachment' and float(data.get('height', 0.) or 0.) > 0.
                     if world_sized:
                         from gui.native_label_layout import world_text_transform
@@ -437,22 +463,31 @@ class CanvasOverlay(QWidget):
                     painter.setBrush(color)
                     painter.drawEllipse(qpts[0], 4., 4.)
                 elif dtype == 'hatch' and len(qpts) >= 3:
-                    if not data.get('fill_enabled'):
-                        fill = QColor(color); fill.setAlpha(55)
-                        painter.setBrush(fill)
+                    # Unlike a translucent polygon fill, actual hatch lines
+                    # are clipped to the closed boundary in world coordinates.
+                    painter.setBrush(Qt.NoBrush)
                     painter.drawPolygon(QPolygonF(qpts))
+                    for a,b in data.get('hatch_segments', []):
+                        painter.drawLine(QPointF(*to_qt(*a)), QPointF(*to_qt(*b)))
                 elif len(qpts) >= 2:
                     if data.get('fill_enabled') and len(qpts) >= 3:
                         painter.drawPolygon(QPolygonF(qpts))
                     else:
                         painter.drawPolyline(QPolygonF(qpts))
-                # Freehand can contain hundreds of sampled points; displaying
-                # every sample as a vertex turns the stroke into a dotted chain.
-                # Keep its samples internal and render only the continuous line.
-                show_vertices = (dtype not in ('text', 'freehand') and
-                                 data.get('source') not in ('block_creation', 'cell_creation'))
-                for point in qpts if show_vertices else []:
-                    painter.drawEllipse(point, 2.5, 2.5)
+                # Control handles belong to an ACTIVE placement or an
+                # EXPLICIT Vertex Display/Edit mode, not to finished geometry.
+                # Rectangle and circle use their two true control points, not
+                # extra points on the tessellated perimeter. Curves use control
+                # points rather than their interpolated samples. Avoid even
+                # building the handle list when hidden (large CAD polylines).
+                if _drawing_vertex_markers_visible(kind, data):
+                    vertex_points = (
+                        [QPointF(*to_qt(*p)) for p in data['control_points']]
+                        if dtype == 'curve' and data.get('control_points')
+                        else qpts
+                    )
+                    for point in vertex_points:
+                        painter.drawEllipse(point, 2.5, 2.5)
             elif kind == "cut_preview" and len(qpts) == 2:
                 painter.setPen(QPen(QColor(255, 165, 0), 2, Qt.DashLine))
                 painter.drawRect(QRectF(qpts[0], qpts[1]).normalized())

@@ -4264,6 +4264,13 @@ class NakshaApp(QMainWindow):
 
     def _sync_tools_for_ribbon_tab(self, ribbon_name):
         """Keep all tool tabs mutually exclusive when switching tabs."""
+        if ribbon_name != "draw":
+            # The native Vulkan layer is independent of digitizer.active_tool.
+            # Disarm it too, or it will keep capturing clicks on other tabs.
+            from gui.native_draw import get_native_draw
+            native = get_native_draw(self)
+            if native is not None and native.active():
+                native.cancel()
         if ribbon_name == "draw":
             self._enter_draw_tab_mode()
             self._clear_ribbon_active_buttons("classify")
