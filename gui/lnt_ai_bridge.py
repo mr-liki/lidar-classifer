@@ -247,6 +247,9 @@ class LntAiBridge(QObject):
         classification = np.empty(total, dtype=np.uint8)
         classification[order] = rec_cls
         self.on_disk = classification.copy()            # what the .lnt holds right now
+        from gui.class_slots import code_for
+        codes = np.array([code_for(self.app, slot) for slot in range(256)], dtype=np.int64)
+        classification = codes[classification]
         progress(95, "Starting AI classification…")
         return {
             "xyz": xyz, "intensity": intensity, "classification": classification,
@@ -308,10 +311,19 @@ class LntAiBridge(QObject):
         """Write every class the AI dataset holds that the .lnt does not. Returns the count."""
         if not self.active or self.view.native is None:
             return 0
-        cur = np.asarray(self.dataset.get("classification"), dtype=np.uint8)
-        if cur.shape != self.on_disk.shape:
+        user_classes = np.asarray(self.dataset.get("classification"))
+        if user_classes.shape != self.on_disk.shape:
             print("[LNT-AI] classification length changed; nothing written")
             return 0
+        from gui.class_slots import slot_for
+        codes, inverse = np.unique(user_classes, return_inverse=True)
+        slots = []
+        for code in codes:
+            slot = slot_for(self.app, code, allocate=True)
+            if slot is None:
+                raise ValueError(f"Invalid AI class number: {code}")
+            slots.append(slot)
+        cur = np.asarray(slots, dtype=np.uint8)[inverse].reshape(user_classes.shape)
         rows = np.flatnonzero(cur != self.on_disk)
         if rows.size == 0:
             return 0

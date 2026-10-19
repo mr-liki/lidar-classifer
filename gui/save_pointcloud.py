@@ -667,6 +667,9 @@ def has_fenced_parent_writeback(app) -> bool:
 
 def save_current_pointcloud_in_place(app) -> bool:
     """Silently save the currently editable dataset to its real source."""
+    from .native_save import native_active, save_native
+    if native_active(app):
+        return save_native(app)
     data = getattr(app, "data", None)
     if not isinstance(data, dict) or data.get("xyz") is None:
         return False
@@ -1487,6 +1490,10 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     - Drawings are fully editable after reload
     """
 
+    from .native_save import native_active, save_native
+    if native_active(app):
+        return save_native(app, path, show_dialog=show_dialog, version=las_version)
+
     data = getattr(app, "data", None)
     if data is None or "xyz" not in data or data["xyz"] is None:
         print("⚠️ No dataset loaded")
@@ -2045,6 +2052,9 @@ def save_pointcloud_quick(app, path):
     Silent quick-save version used for auto-backup.
     ✅ Also saves drawings.
     """
+    from .native_save import native_active, save_native
+    if native_active(app):
+        return save_native(app, path, reopen=False)
     try:
         data = getattr(app, "data", None)
         if data is None or "xyz" not in data or data["xyz"] is None:

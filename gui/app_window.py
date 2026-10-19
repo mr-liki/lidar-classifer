@@ -19483,6 +19483,9 @@ class NakshaApp(QMainWindow):
             print(f"⚠️ Failed to refresh 2D lock: {e}")
         
     def _save_quick_no_dialog(self):
+        from .native_save import native_active, save_native
+        if native_active(self):
+            return save_native(self)
         from .save_pointcloud import save_pointcloud, has_fenced_parent_writeback
 
         if has_fenced_parent_writeback(self):

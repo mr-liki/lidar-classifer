@@ -553,6 +553,19 @@ class CanvasOverlay(QWidget):
         painter.end()
 
 
+def _class_lut(slots):
+    """256-entry mask of stored class slots (see gui/class_slots.py)."""
+    lut = np.zeros(256, dtype=np.bool_)
+    for code in slots:
+        try:
+            code = int(code)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= code <= 255:
+            lut[code] = True
+    return lut
+
+
 class SectionClassifier:
     """Mouse gesture state machine for one canvas; reads the app's active tool,
     From/To classes and brush settings on every event (no attach step)."""
@@ -752,8 +765,9 @@ class SectionClassifier:
         palette = self.canvas.palette or {}
         if not palette:
             return None
-        return np.array([int(c) for c, rule in palette.items() if rule.get("show", True)],
-                        dtype=np.int64)
+        from gui.class_slots import stored_palette
+        return np.array([slot for slot, rule in stored_palette(self.app, palette).items()
+                         if rule.get("show", True)], dtype=np.int64)
 
     def candidates(self, tool, shape):
         """Store indices this gesture would classify (before the From filter)."""
@@ -785,9 +799,7 @@ class SectionClassifier:
         visible = self._visible_classes()
         if visible is not None and indices.size:
             classes = self.app.data["classification"]
-            lut = np.zeros(256, dtype=np.bool_)
-            lut[np.asarray(visible, dtype=np.uint8)] = True
-            indices = indices[lut[classes[indices]]]
+            indices = indices[_class_lut(visible)[classes[indices]]]
         return indices
 
     def _commit(self, tool, shape):
@@ -796,15 +808,26 @@ class SectionClassifier:
         if to_class is None:
             app.statusBar().showMessage("Target class not set.", 2500)
             return 0
+        # User class numbers can be anything (e.g. 999); points store a one-byte
+        # slot (gui/class_slots.py). Never raise here: an exception escaping a
+        # Qt mouse override crashes the app.
+        from gui.class_slots import NoFreeSlot, slot_for, slots_for
+        to_code = to_class
+        try:
+            to_class = slot_for(app, to_code, allocate=True)
+        except (NoFreeSlot, OSError) as exc:
+            app.statusBar().showMessage(str(exc), 6000)
+            return 0
+        if to_class is None:
+            app.statusBar().showMessage(f"Class {to_code} is not a valid class number.", 4000)
+            return 0
         indices = self.candidates(tool, shape)
         if not indices.size:
             return 0
         classes = app.data["classification"]
         from_classes = getattr(app, "from_classes", None)
         if from_classes and indices.size:
-            lut = np.zeros(256, dtype=np.bool_)
-            lut[np.asarray(from_classes, dtype=np.uint8)] = True
-            indices = indices[lut[classes[indices]]]
+            indices = indices[_class_lut(slots_for(app, from_classes))[classes[indices]]]
         if indices.size:
             indices = indices[classes[indices] != np.asarray(to_class, dtype=classes.dtype)]
         if indices.size == 0:
@@ -831,5 +854,5 @@ class SectionClassifier:
         app._last_classify_ts = time.time()
         app.classification_revision = int(getattr(app, "classification_revision", 0) or 0) + 1
         self.canvas.owner.refresh_edits(force=True, changed=(indices, old))
-        app.statusBar().showMessage(f"{indices.size:,} points -> class {to_class}", 3000)
+        app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)
