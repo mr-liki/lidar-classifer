@@ -13,10 +13,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
     QVBoxLayout,
 )
 
+from gui.block_split import BlockEditRefreshMixin
 from gui.native_draw import get_native_draw
 from gui.theme_manager import ThemeColors, ThemeManager, get_dialog_stylesheet
 
@@ -340,15 +341,26 @@ class NativeCreation:
 
     def clear_cells(self):
         """Remove generated cells from the drawing overlay and pending redo."""
+        return self._clear_generated('cell_creation')
+
+    def clear_blocks(self):
+        """Remove generated blocks from the drawing overlay, pending redo and
+        the app's block records (export/point assignment read those)."""
+        if getattr(self.app, 'block_creation_generated_blocks', None):
+            self.app.block_creation_generated_blocks = []
+            self.app.block_creation_generated_source = None
+        return self._clear_generated('block_creation')
+
+    def _clear_generated(self, source):
         drawings = self.draw.drawings
         selected_index = getattr(self.draw, 'selected', None)
         selected = (drawings[selected_index] if isinstance(selected_index, int)
                     and 0 <= selected_index < len(drawings) else None)
-        kept = [drawing for drawing in drawings if drawing.get('source') != 'cell_creation']
+        kept = [drawing for drawing in drawings if drawing.get('source') != source]
         removed = len(drawings) - len(kept)
         drawings[:] = kept
         self.draw.redo[:] = [drawing for drawing in self.draw.redo
-                             if drawing.get('source') != 'cell_creation']
+                             if drawing.get('source') != source]
         if removed:
             self.draw.selected = next((i for i, drawing in enumerate(kept)
                                        if drawing is selected), None)
@@ -394,7 +406,7 @@ class _BaseDialog(QDialog):
     def __init__(self, app):
         super().__init__(app)
         self.app = app
-        self.controller = get_native_creation(app, create=True)
+        self._controller = get_native_creation(app, create=True)
         self.setWindowTitle(f'{self.mode.title()} Creation Settings')
         self.setProperty('renderBackend', 'native-vulkan')
         self.setSizeGripEnabled(False)
@@ -407,6 +419,11 @@ class _BaseDialog(QDialog):
                 background-color: {accent}; border: 1px solid {hover}; color: white; font-weight: bold;
             }}
             QPushButton#selectClButton:checked:hover {{ background-color: {hover}; }}
+            QPushButton#splitButton {{
+                background-color: #1a1a00; border: 1px solid #ccff00; color: #ccff00; font-weight: bold;
+            }}
+            QPushButton#splitButton:hover {{ background-color: #2e2e00; border-color: #eeff44; color: #eeff44; }}
+            QPushButton#splitButton:pressed {{ background-color: #ccff00; color: #000000; }}
         """)
         self.root = QVBoxLayout(self)
         group = QGroupBox('CL'); row = QHBoxLayout(group)
@@ -418,8 +435,40 @@ class _BaseDialog(QDialog):
         row.addWidget(self.select_btn); row.addWidget(self.selection_label, 1)
         self.root.addWidget(group)
 
+    @property
+    def controller(self):
+        """The creation controller of the CURRENT plan viewport.
+
+        The viewport is replaced under an open dialog - loading a point cloud
+        over an SNT-only session swaps the SNT viewport view for the .lnt view,
+        and closing it swaps back - and each view has its own controller.  A
+        dialog that kept the one from when it was opened armed Select CL on a
+        viewport that no longer receives clicks, so look it up on every use.
+        """
+        current = get_native_creation(self.app, create=True)
+        previous = self._controller
+        if current is None or current is previous:
+            return previous
+        self._controller = current
+        if previous is not None and previous.mode is not None:
+            try:
+                previous.disarm()
+            except RuntimeError:
+                pass                            # its canvas was already deleted
+        print(f'[native create] {self.mode} dialog moved to the current plan viewport')
+        try:
+            self.select_btn.blockSignals(True); self.select_btn.setChecked(False)
+            self.select_btn.blockSignals(False)
+            self.update_selection()
+        except (AttributeError, RuntimeError):
+            pass                                # still building the dialog
+        return current
+
     def _select(self, checked):
-        if checked: self.controller.arm(self.mode)
+        # A click on a dialog still bound to a replaced viewport means "select
+        # here", even when the button showed the old viewport as armed.
+        moved = self._controller is not get_native_creation(self.app, create=True)
+        if checked or moved: self.controller.arm(self.mode)
         else: self.controller.disarm()
 
     def update_selection(self):
@@ -430,6 +479,7 @@ class _BaseDialog(QDialog):
         row = QHBoxLayout(); clear = QPushButton('Clear'); create = QPushButton('Create')
         clear.clicked.connect(self._clear); create.clicked.connect(create_callback)
         row.addWidget(clear); row.addStretch(); row.addWidget(create); self.root.addLayout(row)
+        self.button_row = row
 
     def _clear(self):
         self.controller.clear_selection()
@@ -444,7 +494,7 @@ class _BaseDialog(QDialog):
         self.select_btn.setChecked(False); super().closeEvent(event)
 
 
-class NativeBlockDialog(_BaseDialog):
+class NativeBlockDialog(BlockEditRefreshMixin, _BaseDialog):
     mode = 'block'
     def __init__(self, app):
         super().__init__(app)
@@ -456,6 +506,12 @@ class NativeBlockDialog(_BaseDialog):
         form.addRow('Mode:', self.mode_box); form.addRow('Total width:', self.total)
         form.addRow('Tolerance above:', self.above); form.addRow('Tolerance below:', self.below)
         form.addRow('Distance:', self.distance); self.root.addWidget(group); self._buttons(self.create)
+        # Split writes one point-cloud file per created block; shown once blocks exist.
+        self.split_btn = QPushButton('Split'); self.split_btn.setObjectName('splitButton')
+        self.split_btn.setAutoDefault(False); self.split_btn.setCursor(Qt.PointingHandCursor)
+        self.split_btn.clicked.connect(self.split)
+        self.button_row.insertWidget(1, self.split_btn)
+        self._sync_split_button()
         self._mode_changed(0); self.adjustSize(); ThemeManager.apply_native_window_theme(self)
         self.setFixedSize(self.size())
 
@@ -476,6 +532,67 @@ class NativeBlockDialog(_BaseDialog):
         else: above, below = self.above.value(), self.below.value()
         count = self.controller.create_blocks(above, below, self.distance.value())
         self.app.statusBar().showMessage(f'Created {count} native Vulkan block(s)', 4000)
+        self._sync_split_button()
+
+    def _live_blocks(self):
+        """Created block records whose outlines are still drawn in the viewport."""
+        drawings = self.controller.draw.drawings
+        if not any(d.get('source') == 'block_creation' for d in drawings):
+            return []
+        return list(getattr(self.app, 'block_creation_generated_blocks', None) or [])
+
+    def _sync_split_button(self):
+        has_blocks = bool(self._live_blocks())
+        self.split_btn.setVisible(has_blocks); self.split_btn.setEnabled(has_blocks)
+
+    def split(self):
+        from gui.block_split import BlockSplitSaveDialog
+        blocks = self._live_blocks()
+        if not blocks:
+            QMessageBox.warning(self, 'Split Blocks',
+                                'Create the blocks first: select CL lines and press Create.')
+            self._sync_split_button(); return
+        generated = getattr(self.app, 'block_creation_generated_source', None)
+        current = next((str(v) for v in (getattr(self.app, a, None) for a in
+                        ('loaded_file', 'current_file_path', 'last_save_path')) if v), None)
+        if generated and current and generated != current:
+            QMessageBox.warning(self, 'Split Blocks',
+                                'The blocks belong to a different source file. '
+                                'Create them again before splitting.')
+            return
+        # Outlines edited in the viewport (moved vertices, deleted edges) decide
+        # each block's polygon, exactly as in the reference Split.
+        live_ids = {id(d) for d in self.controller.draw.drawings}
+        blocks, invalid = self._refresh_blocks_from_live_drawings(blocks, live_ids)
+        if invalid:
+            lines = '\n'.join(f'- Priority {priority}: {reason}' for priority, reason in invalid)
+            print(f'[Split] blocks rejected:\n{lines}')
+            QMessageBox.warning(self, 'Split Blocks',
+                                'Some edited blocks no longer form a closed polygon. '
+                                'Fix or undo the edits for these blocks:\n' + lines)
+            return
+        if not blocks:
+            QMessageBox.warning(self, 'Split Blocks', 'No valid block remains to split.')
+            return
+        self.app.block_creation_generated_blocks = blocks
+        dialog = BlockSplitSaveDialog(self.app, blocks, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self._clear()
+
+    def _clear(self):
+        self.controller.clear_blocks()
+        super()._clear()
+        self._sync_split_button()
+
+    def closeEvent(self, event):
+        # Closing the dialog discards its generated blocks, like Clear.
+        self.controller.clear_blocks()
+        super().closeEvent(event)
+
+    def reject(self):
+        # Esc closes the dialog without a closeEvent.
+        self.controller.clear_blocks()
+        super().reject()
 
     def reset(self):
         self.mode_box.setCurrentIndex(0); self.total.setValue(60.); self.above.setValue(1.)
@@ -530,6 +647,7 @@ def _show(app, attr, cls):
         if dialog is None or not dialog.windowTitle(): raise RuntimeError
     except (RuntimeError, ReferenceError):
         dialog = cls(app); setattr(app, attr, dialog)
+    dialog.update_selection()                   # binds a reused dialog to the current viewport
     dialog.show(); dialog.raise_(); dialog.activateWindow()
     return True
 

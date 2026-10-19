@@ -56,12 +56,152 @@ def _quantize_21(val, lo, hi):
     return np.where(u > 0.0, q, 0.0).astype(np.uint32)
 
 
+_SPREAD_7 = None
+
+
+def morton_keys(xyz, bounds_min, bounds_max):
+    """The builder's 63-bit Morton key of every point (same bits as
+    _expand_bits_21 per axis, built from 7-bit lookup tables: fewer passes)."""
+    global _SPREAD_7
+    if _SPREAD_7 is None:
+        _SPREAD_7 = _expand_bits_21(np.arange(128, dtype=np.uint32))
+    keys = np.zeros(len(xyz), dtype=np.uint64)
+    for axis in range(3):
+        q = _quantize_21(xyz[:, axis], bounds_min[axis], bounds_max[axis])
+        for part in range(3):
+            keys |= _SPREAD_7[(q >> np.uint32(7 * part)) & np.uint32(127)] << np.uint64(axis + 21 * part)
+    return keys
+
+
 def source_order(xyz, bounds_min, bounds_max):
     """Source index of every .lnt leaf record, in record order (the builder's ids)."""
-    keys = _expand_bits_21(_quantize_21(xyz[:, 0], bounds_min[0], bounds_max[0]))
-    keys |= _expand_bits_21(_quantize_21(xyz[:, 1], bounds_min[1], bounds_max[1])) << np.uint64(1)
-    keys |= _expand_bits_21(_quantize_21(xyz[:, 2], bounds_min[2], bounds_max[2])) << np.uint64(2)
-    return np.argsort(keys, kind="stable")
+    return np.argsort(morton_keys(xyz, bounds_min, bounds_max), kind="stable")
+
+
+def _lnt_bounds(lnt):
+    with open(lnt, "rb") as f:
+        header = f.read(64)
+    return (np.array(struct.unpack_from("<3d", header, 16)),
+            np.array(struct.unpack_from("<3d", header, 40)))
+
+
+def lnt_classes_at(lnt, xyz, indices, entries, samples=256):
+    """Classes the .lnt holds now (user edits included) for source points ``indices``.
+
+    Same mapping as read_lnt_records - record k is the k-th point in stable
+    Morton-key order - without ordering the whole cloud: a point's record is
+    the number of smaller keys plus its rank among equal keys (ties keep source
+    order).  So only the keys are sorted (np.sort, no stable argsort) and only
+    the requested points are ranked.  Raises when the .lnt was not built from
+    ``xyz``.
+    """
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size == 0:
+        return np.empty(0, dtype=np.uint8)
+    bmin, bmax = _lnt_bounds(lnt)
+    keys = morton_keys(xyz, bmin, bmax)
+    sorted_keys = np.sort(keys)
+    query = keys[indices]
+    by_key = np.argsort(query)                    # sorted queries: cache-friendly search
+    q_sorted = query[by_key]
+    first = np.searchsorted(sorted_keys, q_sorted, side="left")
+    last = np.searchsorted(sorted_keys, q_sorted, side="right")
+    del sorted_keys
+    rank = np.empty(indices.size, dtype=np.int64)
+    rank[by_key] = first
+    tied = np.zeros(indices.size, dtype=bool)
+    tied[by_key] = (last - first) > 1
+    if tied.any():
+        # Equal keys keep source order: add how many equal-key points come first.
+        tie_keys = np.unique(query[tied])
+        pos = np.minimum(np.searchsorted(tie_keys, keys), tie_keys.size - 1)
+        members = np.flatnonzero(tie_keys[pos] == keys)        # ascending source index
+        member_keys = keys[members]
+        grouped = np.argsort(member_keys, kind="stable")
+        group_start = np.searchsorted(member_keys[grouped], member_keys[grouped], side="left")
+        within = np.empty(members.size, dtype=np.int64)
+        within[grouped] = np.arange(members.size) - group_start
+        rank[tied] += within[np.searchsorted(members, indices[tied])]
+    del keys
+
+    leaves = np.flatnonzero(entries["children_mask"] == 0)
+    counts = entries["point_count"][leaves].astype(np.int64)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    slot = np.searchsorted(starts, rank, side="right") - 1    # last leaf starting at/below
+    leaf = leaves[slot]
+    offset = entries["byte_offset"][leaf].astype(np.int64) + (rank - starts[slot]) * _POINT_BYTES
+    mm = np.memmap(lnt, dtype=np.uint8, mode="r")
+    try:
+        classes = np.asarray(mm[offset + _CLASS_BYTE])
+        # Decode a spread of the looked-up records: they must be these source
+        # points, or the .lnt is stale/foreign and its classes must not be used.
+        picks = np.unique(np.linspace(0, indices.size - 1, min(samples, indices.size)).astype(np.int64))
+        rows = np.asarray(mm[offset[picks, None] + np.arange(6)]).copy().view("<u2").astype(np.float64)
+        e = entries[leaf[picks]]
+        half = e["half_size"].astype(np.float64)[:, None]
+        world = (bmin + e["center"].astype(np.float64) - half) + rows * (2 * half) / 65535.0
+        err = np.abs(world - xyz[indices[picks]])
+        if (err > 0.51 * (2 * half / 65535.0) + 1e-9).any():
+            raise RuntimeError("The open .lnt no longer matches its source point cloud "
+                               "(it was built from a different file). Reopen the source "
+                               "file to rebuild the .lnt, then try again.")
+    finally:
+        del mm
+    return classes
+
+
+def read_lnt_records(lnt, xyz, total, entries, progress=lambda pct, text: None):
+    """Map every .lnt record to its source point.
+
+    Returns (order, rec_node, rec_local, rec_cls): record k is source point
+    order[k], stored at (rec_node[k], rec_local[k]) with class rec_cls[k] - the
+    .lnt's current class, user edits included.  Raises when the .lnt was not
+    built from ``xyz``.
+    """
+    progress(35, "Matching the .lnt records to the source points…")
+    bmin, bmax = _lnt_bounds(lnt)
+    order = source_order(xyz, bmin, bmax)          # record k <- source order[k]
+
+    leaves = np.flatnonzero(entries["children_mask"] == 0)
+    counts = entries["point_count"][leaves].astype(np.int64)
+    rec_node = np.repeat(leaves.astype(np.uint32), counts)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    rec_local = (np.arange(total, dtype=np.int64) - np.repeat(starts, counts)).astype(np.uint32)
+
+    progress(60, "Reading the current classes from the .lnt…")
+    rec_cls = np.empty(total, dtype=np.uint8)
+    mm = np.memmap(lnt, dtype=np.uint8, mode="r")
+    try:
+        for leaf, start, count in zip(leaves.tolist(), starts.tolist(), counts.tolist()):
+            if count:
+                off = int(entries["byte_offset"][leaf]) + _CLASS_BYTE
+                rec_cls[start:start + count] = mm[off:off + _POINT_BYTES * count:_POINT_BYTES]
+        _verify_records(mm, entries, leaves, starts, counts, xyz, order, bmin)
+    finally:
+        del mm
+    return order, rec_node, rec_local, rec_cls
+
+
+def _verify_records(mm, entries, leaves, starts, counts, xyz, order, bmin, samples=64):
+    """Decode a spread of leaves and check they are the source points the
+    permutation claims - a stale or foreign .lnt must never be written to."""
+    picks = np.unique(np.linspace(0, len(leaves) - 1, min(samples, len(leaves))).astype(int))
+    for i in picks.tolist():
+        leaf, start, count = int(leaves[i]), int(starts[i]), int(counts[i])
+        if not count:
+            continue
+        e = entries[leaf]
+        off = int(e["byte_offset"])
+        raw = np.asarray(mm[off:off + _POINT_BYTES * count]).reshape(count, _POINT_BYTES)
+        rel = raw[:, :6].copy().view("<u2").astype(np.float64)
+        half = float(e["half_size"])
+        world = (bmin + e["center"].astype(np.float64) - half) + rel * (2 * half) / 65535.0
+        step = 2 * half / 65535.0
+        err = np.abs(world - xyz[order[start:start + count]]).max()
+        if err > 0.51 * step + 1e-9:
+            raise RuntimeError("The open .lnt no longer matches its source point cloud "
+                               "(it was built from a different file). Reopen the source "
+                               "file to rebuild the .lnt, then try again.")
 
 
 class LntAiBridge(QObject):
@@ -98,30 +238,7 @@ class LntAiBridge(QObject):
         nr = (np.asarray(las.number_of_returns, dtype=np.uint8) if "number_of_returns" in dims else None)
         del las
 
-        progress(35, "Matching the .lnt records to the source points…")
-        with open(lnt, "rb") as f:
-            header = f.read(64)
-        bmin = np.array(struct.unpack_from("<3d", header, 16))
-        bmax = np.array(struct.unpack_from("<3d", header, 40))
-        order = source_order(xyz, bmin, bmax)          # record k <- source order[k]
-
-        leaves = np.flatnonzero(entries["children_mask"] == 0)
-        counts = entries["point_count"][leaves].astype(np.int64)
-        rec_node = np.repeat(leaves.astype(np.uint32), counts)
-        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
-        rec_local = (np.arange(total, dtype=np.int64) - np.repeat(starts, counts)).astype(np.uint32)
-
-        progress(60, "Reading the current classes from the .lnt…")
-        rec_cls = np.empty(total, dtype=np.uint8)
-        mm = np.memmap(lnt, dtype=np.uint8, mode="r")
-        try:
-            for leaf, start, count in zip(leaves.tolist(), starts.tolist(), counts.tolist()):
-                if count:
-                    off = int(entries["byte_offset"][leaf]) + _CLASS_BYTE
-                    rec_cls[start:start + count] = mm[off:off + _POINT_BYTES * count:_POINT_BYTES]
-            self._verify(mm, entries, leaves, starts, counts, xyz, order, bmin)
-        finally:
-            del mm
+        order, rec_node, rec_local, rec_cls = read_lnt_records(lnt, xyz, total, entries, progress)
 
         self.node = np.empty(total, dtype=np.uint32)
         self.local = np.empty(total, dtype=np.uint32)
@@ -137,28 +254,6 @@ class LntAiBridge(QObject):
             "rgb": None, "_source_file_path": str(source), "loaded_file": str(source),
             "_lnt_ai_dataset": True,
         }
-
-    @staticmethod
-    def _verify(mm, entries, leaves, starts, counts, xyz, order, bmin, samples=64):
-        """Decode a spread of leaves and check they are the source points the
-        permutation claims - a stale or foreign .lnt must never be written to."""
-        picks = np.unique(np.linspace(0, len(leaves) - 1, min(samples, len(leaves))).astype(int))
-        for i in picks.tolist():
-            leaf, start, count = int(leaves[i]), int(starts[i]), int(counts[i])
-            if not count:
-                continue
-            e = entries[leaf]
-            off = int(e["byte_offset"])
-            raw = np.asarray(mm[off:off + _POINT_BYTES * count]).reshape(count, _POINT_BYTES)
-            rel = raw[:, :6].copy().view("<u2").astype(np.float64)
-            half = float(e["half_size"])
-            world = (bmin + e["center"].astype(np.float64) - half) + rel * (2 * half) / 65535.0
-            step = 2 * half / 65535.0
-            err = np.abs(world - xyz[order[start:start + count]]).max()
-            if err > 0.51 * step + 1e-9:
-                raise RuntimeError("The open .lnt no longer matches its source point cloud "
-                                   "(it was built from a different file). Reopen the source "
-                                   "file to rebuild the .lnt, then run AI again.")
 
     # ---- session --------------------------------------------------------------
     def begin(self, dataset):
