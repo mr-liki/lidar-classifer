@@ -45,10 +45,16 @@ class SNTLayerPickTool(QObject):
         # Native first: when the main canvas is the Vulkan viewport the VTK
         # interactor never sees clicks, so they must be picked natively
         # (segment hit-test against the GPU vector arena - no VTK).
-        if self._attach_native_input():
+        native_ok = self._attach_native_input()
+        if native_ok:
             print("   ✅ SNT layer pick native click input armed (no VTK observers)")
         else:
-            self._attach_main_observer()
+            print("   ⚠️ SNT layer pick native arming failed - VTK fallback armed")
+        # Always keep the legacy VTK observer as a fallback: it is harmless
+        # when the Vulkan viewport consumes clicks (it simply never fires),
+        # and it keeps Identify working if the canvas is VTK or the native
+        # view goes away mid-session (e.g. .lnt closed while tool is armed).
+        self._attach_main_observer()
         self._sync_cursor(True)
         self._sync_footer_button_state(True)
         self._set_footer_text(None, None, None)
@@ -129,14 +135,6 @@ class SNTLayerPickTool(QObject):
         in use, so the legacy VTK observer path keeps working there.
         """
         try:
-            from gui.native_vector_overlay import vector_layer_for
-            native_layer = vector_layer_for(self.app)
-        except Exception:
-            native_layer = None
-        if native_layer is None:
-            return False
-
-        try:
             from gui.native_vector_overlay import _view_for
             view = _view_for(self.app)
         except Exception:
@@ -157,10 +155,41 @@ class SNTLayerPickTool(QObject):
                     print(f"   ⚠️ Native layer pick input arming failed: {e}")
                     return False
 
+        try:
+            from gui.native_vector_overlay import vector_layer_for
+            native_layer = vector_layer_for(self.app)
+        except Exception:
+            native_layer = None
+        if native_layer is None:
+            return False
+
         # SNT-only promoted viewport: no _InputFilter to feed, the Vulkan
         # surface dispatches clicks instead.
         self._surface_dispatch = True
         return True
+
+    def ensure_native_input(self) -> bool:
+        """(Re-)arm native click input if an .lnt session is now live.
+
+        Called lazily on every surface click so Identify keeps working when
+        the point cloud loads after the tool was activated, or when the view
+        is recreated mid-session. Never deactivates the tool.
+        """
+        if not self.active:
+            return False
+        try:
+            from gui.native_attachments import is_native_main
+            if not is_native_main(self.app):
+                return self._native_pick is not None or self._surface_dispatch
+            lp = getattr(self._native_pick, "view", None)
+            from gui.native_vector_overlay import _view_for
+            view = _view_for(self.app)
+            if (self._native_pick is not None and view is not None
+                    and lp is view and getattr(self._native_pick, "active", False)):
+                return True
+            return bool(self._attach_native_input())
+        except Exception:
+            return False
 
     def on_surface_click(self, world_xy, upp) -> bool:
         """A left-click to identify on the native Vulkan main canvas.
@@ -170,13 +199,14 @@ class SNTLayerPickTool(QObject):
         """
         if not self.active:
             return False
+        # The .lnt may have loaded AFTER this tool was activated (or been
+        # closed/reopened mid-session): lazily arm the native pick so the
+        # click never dies silently.
+        self.ensure_native_input()
         try:
             wx, wy = float(world_xy[0]), float(world_xy[1])
         except Exception:
             return False
-        try:
-            if not self._surface_dispatch and self._native_pick is None:
-                return False
             picked = self._pick_native_geometry(wx, wy, upp)
         except Exception as e:
             print(f"   ⚠️ Native layer pick failed: {e}")
