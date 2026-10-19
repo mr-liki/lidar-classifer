@@ -174,17 +174,21 @@ class PointSyncTool(QObject):
             print("⚠️ Point sync tool already active")
             return
 
-        self._deactivate_conflicting_tools()
-
-        self.active = True
         from gui.native_vector_overlay import snt_viewport_active
         if (getattr(self.app, '_lnt_main_view', None) is not None
                 or snt_viewport_active(self.app)):
+            ribbon = getattr(getattr(self.app, 'ribbon_manager', None), 'ribbons', {}).get('identify')
+            if ribbon is not None:
+                ribbon._deactivate_zoom_rectangle()
+                ribbon._deactivate_select_rectangle()
+            self.active = True
             from gui.native_point_target import NativePointTarget
             self._native_target = NativePointTarget(self)
             self._native_target.start()
             self._sync_footer_button_state(True)
             return
+        self._deactivate_conflicting_tools()
+        self.active = True
         print("🎯 Point sync tool ACTIVATED")
         self._sync_shared_canvas_cursor(True)
 
@@ -619,6 +623,7 @@ class PointSyncTool(QObject):
                     self.app.snt_layer_pick_footer_label.setText(display_text)
                     self.app.snt_layer_pick_footer_label.setToolTip(display_text)
                     self.app.snt_layer_pick_footer_label.setStatusTip(display_text)
+                    self.app.snt_layer_pick_footer_label.setVisible(True)
 
         except Exception as e:
             print(f"   ⚠️ Failed to refresh point sync info panel: {e}")
@@ -845,3 +850,6 @@ class PointSyncTool(QObject):
                 self.app._sync_point_sync_footer_button(enabled)
         except Exception:
             pass
+        ribbon = getattr(getattr(self.app, 'ribbon_manager', None), 'ribbons', {}).get('identify')
+        if ribbon is not None and hasattr(ribbon, 'sync_point_target_active'):
+            ribbon.sync_point_target_active(bool(enabled))

@@ -1649,23 +1649,27 @@ class NakshaApp(QMainWindow):
         self._update_point_sync_footer_icon()
         self._update_point_sync_footer_state_visual(False)
 
-        # 3. SNT layer pick toggle + result text
+        # 3. Identify Layer toggle (click the name directly) + result text
         self.snt_layer_pick_footer_btn = QToolButton(self.status)
         self.snt_layer_pick_footer_btn.setObjectName("statusSntLayerPickButton")
         self.snt_layer_pick_footer_btn.setCheckable(True)
         self.snt_layer_pick_footer_btn.setAutoRaise(True)
-        self.snt_layer_pick_footer_btn.setFixedSize(22, 20)
-        self.snt_layer_pick_footer_btn.setIconSize(QSize(16, 16))
+        self.snt_layer_pick_footer_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.snt_layer_pick_footer_btn.setIconSize(QSize(14, 14))
+        self.snt_layer_pick_footer_btn.setText("Identify Layer")
         self.snt_layer_pick_footer_btn.setCursor(Qt.PointingHandCursor)
         self.snt_layer_pick_footer_btn.setFocusPolicy(Qt.NoFocus)
-        self.snt_layer_pick_footer_btn.setToolTip("Identify layer on main-view click")
+        self.snt_layer_pick_footer_btn.setToolTip(
+            "Click to activate layer identification, then click features in main view. Click again or press Esc to deactivate."
+        )
         self.snt_layer_pick_footer_btn.toggled.connect(self._toggle_snt_layer_pick_from_footer)
         self.status.addPermanentWidget(self.snt_layer_pick_footer_btn)
 
-        self.snt_layer_pick_footer_label = QLabel("Layer: -")
+        self.snt_layer_pick_footer_label = QLabel()
         self.snt_layer_pick_footer_label.setObjectName("sntLayerPickFooterLabel")
         self.snt_layer_pick_footer_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.snt_layer_pick_footer_label.setMinimumWidth(210)
+        self.snt_layer_pick_footer_label.setVisible(False)
         self.status.addPermanentWidget(self.snt_layer_pick_footer_label)
 
         self._update_snt_layer_pick_footer_icon()
@@ -3234,8 +3238,8 @@ class NakshaApp(QMainWindow):
     def _update_point_sync_footer_state_visual(self, enabled):
         from gui.theme_manager import ThemeColors
 
-        accent = ThemeColors.get("accent_alt")
-        accent_hover = ThemeColors.get("accent_hover")
+        accent = '#2196f3'
+        accent_hover = '#1976d2'
         button_hover = ThemeColors.get("bg_button_hover")
         button_idle = ThemeColors.get("bg_button")
         border = ThemeColors.get("border")
@@ -3294,13 +3298,10 @@ class NakshaApp(QMainWindow):
     def _update_snt_layer_pick_footer_state_visual(self, enabled):
         from gui.theme_manager import ThemeColors
 
-        accent = ThemeColors.get("accent")
-        accent_hover = ThemeColors.get("accent_hover")
-        button_hover = ThemeColors.get("bg_button_hover")
-        button_idle = ThemeColors.get("bg_button")
-        border = ThemeColors.get("border")
-        border_light = ThemeColors.get("border_light")
-        is_light = ThemeColors.is_light()
+        accent = ThemeColors.get("accent") or "#007acc"
+        accent_hover = ThemeColors.get("accent_hover") or "#0098ff"
+        text_on_active = ThemeColors.get("text_on_active") or "#FFFFFF"
+        text_primary = ThemeColors.get("text_primary") or "#DDDDDD"
 
         if hasattr(self, "snt_layer_pick_footer_btn"):
             if enabled:
@@ -3308,9 +3309,12 @@ class NakshaApp(QMainWindow):
                     QToolButton {{
                         border: 1px solid {accent};
                         border-radius: 4px;
-                        padding: 0px;
+                        padding: 0px 8px;
                         margin: 0 2px;
                         background: {accent};
+                        color: {text_on_active};
+                        font-size: 11px;
+                        font-weight: 600;
                     }}
                     QToolButton:hover {{
                         background: {accent_hover};
@@ -3321,32 +3325,34 @@ class NakshaApp(QMainWindow):
                         border-color: {accent};
                     }}
                 """)
-                self.snt_layer_pick_footer_btn.setToolTip("Layer identifier is enabled")
+                self.snt_layer_pick_footer_btn.setToolTip(
+                    "Layer identifier is enabled - click features in main view. Click again or press Esc to deactivate."
+                )
                 self.snt_layer_pick_footer_btn.setStatusTip("Layer identifier is enabled")
             else:
-                idle_bg = button_idle if is_light else ThemeColors.get("bg_secondary")
-                idle_border = border if is_light else border_light
-                hover_bg = button_hover if is_light else ThemeColors.get("bg_tertiary")
-                hover_border = border_light if is_light else ThemeColors.get("text_secondary")
-
                 self.snt_layer_pick_footer_btn.setStyleSheet(f"""
                     QToolButton {{
-                        border: 1px solid {idle_border};
+                        border: 1px solid transparent;
                         border-radius: 4px;
-                        padding: 0px;
+                        padding: 0px 8px;
                         margin: 0 2px;
-                        background: {idle_bg};
+                        background: transparent;
+                        color: {text_primary};
+                        font-size: 11px;
+                        font-weight: 600;
                     }}
                     QToolButton:hover {{
-                        background: {hover_bg};
-                        border-color: {hover_border};
+                        background: rgba(255, 255, 255, 0.08);
+                        border-color: rgba(255, 255, 255, 0.12);
                     }}
                     QToolButton:pressed {{
-                        background: {hover_bg};
+                        background: rgba(255, 255, 255, 0.14);
                         border-color: {accent};
                     }}
                 """)
-                self.snt_layer_pick_footer_btn.setToolTip("Layer identifier is disabled")
+                self.snt_layer_pick_footer_btn.setToolTip(
+                    "Click to activate layer identification, then click features in main view. Click again or press Esc to deactivate."
+                )
                 self.snt_layer_pick_footer_btn.setStatusTip("Layer identifier is disabled")
 
         self._update_snt_layer_pick_footer_icon()
@@ -3374,9 +3380,10 @@ class NakshaApp(QMainWindow):
             return
 
         if not layer_name:
-            self.snt_layer_pick_footer_label.setText("Layer: -")
-            self.snt_layer_pick_footer_label.setToolTip("Enable layer identifier and click features in main view")
+            self.snt_layer_pick_footer_label.setText("")
+            self.snt_layer_pick_footer_label.setToolTip("")
             self.snt_layer_pick_footer_label.setStatusTip("No layer selected")
+            self.snt_layer_pick_footer_label.setVisible(False)
             return
 
 
@@ -3396,6 +3403,7 @@ class NakshaApp(QMainWindow):
         self.snt_layer_pick_footer_label.setText(display)
         self.snt_layer_pick_footer_label.setToolTip(display)
         self.snt_layer_pick_footer_label.setStatusTip(display)
+        self.snt_layer_pick_footer_label.setVisible(True)
 
     def _toggle_point_sync_from_footer(self, enabled):
         if not hasattr(self, "point_sync_tool") or self.point_sync_tool is None:
@@ -3436,11 +3444,11 @@ class NakshaApp(QMainWindow):
 
         if enabled:
             self.snt_layer_pick_tool.activate()
-            self.statusBar().showMessage("🎯 Layer identifier enabled (click SNT, DXF, or GIS features in main view)", 2500)
+            self.statusBar().showMessage("🎯 Identify Layer activated (click SNT, DXF, or GIS features in main view). Click again or press Esc to deactivate.", 2500)
         else:
             self.snt_layer_pick_tool.deactivate()
             self._set_snt_layer_pick_footer_text(None, None, None)
-            self.statusBar().showMessage("🎯 Layer identifier disabled", 2000)
+            self.statusBar().showMessage("🎯 Identify Layer deactivated", 2000)
 
     def open_global_settings(self):
         """Open the consolidated global settings dialog."""

@@ -1088,6 +1088,16 @@ class GlobalShortcutFilter(QObject):
                     print("🛑 ESC - measurement tool deactivated")
                     return True
 
+                # Deactivate Identify Layer (footer SNT layer pick) tool on Escape
+                _lpk = getattr(self.app_window, 'snt_layer_pick_tool', None)
+                if _lpk is not None and getattr(_lpk, 'active', False):
+                    try:
+                        _lpk.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC identify layer deactivation failed: {e}")
+                    print("🛑 ESC - identify layer tool deactivated")
+                    return True
+
                 cross_action = getattr(self.app_window, 'cross_action', None)
                 cross_checked = bool(cross_action is not None and cross_action.isChecked())
                 cross_interactor_active = bool(getattr(self.app_window, 'cross_interactor', None) is not None)

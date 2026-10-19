@@ -3572,11 +3572,14 @@ class _VulkanSurfaceWidget(_QWidget):
         self._panning = False
         self._right_press_pos = None
         self._right_dragged = False
+        self._left_press_pos = None
+        self._left_dragged = False
         self._draw_pressed_button = None
         # Native placement previews must update while the pointer moves with
         # no mouse button down. The LNT event filter already does this itself.
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
+
 
     def _active_plan_draw(self):
         """Ordinary Vulkan SNT/LAZ Draw, not the separate LNT input filter."""
@@ -3644,6 +3647,11 @@ class _VulkanSurfaceWidget(_QWidget):
         self._right_press_pos = (
             self._last_pos if event.button() == Qt.MouseButton.RightButton else None)
         self._right_dragged = False
+        # A plain left press is a click candidate too (Identify Layer pick on
+        # the promoted viewport); drag cancels it.
+        self._left_press_pos = (
+            self._last_pos if event.button() == Qt.MouseButton.LeftButton else None)
+        self._left_dragged = False
         self._panning = event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton
             and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -3676,6 +3684,11 @@ class _VulkanSurfaceWidget(_QWidget):
                 self._last_pos = last
                 return
             self._right_dragged = True
+        left_press = getattr(self, "_left_press_pos", None)
+        if left_press is not None and not self._left_dragged and (
+                abs(pos.x() - left_press.x()) > self._CLICK_SLOP_PX
+                or abs(pos.y() - left_press.y()) > self._CLICK_SLOP_PX):
+            self._left_dragged = True
         rig = self._rig()
         if rig is None:
             return
@@ -3722,11 +3735,25 @@ class _VulkanSurfaceWidget(_QWidget):
             and event.button() == Qt.MouseButton.RightButton
             and not getattr(self, "_right_dragged", False)
         )
+        is_left_click = (
+            event.button() == Qt.MouseButton.LeftButton
+            and getattr(self, "_left_press_pos", None) is not None
+            and not getattr(self, "_left_dragged", False)
+        )
         self._last_pos = None
         self._panning = False
         self._right_press_pos = None
         self._right_dragged = False
+        self._left_press_pos = None
+        self._left_dragged = False
         event.accept()
+        if is_left_click and self._owner is not None:
+            pos = self._event_pos(event)
+            x, y = float(pos.x()), float(pos.y())
+            w, h = max(1, self.width()), max(1, self.height())
+            QTimer.singleShot(
+                0, lambda: self._owner.dispatch_surface_left_click(x, y, w, h))
+            return
         if is_right_click and self._owner is not None:
             pos = self._event_pos(event)
             x, y = float(pos.x()), float(pos.y())
@@ -7021,6 +7048,25 @@ class AppRenderBackendOwner:
             return bool(handler(world_xy, upp))
         except Exception:
             self._log.exception("surface right-click dispatch failed (ignored)")
+            return False
+
+    def dispatch_surface_left_click(self, x: float, y: float, w: float, h: float) -> bool:
+        """A plain left-click (no drag) on the Vulkan main viewport.
+
+        The VTK interactor never sees it, so click-to-identify tools are
+        routed natively: the active footer Identify Layer tool hits the GPU
+        vector arena in world coordinates. Returns True when consumed."""
+        try:
+            tool = getattr(self._app, "snt_layer_pick_tool", None)
+            if tool is None or not getattr(tool, "active", False) or not getattr(tool, "_surface_dispatch", False):
+                return False
+            hit = self.surface_to_world(x, y, w, h)
+            if hit is None:
+                return False
+            world_xy, upp = hit
+            return bool(tool.on_surface_click(world_xy, upp))
+        except Exception:
+            self._log.exception("surface left-click dispatch failed (ignored)")
             return False
 
     def main_vtk_adoption_blocked(self) -> bool:

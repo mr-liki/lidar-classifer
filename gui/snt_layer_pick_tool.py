@@ -25,6 +25,8 @@ class SNTLayerPickTool(QObject):
         self._main_observer = None
         self._prop_picker = None
         self._cell_picker = None
+        self._native_pick = None
+        self._surface_dispatch = False
         self._click_popup_label = None
         self._click_popup_timer = QTimer(self)
         self._click_popup_timer.setSingleShot(True)
@@ -40,7 +42,13 @@ class SNTLayerPickTool(QObject):
         self._deactivate_conflicting_tools()
 
         self.active = True
-        self._attach_main_observer()
+        # Native first: when the main canvas is the Vulkan viewport the VTK
+        # interactor never sees clicks, so they must be picked natively
+        # (segment hit-test against the GPU vector arena - no VTK).
+        if self._attach_native_input():
+            print("   ✅ SNT layer pick native click input armed (no VTK observers)")
+        else:
+            self._attach_main_observer()
         self._sync_cursor(True)
         self._sync_footer_button_state(True)
         self._set_footer_text(None, None, None)
@@ -51,6 +59,13 @@ class SNTLayerPickTool(QObject):
             return
 
         self.active = False
+        if self._native_pick is not None:
+            try:
+                self._native_pick.deactivate()
+            except Exception:
+                pass
+            self._native_pick = None
+            self._surface_dispatch = False
         self._detach_main_observer()
         self._hide_click_popup()
         self._sync_cursor(False)
@@ -100,6 +115,136 @@ class SNTLayerPickTool(QObject):
             print(f"   ⚠️ Failed to remove SNT layer pick observer: {e}")
         finally:
             self._main_observer = None
+
+    def _attach_native_input(self) -> bool:
+        """Arm click input on the native Vulkan main viewport (no VTK).
+
+        Two native surfaces:
+          - an .lnt session: the session's ``_InputFilter`` forwards press/key
+            to a ``NativeLayerPick`` tool hung on the view;
+          - an SNT-only session: the promoted viewport surface dispatches
+            plain left-clicks via ``dispatch_surface_left_click``.
+
+        Returns False (and arms nothing) when the GPU vector arena is not
+        in use, so the legacy VTK observer path keeps working there.
+        """
+        try:
+            from gui.native_vector_overlay import vector_layer_for
+            native_layer = vector_layer_for(self.app)
+        except Exception:
+            native_layer = None
+        if native_layer is None:
+            return False
+
+        try:
+            from gui.native_vector_overlay import _view_for
+            view = _view_for(self.app)
+        except Exception:
+            view = None
+
+        if view is not None and getattr(view, "native", None) is not None:
+            from gui.native_attachments import is_native_main
+            if is_native_main(self.app):
+                try:
+                    from gui.native_layer_pick import NativeLayerPick
+                    lp = getattr(view, "native_layer_pick", None)
+                    if lp is None or getattr(lp, "view", None) is not view:
+                        lp = view.native_layer_pick = NativeLayerPick(view)
+                    lp.activate()
+                    self._native_pick = lp
+                    return True
+                except Exception as e:
+                    print(f"   ⚠️ Native layer pick input arming failed: {e}")
+                    return False
+
+        # SNT-only promoted viewport: no _InputFilter to feed, the Vulkan
+        # surface dispatches clicks instead.
+        self._surface_dispatch = True
+        return True
+
+    def on_surface_click(self, world_xy, upp) -> bool:
+        """A left-click to identify on the native Vulkan main canvas.
+
+        ``world_xy`` is already resolved in world coordinates (from
+        MainCamera2D - native screen_to_world, no VTK).
+        """
+        if not self.active:
+            return False
+        try:
+            wx, wy = float(world_xy[0]), float(world_xy[1])
+        except Exception:
+            return False
+        try:
+            if not self._surface_dispatch and self._native_pick is None:
+                return False
+            picked = self._pick_native_geometry(wx, wy, upp)
+        except Exception as e:
+            print(f"   ⚠️ Native layer pick failed: {e}")
+            self._hide_click_popup()
+            return True
+
+        if picked is None:
+            self._hide_click_popup()
+            self._set_footer_text(None, None, None)
+            self.app.statusBar().showMessage("Identify Layer: no layer linework near click", 2500)
+            return True
+
+        layer_name, source_name = picked
+        entity_count = self._resolve_layer_entity_count(source_name, layer_name)
+        self._set_footer_text(layer_name, source_name, entity_count)
+        self._show_click_popup(layer_name, source_name, entity_count)
+        self.app.statusBar().showMessage(f"Layer: {layer_name}", 4000)
+        return True
+
+    def _pick_native_geometry(self, wx: float, wy: float, upp: float):
+        """Nearest visible native linework segment to a world point.
+
+        Searches every document of the GPU vector arena
+        (``gui.native_vector_overlay``) in world XY - the chunk vertices keep
+        authored world coordinates, so no projection pass is needed. Returns
+        ``(layer_name, source_name)`` or None when nothing is within the
+        pick tolerance.
+        """
+        import numpy as np
+
+        try:
+            from gui.native_vector_overlay import vector_layer_for
+            layer = vector_layer_for(self.app)
+        except Exception:
+            layer = None
+        if layer is None:
+            return None
+
+        tolerance = max(float(upp or 1.0) * 8.0, 1.0)
+        tolerance_sq = float(tolerance) * float(tolerance)
+
+        # Dynamic overlays (identify outlines, point targets ...) are camera
+        # UI aids, not attachment linework - they must never report a level.
+        internal_kinds = {"identify", "target", "classify", "fence", "measure"}
+
+        best = None            # (dist_sq, layer_name, source_name)
+        for key, document in list(getattr(layer, "documents", {}).items()):
+            try:
+                kind = str(key[0]).lower()
+            except Exception:
+                kind = ""
+            if kind in internal_kinds:
+                continue
+            handles = document.get("handles") or {}
+            for group_name, chunks in (document.get("gpu") or {}).items():
+                handle = handles.get(group_name)
+                if handle is not None and not getattr(handle, "_visible", True):
+                    continue
+                for chunk in chunks or ():
+                    dist_sq, index = _chunk_nearest_segment(chunk, wx, wy)
+                    if dist_sq is None or index is None:
+                        continue
+                    if dist_sq <= tolerance_sq and (best is None or dist_sq < best[0]):
+                        best = (float(dist_sq), str(group_name), str(key[1]))
+
+        if best is None:
+            return None
+        return best[1], best[2]
 
     def _on_main_click(self, obj, event):
         if not self.active:
@@ -353,3 +498,67 @@ class SNTLayerPickTool(QObject):
             self._click_popup_label = label
         except Exception:
             self._click_popup_label = None
+
+
+def _chunk_nearest_segment(chunk, wx: float, wy: float):
+    """(dist_sq, vertex_index) of the chunk segment closest to a world point.
+
+    Chunk layout is the ``group_entities`` contract: ``xyz`` holds authored
+    WORLD coordinates (rebinding/picking keeps them) and ``indices`` is the
+    restart-separated strip list indexing into ``xyz``. Returns (None, None)
+    for an unusable chunk.
+    """
+    import numpy as np
+
+    try:
+        xyz = np.asarray(chunk.get("xyz"))
+        idx = np.asarray(chunk.get("indices"))
+    except Exception:
+        return None, None
+    if xyz.ndim != 2 or xyz.shape[0] == 0 or xyz.shape[1] < 2 or idx.size < 2:
+        return None, None
+
+    a_idx = idx[:-1].astype(np.int64)
+    b_idx = idx[1:].astype(np.int64)
+    live = (a_idx != 0xFFFFFFFF) & (b_idx != 0xFFFFFFFF)
+    a_idx = a_idx[live]
+    b_idx = b_idx[live]
+    if a_idx.size == 0:
+        return None, None
+
+    ax = xyz[a_idx, 0]
+    ay = xyz[a_idx, 1]
+    bx = xyz[b_idx, 0]
+    by = xyz[b_idx, 1]
+
+    lo_x = np.minimum(ax, bx)
+    hi_x = np.maximum(ax, bx)
+    lo_y = np.minimum(ay, by)
+    hi_y = np.maximum(ay, by)
+
+    # Cheap bbox prefilter before the exact segment distance.
+    dx_bbox = np.maximum(np.maximum(lo_x - wx, wx - hi_x), 0.0)
+    dy_bbox = np.maximum(np.maximum(lo_y - wy, wy - hi_y), 0.0)
+    cand = (dx_bbox * dx_bbox + dy_bbox * dy_bbox) <= (64.0 * 64.0)
+    if not np.any(cand):
+        return None, None
+
+    ax = ax[cand]
+    ay = ay[cand]
+    bx = bx[cand]
+    by = by[cand]
+    a_idx = a_idx[cand]
+
+    vx = bx - ax
+    vy = by - ay
+    px = wx - ax
+    py = wy - ay
+    denom = vx * vx + vy * vy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(denom > 0.0, (px * vx + py * vy) / denom, 0.0)
+    np.clip(t, 0.0, 1.0, out=t)
+    cx = ax + t * vx
+    cy = ay + t * vy
+    dist_sq = (cx - wx) * (cx - wx) + (cy - wy) * (cy - wy)
+    best = int(np.argmin(dist_sq))
+    return float(dist_sq[best]), int(a_idx[best])

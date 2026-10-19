@@ -269,6 +269,7 @@ class IdentificationTool(QObject):
                 )
                 lbl.setToolTip(plain_text)
                 lbl.setStatusTip(plain_text)
+                lbl.setVisible(True)
 
         except Exception as e:
             print(f"   ⚠️ Failed to update ribbon: {e}")
