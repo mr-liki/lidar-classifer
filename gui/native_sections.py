@@ -435,7 +435,7 @@ class SectionCanvas(QWidget):
                 or (measurement is not None and measurement.active)):
             self.pan_gesture.finish()
             return False
-        return self.pan_gesture.handle(self.owner.app, event)
+        return self.pan_gesture.handle(self.owner.app, event, self)
 
     def mousePressEvent(self, event):
         self.setFocus()

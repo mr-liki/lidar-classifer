@@ -1105,6 +1105,25 @@ class NakshaApp(QMainWindow):
     # Phase 4: Global signal bus
     classification_finished = Signal(object)  # emits changed_mask (numpy array or None)
 
+    @property
+    def _left_pan_shortcut_active(self):
+        """True while the Pan shortcut tool (Left - Click / Tap - Tap) is armed."""
+        return getattr(self, "_left_pan_shortcut_active_value", False)
+
+    @_left_pan_shortcut_active.setter
+    def _left_pan_shortcut_active(self, active):
+        # Every arm / disarm path (shortcut, Esc, another tool) lands here, so
+        # the native Vulkan canvases switch to / from the pan hand at once.
+        active = bool(active)
+        changed = active != getattr(self, "_left_pan_shortcut_active_value", False)
+        self._left_pan_shortcut_active_value = active
+        if changed:
+            try:
+                from gui.native_pan import refresh_pan_cursors
+                refresh_pan_cursors(self)
+            except Exception as exc:
+                print(f"Pan cursor refresh failed: {exc}")
+
     def __init__(self):
 
        
