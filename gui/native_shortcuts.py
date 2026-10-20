@@ -429,8 +429,25 @@ def _native_ai_history(app, view, source, destination, redo):
     return True
 
 
+# Shortcut tools that take over the canvas click; one-shot actions (Save,
+# DisplayMode, SyncViews ...) leave the footer Identify tools alone.
+_FOOTER_PICK_EXCLUSIVE = {
+    'AboveLine', 'BelowLine', 'ParallelLine', 'Rectangle', 'Circle', 'Polygon',
+    'Freehand', 'Brush', 'Point', 'TempFence',
+    'CrossSectionRect', 'CutSectionRect', 'CutFromCross', 'CutFromCut',
+    'MeasureLine', 'MeasurePath', 'MeasureGridArea', 'MeasureBlockArea',
+    'CrossSectionMeasure', 'Pan',
+}
+
+
 def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label='',
                             pan_mode=None):
+    # Every shortcut (VTK execute_tool included) passes here first: a click
+    # tool turns off the footer Identify / Identify Layer tools.
+    if MEASURE_NAMES.get(tool, tool) in _FOOTER_PICK_EXCLUSIVE:
+        deactivate_footer = getattr(app, '_deactivate_footer_pick_tools', None)
+        if callable(deactivate_footer):
+            deactivate_footer(reason=f'{tool} shortcut')
     view = getattr(app, '_lnt_main_view', None)
     if view is None or getattr(view, 'native', None) is None:
         name = MEASURE_NAMES.get(TOOL_NAMES.get(tool, tool), tool)
