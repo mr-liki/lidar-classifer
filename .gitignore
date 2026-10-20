@@ -98,6 +98,7 @@ vulkan_*_output/
 
 # Per-source native point-cache provenance and selection indexes
 *.lnt.source.json
+*.lnt.lines
 *.lnt.class-semantics
 *.lntset
 naksha_native_batches/

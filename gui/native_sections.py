@@ -680,6 +680,22 @@ class SectionCanvas(QWidget):
                 QTimer.singleShot(0, dialog._open_lines_dialog)
 
     def _load_source_lines(self, store):
+        from gui.native_flight_lines import prepare
+        app=self.owner.app
+        view=getattr(app,'_lnt_main_view',None)
+        if view is not None and getattr(view,'flight_lines',None) is not None:
+            from gui.lnt_class_counts import read_directory
+            _, entries=read_directory(view.lnt_path)
+            self._source_ids=view.flight_lines.ids(store.node[self.indices],store.local[self.indices],entries)
+            self.apply_palette(self.palette,self.mode,sync=False)
+            if getattr(self,'_open_lines_when_ready',False):
+                self._open_lines_when_ready=False
+                dialog=getattr(app,'display_mode_dialog',None)
+                if dialog is not None: QTimer.singleShot(0,dialog._open_lines_dialog)
+            return
+        if view is not None and hasattr(view,'app') and hasattr(store,'node'):
+            prepare(view,lambda:self._load_source_lines(store) if not self._closed else None)
+            return
         import os
         from gui.native_section_display import source_line_ids
         from gui.lnt_class_counts import read_directory

@@ -123,7 +123,7 @@ vec3 intensityColor(float intensity) {
 
 // DEPTH. The legacy VTK depth mode shades by distance from the eye
 // (gui/naksha_cache/display_modes.py::depth_lut), and the legacy colour table
-// is the GRAYSCALE ramp - the same intensityLut - not a rainbow.
+// is the GRAYSCALE ramp, independent of the intensity colour table.
 //
 // inPos and ubo.cameraPos are both in RENDER space (world - origin), so the
 // difference is a true eye-relative distance in either projection. Using the
@@ -134,7 +134,7 @@ vec3 depthColor(vec3 renderPos) {
     float d = length(renderPos - ubo.cameraPos.xyz);
     float t = normalize01(d, pc.parity.y, pc.parity.z);
     t = pow(t, max(pc.parity.w, 0.01));
-    return ubo.intensityLut[int(t * 255.0)].rgb;
+    return vec3(1.0 - t);
 }
 
 void main() {

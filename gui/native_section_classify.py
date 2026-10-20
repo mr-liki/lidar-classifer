@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
-from PySide6.QtGui import QColor, QCursor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
 from gui.native_measure_geometry import measurement_labels, measurement_text
 
@@ -28,11 +28,6 @@ DRAWABLE_TOOLS = ("rectangle", "circle", "polygon", "freehand", "brush", "point"
 _TWO_CLICK = ("rectangle", "circle", "above_line", "below_line", "parallel_line")
 LINE_TOOLS = ("above_line", "below_line", "parallel_line")
 _CLICK_SLOP_PX = 4.0
-# Two-point tools use tap-tap by default.  A press becomes a drag only after
-# the cursor crosses the threshold *after* the short settle window.  These
-# values deliberately mirror the proven VTK ClassificationInteractor path.
-_TAP_GRACE_SEC = 0.12
-_TAP_DRAG_THRESHOLD_PX = 6.0
 # Two-point tools use tap-tap by default.  A press becomes a drag only after
 # the cursor crosses the threshold *after* the short settle window.  These
 # values deliberately mirror the proven VTK ClassificationInteractor path.
@@ -1183,8 +1178,27 @@ class SectionClassifier:
         if key in (Qt.Key_Return, Qt.Key_Enter) and self.tool() == "polygon" and len(self.points) >= 3:
             self._finish_polygon()
             return True
-        if key == Qt.Key_Escape and self.points:
-            self.cancel()
+        if key == Qt.Key_Escape and self.active():
+            # Escape exits the classification tool itself, not just the current
+            # rectangle/polygon/line gesture.  Defer the full teardown until the
+            # key handler returns because it can destroy this canvas' classifier.
+            if self._brush_tx_active:
+                self.cancel_pending_brush_transaction(reason="escape")
+            else:
+                self.cancel()
+            deactivate = getattr(self.app, "deactivate_classification_tool", None)
+            if callable(deactivate):
+                QTimer.singleShot(
+                    0,
+                    lambda: deactivate(
+                        preserve_cross_section=True,
+                        cancel_pending_brush=True,
+                    ),
+                )
+            else:
+                # Minimal fallback for lightweight/test hosts which do not expose
+                # the application's normal teardown helper.
+                self.app.active_classify_tool = None
             return True
         return False
 
@@ -1268,6 +1282,11 @@ class SectionClassifier:
 
     def _begin_brush_transaction(self, first_point):
         """Begin speculative live painting; no disk write/history exists yet."""
+        # A newly opened native main view intentionally has no app.data yet.
+        # Create its empty region store before checking the transaction data;
+        # the first swept query will populate only the records it touches.
+        from gui.lnt_section_bridge import get_store
+        get_store(self.app)
         resolved = self._resolve_brush_transaction_classes()
         if resolved is None:
             return False

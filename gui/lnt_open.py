@@ -93,7 +93,7 @@ def _source_cache_current(source, lnt):
 
 
 def _class_semantics_path(lnt):
-    return lnt + '.class-semantics'
+    return os.fspath(lnt) + '.class-semantics'
 
 
 def _has_current_class_semantics(lnt):
@@ -117,6 +117,8 @@ def _publish_source_cache(source, staged, destination, signature):
     with open(marker, 'w', encoding='ascii') as f:
         f.write(LNT_CLASS_SEMANTICS + '\n')
     os.replace(staged, destination)
+    if os.path.isfile(os.fspath(staged) + '.lines'):
+        os.replace(os.fspath(staged) + '.lines', os.fspath(destination) + '.lines')
     os.replace(metadata, os.fspath(destination) + '.source.json')
     os.replace(marker, _class_semantics_path(destination))
 
@@ -670,6 +672,16 @@ class LntMainView(QObject):
         .lnt open) never bounce through the VTK viewport and back - clearing
         data must not change which viewport the session lives in.
         """
+        self._flight_closing=True
+        flight_worker=getattr(self,'_flight_worker',None)
+        if flight_worker is not None and flight_worker.isRunning():
+            flight_worker.requestInterruption()
+            flight_worker.wait()
+        flight=getattr(self,'flight_lines',None)
+        if flight is not None:
+            flight.close(); self.flight_lines=None
+        fields=getattr(self.app,'_view_fields_table_dialog',None)
+        if fields is not None and getattr(fields,'view',None) is self: fields.close()
         try:
             from gui.lnt_ai_bridge import active_bridge
             bridge = active_bridge(self.app)
@@ -867,6 +879,21 @@ class LntMainView(QObject):
         """Select a native presentation mode. Shaded builds a triangulated, lit
         surface from the visible .lnt cut; other modes update GPU uniforms."""
         name = str(ui_mode or "").strip().lower()
+        if name == 'line':
+            from gui.native_flight_lines import prepare
+            self.shading_name='line'
+            def ready():
+                if self.shading_name != 'line' or self.native is None: return
+                from gui.native_section_display import line_colors
+                ids=np.arange(65536,dtype=np.uint32)
+                colors=line_colors(ids,getattr(self.app,'flight_line_colors',{}))
+                visible=np.ones(65536,dtype=np.uint8)
+                for key,show in getattr(self.app,'flight_line_visibility_by_slot',{}).get(0,getattr(self.app,'flight_line_visibility',{})).items():
+                    if 0<=int(key)<65536: visible[int(key)]=int(bool(show))
+                if not self.native.set_lines(colors,visible):
+                    self.app.statusBar().showMessage('Native flight-line rendering is unavailable; rebuild the LNT viewer.',10000)
+            prepare(self,ready)
+            return True
         if name == "depth":
             # Genuine Vulkan view-space depth. It is derived in the point
             # shader from resident XYZ and the live native camera; no VTK

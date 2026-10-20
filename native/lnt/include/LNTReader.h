@@ -248,6 +248,19 @@ public:
     const std::string& path() const { return path_; }
     const std::string& last_error() const { return last_error_; }
     bool is_collection() const { return !source_paths_.empty(); }
+    bool read_line_ids(const LNTNodeEntry& n, std::vector<uint16_t>& ids) const {
+        std::string path; uint64_t offset;
+        if (!physical_location(n, path, offset) || offset < 64) return false;
+        std::ifstream lines(std::filesystem::u8path(path + ".lines"), std::ios::binary);
+        char magic[8]{}; uint64_t count=0;
+        lines.read(magic,8); lines.read(reinterpret_cast<char*>(&count),8);
+        const uint64_t at=(offset-64)/11;
+        if (!lines || std::memcmp(magic,"LNTLINE1",8) || at+n.point_count>count) return false;
+        ids.resize(n.point_count);
+        lines.seekg(16+at*2);
+        lines.read(reinterpret_cast<char*>(ids.data()),ids.size()*2);
+        return bool(lines);
+    }
     bool is_root_node(const LNTNodeEntry& n) const {
         if (!is_collection()) return n.tree_level == 0;
         auto it = routes_.find(n.byte_offset);
