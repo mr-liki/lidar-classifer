@@ -856,6 +856,7 @@ class NativeVectorLayer(NativeAttachmentLayer):
         gui.native_attachments.render_entities returns, so the SNT caller's
         actor_cache handling is unchanged.
         """
+        entities = list(entities or ())
         gpu_groups = prepared_groups if prepared_groups is not None else group_entities(entities)
         # World-sized CAD labels must share the linework's Vulkan camera frame.
         # A separate transparent window can present an older frame during pan.
@@ -867,6 +868,8 @@ class NativeVectorLayer(NativeAttachmentLayer):
                 if str(entity.get("type", "")).strip().lower() != "text":
                     continue
             except Exception:
+                continue
+            if entity.get("_naksha_label_font_size") == 0:
                 continue
             glyphs = native_text_entities(entity)
             if glyphs is not None:
@@ -892,6 +895,7 @@ class NativeVectorLayer(NativeAttachmentLayer):
         # so the replaced file's chunks would otherwise stay reserved forever;
         # dropping it and forcing a compaction re-uploads every remaining
         # document at fresh offsets and reclaims the space.
+        previous = self.documents.get(key, {})
         replacing = key in self.documents
         if replacing:
             self.documents.pop(key, None)
@@ -921,7 +925,8 @@ class NativeVectorLayer(NativeAttachmentLayer):
             # draw instead of showing a canvas with nothing on it.
             return None
 
-        document = {"kind": key[0], "groups": text_grouped, "handles": {}, "gpu": gpu_groups}
+        document = {"kind": key[0], "groups": text_grouped, "handles": {}, "gpu": gpu_groups,
+                    "entities": entities, "bounds": bounds}
         self._upload_document(document)
 
         layer_names = set(text_grouped) | set(gpu_groups)
@@ -931,6 +936,16 @@ class NativeVectorLayer(NativeAttachmentLayer):
                 document["gpu"].get(layer_name, []))
             for layer_name in layer_names
         }
+        # Keep layer-widget handles and visibility valid when label edits rebuild
+        # a document's glyph geometry.
+        for layer_name, handle in previous.get("handles", {}).items():
+            if layer_name in document["handles"]:
+                handle.chunks = list(document["gpu"].get(layer_name, []))
+                document["handles"][layer_name] = handle
+        if previous:
+            previous.clear()
+            previous.update(document)
+            document = previous
         self.documents[key] = document
         self._push_line_width()
         self.refresh()

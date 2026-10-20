@@ -806,7 +806,7 @@ def encode_surface_preset(payload: dict) -> str:
             "angle": float(payload.get("angle", 45.0)),
             "ambient": float(payload.get("ambient", 0.1)),
             "quality": float(payload.get("quality", 100.0)),
-            "speed": int(payload.get("speed", 1)),
+            "speed": 1,
             "max_edge": float(payload.get("max_edge", 0.0)),
             "classes": classes_json,
         }
@@ -842,7 +842,7 @@ def decode_surface_preset(text):
                 "angle": float(data.get("angle", 45.0)),
                 "ambient": float(data.get("ambient", 0.1)),
                 "quality": float(data.get("quality", 100.0)),
-                "speed": int(data.get("speed", 1)),
+                "speed": 1,
                 "max_edge": float(data.get("max_edge", 0.0)),
                 "classes": classes,
             }
@@ -1676,23 +1676,6 @@ class ClassVisibilityPicker(QDialog):
             self.quality_spin.setValue(100.0)
             shading_layout.addWidget(self.quality_spin, 3, 1)
 
-            shading_layout.addWidget(QLabel("Speed:"), 4, 0)
-            if mode == "shading":
-                self.shading_quality_combo = QComboBox()
-                for label, quality_key in SHADING_QUALITY_CHOICES:
-                    self.shading_quality_combo.addItem(label, quality_key)
-                self.shading_quality_combo.setCurrentIndex(1)
-                self.shading_quality_combo.setToolTip(
-                    "Fast uses 1M representatives, Normal uses 3M, and "
-                    "Slow triangulates every eligible point."
-                )
-                shading_layout.addWidget(self.shading_quality_combo, 4, 1)
-            else:
-                self.speed_spin = QSpinBox()
-                self.speed_spin.setRange(1, 10)
-                self.speed_spin.setValue(1)
-                shading_layout.addWidget(self.speed_spin, 4, 1)
-
             if mode == "surface":
                 shading_layout.addWidget(QLabel("Max Edge:"), 5, 0)
                 self.max_edge_spin = QDoubleSpinBox()
@@ -1981,25 +1964,6 @@ class ClassVisibilityPicker(QDialog):
         )
         controls_row.addWidget(self.display_mode_selector)
 
-        # Speed (Fast/Normal/Slow) and Lines... sit inline on this SAME row,
-        # right after Display Mode -- exactly like the live Display Mode
-        # dialog (gui/display_mode.py ~1094-1136: color_mode, then
-        # shading_quality, then lines_button, all on one controls_layout).
-        # Each is independently shown/hidden by mode (Speed for Shaded/
-        # Surface, Lines for Line) via setVisible(), which Qt collapses to
-        # zero width when hidden -- so only the relevant one ever occupies
-        # space, on one line, instead of reserving a whole extra row.
-        self.shading_quality_label = QLabel("Speed")
-        controls_row.addWidget(self.shading_quality_label)
-        self.shading_quality_selector = QComboBox()
-        self.shading_quality_selector.setObjectName("displayShadingQuality")
-        self.shading_quality_selector.setMinimumWidth(150)
-        self.shading_quality_selector.addItem("Fast", "fast")
-        self.shading_quality_selector.addItem("Normal", "normal")
-        self.shading_quality_selector.addItem("Slow – all points", "slow")
-        self.shading_quality_selector.setCurrentIndex(1)
-        controls_row.addWidget(self.shading_quality_selector)
-
         self.lines_button = QPushButton("Lines…")
         self.lines_button.setObjectName("displayLinesButton")
         self.lines_button.clicked.connect(self._open_line_selection)
@@ -2007,9 +1971,6 @@ class ClassVisibilityPicker(QDialog):
 
         def _sync_mode_extra_controls():
             _mode = str(self.display_mode_selector.currentData() or "class")
-            _speed_visible = _mode in ("shaded_class", "surface")
-            self.shading_quality_label.setVisible(_speed_visible)
-            self.shading_quality_selector.setVisible(_speed_visible)
             self.lines_button.setVisible(_mode == "line")
 
         self.display_mode_selector.currentIndexChanged.connect(
@@ -2483,11 +2444,9 @@ class ClassVisibilityPicker(QDialog):
             "quality": self.quality_spin.value(),
         }
         if self.mode == "shading":
-            params["quality_mode"] = str(
-                self.shading_quality_combo.currentData() or "normal"
-            )
+            params["quality_mode"] = "normal"
         else:
-            params["speed"] = self.speed_spin.value()
+            params["speed"] = 1
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             params["max_edge"] = self.max_edge_spin.value()
         return params
@@ -2517,17 +2476,6 @@ class ClassVisibilityPicker(QDialog):
         self.angle_spin.setValue(params.get("angle", 45.0))
         self.ambient_spin.setValue(params.get("ambient", 0.1))
         self.quality_spin.setValue(params.get("quality", 100.0))
-        if self.mode == "shading":
-            quality_mode = normalize_shading_preset_quality(
-                params.get("quality_mode"),
-                params.get("speed"),
-            )
-            quality_index = self.shading_quality_combo.findData(quality_mode)
-            self.shading_quality_combo.setCurrentIndex(
-                quality_index if quality_index >= 0 else 1
-            )
-        else:
-            self.speed_spin.setValue(params.get("speed", 1))
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             self.max_edge_spin.setValue(params.get("max_edge", 0.0))
 
@@ -2616,10 +2564,7 @@ class ClassVisibilityPicker(QDialog):
                 str(self.display_mode_selector.currentData() or "class")
                 if hasattr(self, "display_mode_selector") else "class"
             ),
-            "quality_mode": (
-                str(self.shading_quality_selector.currentData() or "normal")
-                if hasattr(self, "shading_quality_selector") else "normal"
-            ),
+            "quality_mode": "normal",
             "flight_lines": self.get_line_visibility(),
             "border_percent": self.border_spin.value() if hasattr(self, 'border_spin') else 0,
             "border_type": self.get_border_logic_mode(),
@@ -4326,14 +4271,7 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
-                if hasattr(picker, "shading_quality_selector"):
-                    preset_quality = str(
-                        existing_preset.get("quality_mode", "normal") or "normal"
-                    )
-                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
-                    picker.shading_quality_selector.setCurrentIndex(
-                        quality_idx if quality_idx >= 0 else 1
-                    )
+
                 picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 picker.view_selector.blockSignals(True)
@@ -4363,14 +4301,7 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
-                if hasattr(picker, "shading_quality_selector"):
-                    preset_quality = str(
-                        existing_preset.get("quality_mode", "normal") or "normal"
-                    )
-                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
-                    picker.shading_quality_selector.setCurrentIndex(
-                        quality_idx if quality_idx >= 0 else 1
-                    )
+
                 picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 print(f"📋 Preset has no views configured")
@@ -4996,7 +4927,7 @@ class ShortcutManager(QWidget):
             visible_count = sum(1 for c in selected_classes.values() if c.get("show"))
             quality_label = shading_quality_label(preset["quality_mode"])
             summary = (f"Shading: {preset['azimuth']}°/{preset['angle']}°, "
-                       f"{visible_count} visible, Speed={quality_label}")
+                       f"{visible_count} visible")
 
             item = QTableWidgetItem(summary)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -5563,7 +5494,7 @@ class ShortcutManager(QWidget):
                                     preset_payload.get("quality_mode", "normal")
                                 )
                                 item = QTableWidgetItem(
-                                    f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={quality_label}")
+                                    f"Shading: {az}°/{ang}°, {len(visible)} visible")
                                 item.setData(Qt.UserRole, parts[3])
                             else:
                                 item = QTableWidgetItem("Preset: Not configured yet")
@@ -6216,7 +6147,7 @@ class ShortcutManager(QWidget):
                             visible = [c for c, info in (preset_payload.get("classes", {}) or {}).items()
                                        if info.get("show", True)]
                             item = QTableWidgetItem(
-                                f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={quality_label}"
+                                f"Shading: {az}°/{ang}°, {len(visible)} visible"
                             )
                         else:
                             item = QTableWidgetItem("Preset: Not configured yet")

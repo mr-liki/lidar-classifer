@@ -209,6 +209,7 @@ class _InputFilter(QObject):
         super().__init__(view)
         self.view = view
         self._last = None
+        self._context_press = None
         self._pan = NativePanGesture(self._pan_main)
 
     def _pan_main(self, dx, dy):
@@ -216,12 +217,38 @@ class _InputFilter(QObject):
         if nv is not None:
             nv.pan(dx, dy)
 
+    def _show_snt_context_menu(self, x, y):
+        if not self.view.mode_2d or self.view.native is None:
+            return
+        app = getattr(self.view, "app", None)
+        manager = getattr(app, "grid_label_manager", None)
+        handler = getattr(manager, "on_native_right_click", None)
+        if not callable(handler):
+            return
+        from gui.native_main_classify import MainCanvas
+        canvas = MainCanvas(self.view)
+        world_xy = canvas.section_at(x, y)
+        handler(world_xy, float(canvas.world_per_pixel()))
+
     def eventFilter(self, obj, ev):   # noqa: N802 (Qt API)
         t = ev.type()
         nv = self.view.native
         if nv is None:
             return False
         E = QEvent
+        # Track only free right-clicks; tool-owned presses below never arm a menu.
+        context_click = False
+        if t == E.MouseButtonPress:
+            self._context_press = None
+        elif t == E.MouseMove and self._context_press is not None:
+            if (ev.position() - self._context_press).manhattanLength() > 4:
+                self._context_press = None
+        elif t == E.MouseButtonRelease and ev.button() == Qt.RightButton:
+            press = self._context_press
+            self._context_press = None
+            context_click = (press is not None
+                             and (ev.position() - press).manhattanLength() <= 4)
+
         creation = getattr(self.view, 'creation', None)
         if creation is not None and creation.active:
             middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
@@ -327,6 +354,8 @@ class _InputFilter(QObject):
             self._last = None
             return True
         if t == E.MouseButtonPress:
+            if ev.button() == Qt.RightButton and self.view.mode_2d:
+                self._context_press = ev.position()
             picker = getattr(self.view, "picker", None)
             if picker is not None and ev.button() == Qt.LeftButton:
                 # Handled above (armed Cross Section owns left-press); kept as
@@ -347,6 +376,9 @@ class _InputFilter(QObject):
             return True
         if t == E.MouseButtonRelease:
             self._last = None
+            if context_click:
+                x, y = float(ev.position().x()), float(ev.position().y())
+                QTimer.singleShot(0, lambda: self._show_snt_context_menu(x, y))
             return True
         if t == E.MouseMove:
             picker = getattr(self.view, "picker", None)
