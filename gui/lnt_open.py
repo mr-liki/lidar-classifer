@@ -123,6 +123,23 @@ def _publish_source_cache(source, staged, destination, signature):
     os.replace(marker, _class_semantics_path(destination))
 
 
+def stamp_source_cache(source, lnt):
+    """Re-bind an existing cache to the current bytes of its source file.
+
+    Saving classification edits rewrites the LAS/LAZ, which changes its size and
+    mtime. Without a fresh fingerprint the next open sees a "different source"
+    and rebuilds the whole cache.
+    """
+    source, lnt = os.fspath(source), os.fspath(lnt)
+    signature = _source_signature(source)
+    for path, text in ((lnt + '.source.json', json.dumps(signature, sort_keys=True)),
+                       (_class_semantics_path(lnt), LNT_CLASS_SEMANTICS + '\n')):
+        temp = path + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(temp, path)
+
+
 def lnt_is_current(source):
     """A usable cache of the current format, built from this exact source.
 
@@ -1323,6 +1340,18 @@ def _show(app, lnt_path, name):
             restore_palette = clone_palette(getattr(app, "class_palette", {}) or {})
         except Exception as exc:  # noqa: BLE001
             print(f"[LNT] could not snapshot the applied PTC before reopen: {exc}")
+    elif getattr(app, "active_ptc_schema", None):
+        # A PTC was Applied earlier in this session (possibly before the
+        # project was cleared or while no cloud was open). Every cloud opened
+        # later must use it without another Display Mode > Apply.
+        try:
+            from gui.display_mode import clone_palette
+            restore_palette = clone_palette(
+                getattr(app, "class_palette", None) or app.active_ptc_schema)
+            restore_applied_palette = bool(restore_palette)
+            print(f"[LNT] auto-applying the session PTC: {getattr(app, 'active_ptc_path', '')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[LNT] could not prepare the session PTC for the new cloud: {exc}")
     close_lnt_view(app, reopening=True)
     view = LntMainView(app, lnt_path, name)
     try:
