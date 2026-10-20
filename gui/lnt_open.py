@@ -832,6 +832,11 @@ class LntMainView(QObject):
                     except (TypeError, ValueError):
                         raw = 1.0
                     weights[code] = np.float32(max(0.1, min(raw, 12.0)))
+            # "Load selected classifications" (Read points): classes left out at
+            # import stay hidden on the GPU, whatever a later Display Apply says.
+            for code in getattr(self.app, "_import_class_blocked", None) or ():
+                if 0 <= int(code) < 256:
+                    packed[int(code), 3] = 0
             # Only the CLASS palette comes from the Display dialog. The elevation and
             # intensity ramps are generated on the GPU by apply_shading(); the VTK-side
             # tables built by build_point_luts() must not overwrite them.
@@ -1107,6 +1112,8 @@ class _BuildUi(QObject):
             pass
         self.dlg.close()
         self.mw._lnt_build = None
+        if error:
+            self.mw._lnt_import_class_filter = None   # never leak into a later reopen
         if error == "cancelled":
             print("[LNT] build cancelled")
         elif error:
@@ -1189,6 +1196,62 @@ def open_with_lnt(main_window, source):
     thread.started.connect(worker.run)
     thread.start()
     return True
+
+
+def set_import_class_filter(app, import_options):
+    """Record the Read points class choice for the next native open (File >
+    Open, Load Block Data). Applied by _show() once the view exists."""
+    opts = import_options if isinstance(import_options, dict) else {}
+    codes = (opts.get("class_codes") or []) if opts.get("only_class") else []
+    app._lnt_import_class_filter = {int(c) for c in codes}   # empty = no filter
+
+
+def _apply_import_class_filter(app, view):
+    """Show only the classes picked in Read points - on the native GPU class
+    LUT (alpha = visible), no VTK. Every other class code is blocked, which the
+    native Cross/Cut Sections and the Display dialog already honour. Opens
+    that did not go through Read points (Save reopening) keep the current state."""
+    selected = getattr(app, "_lnt_import_class_filter", None)
+    if selected is None:
+        return
+    app._lnt_import_class_filter = None
+    try:
+        from gui.unified_actor_manager import set_import_blocked_classes
+    except Exception:   # noqa: BLE001
+        set_import_blocked_classes = None
+    if not selected:
+        app._import_class_blocked = None
+        if set_import_blocked_classes:
+            set_import_blocked_classes(())
+        return
+    from gui.display_mode import clone_palette
+    dialog = getattr(app, "display_mode_dialog", None)
+    source = None
+    for slot0 in ((getattr(app, "view_palettes", None) or {}).get(0),
+                  (getattr(dialog, "view_palettes", None) or {}).get(0),
+                  getattr(app, "class_palette", None)):
+        if isinstance(slot0, dict) and slot0:
+            source = slot0
+            break
+    palette = clone_palette(source or {})
+    for code, entry in palette.items():
+        entry["show"] = int(code) in selected
+    app._import_class_blocked = {c for c in range(256) if c not in selected}
+    if set_import_blocked_classes:
+        set_import_blocked_classes(app._import_class_blocked)
+    app.class_palette = palette
+    if not isinstance(getattr(app, "view_palettes", None), dict):
+        app.view_palettes = {}
+    app.view_palettes[0] = clone_palette(palette)
+    if dialog is not None:
+        if not isinstance(getattr(dialog, "view_palettes", None), dict):
+            dialog.view_palettes = {}
+        dialog.view_palettes[0] = clone_palette(palette)
+        if hasattr(dialog, "sync_slot_visibility_from_palette"):
+            dialog.sync_slot_visibility_from_palette(0, palette)
+    if view._push_applied_palette():
+        view.apply_shading(view.shading_name or "class")
+    print(f"[LNT] Read points: showing only classes {sorted(selected)}")
 
 
 def _keep_vector_overlay(app):
@@ -1391,6 +1454,7 @@ def _show(app, lnt_path, name):
             )
         else:
             print("[LNT] could not restore the applied PTC palette after document reopen")
+    _apply_import_class_filter(app, view)
     from gui.native_border import apply_border
     apply_border(app, 0)
     _keep_vector_overlay(app)
