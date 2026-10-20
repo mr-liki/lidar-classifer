@@ -7066,7 +7066,13 @@ class NakshaApp(QMainWindow):
         native_single = len(filenames) == 1 and os.path.splitext(filenames[0])[1].lower() in (".las", ".laz", ".lnt", ".lntset")
         native_batch = len(filenames) > 1 and all(os.path.splitext(path)[1].lower() in (".las", ".laz", ".lnt") for path in filenames)
         if native_single or native_batch:
-            from gui.lnt_open import open_with_lnt
+            # "Read points" dialog first (LAS/LAZ only); Cancel aborts the open.
+            import_options = self._prompt_lidar_import_options_for_files(filenames)
+            if import_options is None:
+                print("   User cancelled import setup")
+                return
+            from gui.lnt_open import open_with_lnt, set_import_class_filter
+            set_import_class_filter(self, import_options)
             open_with_lnt(self, filenames if native_batch else filenames[0])
             return
 
