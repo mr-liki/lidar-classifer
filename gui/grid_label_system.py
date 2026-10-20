@@ -6981,6 +6981,11 @@ class GridLabelManager:
         default or an undo entry. Never raises — falls back to safe
         defaults on any VTK access error so a single bad actor can't crash
         the caller."""
+        if isinstance(actor, dict) and actor.get("_native_label"):
+            entity = actor["entity"]
+            return {"actor": actor, "text": str(entity.get("text", "")),
+                    "size": entity.get("_naksha_label_font_size", 75),
+                    "color": entity.get("color"), "is_text_actor3d": False}
         is_text_actor3d = False
         try:
             is_text_actor3d = isinstance(actor, vtk.vtkTextActor3D)
@@ -7039,6 +7044,15 @@ class GridLabelManager:
         elsewhere (load_grid_las, loaded_grids, PRJ/SNT filename inference)
         to associate the label with its LAS/PRJ data.
         """
+        if isinstance(actor, dict) and actor.get("_native_label"):
+            entity = actor["entity"]
+            base_height = entity.setdefault("_naksha_base_height", float(entity.get("height", 0.) or 0.))
+            entity["height"] = base_height * self._label_font_scale_factor(int(size), 75)
+            entity["text"] = text
+            entity["color"] = color
+            entity["_naksha_label_font_size"] = int(size)
+            actor["document"]["_labels_dirty"] = True
+            return True
         if actor is None:
             return False
         try:
@@ -7233,9 +7247,20 @@ class GridLabelManager:
             import traceback
             traceback.print_exc()
 
+    def _iter_native_grid_labels(self):
+        """Yield editable labels from native Vulkan attachment documents."""
+        layer = getattr(self.app, "_native_vector_layer", None)
+        for key, document in getattr(layer, "documents", {}).items():
+            if key[0] not in ("snt", "dxf"):
+                continue
+            for entity in document.get("entities", ()):
+                if str(entity.get("type", "")).lower() == "text":
+                    yield {"_native_label": True, "entity": entity, "document": document}
+
     def _iter_all_grid_label_actors(self):
         """Yield every live grid/block-name label actor currently tracked
         by the app (SNT + DXF stores), de-duplicated. Never raises."""
+        yield from self._iter_native_grid_labels()
         seen = set()
         for store_name in ('snt_actors', 'dxf_actors'):
             try:
@@ -7253,13 +7278,13 @@ class GridLabelManager:
 
     def edit_all_grid_labels_font_size(self):
         """Bulk-apply a single font size to every block-name label in the
-        scene at once. Text and color are left exactly as each label
+        native Vulkan scene at once. Text and color are left exactly as each label
         already has them — only size changes. Fully undoable in one step
         via _undo_last_label_edit."""
         try:
             from PySide6.QtWidgets import QInputDialog
 
-            actors = list(self._iter_all_grid_label_actors())
+            actors = list(self._iter_native_grid_labels())
             if not actors:
                 QMessageBox.information(
                     self.app, "No Block Labels",
@@ -7314,6 +7339,16 @@ class GridLabelManager:
             traceback.print_exc()
 
     def _force_render_after_label_edit(self):
+        layer = getattr(self.app, "_native_vector_layer", None)
+        if layer is not None:
+            for key, document in list(layer.documents.items()):
+                if not document.get("_labels_dirty"):
+                    continue
+                result = layer.put_entities(key[0], key[1], document["entities"],
+                                            document.get("bounds"))
+                if result is None:
+                    raise RuntimeError("Could not upload resized block labels")
+            return  # Native upload/refresh presents the Vulkan frame.
         try:
             handles = self._get_main_interactor_handles()
             if handles is not None:

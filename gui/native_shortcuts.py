@@ -430,8 +430,8 @@ def _native_ai_history(app, view, source, destination, redo):
 
 
 # Shortcut tools that take over the canvas click; one-shot actions (Save,
-# DisplayMode, SyncViews ...) leave the footer Identify tools alone.
-_FOOTER_PICK_EXCLUSIVE = {
+# DisplayMode, SyncViews ...) leave the latched click tools alone.
+_CLICK_TOOL_SHORTCUTS = {
     'AboveLine', 'BelowLine', 'ParallelLine', 'Rectangle', 'Circle', 'Polygon',
     'Freehand', 'Brush', 'Point', 'TempFence',
     'CrossSectionRect', 'CutSectionRect', 'CutFromCross', 'CutFromCut',
@@ -442,12 +442,18 @@ _FOOTER_PICK_EXCLUSIVE = {
 
 def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label='',
                             pan_mode=None):
-    # Every shortcut (VTK execute_tool included) passes here first: a click
-    # tool turns off the footer Identify / Identify Layer tools.
-    if MEASURE_NAMES.get(tool, tool) in _FOOTER_PICK_EXCLUSIVE:
-        deactivate_footer = getattr(app, '_deactivate_footer_pick_tools', None)
-        if callable(deactivate_footer):
-            deactivate_footer(reason=f'{tool} shortcut')
+    # Every shortcut (VTK execute_tool included) passes here first. Pan
+    # stands every other click tool down; any other click tool turns off the
+    # latched ones (Pan, footer Identify / Identify Layer, Identify ribbon).
+    click_tool = MEASURE_NAMES.get(tool, tool)
+    if click_tool == 'Pan':
+        release = getattr(app, '_release_other_click_tools', None)
+        if callable(release):
+            release('pan')
+    elif click_tool in _CLICK_TOOL_SHORTCUTS:
+        deactivate = getattr(app, '_deactivate_transient_click_tools', None)
+        if callable(deactivate):
+            deactivate(reason=f'{tool} shortcut')
     view = getattr(app, '_lnt_main_view', None)
     if view is None or getattr(view, 'native', None) is None:
         name = MEASURE_NAMES.get(TOOL_NAMES.get(tool, tool), tool)
@@ -482,7 +488,12 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
     drawing = getattr(view, 'drawing', None)
     if drawing is not None:
         drawing.cancel()
-    app._left_pan_shortcut_active = False
+    disarm_pan_tool = getattr(app, '_disarm_pan_tool', None)
+    if name != 'Pan' and callable(disarm_pan_tool):
+        # Full stand-down: also restores the panning-button preference.
+        disarm_pan_tool(f'{tool} shortcut')
+    else:
+        app._left_pan_shortcut_active = False
     if getattr(app, '_native_xs_active', False) and name != 'CrossSectionMeasure':
         if name in DRAWABLE_TOOLS or name in _XS_EXCLUSIVE:
             set_xs(app, False)

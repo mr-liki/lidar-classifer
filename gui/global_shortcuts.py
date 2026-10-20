@@ -1975,11 +1975,7 @@ class GlobalShortcutFilter(QObject):
                     target_display_mode = str(
                         preset.get("display_mode", "class") or "class"
                     ).lower()
-                    target_quality_mode = str(
-                        preset.get("quality_mode", "normal") or "normal"
-                    ).lower()
-                    if target_quality_mode not in ("fast", "normal", "slow"):
-                        target_quality_mode = "normal"
+                    target_quality_mode = "normal"
 
                     # Shaded Classification / Surface both read their quality
                     # (Fast/Normal/Slow) from a global app attribute -- the
@@ -3133,7 +3129,7 @@ class GlobalShortcutFilter(QObject):
                     )
 
                     print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
-                        f"| {visible_count} classes | Speed={shading_quality_label(quality_mode)}")
+                        f"| {visible_count} classes")
                     print(f"{'='*60}\n")
 
                     if hasattr(self.app_window, 'statusBar'):

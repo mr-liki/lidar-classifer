@@ -983,8 +983,9 @@ class RibbonSection(QWidget):
         callback()
 
     def _deactivate_footer_pick_for_tool_button(self, btn):
-        """A ribbon tool being switched on turns off the footer Identify /
-        Identify Layer tools, so only one tool owns the canvas click."""
+        """A ribbon tool being switched on turns off the latched click tools
+        (Pan, footer Identify / Identify Layer, other Identify-ribbon tools),
+        so only one tool owns the canvas click."""
         if not btn.isChecked():
             return
         ribbon_scope = btn.property("ribbonScope") or self.ribbon_scope
@@ -994,9 +995,9 @@ class RibbonSection(QWidget):
             return
 
         main_window = self._find_app_window() or self.window()
-        deactivate = getattr(main_window, "_deactivate_footer_pick_tools", None)
+        deactivate = getattr(main_window, "_deactivate_transient_click_tools", None)
         if callable(deactivate):
-            deactivate(reason=f"{ribbon_text} activated")
+            deactivate(reason=f"{ribbon_text} activated", source=ribbon_scope)
 
 
 class FileRibbon(QWidget):
@@ -4001,7 +4002,7 @@ class MeasurementRibbon(QWidget):
         """add_button()'s clicked-driven callback — the button's checked
         state already reflects the click by the time this runs."""
         if self.cross_section_measure_btn.isChecked():
-            deactivate = getattr(self.window(), "_deactivate_footer_pick_tools", None)
+            deactivate = getattr(self.window(), "_deactivate_transient_click_tools", None)
             if callable(deactivate):
                 deactivate(reason="XS activated")
         self._sync_cross_section_measure_tool(self.cross_section_measure_btn.isChecked())
