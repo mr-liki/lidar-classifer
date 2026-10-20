@@ -2539,6 +2539,12 @@ class NakshaApp(QMainWindow):
             self._active_tools = set()
 
         if active:
+            # Any other tool taking the canvas cursor (cross/cut section,
+            # draw, curve, coordinate pick ...) also takes the click, so the
+            # footer Identify / Identify Layer tools step aside.
+            # (Axis guides are a display aid, not a click tool.)
+            if tool_name not in ("point_target_sync", "snt_layer_pick", "axis_guides"):
+                self._deactivate_footer_pick_tools(reason=f"{tool_name or 'tool'} activated")
             if tool_name:
                 self._active_tools.add(tool_name)
             self._cursor_state = True
@@ -3417,9 +3423,9 @@ class NakshaApp(QMainWindow):
         self._update_point_sync_footer_state_visual(bool(enabled))
 
         if enabled:
-            if hasattr(self, "snt_layer_pick_tool") and self.snt_layer_pick_tool is not None:
-                if getattr(self.snt_layer_pick_tool, "active", False):
-                    self.snt_layer_pick_tool.deactivate()
+            # Only one click tool at a time: Identify Layer, ribbon tools,
+            # sections, classification, measurement and drawing stand down.
+            self._release_tools_for_footer_pick("point_sync_tool")
             self.point_sync_tool.activate()
             self.statusBar().showMessage("🎯 Point target sync enabled", 2000)
         else:
@@ -3447,6 +3453,7 @@ class NakshaApp(QMainWindow):
             return
 
         if enabled:
+            self._release_tools_for_footer_pick("snt_layer_pick_tool")
             self.snt_layer_pick_tool.activate()
             self.statusBar().showMessage("🎯 Identify Layer activated (click SNT, DXF, or GIS features in main view). Click again or press Esc to deactivate.", 2500)
         else:
@@ -4757,6 +4764,151 @@ class NakshaApp(QMainWindow):
         if disabled:
             print("🚫 Point-pick tools auto-disabled (Cross/Cut Section activated)")
         return disabled
+
+    # Footer click tools: Identify (point target sync) and Identify Layer.
+    _FOOTER_PICK_TOOLS = ("point_sync_tool", "snt_layer_pick_tool")
+
+    def _deactivate_footer_pick_tools(self, keep=None, reason="another tool activated"):
+        """Turn off the footer Identify / Identify Layer tools (except ``keep``).
+
+        Called whenever another tool takes over the canvas click so only one
+        click tool is ever live; each tool's deactivate() also unchecks its
+        footer button. Returns True when anything was turned off.
+        """
+        if getattr(self, "_releasing_for_footer_pick", False):
+            return False
+        disabled = False
+        for tool_name in self._FOOTER_PICK_TOOLS:
+            if tool_name == keep:
+                continue
+            tool = getattr(self, tool_name, None)
+            if tool is None or not getattr(tool, "active", False):
+                continue
+            try:
+                tool.deactivate()
+                disabled = True
+                print(f"🚫 Footer {tool_name} deactivated ({reason})")
+            except Exception as exc:
+                print(f"⚠️ Could not deactivate footer {tool_name}: {exc}")
+        return disabled
+
+    def _release_tools_for_footer_pick(self, owner):
+        """Stand down every other click tool before a footer pick tool takes over.
+
+        ``owner`` is the footer tool being activated ("point_sync_tool" or
+        "snt_layer_pick_tool"). Completed cross/cut docks and finished
+        measurements/drawings stay; only the tools that own left-click
+        (VTK and native .lnt) are released and their ribbon buttons unchecked.
+        """
+        self._releasing_for_footer_pick = True
+        try:
+            for tool_name in self._FOOTER_PICK_TOOLS:
+                tool = getattr(self, tool_name, None)
+                if tool_name != owner and tool is not None and getattr(tool, "active", False):
+                    try:
+                        tool.deactivate()
+                    except Exception:
+                        pass
+
+            # Identify ribbon (Identify / Zoom / Select).
+            self._deactivate_identify_tab_tools()
+            self._deactivate_selection_tools("footer pick tool activated")
+
+            # Cross / Cut placement (completed docks stay open).
+            if getattr(self, "cross_section_active", False):
+                cancel_cross = getattr(self, "_cancel_cross_section_tool_only", None)
+                if callable(cancel_cross):
+                    cancel_cross()
+            self._deactivate_pending_cut_section_tool("footer pick tool activated")
+
+            # Classification.
+            if getattr(self, "active_classify_tool", None) is not None or getattr(
+                self, "classify_interactor", None
+            ) or getattr(self, "classify_interactors", None) or getattr(
+                self, "cut_classify_interactor", None
+            ):
+                try:
+                    self.deactivate_classification_tool(preserve_cross_section=True)
+                except Exception as exc:
+                    print(f"⚠️ Footer pick: classification stand-down failed: {exc}")
+                self.active_classify_tool = None
+
+            # Measurement, temp fence, draw/AccuDraw, curve, coordinate pick.
+            from gui.execute_tool import (
+                _deactivate_measurement_tool_safely,
+                _deactivate_temp_fence_safely,
+            )
+            _deactivate_measurement_tool_safely(self, "footer pick tool activated")
+            _deactivate_temp_fence_safely(self, "footer pick tool activated")
+            self._deactivate_digitize_tool()
+            curve_tool = getattr(self, "curve_tool", None)
+            if curve_tool is not None:
+                try:
+                    if getattr(curve_tool, "active", False):
+                        if callable(getattr(curve_tool, "suspend", None)):
+                            curve_tool.suspend()
+                        elif callable(getattr(curve_tool, "_cancel_curve", None)):
+                            curve_tool._cancel_curve()
+                    if getattr(curve_tool, "_select_mode", False):
+                        curve_tool.deactivate_select_mode()
+                except Exception as exc:
+                    print(f"⚠️ Footer pick: curve stand-down failed: {exc}")
+            coordinate_pick = getattr(self, "coordinate_pick_tool", None)
+            if coordinate_pick is not None and getattr(coordinate_pick, "active", False):
+                try:
+                    coordinate_pick.deactivate()
+                except Exception:
+                    pass
+
+            # XS (cross-section measuring) - its toggled handler stands the
+            # VTK or native tool down.
+            measure_ribbon = getattr(getattr(self, "ribbon_manager", None), "ribbons", {}).get("measure")
+            xs_btn = getattr(measure_ribbon, "cross_section_measure_btn", None)
+            if xs_btn is not None and xs_btn.isChecked():
+                xs_btn.setChecked(False)
+
+            self._release_native_tools_for_footer_pick()
+
+            ribbon_manager = getattr(self, "ribbon_manager", None)
+            if ribbon_manager is not None:
+                ribbon_manager.clear_all_tool_buttons()
+                try:
+                    from gui.native_shortcuts import refresh_measure_ribbon
+                    refresh_measure_ribbon(self)
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"⚠️ Footer pick tool stand-down failed: {exc}")
+        finally:
+            self._releasing_for_footer_pick = False
+
+    def _release_native_tools_for_footer_pick(self):
+        """Cancel native (.lnt / SNT viewport) gesture owners, like a native shortcut does."""
+        try:
+            from gui.native_shortcuts import cancel_native_measurements
+            cancel_native_measurements(self)
+        except Exception:
+            pass
+        view = getattr(self, "_lnt_main_view", None)
+        if view is None or getattr(view, "native", None) is None:
+            return
+        try:
+            from gui.native_sections import manager
+            sections = manager(self)
+            sections.cancel_cut()
+            sections.cancel_cross()
+            owners = [view] + list(sections.views.values())
+        except Exception as exc:
+            print(f"⚠️ Footer pick: native section stand-down failed: {exc}")
+            owners = [view]
+        for owner in owners:
+            for attr in ("classifier", "measurement", "drawing"):
+                tool = getattr(owner, attr, None)
+                if tool is not None and callable(getattr(tool, "cancel", None)):
+                    try:
+                        tool.cancel()
+                    except Exception:
+                        pass
 
     def enable_cross_section_mode(self):   #Added by bala
         from gui.native_sections import manager
@@ -10267,6 +10419,9 @@ class NakshaApp(QMainWindow):
                 cancel_cross = getattr(self, "_cancel_cross_section_tool_only", None)
                 if callable(cancel_cross):
                     cancel_cross()
+
+            # Footer Identify / Identify Layer would compete for the click.
+            self._deactivate_footer_pick_tools(reason="classification reactivated")
 
             # Temp Fence can otherwise leave competing click observers alive.
             try:

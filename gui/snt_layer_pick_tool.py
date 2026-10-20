@@ -207,6 +207,7 @@ class SNTLayerPickTool(QObject):
             wx, wy = float(world_xy[0]), float(world_xy[1])
         except Exception:
             return False
+        try:
             picked = self._pick_native_geometry(wx, wy, upp)
         except Exception as e:
             print(f"   ⚠️ Native layer pick failed: {e}")
