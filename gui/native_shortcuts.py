@@ -715,6 +715,10 @@ def _apply_display(app, view, sections, slot, palette, mode, status):
         app.class_palette = palette
         view._push_applied_palette()
         view.set_app_display_mode(mode)
+    dialog = (getattr(app, 'display_mode_dialog', None)
+              or getattr(app, 'display_dialog', None))
+    if dialog is not None:
+        dialog.sync_applied_palette(slot, palette, mode)
     status(f'{mode.replace("_", " ").title()} applied to {"Main View" if not slot else "View " + str(slot)}')
 
 
