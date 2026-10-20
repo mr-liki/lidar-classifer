@@ -18650,6 +18650,23 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
     popup changes Azimuth/Sharpness/Ambient and prevents the hatched/line-based
     regression caused by enabling lighting on the crisp base actor.
     """
+    native_view = getattr(app, "_lnt_main_view", None)
+    if native_view is not None:
+        if azimuth is not None:
+            app.last_shade_azimuth = float(azimuth)
+        if angle is not None:
+            app.shading_sharpness_angle = float(angle)
+        if ambient is not None:
+            app.shade_ambient = float(ambient)
+        updated = bool(native_view._push_surface_shading())
+        print(
+            f"SHADING_LIGHT_ONLY backend=native status={'updated' if updated else 'failed'} "
+            f"azimuth={native_view.shading_azimuth:.2f} "
+            f"sharpness={native_view.shading_sharpness:.2f} "
+            f"ambient={native_view.shading_ambient:.3f}"
+        )
+        return updated
+
     data = getattr(app, "data", None)
     if not isinstance(data, dict):
         return False

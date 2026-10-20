@@ -627,7 +627,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         if self._shortcut_should_skip_text_edit():
             return
         if self._native_selection is not None:
-            self._native_selection.draw.history(redo=False)
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, self._native_selection.draw, redo=False)
             return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
@@ -643,7 +644,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         if self._shortcut_should_skip_text_edit():
             return
         if self._native_selection is not None:
-            self._native_selection.draw.history(redo=True)
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, self._native_selection.draw, redo=True)
             return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
@@ -1349,6 +1351,33 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             except Exception:
                 pass
 
+    def _selected_fence_shapes(self):
+        """Use the *active* renderer's selection and real drawn world geometry.
+
+        NativeSelectionManager.get() yields the compact 2-corner editor records.
+        Passing those through the VTK digitizer loses rectangles and circles.
+        """
+        manager = self._selection_manager()
+        if manager is None:
+            return []
+        from gui.native_fence_selection import selected_fence_shapes
+        native = getattr(self, '_native_selection', None)
+        draw = native.draw if native is not None else None
+        selected = manager.get()
+        if not selected and draw is not None:
+            # A fence picked with Draw > Select (without opening the Element
+            # Selection panel first) is still the user's current selection.
+            get_feature = getattr(draw, '_selected_feature', None)
+            feature = get_feature() if callable(get_feature) else None
+            if isinstance(feature, dict) and feature.get('source') == 'native':
+                original = feature.get('drawing')
+                if isinstance(original, dict):
+                    selected = [original]
+        return selected_fence_shapes(
+            selected, native_draw=draw,
+            digitizer=getattr(self.app, 'digitizer', None),
+        )
+
     def _on_add_to_byclass(self):
         """Send selected drawings as fences to the Inside Fence (By Class) dialog.
 
@@ -1356,50 +1385,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         drawing into a fence dict compatible with InsideFenceDialog, opens the
         dialog, and pre-loads the fences.
         """
-        digitizer = getattr(self.app, "digitizer", None)
-        if digitizer is None:
-            self.app.statusBar().showMessage("Digitizer not available", 2500)
-            return
-
-        mgr = self._selection_manager()
-        if mgr is None:
-            self.app.statusBar().showMessage("Selection manager not available", 2500)
-            return
-
-        selected = mgr.get()
-        if not selected:
-            try:
-                self.app.statusBar().showMessage(
-                    "No drawings selected — select at least one drawing first", 2500
-                )
-            except Exception:
-                pass
-            return
-
-        fence_shapes = []
-        for drawing in selected:
-            if drawing is None:
-                continue
-            coords = None
-            if hasattr(digitizer, "_get_drawing_coords"):
-                coords = digitizer._get_drawing_coords(drawing)
-            if coords is None:
-                coords = drawing.get("coords")
-            if not coords:
-                continue
-
-            shape = dict(drawing)
-            shape["coords"] = coords
-            fence_shapes.append(shape)
-
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Selected drawings have no usable coordinates", 2500
-                )
-            except Exception:
-                pass
-            return
+        fence_shapes = self._selected_fence_shapes()
 
         ribbon = None
         try:
@@ -1441,7 +1427,16 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                # Selection: 0 does not mean there are no finalized drawings.
+                # Let the user pick one or several available mixed fences.
+                from gui.native_fence_selection import offer_fence_picker
+                if not offer_fence_picker(fence_dialog, self.app):
+                    raise RuntimeError('Inside Fence has no working fence picker')
+                return
             fence_dialog.add_fences_from_selection(fence_shapes)
+            from gui.native_fence_selection import sync_native_fence_highlights
+            sync_native_fence_highlights(fence_dialog, fence_dialog.selected_fences)
             count = len(fence_shapes)
             try:
                 self.app.statusBar().showMessage(
@@ -1474,55 +1469,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _on_add_to_byclass_tool(self, tool_name: str):
         """Open Close or Height By Class dialog with selected drawings pre-loaded as fences."""
-        digitizer = getattr(self.app, "digitizer", None)
-        if digitizer is None:
-            try:
-                self.app.statusBar().showMessage("Digitizer not available", 2500)
-            except Exception:
-                pass
-            return
-
-        mgr = self._selection_manager()
-        if mgr is None:
-            try:
-                self.app.statusBar().showMessage("Selection manager not available", 2500)
-            except Exception:
-                pass
-            return
-
-        selected = mgr.get()
-        if not selected:
-            try:
-                self.app.statusBar().showMessage(
-                    "No drawings selected — select at least one drawing first", 2500
-                )
-            except Exception:
-                pass
-            return
-
-        fence_shapes = []
-        for drawing in selected:
-            if drawing is None:
-                continue
-            coords = None
-            if hasattr(digitizer, "_get_drawing_coords"):
-                coords = digitizer._get_drawing_coords(drawing)
-            if coords is None:
-                coords = drawing.get("coords")
-            if not coords:
-                continue
-            shape = dict(drawing)
-            shape["coords"] = coords
-            fence_shapes.append(shape)
-
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Selected drawings have no usable coordinates", 2500
-                )
-            except Exception:
-                pass
-            return
+        fence_shapes = self._selected_fence_shapes()
 
         ribbon = None
         try:
@@ -1556,7 +1503,14 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                from gui.native_fence_selection import offer_fence_picker
+                if not offer_fence_picker(dlg, self.app):
+                    raise RuntimeError(f'{tool_name} has no working fence picker')
+                return
             dlg.add_fences_from_selection(fence_shapes)
+            from gui.native_fence_selection import sync_native_fence_highlights
+            sync_native_fence_highlights(dlg, getattr(dlg, 'selected_fences', fence_shapes))
             count = len(fence_shapes)
             try:
                 self.app.statusBar().showMessage(
@@ -1577,7 +1531,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         menu.addAction("Low Points",  lambda: self._on_add_to_lidar_classif("low_points"))
         menu.addAction("Isolated",    lambda: self._on_add_to_lidar_classif("isolated"))
         menu.addAction("Ground",      lambda: self._on_add_to_lidar_classif("ground"))
-        menu.addAction("Surface",     lambda: self._on_add_to_lidar_classif("surface"))
+        menu.addAction("Surface Points", lambda: self._on_add_to_lidar_classif("surface_points"))
+        menu.addAction("Below Surface", lambda: self._on_add_to_lidar_classif("surface"))
         menu.exec(self.btn_lidar_classif.mapToGlobal(
             self.btn_lidar_classif.rect().bottomLeft()
         ))
@@ -1585,14 +1540,15 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     def _on_add_to_lidar_classif(self, tool_name: str):
         """Open a LiDAR classification dialog with selected drawings pre-loaded as fences.
 
-        The fence selector inside the dialog is hidden — the fence is determined
-        by the current drawing selection, matching the InsideFenceDialog pattern.
+        Keep the fence picker available so the user can adjust the transferred
+        selection or combine it with other drawn shapes.
         """
         _OPENERS = {
             "low_points": ("_classify_low_points_dlg",    "open_classify_low_points"),
             "isolated":   ("_classify_isolated_points_dlg", "open_classify_isolated_points"),
             "ground":     ("_classify_ground_dlg",          "open_classify_ground"),
             "surface":    ("_classify_below_surface_dlg",   "open_classify_below_surface"),
+            "surface_points": ("_classify_surface_points_dlg", "open_classify_surface_points"),
         }
         entry = _OPENERS.get(tool_name)
         if entry is None:
@@ -1600,68 +1556,12 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
         dlg_attr, opener_name = entry
 
-        digitizer = getattr(self.app, "digitizer", None)
-        if digitizer is None:
-            try:
-                self.app.statusBar().showMessage("Digitizer not available", 2500)
-            except Exception:
-                pass
-            return
-
-        mgr = self._selection_manager()
-        if mgr is None:
-            try:
-                self.app.statusBar().showMessage("Selection manager not available", 2500)
-            except Exception:
-                pass
-            return
-
-        selected = mgr.get()
-        if not selected:
-            try:
-                self.app.statusBar().showMessage(
-                    "No drawings selected — select at least one drawing first", 2500
-                )
-            except Exception:
-                pass
-            return
-
-        fence_shapes = []
-        for drawing in selected:
-            if drawing is None:
-                continue
-            coords = None
-            if hasattr(digitizer, "_get_drawing_coords"):
-                coords = digitizer._get_drawing_coords(drawing)
-            if coords is None:
-                coords = drawing.get("coords")
-            if not coords:
-                continue
-            shape = dict(drawing)
-            shape["coords"] = coords
-            fence_shapes.append(shape)
-
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Selected drawings have no usable coordinates", 2500
-                )
-            except Exception:
-                pass
-            return
+        fence_shapes = self._selected_fence_shapes()
 
         try:
-            from gui.lidar_classification_tools import (
-                open_classify_low_points, open_classify_isolated_points,
-                open_classify_ground, open_classify_below_surface,
-            )
-            openers = {
-                "low_points": open_classify_low_points,
-                "isolated":   open_classify_isolated_points,
-                "ground":     open_classify_ground,
-                "surface":    open_classify_below_surface,
-            }
-            openers[tool_name](self.app)
+            from importlib import import_module
+            tools = import_module('gui.lidar_classification_tools')
+            getattr(tools, opener_name)(self.app)
         except Exception as e:
             print(f"⚠️ Failed to open LiDAR classification dialog: {e}")
             try:
@@ -1677,7 +1577,23 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                # Algorithms can operate without a fence when their original
+                # rules permit. If drawings exist, offer the normal picker so
+                # the user chooses which (rather than converting them all).
+                from gui.native_fence_selection import offer_fence_picker
+                if offer_fence_picker(dlg, self.app, only_if_candidates=True):
+                    return
+                try:
+                    self.app.statusBar().showMessage(
+                        'No fence selected: configure the tool scope before applying', 4000)
+                except Exception:
+                    pass
+                return
             dlg.add_fences_from_selection(fence_shapes)
+            from gui.native_fence_selection import sync_native_fence_highlights
+            fence_sel = getattr(dlg, '_fence_sel', None)
+            sync_native_fence_highlights(fence_sel, getattr(fence_sel, 'selected_fences', fence_shapes))
             count = len(fence_shapes)
             try:
                 self.app.statusBar().showMessage(

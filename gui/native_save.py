@@ -87,6 +87,67 @@ def read_classes(path):
     return classes, entries, leaves, starts
 
 
+def _mapping_cache_paths(lnt):
+    """Where the source->document permutation is kept between sessions."""
+    base = os.fspath(lnt)
+    return base + '.sourceorder.npy', base + '.sourceorder.json'
+
+
+def _signature_json(signature):
+    """The mapping signature in a JSON-friendly form."""
+    path, size, mtime_ns, digest = signature
+    return [str(path), int(size), int(mtime_ns), digest.hex()]
+
+
+def _load_mapping_cache(lnt, signature):
+    """The permutation from a previous session, when it still matches.
+
+    Building it costs a full pass over the source plus a sort (measured at
+    ~9.5 s for 15 million points), and it is needed again by every export -
+    including the backup written when the application closes, which is exactly
+    the moment a user is waiting. The signature covers the source's bytes and
+    the document's directory, so a stale cache can never be used.
+    """
+    import json
+    order_path, meta_path = _mapping_cache_paths(lnt)
+    try:
+        with open(meta_path, encoding='utf-8') as handle:
+            meta = json.load(handle)
+        if meta.get('signature') != _signature_json(signature):
+            return None
+        order = np.load(order_path)
+        if order.dtype.kind not in 'iu' or order.size <= 0:
+            return None
+        return order
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _save_mapping_cache(lnt, signature, order):
+    """Keep the permutation beside the document for the next session."""
+    import json
+    order_path, meta_path = _mapping_cache_paths(lnt)
+    temp_order = order_path + '.tmp.npy'
+    temp_meta = meta_path + '.tmp'
+    try:
+        stored = order
+        if stored.dtype == np.int64 and int(stored.max(initial=0)) < 2 ** 31:
+            stored = stored.astype(np.int32)          # half the size on disk
+        np.save(temp_order, stored)
+        payload = {'signature': _signature_json(signature), 'points': int(order.size)}
+        with open(temp_meta, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle)
+        # The metadata is written last: without it the array is ignored.
+        os.replace(temp_order, order_path)
+        os.replace(temp_meta, meta_path)
+    except (OSError, ValueError, TypeError):
+        for temp in (temp_order, temp_meta):
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+
+
 def source_mapping(source, lnt, entries, leaves, starts, cache, progress):
     """Cache only the permutation; repeated saves never sort coordinates again."""
     import laspy
@@ -97,6 +158,12 @@ def source_mapping(source, lnt, entries, leaves, starts, cache, progress):
     if cache.get('signature') == signature:
         return cache['order']
     total = int(starts[-1])
+    order = _load_mapping_cache(lnt, signature)
+    if order is not None and order.size == total:
+        progress(25, 'Reusing the point mapping from the last session…')
+        cache.clear()
+        cache.update(signature=signature, order=order)
+        return order
     bounds_min, bounds_max = _lnt_bounds(lnt)
     keys = np.empty(total, dtype=np.uint64)
     # Memory is bounded by keys/order, not a full XYZ + all LAS attributes array.
@@ -143,6 +210,7 @@ def source_mapping(source, lnt, entries, leaves, starts, cache, progress):
         del mm
     cache.clear()
     cache.update(signature=signature, order=order)
+    _save_mapping_cache(lnt, signature, order)
     return order
 
 
@@ -171,11 +239,17 @@ def _native_chunks(lnt, entries, progress):
 
 def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                classes=None, fences=None, attributes=None, version=None,
-               lines=None, progress=lambda n, text: None, drawings=None):
+               lines=None, progress=lambda n, text: None, drawings=None,
+               companion=True):
     """Stage both outputs before replacing either. All heavy work stays off Qt's thread.
 
     Source LAS dimensions, CRS, VLRs and EVLRs are preserved. Class numbers above
     255 additionally live in naksha_class extra bytes; classification holds slots.
+
+    `companion=False` publishes ONLY the LAS/LAZ destination: the native
+    document and its class map are left alone. That is the backup mode - the
+    classified result is written to a NEW file and the open document (and the
+    source it was built from) are never replaced.
     """
     import laspy
     cache = cache if cache is not None else {}
@@ -320,14 +394,16 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         if subset or attributes is not None:
             from gui.lnt_open import build_lnt
             build_lnt(staged, lambda n, text: progress(80 + int(n * .15), text), lambda: False)
-        elif not same_lnt:
+        elif companion and not same_lnt:
             progress(85, 'Copying the native document…')
             shutil.copyfile(lnt, staged_lnt)
         # Every output is staged before publication; replacement failures roll back.
         files = []
-        if os.path.isfile(staged_lnt):
+        if companion and os.path.isfile(staged_lnt):
             files.append((staged_lnt, target_lnt))
-        for i, target in enumerate((target_lnt + '.classmap.json', destination + '.classmap.json')):
+        classmap_targets = [target_lnt + '.classmap.json'] if companion else []
+        classmap_targets.append(destination + '.classmap.json')
+        for i, target in enumerate(classmap_targets):
             temp = None
             if mapping:
                 payload = json.dumps({'version': 1, 'code_to_slot': {str(c): s for c, s in mapping.items()}}, indent=1)
@@ -349,11 +425,12 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         files.append((staged, destination))
         _publish(files, stage_dir)
         # A source save must not invalidate the edited native cache on next open.
-        stamp = max(time.time_ns(), os.stat(destination).st_mtime_ns + 1_000_000)
-        os.utime(target_lnt, ns=(stamp, stamp))
-        if Path(destination).suffix.lower() in ('.las', '.laz') and os.path.isfile(target_lnt):
-            from gui.lnt_open import stamp_source_cache
-            stamp_source_cache(destination, target_lnt)
+        if companion and os.path.isfile(target_lnt):
+            stamp = max(time.time_ns(), os.stat(destination).st_mtime_ns + 1_000_000)
+            os.utime(target_lnt, ns=(stamp, stamp))
+            if Path(destination).suffix.lower() in ('.las', '.laz'):
+                from gui.lnt_open import stamp_source_cache
+                stamp_source_cache(destination, target_lnt)
         if same_source and not subset and attributes is None:
             cache['saved_digest'] = digest
             cache['saved_stat'] = os.stat(destination).st_mtime_ns

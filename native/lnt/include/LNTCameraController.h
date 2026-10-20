@@ -9,9 +9,16 @@
 //
 // ORBIT moves the angles; PAN moves target AND eye together along the view's
 // right and up axes (so the orientation and distance are unchanged); ZOOM sets a
-// goal distance, clamped to [0.0001, 10000] at the moment it is requested, and
+// goal distance, clamped to [0.0001, 1e12] at the moment it is requested, and
 // update(dt) approaches that goal exponentially - a smooth glide, with the
 // clamp applied to the goal so the glide can never overshoot the range.
+//
+// THERE IS NO MAXIMUM ZOOM-OUT LIMIT. The upper clamp is a SANITY bound, not a
+// zoom limit: it only keeps the matrices finite. A dataset that spans tens of
+// kilometres, or an attached SNT drawing that is larger than the cloud, must be
+// framable at ANY scale - with the old 10 km ceiling the fit of a large dataset
+// was clamped (the view opened too close) and the user could not zoom out past
+// it, which is why an attached SNT could never be seen in full.
 //
 // SSE TUNING. The screen-space-error threshold is the LOD dial: 0 is full
 // resolution (descend to the leaves), larger is coarser. It is clamped to
@@ -29,7 +36,9 @@ class LntCameraController {
 public:
     // Sub-millimetre plan extents allow individual returns to be isolated.
     static constexpr double kMinDistance = 1e-4;
-    static constexpr double kMaxDistance = 10000.0;
+    // NO MAXIMUM ZOOM-OUT LIMIT. This is a sanity bound only (it keeps the
+    // camera matrices finite), NOT a zoom limit - see the file header.
+    static constexpr double kMaxDistance = 1.0e12;
     static constexpr double kMinSse = 0.0;
     static constexpr double kMaxSse = 50.0;
 

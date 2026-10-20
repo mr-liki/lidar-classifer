@@ -113,11 +113,24 @@ bool LntCameraController::apply_to(LNTCamera& cam, const double origin[3], doubl
     cam.up[1] = view_preset_ == 1 ? 1.0 : 0.0;
     cam.up[2] = view_preset_ == 1 ? 0.0 : 1.0;
     cam.fov_y_deg = fov_;
-    // Perspective close-ups must not clip the target with the overview's
-    // one-metre near plane. Orthographic depth is independent of zoom scale.
-    cam.near_clip = ortho2d_ ? near_ : std::min(near_, std::max(1e-8, dist_ * 0.01));
-    cam.far_clip = far_;
     cam.ortho = ortho2d_;
+    if (ortho2d_) {
+        // Orthographic depth is independent of zoom scale, so the fixed
+        // near/far band around the target stays valid at any zoom.
+        cam.near_clip = near_;
+        cam.far_clip = far_;
+    } else {
+        // Perspective close-ups must not clip the target with the overview's
+        // one-metre near plane. The FAR plane must FOLLOW the zoom: a fixed
+        // far clip is a hard zoom-out limit, because everything beyond it - the
+        // cloud AND the attached SNT linework - is clipped away instead of
+        // simply getting smaller. The near plane grows with the distance so
+        // the far/near ratio, and with it the float32 depth precision, stays
+        // bounded at every zoom scale.
+        const double near_for_dist = std::max(near_, dist_ * 1e-4);
+        cam.near_clip = std::min(near_for_dist, std::max(1e-8, dist_ * 0.01));
+        cam.far_clip = std::max(far_, dist_ * 4.0 + 1.0);
+    }
     if (ortho2d_) {
         // Same visible extent at the target as the perspective camera would show at
         // `dist_`, as a parallel scale (half the visible height). The engine puts the
