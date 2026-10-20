@@ -2953,9 +2953,9 @@ static void section_interactive() {
         c.set_angles(0.0, 0.0);
         double e[3];
         c.eye(e);
-        check("controller: yaw 0 / pitch 0 puts the eye on +Z at the set distance",
-              std::fabs(e[0] - 10.0) < 1e-9 && std::fabs(e[1] - 20.0) < 1e-9 &&
-                  std::fabs(e[2] - 130.0) < 1e-9);
+        check("controller: yaw 0 / pitch 0 puts the eye on +Y at the set distance",
+              std::fabs(e[0] - 10.0) < 1e-9 && std::fabs(e[1] - 120.0) < 1e-9 &&
+                  std::fabs(e[2] - 30.0) < 1e-9);
         c.orbit(1.5707963267948966f, 0.0f);
         c.eye(e);
         const double d = std::sqrt((e[0] - 10) * (e[0] - 10) + (e[1] - 20) * (e[1] - 20) +
@@ -2987,20 +2987,26 @@ static void section_interactive() {
 
         c.set_distance(100.0);
         c.zoom(1e9f);
-        check("controller: zoom clamps its goal to 10000", c.goal_distance() == 10000.0);
+        check("controller: zoom has no maximum zoom-out limit (sanity bound only)",
+              c.goal_distance() > 10000.0 &&
+                  c.goal_distance() <= LntCameraController::kMaxDistance);
+        c.set_distance(100.0);
         c.zoom(-1e9f);
-        check("controller: zoom clamps its goal to 1", c.goal_distance() == 1.0);
+        check("controller: zoom clamps its goal to the minimum distance",
+              c.goal_distance() == LntCameraController::kMinDistance);
         double prev = c.distance();
         bool smooth = true, never_out = true;
         for (int i = 0; i < 600; ++i) {
             c.update(1.0f / 60.0f);
             const double dd = c.distance();
             if (dd > prev + 1e-12) smooth = false;               // monotone glide
-            if (dd < 1.0 || dd > 10000.0) never_out = false;
+            if (dd < LntCameraController::kMinDistance ||
+                dd > LntCameraController::kMaxDistance) never_out = false;
             prev = dd;
         }
         check("controller: the zoom glide is monotone, in range, and settles on the goal",
-              smooth && never_out && c.distance() == 1.0, std::to_string(c.distance()));
+              smooth && never_out && c.distance() == LntCameraController::kMinDistance,
+              std::to_string(c.distance()));
         c.set_sse_threshold(-5.0);
         const bool lo = c.sse_threshold() == 0.0;
         c.set_sse_threshold(500.0);
