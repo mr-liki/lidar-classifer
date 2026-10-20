@@ -10,7 +10,7 @@ from gui.shading_preset_quality import (
 from gui.shortcut_manager import decode_shading_preset, encode_shading_preset
 
 
-def test_named_quality_round_trips_without_legacy_numeric_speed():
+def test_retired_quality_uses_normal_without_legacy_numeric_speed():
     encoded = encode_shading_preset({
         "quality_mode": "fast",
         "classes": {2: {"show": True, "color": (1, 2, 3)}},
@@ -19,16 +19,16 @@ def test_named_quality_round_trips_without_legacy_numeric_speed():
     raw = json.loads(encoded)
     decoded = decode_shading_preset(encoded)
 
-    assert raw["quality_mode"] == "fast"
+    assert raw["quality_mode"] == "normal"
     assert "speed" not in raw
-    assert decoded["quality_mode"] == "fast"
+    assert decoded["quality_mode"] == "normal"
 
 
 @pytest.mark.parametrize(
     ("legacy_speed", "expected"),
-    [(1, "slow"), (2, "normal"), (6, "normal"), (7, "fast"), (10, "fast")],
+    [(1, "normal"), (2, "normal"), (6, "normal"), (7, "normal"), (10, "normal")],
 )
-def test_legacy_numeric_speed_maps_to_named_quality(legacy_speed, expected):
+def test_legacy_numeric_speed_is_ignored(legacy_speed, expected):
     encoded = json.dumps({
         "__type__": "shading_mode_preset",
         "speed": legacy_speed,
@@ -38,10 +38,10 @@ def test_legacy_numeric_speed_maps_to_named_quality(legacy_speed, expected):
     assert decode_shading_preset(encoded)["quality_mode"] == expected
 
 
-def test_quality_labels_match_display_mode_selector():
-    assert shading_quality_label("fast") == "Fast"
+def test_retired_quality_choices_use_normal():
+    assert shading_quality_label("fast") == "Normal"
     assert shading_quality_label("normal") == "Normal"
-    assert shading_quality_label("slow") == "Slow – all points"
+    assert shading_quality_label("slow") == "Normal"
     assert normalize_shading_preset_quality("unexpected") == "normal"
 
 
