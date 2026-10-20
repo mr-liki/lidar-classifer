@@ -224,6 +224,9 @@ struct View {
     }
     // Geometry parameters and colours; a palette/light change recolours, never rebuilds.
     void lod_sync() {
+        // Tiled surfaces use the same crisp shader as cut-based surfaces, but
+        // never set surface_shading_upload. Seed its lighting on entry too.
+        push_crisp_shading_params();
         SurfaceParams p = make_surface_params();
         lod->set_params(p);
         uint8_t lut[768];
@@ -1276,9 +1279,14 @@ __declspec(dllexport) int lnt_view_set_surface_shading(void* h, double azimuth_d
     v->surface_shading.ambient = float(ambient);
     if (light_elevation_deg > 0.0) v->surface_shading.light_elevation_deg = float(light_elevation_deg);
     v->has_surface_shading = true;
+    v->frame_sig_valid = false;
+    if (v->lod_mode_last) {
+        // The tiled arena is already resident: update shader push constants,
+        // not the cut-builder's CPU colours or its geometry generation.
+        return v->push_crisp_shading_params() ? 1 : 0;
+    }
     if (v->surface_shading_upload) {          // engine-lit mesh: relight in place
-        v->push_crisp_shading_params();
-        return 1;
+        return v->push_crisp_shading_params() ? 1 : 0;
     }
     // Legacy CPU-baked path: the shade is baked into the vertex colours, so re-light by
     // rebuilding. Same TIN, so the node source cache is still valid.

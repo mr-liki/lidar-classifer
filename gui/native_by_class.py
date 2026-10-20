@@ -96,8 +96,7 @@ def visible_class_mask(app, cls):
     if isinstance(palette, dict) and palette:
         visible = [int(c) for c, info in palette.items()
                    if isinstance(info, dict) and info.get("show", True)]
-        if visible:
-            return np.isin(cls, np.asarray(visible))
+        return np.isin(cls, np.asarray(visible))
     return np.ones(len(cls), dtype=bool)
 
 
@@ -390,11 +389,15 @@ def run_tiled(app, view, name, halo, op, scope=None, parent=None):
         node = np.concatenate(undo_node)
         local = np.concatenate(undo_local)
         app.undo_stack.append({
-            "node": node,
-            "local": local,
+            "lnt_path": view.lnt_path,
+            "lnt_node": node, "lnt_local": local,
+            # Preserve the old aliases for any Stage 6 diagnostics/readers.
+            "node": node, "local": local,
             "old_classes": np.concatenate(undo_old),
             "new_classes": np.concatenate(undo_new),
         })
+        from gui.native_history_routing import record_native_action
+        record_native_action(app, 'classification')
         for stack_name in ("redo_stack", "redostack"):
             stack = getattr(app, stack_name, None)
             if isinstance(stack, list):

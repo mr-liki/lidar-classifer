@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_lighting.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
@@ -207,6 +207,7 @@ class NativeView:
         Main and section views share the engine's Vulkan device; each HWND
         has its own renderer handle."""
         err = create_string_buffer(512)
+        self.class_writes = 0            # class records written into the document
         self.h = lib().lnt_view_open_on_window(c_void_p(int(hwnd)), int(width), int(height),
                                                os.fsencode(lnt_path), os.fsencode(VULKAN_DLL),
                                                int(budget_mb), float(sse), err, 512)
@@ -462,6 +463,11 @@ class NativeView:
                                    len(node), err, 256)
         if not ok:
             self.last_error = err.value.decode("utf-8", "replace") or "write failed"
+        else:
+            # How many class records this session wrote into the document. The
+            # backup uses it to tell "there is work to save" from "nothing was
+            # classified", so a close never writes a pointless full copy.
+            self.class_writes = int(getattr(self, "class_writes", 0) or 0) + len(node)
         if counts is not None:
             counts.after_write(token, bool(ok))
         return bool(ok)

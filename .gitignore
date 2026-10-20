@@ -46,6 +46,7 @@ native/lnt/main
 native/lnt/*.exe
 native/lnt/*.dll
 !native/lnt/main_display_modes_zoom.dll
+!native/lnt/main_display_modes_lighting.dll
 native/lnt/*.lnt*
 native/lnt/*.o
 native/lnt/*.obj
@@ -102,3 +103,26 @@ vulkan_*_output/
 *.lnt.class-semantics
 *.lntset
 naksha_native_batches/
+
+# ============================================================
+# Vulkan build output
+# Ignore everything except runtime artifacts required by Naksha
+# ============================================================
+
+native/naksha_vulkan/build_msvc/*
+
+# Keep runtime DLL and build stamp
+!native/naksha_vulkan/build_msvc/naksha_vulkan.dll
+!native/naksha_vulkan/build_msvc/native_build_stamp.json
+
+# Keep root compiled point shaders
+!native/naksha_vulkan/build_msvc/*.spv
+!native/naksha_vulkan/build_msvc/point.vert.spv
+!native/naksha_vulkan/build_msvc/point.frag.spv
+
+# Allow shaders directory so selected SPV files can be tracked
+!native/naksha_vulkan/build_msvc/shaders/
+native/naksha_vulkan/build_msvc/shaders/*
+
+# Keep compiled shaders only
+!native/naksha_vulkan/build_msvc/shaders/*.spv
