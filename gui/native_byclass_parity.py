@@ -424,6 +424,8 @@ def _with_progress(dialog, name, operation, preview=False):
             step = dict(lnt_path=view.lnt_path, lnt_node=nodes,
                         lnt_local=locals_, old_classes=old, new_classes=new)
             app.undo_stack.append(step)
+            from gui.native_history_routing import record_native_action
+            record_native_action(app, 'classification')
             for stack in (getattr(app, 'redo_stack', None),
                           getattr(app, 'redostack', None)):
                 if isinstance(stack, list):
@@ -510,6 +512,20 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
             # implement VTK's fence_mask contract.
             updated[~eligible] = before[~eligible]
         count = _with_progress(dialog, name, calculate)
+        # Only a successful nonempty exact native point write makes a fence
+        # "used for classification". Preview/selection/cancellation do not.
+        # Saved macros store their step fence coordinates without Python refs;
+        # the marker helper checks unambiguous live drawings, including compact
+        # native rectangles/circles expanded into world-coordinate polygons.
+        if count > 0:
+            used_fences = list(fences or ())
+            if name == 'By Class Macro':
+                for step in kwargs.get('steps', ()):
+                    if step.get('operation') in ('Fence', 'Close', 'Height'):
+                        used_fences.extend(step.get('lines', ()) or ())
+            if used_fences:
+                from gui.draw_clear_selection import mark_used_classification_fences
+                mark_used_classification_fences(dialog.app, used_fences, operation=name)
         _report(dialog, f'{name}: {count:,} exact native records reclassified.')
     except NativeByClassCancelled:
         pass
@@ -618,6 +634,14 @@ def route_convert_dialog(dialog, mode, preview=False):
             if cancelled():
                 raise NativeByClassCancelled('Cancelled; nothing written.')
         count = _with_progress(dialog, mode.title(), calculate, preview=preview)
+        if not preview and count > 0 and mode != 'convert' and polygons:
+            fences_used = getattr(dialog, 'selected_fences', None)
+            if not fences_used:
+                selector = getattr(dialog, '_fence_sel', None)
+                fences_used = getattr(selector, 'selected_fences', None)
+            if fences_used:
+                from gui.draw_clear_selection import mark_used_classification_fences
+                mark_used_classification_fences(dialog.app, fences_used, operation=mode)
         label = getattr(dialog, 'preview_label', None) or getattr(dialog, 'info_label', None)
         if label is not None:
             label.setText(f'{"Preview" if preview else "Converted"}: {count:,} points')

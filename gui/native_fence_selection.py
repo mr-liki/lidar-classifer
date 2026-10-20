@@ -98,3 +98,127 @@ def clear_native_fence_highlights(owner):
         return False
     draw.set_classification_fence_highlights(owner, ())
     return True
+
+
+def collect_fence_candidates(app, allowed_types=None, *, include_curves=True, native_records=None):
+    """Enumerate each *valid completed* fence once across VTK, native Draw and Curve.
+
+    Never use the point-cloud storage/backend to decide where drawings live.
+    Source references give the pickers stable IDs across refreshes. We only
+    duplicate geometry, never mutate the actual editable drawing or SNT data.
+    ``native_records`` can be supplied by headless tests without loading Qt.
+    """
+    from gui.native_byclass_fences import (NATIVE_FENCE_TYPES, _valid_ring,
+                                           fence_identity)
+
+    allowed = (set(NATIVE_FENCE_TYPES) if allowed_types is None else
+               set(str(t).strip().lower() for t in allowed_types) &
+               set(NATIVE_FENCE_TYPES))
+    if native_records is None:
+        from gui.native_byclass_fences import native_fence_records
+        native_records = native_fence_records(app, allowed)
+    native_records = list(native_records)
+    result, seen = [], set()
+    # A native original also appearing in the legacy digitizer is one drawing,
+    # not two separate fences in the list.
+    native_original_ids = {id(f.get('native_ref')) for f in native_records
+                           if isinstance(f, dict) and f.get('native_ref') is not None}
+
+    def append_if_valid(shape):
+        if not isinstance(shape, dict):
+            return
+        kind = str(shape.get('type', '')).strip().lower()
+        if kind not in allowed or shape.get('imported') or shape.get('source') in (
+                'snt_readonly', 'block_creation', 'cell_creation',
+                'measure_selection'):
+            return
+        coords = shape.get('coords')
+        ring = _valid_ring(coords) if coords is not None else None
+        if ring is None:
+            return
+        identity = fence_identity(shape)
+        if identity in seen:
+            return
+        seen.add(identity)
+        result.append(shape)
+
+    curve_tool = getattr(app, 'curve_tool', None)
+    digitizer = getattr(app, 'digitizer', None)
+    if digitizer is not None:
+        getter = getattr(digitizer, '_get_drawing_coords', None)
+        for drawing in getattr(digitizer, 'drawings', ()) or ():
+            if not isinstance(drawing, dict) or id(drawing) in native_original_ids:
+                continue
+            if (drawing.get('source') == 'curve_tool' and curve_tool is not None
+                    and any(drawing is item for item in
+                            (getattr(curve_tool, 'finalized_actors', ()) or ()))):
+                continue  # Curve owner supplies the authoritative interpolated geometry.
+            kind = str(drawing.get('type', '')).strip().lower()
+            if kind not in allowed or drawing.get('imported') or drawing.get('source') in (
+                    'snt_readonly', 'block_creation', 'cell_creation', 'measure_selection'):
+                continue
+            is_cell = getattr(digitizer, 'is_cell_creation_drawing', None)
+            if callable(is_cell) and is_cell(drawing):
+                continue
+            coords = None
+            if callable(getter):
+                try:
+                    coords = getter(drawing)
+                except (ValueError, TypeError, IndexError):
+                    pass
+            if coords is None:
+                coords = drawing.get('coords')
+            ring = _valid_ring(coords) if coords is not None else None
+            if ring is None:
+                continue
+            # Keep VTK's original XYZ vertices, including Z, for its actors;
+            # the Polygon mask will project to XY only when needed.
+            vertices = list(coords)
+            if tuple(vertices[0][:2]) != tuple(vertices[-1][:2]):
+                vertices.append(vertices[0])
+            wrapped = dict(drawing, type=kind, coords=vertices,
+                           source_ref=drawing, _fence_normalized=True)
+            append_if_valid(wrapped)
+
+    for fence in native_records:
+        append_if_valid(fence)
+
+    if include_curves and curve_tool is not None:
+        # The legacy get_curves_as_fences() mutates curve_data on read. Build
+        # compatible descriptors from the authoritative finished strokes instead.
+        # Preserve the original object for stable picker identities and deletion.
+        for idx, original in enumerate(getattr(curve_tool, 'finalized_actors', ()) or ()):
+            if not isinstance(original, dict):
+                continue
+            coords = original.get('interpolated')
+            if coords is None:
+                coords = original.get('coords')
+            ring = _valid_ring(coords) if coords is not None else None
+            if ring is None:
+                continue
+            vertices = list(coords)
+            if tuple(vertices[0][:2]) != tuple(vertices[-1][:2]):
+                vertices.append(vertices[0])
+            append_if_valid(dict(original, type='curve', source='curve_tool',
+                                 curve_data=original, curve_index=idx,
+                                 coords=vertices, _fence_normalized=True))
+    return result
+
+
+def offer_fence_picker(dialog, app, *, only_if_candidates=False):
+    """Open an existing tool's fence picker when Element Selection is empty.
+
+    A zero Element Selection counter means *no preselection*, not *no drawings*.
+    Keep the tool's normal picker, which can select one or many mixed fences.
+    Returns False when no picker exists or optional tools have no candidates.
+    """
+    if only_if_candidates and not collect_fence_candidates(app):
+        return False
+    opener = getattr(dialog, 'select_fence', None)
+    if not callable(opener):
+        selector = getattr(dialog, '_fence_sel', None)
+        opener = getattr(selector, 'open_fence_picker', None)
+    if callable(opener):
+        opener()
+        return True
+    return False

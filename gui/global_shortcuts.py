@@ -859,7 +859,8 @@ class GlobalShortcutFilter(QObject):
                     if _native_plan_escape:
                         _native_plan_draw.cancel()
                     elif not event.isAutoRepeat():
-                        _native_plan_draw.history(
+                        from gui.native_history_routing import route_native_history
+                        route_native_history(self.app_window, _native_plan_draw,
                             redo=event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift')
                     event.accept()
                     return True
@@ -872,6 +873,15 @@ class GlobalShortcutFilter(QObject):
                 native_canvas = focused_canvas(self.app_window)
                 measurement = getattr(native_canvas if native_canvas is not None else native_view, 'measurement', None)
                 drawing = getattr(native_view, 'drawing', None)
+                if drawing is None and (
+                    getattr(native_view, '_draw_saved_history', None) or
+                    getattr(native_view, '_draw_saved_shapes', None)
+                ):
+                    # A viewport replacement retains Draw objects/history,
+                    # but no longer has a live controller. Restore it so
+                    # Ctrl+Z/Y continues to reverse the actual last action.
+                    from gui.native_draw import get_native_draw
+                    drawing = get_native_draw(self.app_window, create=True)
                 # Shift+P is a preserved application shortcut. It must win over
                 # stale/imported user mappings and always put the native main
                 # viewport into 3D perspective/orbit mode.
@@ -883,6 +893,23 @@ class GlobalShortcutFilter(QObject):
                     if hasattr(self.app_window, 'statusBar'):
                         self.app_window.statusBar().showMessage(
                             '3D View (Shift+P)', 3000)
+                    return True
+                # Ctrl+Z/Y in a native point-cloud session always goes through
+                # the chronological Draw/classification history coordinator.
+                # Otherwise an armed Draw tool shadows the most recent By Class
+                # write, and Redo can be routed to a different history stack.
+                if combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
+                    if not event.isAutoRepeat():
+                        from gui.native_history_routing import route_native_history
+                        done = route_native_history(
+                            self.app_window, drawing,
+                            redo=event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift',
+                        )
+                        if not done:
+                            self.app_window.statusBar().showMessage(
+                                'Nothing to redo' if (event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift')
+                                else 'Nothing to undo', 2500)
+                    event.accept()
                     return True
                 if configured_shortcut:
                     if event.isAutoRepeat():

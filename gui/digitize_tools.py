@@ -12061,6 +12061,33 @@ class DigitizeManager:
     # ==================================================================
     # MicroStation-style delete operations (Phase 3)
     # ==================================================================
+    def delete_drawings_by_identity(self, selected_ids):
+        """Draw > Clear: delete only checked editable drawings in one Undo step.
+
+        VTK actors, fence dialogs, curve references and selections are cleaned
+        through the existing _remove_drawing() lifecycle. No point-class edits.
+        """
+        from gui.draw_clear_selection import select_drawings_by_identity
+        scope = getattr(self, 'drawing_in_edit_scope', None)
+        selected = select_drawings_by_identity(
+            self.drawings, selected_ids, vtk=True,
+            in_scope=scope if callable(scope) else None,
+        )
+        if not selected:
+            return 0
+        # A failed snapshot must not result in an irreversible deletion.
+        self._save_state()
+        for drawing in selected:
+            self._remove_drawing(drawing)
+        try:
+            self.renderer.Modified()
+            if getattr(self, 'overlay_renderer', None) is not None:
+                self.overlay_renderer.Modified()
+            self.app.vtk_widget.render()
+        except (AttributeError, RuntimeError):
+            pass
+        return len(selected)
+
     def delete_selection(self, include_classified=False):
         """Delete every drawing currently in the SelectionManager.
 

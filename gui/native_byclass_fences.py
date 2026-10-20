@@ -53,18 +53,27 @@ def native_drawings(app):
     # classification arrays live. Surface Vulkan keeps app.data populated and
     # has no _lnt_main_view, so want_native() is deliberately NOT a Draw gate.
     draw = get_native_draw(app, create=False)
-    if draw is not None:
-        return list(getattr(draw, 'drawings', ()) or ())
-    view = getattr(app, '_lnt_main_view', None)
+    view = getattr(draw, 'view', None)
+    if view is None:
+        view = getattr(app, '_lnt_main_view', None)
     if view is None:
         backend = getattr(app, 'render_backend', None)
         if (backend is not None and getattr(backend, 'active', False)
                 and backend.vulkan_viewport_is_visible()
                 and backend.owns_main_camera()):
             view = getattr(backend, '_plan_draw_view', None)
-    draw = getattr(view, 'drawing', None)
-    return list(getattr(draw, 'drawings', ()) or
-                getattr(view, '_draw_saved_shapes', ()) or ())
+    if draw is None:
+        draw = getattr(view, 'drawing', None)
+    # A replacement Vulkan QWidget can leave completed shapes staged on its
+    # view. Do not discard them just because an empty new Draw overlay exists.
+    result, seen = [], set()
+    for group in (getattr(draw, 'drawings', ()) or (),
+                  getattr(view, '_draw_saved_shapes', ()) or ()):
+        for drawing in group:
+            if id(drawing) not in seen:
+                result.append(drawing)
+                seen.add(id(drawing))
+    return result
 
 
 def native_fence_records(app, allowed_types=None):
@@ -82,7 +91,9 @@ def native_fence_records(app, allowed_types=None):
         if not isinstance(drawing, dict):
             continue
         shape_type = str(drawing.get('type', '')).strip().lower()
-        if shape_type not in allowed or drawing.get('source') in ('block_creation', 'cell_creation'):
+        if (shape_type not in allowed or drawing.get('imported')
+                or drawing.get('source') in ('block_creation', 'cell_creation',
+                                           'snt_readonly', 'measure_selection')):
             continue
         # The Draw renderer expands rectangle (2 corners), circle (2 points)
         # and interpolated curve; raw ``drawing['coords']`` is NOT a fence.

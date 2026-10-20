@@ -1303,11 +1303,15 @@ class FenceSelectorWidget(QWidget):
                 is_valid = native_ref is not None and id(native_ref) in drawing_ids
                 if not is_valid:
                     removed_actor_ids.add(id(fence))
+            elif fence.get('source_ref') is not None:
+                # Normalized VTK polygon is a coordinate copy with a stable
+                # original reference. Removing that original invalidates it.
+                is_valid = id(fence['source_ref']) in drawing_ids
+                if not is_valid:
+                    removed_actor_ids.add(id(fence))
             elif fence.get('_selection_panel_fence'):
-                # Fence was injected via the Element Selection panel — it is a
-                # coordinate copy, not a live digitizer object, so skip id-based
-                # validation.  restore_fence_mode() clears these when the dialog
-                # is reopened from the toolbar.
+                # Detached snapshot from the legacy selection panel; preserve
+                # until explicitly cleared if no live source reference exists.
                 is_valid = True
             elif fence.get('_temp_fence'):
                 # ✅ Temp Fence tool fence — a coordinate copy, not a live
@@ -1368,7 +1372,7 @@ class FenceSelectorWidget(QWidget):
         """Read fence vertices from live and restored drawing formats."""
         if not isinstance(shape, dict):
             return []
-        if shape.get('source') == 'native_draw':
+        if shape.get('source') == 'native_draw' or shape.get('_fence_normalized'):
             return shape.get('coords', [])
         digitizer = getattr(self.app, "digitizer", None)
         getter = getattr(digitizer, "_get_drawing_coords", None)
@@ -1529,33 +1533,15 @@ class FenceSelectorWidget(QWidget):
         digitize = getattr(self.app, 'digitizer', None)
         curve_tool = getattr(self.app, 'curve_tool', None)
         
-        # ── Collect digitizer drawings ────────────────────────────
-        valid = []
-        if digitize:
-            drawings = getattr(digitize, 'drawings', [])
-            for drawing in drawings:
-                stype = str(drawing.get('type', '')).strip().lower()
-                if self.allowed_shape_types and stype not in self.allowed_shape_types:
-                    continue
-                if drawing.get('source') in ('cell_creation', 'block_creation'):
-                    # Cell circles belong to Create > Cell — never fences.
-                    continue
-                if len(self._shape_coords(drawing)) < 3:
-                    continue
-                valid.append(drawing)
-
-        # ── Collect native Vulkan drawings ─────────────────────
-        try:
-            from gui.native_byclass_fences import native_fence_records
-            valid.extend(native_fence_records(self.app, self.allowed_shape_types))
-        except Exception as exc:
-            print(f'[Native By Class] cannot collect Draw fences: {exc}')
-
-        # ── Collect curve tool curves ✅ NEW ─────────────────────
-        curve_fences = []
-        if self.include_curve_fences and curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
-            curve_fences = curve_tool.get_curves_as_fences()
-            valid.extend(curve_fences)
+        # VTK / native Draw / Curve share one validated fence list. In
+        # particular, compact rectangles and circles become real polygons,
+        # and invalid drafts, read-only SNT and duplicate IDs are excluded.
+        from gui.native_fence_selection import collect_fence_candidates
+        valid = collect_fence_candidates(
+            self.app, self.allowed_shape_types,
+            include_curves=self.include_curve_fences,
+        )
+        curve_fences = [f for f in valid if f.get('source') == 'curve_tool']
 
         if not valid:
             QMessageBox.warning(self.window(), "No Shapes Found",
@@ -1760,24 +1746,11 @@ class FenceSelectorWidget(QWidget):
 
         from gui.native_byclass_fences import fence_identity
         def _current_valid_fences():
-            live_valid = []
-            if digitize:
-                drawings = getattr(digitize, 'drawings', [])
-                for drawing in drawings:
-                    stype = str(drawing.get('type', '')).strip().lower()
-                    if self.allowed_shape_types and stype not in self.allowed_shape_types:
-                        continue
-                    if drawing.get('source') in ('cell_creation', 'block_creation'):
-                        continue
-                    live_valid.append(drawing)
-            try:
-                from gui.native_byclass_fences import native_fence_records
-                live_valid.extend(native_fence_records(self.app, self.allowed_shape_types))
-            except Exception as exc:
-                print(f'[Native By Class] fence refresh failed: {exc}')
-            if self.include_curve_fences and curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
-                live_valid.extend(curve_tool.get_curves_as_fences())
-            return live_valid
+            from gui.native_fence_selection import collect_fence_candidates
+            return collect_fence_candidates(
+                self.app, self.allowed_shape_types,
+                include_curves=self.include_curve_fences,
+            )
 
         def _refresh_if_needed():
             if not dlg.isVisible():

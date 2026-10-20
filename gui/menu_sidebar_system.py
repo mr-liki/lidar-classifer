@@ -607,8 +607,8 @@ RIBBON_TOOLTIP_META = {
         "description": "Customise measurement line colour, width, and label font size.",
     },
     ("DrawRibbon", "Utilities", "Clear"): {
-        "title": "Clear Drawings",
-        "description": "Remove all drawings from the scene.",
+        "title": "Clear Selected Drawings",
+        "description": "Choose specific user-drawn shapes to delete; Undo restores them.",
     },
     ("DrawRibbon", "Utilities", "Settings"): {
         "title": "Draw Tool Settings",
@@ -2989,85 +2989,9 @@ class DrawRibbon(QWidget):
         dialog.hide()
 
     def _handle_clear_click(self):
-        main_window = self.window()
-        # An open LNT view owns its Draw figures in the native drawing layer.
-        # Clear that layer directly and stop here: the legacy path below also
-        # knows about classified fences, VTK curves and text actors, none of
-        # which belong to the Draw-tab Clear operation in the native viewport.
-        from gui.native_draw import get_native_draw
-        native_draw = get_native_draw(main_window)
-        if native_draw is not None:
-            native_draw.clear()
-            try:
-                main_window.statusBar().showMessage('Draw figures cleared', 2500)
-            except Exception:
-                pass
-            return
-        if not hasattr(main_window, "digitizer") or not main_window.digitizer:
-            return
-
-        digitizer = main_window.digitizer
-
-        try:
-            accudraw_tool = getattr(digitizer, "accudraw_tool", None)
-            if accudraw_tool is not None:
-                if getattr(accudraw_tool, "active", False):
-                    accudraw_tool.deactivate(cancel=True)
-                if hasattr(accudraw_tool, "reset_after_external_clear"):
-                    accudraw_tool.reset_after_external_clear()
-        except Exception as e:
-            print(f"⚠️ AccuDraw clear cleanup failed: {e}")
-
-        curve_tool = getattr(main_window, "curve_tool", None)
-        classified_fences = [d for d in digitizer.drawings if d.get("classified_fence", False)]
-        has_curves = bool(curve_tool and getattr(curve_tool, "finalized_actors", None))
-        has_non_classified_drawings = any(
-            not drawing.get("classified_fence", False) for drawing in digitizer.drawings
-        )
-
-        dialog = self._get_clear_fence_dialog()
-        if (
-            classified_fences
-            and dialog is not None
-            and (dialog.isVisible() or dialog.windowState() & Qt.WindowMinimized)
-            and not has_curves
-            and not has_non_classified_drawings
-        ):
-            print("🗂️ Clear: reusing existing classified fence picker...")
-            self._show_clear_fence_dialog(digitizer, classified_fences)
-            return
-
-        if has_curves or digitizer.drawings:
-            digitizer._save_state()
-
-        clear_text = True
-        if digitizer._has_hidden_texts():
-            from PySide6.QtWidgets import QMessageBox
-            reply = QMessageBox.question(
-                self,
-                "Hidden Texts Warning",
-                "Hidden texts are getting cleared.\nDO YOU WANT TO CONTINUE?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                clear_text = False
-                print("🗑️ Clear: user chose to preserve hidden texts")
-
-        if not classified_fences:
-            if curve_tool:
-                curve_tool.clear_all_curves()
-            digitizer.clear_drawings(clear_classified=True, record_undo=False, preserve_committed=True, clear_text=clear_text)
-            print("🗑️ Clear: all drawings cleared (no classified fences)")
-        else:
-            # Has classified fences — clear non-classified drawings and curves only,
-            # then show the dialog. curve_tool.clear_all_curves() skips classified
-            # fence curves so they remain visible for the picker.
-            if curve_tool:
-                curve_tool.clear_all_curves()
-            digitizer.clear_drawings(clear_classified=False, record_undo=False, preserve_committed=True, clear_text=clear_text)
-            print("🗑️ Clear: non-classified drawings cleared, showing fence picker...")
-            self._show_clear_fence_dialog(digitizer, classified_fences)
+        """Draw > Clear: choose user drawings, never clear classifications."""
+        from gui.draw_clear_dialog import show_draw_clear_dialog
+        return show_draw_clear_dialog(self.window())
 
     def _show_clear_fence_dialog(self, digitizer, classified_fences):
         """Show a popup letting user choose which classified fences to keep or delete."""
@@ -5095,40 +5019,12 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     digitize = getattr(owner.app, "digitizer", None)
     curve_tool = getattr(owner.app, "curve_tool", None)
 
-    valid_shapes = []
-    if digitize:
-        drawings = getattr(digitize, "drawings", [])
-        if drawings:
-            valid_shapes = [
-                drawing
-                for drawing in drawings
-                if drawing.get("type") in [
-                    "rectangle",
-                    "circle",
-                    "polygon",
-                    "freehand",
-                    "line",
-                    "smart_line",
-                    "polyline",
-                    "smartline",
-                ]
-                # Cell circles belong to Create > Cell — never fences.
-                and not digitize.is_cell_creation_drawing(drawing)
-            ]
-
-    # Expand compact Vulkan Draw objects into the exact world-XY polygons
-    # used by the native overlay (two-corner rectangles and circles included).
-    try:
-        from gui.native_byclass_fences import native_fence_records
-        valid_shapes.extend(native_fence_records(owner.app))
-    except Exception as exc:
-        print(f'[Native By Class] fence enumeration failed: {exc}')
-
-    curve_fences = []
-    if curve_tool and hasattr(curve_tool, "get_curves_as_fences"):
-        curve_fences = curve_tool.get_curves_as_fences()
-
-    all_fences = valid_shapes + curve_fences
+    # Both the main By Class ribbon and embedded LiDAR menus must enumerate
+    # the SAME validated original drawings, with stable IDs on refresh.
+    from gui.native_fence_selection import collect_fence_candidates
+    all_fences = collect_fence_candidates(owner.app)
+    curve_fences = [f for f in all_fences if f.get('source') == 'curve_tool']
+    valid_shapes = [f for f in all_fences if f.get('source') != 'curve_tool']
     if not all_fences:
         QMessageBox.warning(
             owner,
@@ -5503,37 +5399,9 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         dialog = getattr(owner, "_fence_selection_dialog", None)
         if dialog is None or not dialog.isVisible():
             return
-        digitize_live = getattr(owner.app, "digitizer", None)
-        curve_tool_live = getattr(owner.app, "curve_tool", None)
-        live_valid = []
-        if digitize_live:
-            drawings = getattr(digitize_live, "drawings", []) or []
-            if drawings:
-                live_valid = [
-                    drawing
-                    for drawing in drawings
-                    if drawing.get("type") in [
-                        "rectangle",
-                        "circle",
-                        "polygon",
-                        "freehand",
-                        "line",
-                        "smart_line",
-                        "polyline",
-                        "smartline",
-                    ]
-                    # Cell circles belong to Create > Cell — never fences.
-                    and not digitize_live.is_cell_creation_drawing(drawing)
-                ]
-        try:
-            from gui.native_byclass_fences import native_fence_records
-            live_valid.extend(native_fence_records(owner.app))
-        except Exception as exc:
-            print(f'[Native By Class] fence refresh failed: {exc}')
-        live_curve_fences = []
-        if curve_tool_live and hasattr(curve_tool_live, "get_curves_as_fences"):
-            live_curve_fences = curve_tool_live.get_curves_as_fences()
-        live_ids = {_get_fence_identity(fence) for fence in (live_valid + live_curve_fences)}
+        from gui.native_fence_selection import collect_fence_candidates
+        live_valid = collect_fence_candidates(owner.app)
+        live_ids = {_get_fence_identity(fence) for fence in live_valid}
         if live_ids == live_source_ids:
             return
         try:
@@ -5939,6 +5807,12 @@ class ByClassRibbon(QWidget):
         
         
     def perform_classification_undo(self):
+        from gui.native_draw import get_native_draw
+        drawing = get_native_draw(self.app, create=False)
+        if drawing is not None:
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, drawing, redo=False)
+            return
         # ✅ Temp Fence drawing: Ctrl+Z removes the last fence vertex
         try:
             _tft = getattr(self.app, "temp_fence_tool", None)
@@ -5991,6 +5865,12 @@ class ByClassRibbon(QWidget):
             self.update_status("❌ Undo failed", "error")
             
     def perform_classification_redo(self):
+        from gui.native_draw import get_native_draw
+        drawing = get_native_draw(self.app, create=False)
+        if drawing is not None:
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, drawing, redo=True)
+            return
         """
         ✅ Application-level CLASSIFICATION redo
         Works even when dialogs are closed

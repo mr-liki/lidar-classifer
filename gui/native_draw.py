@@ -151,6 +151,7 @@ class NativeDraw:
         # Dialog-owned selected fence outlines, independent of the VTK actors.
         # Geometry is world XY; class colors and native point buffers are untouched.
         self._classification_fence_highlights = {}
+        self._classification_fence_highlight_refs = {}
         self._object_actions = []
         self._object_redo = []
         self._shutting_down = False
@@ -315,6 +316,9 @@ class NativeDraw:
         """
         from gui.native_byclass_fences import _valid_ring
         rings = []
+        refs = []
+        if not hasattr(self, '_classification_fence_highlight_refs'):
+            self._classification_fence_highlight_refs = {}
         for shape in fences:
             if not isinstance(shape, dict):
                 continue
@@ -322,11 +326,17 @@ class NativeDraw:
             ring = _valid_ring(coords) if coords is not None else None
             if ring is not None:
                 rings.append(ring)
+                ref = shape.get('native_ref')
+                if ref is None and any(shape is obj for obj in getattr(self, 'drawings', ())):
+                    ref = shape
+                refs.append(id(ref) if ref is not None else None)
         key = id(owner)
         if rings:
             self._classification_fence_highlights[key] = rings
+            self._classification_fence_highlight_refs[key] = refs
         else:
             self._classification_fence_highlights.pop(key, None)
+            self._classification_fence_highlight_refs.pop(key, None)
         self._paint()
 
     def _scene_token(self):
@@ -836,6 +846,8 @@ class NativeDraw:
             del self._object_actions[:-100]
         self._object_redo.clear()
         self.redo.clear()
+        from gui.native_history_routing import record_native_action
+        record_native_action(self.app, 'draw')
         self._paint()
 
     def _finish_line(self):
@@ -1609,9 +1621,14 @@ class NativeDraw:
         target_actions = self._object_actions if redo else self._object_redo
         if changes:
             before, after = changes.pop()
+            prior = {id(item) for item in self.drawings}
             self.drawings[:] = after if redo else before
             target_actions.append((before,after))
-            if self._selection_bridge is not None:
+            live = {id(item) for item in self.drawings}
+            removed_ids = prior - live
+            if removed_ids:
+                self._prune_deleted_native_refs(removed_ids)
+            elif self._selection_bridge is not None:
                 self._selection_bridge.selection_manager._prune()
             self._paint()
             return True
@@ -1623,6 +1640,63 @@ class NativeDraw:
             target.append(source.pop())
             self._paint()
         return True
+
+    def _prune_deleted_native_refs(self, removed_ids):
+        """Sync live Draw selection/fence dialogs after shape removal."""
+        selected_ref = getattr(self, '_selected_native_ref', None)
+        if selected_ref is not None and id(selected_ref) in removed_ids:
+            self._store_selection(None)
+        elif selected_ref is not None:
+            self.selected = next((i for i, obj in enumerate(self.drawings)
+                                  if obj is selected_ref), None)
+        hover_ref = getattr(self, '_hover_selected_native_ref', None)
+        if hover_ref is not None and id(hover_ref) in removed_ids:
+            self._hover_selected_native_ref = None
+        all_highlights = getattr(self, '_classification_fence_highlights', {})
+        highlight_refs = getattr(self, '_classification_fence_highlight_refs', {})
+        for key, rings in list(all_highlights.items()):
+            refs = highlight_refs.get(key, [])
+            surviving = [(ring, refs[i] if i < len(refs) else None)
+                         for i, ring in enumerate(rings)
+                         if i >= len(refs) or refs[i] not in removed_ids]
+            if surviving:
+                self._classification_fence_highlights[key] = [item[0] for item in surviving]
+                highlight_refs[key] = [item[1] for item in surviving]
+            else:
+                self._classification_fence_highlights.pop(key, None)
+                highlight_refs.pop(key, None)
+        bridge = getattr(self, '_selection_bridge', None)
+        if bridge is not None:
+            bridge.selection_manager._prune()
+        from gui.draw_clear_selection import prune_removed_native_fences
+        prune_removed_native_fences(self.app, self, removed_ids)
+        self._paint()
+
+    def delete_drawings(self, selected_ids):
+        """Delete exactly chosen editable Draw objects; one atomic Undo step.
+
+        Imported SNT, saved/committed objects, point classes, and all unchosen
+        drawings remain untouched. Never compare NumPy-bearing dicts by value.
+        """
+        from gui.draw_clear_selection import select_drawings_by_identity
+        removed = select_drawings_by_identity(self.drawings, selected_ids)
+        if not removed:
+            return 0
+        removed_ids = {id(item) for item in removed}
+        before = list(self.drawings)
+        self.drawings[:] = [item for item in self.drawings if id(item) not in removed_ids]
+        self._line_session_refs[:] = [item for item in self._line_session_refs
+                                      if id(item) not in removed_ids]
+        self._line_session_undone[:] = [item for item in self._line_session_undone
+                                        if id(item) not in removed_ids]
+        # Commit the Undo snapshot before potentially invalid Qt dialogs are
+        # inspected; a stale popup must not make the deletion irreversible.
+        self.record_object_change(before)
+        try:
+            self._prune_deleted_native_refs(removed_ids)
+        except (AttributeError, RuntimeError) as exc:
+            print(f'[Draw Clear] stale selection cleanup warning: {exc}')
+        return len(removed)
 
     def clear(self):
         self._line_session_refs.clear()
@@ -1843,6 +1917,7 @@ class NativeDraw:
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
         self._classification_fence_highlights.clear()
+        self._classification_fence_highlight_refs.clear()
         if dialog is not None:
             try:
                 dialog.close()
@@ -1917,6 +1992,8 @@ def get_native_draw(app, create=False, allow_snt=False):
         # LNT can replace the app's Vulkan QWidget while open. Retire a
         # stale overlay before drawing in the replacement viewport.
         view._draw_saved_shapes = list(draw.drawings)
+        view._draw_saved_history = (list(getattr(draw, '_object_actions', ())),
+                                    list(getattr(draw, '_object_redo', ())))
         draw.shutdown()
         view.drawing = draw = None
     if draw is None and create:
@@ -1924,6 +2001,11 @@ def get_native_draw(app, create=False, allow_snt=False):
         if getattr(view, '_surface_draw', False):
             draw.drawings.extend(getattr(view, '_draw_saved_shapes', ()))
             view._draw_saved_shapes = []
+            saved_history = getattr(view, '_draw_saved_history', None)
+            if saved_history is not None:
+                draw._object_actions[:] = saved_history[0]
+                draw._object_redo[:] = saved_history[1]
+                view._draw_saved_history = None
             draw._paint()
     return draw
 

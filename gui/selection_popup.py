@@ -627,7 +627,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         if self._shortcut_should_skip_text_edit():
             return
         if self._native_selection is not None:
-            self._native_selection.draw.history(redo=False)
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, self._native_selection.draw, redo=False)
             return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
@@ -643,7 +644,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         if self._shortcut_should_skip_text_edit():
             return
         if self._native_selection is not None:
-            self._native_selection.draw.history(redo=True)
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, self._native_selection.draw, redo=True)
             return
         tool = self._get_tool()
         digitizer = getattr(self.app, "digitizer", None)
@@ -1384,14 +1386,6 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         dialog, and pre-loads the fences.
         """
         fence_shapes = self._selected_fence_shapes()
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Select a closed rectangle, circle, polygon or other valid fence first", 3500
-                )
-            except Exception:
-                pass
-            return
 
         ribbon = None
         try:
@@ -1433,6 +1427,13 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                # Selection: 0 does not mean there are no finalized drawings.
+                # Let the user pick one or several available mixed fences.
+                from gui.native_fence_selection import offer_fence_picker
+                if not offer_fence_picker(fence_dialog, self.app):
+                    raise RuntimeError('Inside Fence has no working fence picker')
+                return
             fence_dialog.add_fences_from_selection(fence_shapes)
             from gui.native_fence_selection import sync_native_fence_highlights
             sync_native_fence_highlights(fence_dialog, fence_dialog.selected_fences)
@@ -1469,14 +1470,6 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     def _on_add_to_byclass_tool(self, tool_name: str):
         """Open Close or Height By Class dialog with selected drawings pre-loaded as fences."""
         fence_shapes = self._selected_fence_shapes()
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Select a closed rectangle, circle, polygon or other valid fence first", 3500
-                )
-            except Exception:
-                pass
-            return
 
         ribbon = None
         try:
@@ -1510,6 +1503,11 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                from gui.native_fence_selection import offer_fence_picker
+                if not offer_fence_picker(dlg, self.app):
+                    raise RuntimeError(f'{tool_name} has no working fence picker')
+                return
             dlg.add_fences_from_selection(fence_shapes)
             from gui.native_fence_selection import sync_native_fence_highlights
             sync_native_fence_highlights(dlg, getattr(dlg, 'selected_fences', fence_shapes))
@@ -1559,14 +1557,6 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         dlg_attr, opener_name = entry
 
         fence_shapes = self._selected_fence_shapes()
-        if not fence_shapes:
-            try:
-                self.app.statusBar().showMessage(
-                    "Select a closed rectangle, circle, polygon or other valid fence first", 3500
-                )
-            except Exception:
-                pass
-            return
 
         try:
             from importlib import import_module
@@ -1587,6 +1577,19 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             return
 
         try:
+            if not fence_shapes:
+                # Algorithms can operate without a fence when their original
+                # rules permit. If drawings exist, offer the normal picker so
+                # the user chooses which (rather than converting them all).
+                from gui.native_fence_selection import offer_fence_picker
+                if offer_fence_picker(dlg, self.app, only_if_candidates=True):
+                    return
+                try:
+                    self.app.statusBar().showMessage(
+                        'No fence selected: configure the tool scope before applying', 4000)
+                except Exception:
+                    pass
+                return
             dlg.add_fences_from_selection(fence_shapes)
             from gui.native_fence_selection import sync_native_fence_highlights
             fence_sel = getattr(dlg, '_fence_sel', None)
