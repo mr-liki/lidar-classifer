@@ -91,3 +91,13 @@ patch_backups/
 vulkan_*_output/
 *.shards/
 *.naksha*
+# Local native continuity build output
+/native/naksha_vulkan/build_continuity/
+
+/native/naksha_vulkan/build_msvc/before_continuity/
+
+# Per-source native point-cache provenance and selection indexes
+*.lnt.source.json
+*.lnt.class-semantics
+*.lntset
+naksha_native_batches/

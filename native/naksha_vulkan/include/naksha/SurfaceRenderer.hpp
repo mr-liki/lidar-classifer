@@ -114,6 +114,7 @@ public:
 
     bool Initialize(Renderer& renderer);
     void Shutdown();
+    void Clear();
     bool IsInitialized() const { return initialized_; }
 
     // Upload a single mesh. position/normal/color are N,3 C-contiguous
@@ -123,6 +124,9 @@ public:
                            const uint8_t* colorsRGB,
                            std::size_t vertexCount,
                            const uint32_t* indices, std::size_t indexCount);
+
+    // Recolour the resident legacy triangle soup without uploading geometry.
+    bool UpdateFaceColors(const uint8_t* rgb, std::size_t faceCount);
 
     // ---- State changes (push constants / pipeline switch, no upload) ----
     void SetShadingMode(ShadingMode mode);
@@ -337,7 +341,7 @@ public:
     struct TileDrawItem {
         uint64_t key;
         uint32_t firstFace, faceCount;   // tile-local triangle range
-        uint32_t coverage, pad;
+        uint32_t coverage, pad;          // pad bit 0: background interpolation TIN
     };
     bool ConfigureTiles(uint64_t vertexCapacity, uint64_t faceCapacity, uint64_t coverageCapacity,
                         std::string* error);

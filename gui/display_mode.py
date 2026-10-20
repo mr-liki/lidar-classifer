@@ -1527,26 +1527,20 @@ class DisplayModeDialog(QDialog):
     def _sync_color_mode_state(self) -> None:
         """Keep display controls consistent with the selected view."""
         try:
-            native_section = (self.current_slot > 0 and
-                              getattr(self._get_app_window(), '_lnt_main_view', None) is not None)
+            if not hasattr(self, "color_mode") or self.color_mode is None:
+                return
             for mode in (6, 7):
                 item = self.color_mode.model().item(mode)
                 if item is not None:
-                    item.setEnabled(not native_section)
-            if native_section and self.color_mode.currentIndex() in (6, 7):
-                self.color_mode.setCurrentIndex(0)
-            if not hasattr(self, "color_mode") or self.color_mode is None:
-                return
+                    item.setEnabled(True)
 
             self.color_mode.setVisible(True)
-            # Cross-sections (slots 1-8) support Class/Shaded/Depth/Intensity/RGB/
-            # Elevation; Main View (slot 0) supports everything; Cut Section
-            # (slot 9) supports the same six point modes, unchanged.
+            # Main, cross-section and cut slots all expose the full mode list.
             self.color_mode.setEnabled(getattr(self._get_app_window(), "_lnt_main_view", None) is not None or self.current_slot in range(0, 10))
             # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
-            # Surface(6) / Line(7) are wired up for cross-section views (View 1-8).
-            # Native cut (slot 9) supports the six point modes; only the legacy
-            # VTK cut (slot 5) keeps its classification-only restriction.
+            # Surface(6) / Line(7) are wired up for every native cross-section
+            # and cut view. Only the legacy VTK cut (slot 5 without a native
+            # .lnt main view) keeps its classification-only restriction.
             _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
             legacy_cut_only = (self.current_slot == 5 and getattr(self._get_app_window(), "_lnt_main_view", None) is None)
             if legacy_cut_only and self.color_mode.currentIndex() != 0:
@@ -1906,8 +1900,8 @@ class DisplayModeDialog(QDialog):
 
         # Restore this slot's own remembered color mode.
         #   Slot 0 (Main View): any mode.
-        #   Slots 1-4 (cross-sections): Class/Shaded/Depth/Intensity/RGB/Elevation/Surface/Line.
-        #   Slot 5 (Cut Section): classification-only, unchanged.
+        #   Native slots 1-9: Class/Shaded/Depth/Intensity/RGB/Elevation/Surface/Line.
+        #   Legacy VTK Cut Section (slot 5): classification-only, unchanged.
         _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
         restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
@@ -2379,9 +2373,20 @@ class DisplayModeDialog(QDialog):
             return
         app = self._get_app_window()
         source_ids = None
-        if app is not None and isinstance(getattr(app, "data", None), dict):
+        native_canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(int(getattr(self, 'current_slot', 0)))
+        if native_canvas is not None:
+            source_ids = native_canvas._source_ids
+            if source_ids is None:
+                # Line mode itself prefers the store attribute and only falls
+                # back to ``_source_ids``; list the same IDs here so the Lines
+                # dialog is populated before any recovery scan has run.
+                from gui.lnt_section_bridge import get_store
+                store = get_store(app)
+                if store is not None:
+                    source_ids = store.data.get("point_source_id")
+        if source_ids is None and app is not None and isinstance(getattr(app, "data", None), dict):
             source_ids = app.data.get("point_source_id")
-            if source_ids is None and allow_recovery:
+            if source_ids is None and allow_recovery and native_canvas is None:
                 source_ids = self._recover_flight_line_ids(app)
         slot = int(getattr(self, "current_slot", 0))
         by_slot = getattr(app, "flight_line_visibility_by_slot", None) if app else None
@@ -2436,6 +2441,15 @@ class DisplayModeDialog(QDialog):
 
     def _open_lines_dialog(self):
         """Open a persistent selector; changes commit only when OK is clicked."""
+        app = self._get_app_window()
+        canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(self.current_slot)
+        if canvas is not None and canvas._source_ids is None:
+            from gui.lnt_section_bridge import get_store
+            store = get_store(app)
+            if store is not None and store.data.get('point_source_id') is None and len(canvas.indices):
+                canvas._open_lines_when_ready = True
+                canvas._load_source_lines(store)
+                return
         existing_popup = getattr(self, "_lines_popup", None)
         if existing_popup is not None:
             try:
@@ -2764,7 +2778,10 @@ class DisplayModeDialog(QDialog):
             # Refresh only the selected view. Other slots retain their own
             # independent flight-line selection.
             try:
-                if slot == 0:
+                native_canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(slot)
+                if native_canvas is not None:
+                    native_canvas.apply_palette(native_canvas.palette, native_canvas.mode, sync=False)
+                elif slot == 0:
                     current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
                     from gui.unified_actor_manager import (
                         fast_main_flight_line_visibility_update,
@@ -3242,7 +3259,7 @@ class DisplayModeDialog(QDialog):
         if self.current_slot in range(1, 10) and getattr(app, '_native_sections', None) is not None:
             native_modes = {0: "class", 1: "shaded_class", 2: "depth",
                             3: "intensity", 4: "rgb", 5: "elevation",
-                            6: "class", 7: "class"}
+                            6: "surface", 7: "line"}
             app._native_sections.apply(self.current_slot, class_map,
                                        native_modes.get(idx, "class"))
             fast_path_handled = True

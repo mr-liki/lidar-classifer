@@ -7,7 +7,10 @@ def test_default_crisp_budget_keeps_large_all_class_tile_out_of_hatched_fallback
 
     budget = shading._crisp_mixed_face_budget(69_202_527)
 
-    assert budget == 17_300_632
+    # The documented safety ceiling is absolute, so mesh size cannot
+    # unexpectedly switch the whole presentation to the hatched fallback.
+    assert budget == 20_000_000
+    assert shading._crisp_mixed_face_budget(26_096_170) == budget
     assert budget > 14_192_010
 
 

@@ -207,7 +207,7 @@ public:
     struct SurfaceTileDraw {
         uint64_t key;
         uint32_t first_face, face_count;   // tile-local triangle range
-        uint32_t coverage, _pad;           // 1 = also draw the tile's coverage points
+        uint32_t coverage, _pad;           // coverage: points; _pad bit 0: background TIN
     };
     bool has_surface_tiles() const {
         return api_.surface_tiles_configure && api_.surface_tiles_upload && api_.surface_tiles_evict &&

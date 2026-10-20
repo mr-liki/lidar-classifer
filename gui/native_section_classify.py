@@ -843,6 +843,26 @@ class SectionClassifier:
     # ---- events --------------------------------------------------------------
     def press(self, pos, button):
         tool = self._sync_tool()
+        if tool is None and button == Qt.RightButton:
+            remembered = getattr(self.app, 'last_classify_tool', None)
+            if remembered in DRAWABLE_TOOLS and (
+                    remembered not in LINE_TOOLS or getattr(self.canvas, 'line_tools', True)):
+                # Recall an idle tool without resurrecting partial gestures in
+                # another section. Measurement and cut tools consume their own clicks.
+                manager = getattr(self.app, '_native_sections', self.canvas.owner)
+                for canvas in getattr(manager, 'views', {}).values():
+                    canvas.classifier.cancel()
+                self.cancel()
+                previous = getattr(self.app, '_right_click_reactivating', False)
+                self.app._right_click_reactivating = True
+                try:
+                    saved = getattr(self.app, 'last_classify_from_classes', None)
+                    self.app.from_classes = list(saved) if saved is not None else None
+                    self.app.to_class = getattr(self.app, 'last_classify_to_class', None)
+                    self.app.set_classify_tool(remembered)
+                finally:
+                    self.app._right_click_reactivating = previous
+                return True
         if tool is None:
             if (button == Qt.LeftButton and not getattr(self.canvas, "line_tools", True)
                     and getattr(self.app, "active_classify_tool", None) in LINE_TOOLS):
@@ -864,6 +884,11 @@ class SectionClassifier:
             return False
         if button != Qt.LeftButton:
             return False
+        if not self.points:
+            self.app.last_classify_tool = tool
+            source = getattr(self.app, 'from_classes', None)
+            self.app.last_classify_from_classes = list(source) if source is not None else None
+            self.app.last_classify_to_class = getattr(self.app, 'to_class', None)
         pt = self.canvas.section_at(pos.x(), pos.y())
         self.press_px = (pos.x(), pos.y())
         self._press_time = time.monotonic()

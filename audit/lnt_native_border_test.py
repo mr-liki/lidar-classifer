@@ -21,6 +21,20 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 from gui.native_sections import NativeSections, CUT_SLOT
 from gui import lnt_native
 
+def _await_mesh(canvas, timeout=20.):
+    """Section meshes build on a worker here: wait for the resident swap."""
+    built, recolored = canvas._mesh_build_count, canvas._mesh_recolor_count
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        qapp.processEvents()
+        if canvas._mesh_build_count > built or canvas._mesh_recolor_count > recolored:
+            return True
+        if canvas._mesh_future is None and not canvas._surface_loaded:
+            return False
+        time.sleep(.02)
+    return False
+
+
 qapp = QApplication([])
 app = QMainWindow()
 app.resize(1200, 800)
@@ -38,9 +52,11 @@ app.view_palettes = {}
 app.undo_stack, app.redo_stack = [], []
 app.class_palette = {c: {'color': (255, 255, 255), 'show': True} for c in (1, 2, 5, 6)}
 
-# A grid of records on the section plane y=0: h = 0..10, z = 0..10 (1 m pitch).
+# A grid of records across the section corridor: h = 0..10, z = 0..10 (1 m
+# pitch). Real corridors are a thin slab, so y is spread inside the buffer; an
+# exactly coplanar sheet has no volume and yields no shading triangles.
 hh, zz = np.meshgrid(np.arange(11.), np.arange(11.))
-xyz = np.column_stack([hh.ravel(), np.zeros(hh.size), zz.ravel()])
+xyz = np.column_stack([hh.ravel(), np.linspace(-.2, .2, hh.size), zz.ravel()])
 classes = np.full(len(xyz), 2, dtype=np.uint8)
 classes[::7] = 5
 store = SimpleNamespace(view=app._lnt_main_view, ensure_for_section=Mock(return_value=True),
@@ -138,6 +154,7 @@ try:
     app.view_borders[1] = 100
     apply_border(app, 1, 100, 0)
     canvas.apply_palette(test_palette, 'shaded_class')
+    assert _await_mesh(canvas), 'shaded-class mesh never became resident'
     shaded_border = capture()
     apply_border(app, 1, 0, 0)
     assert np.array_equal(capture(), shaded_border)

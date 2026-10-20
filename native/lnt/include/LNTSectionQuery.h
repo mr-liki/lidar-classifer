@@ -330,7 +330,19 @@ inline bool section_set_classes(Reader& rd, SectionEditIndex& idx, std::shared_m
     }
 
     HANDLE wf = INVALID_HANDLE_VALUE;
-    if (!preview_only) {
+    if (!preview_only && rd.is_collection()) {
+        // Check every affected source before changing any of them. A read-only
+        // member must not leave an edit half-applied across the collection.
+        std::unordered_set<std::string> checked;
+        for(const auto& selected : by_leaf) {
+            std::string path;uint64_t offset=0;
+            if(!rd.physical_location(ns[selected.first],path,offset)) {err="missing individual LNT write route";return false;}
+            if(checked.insert(path).second && idx.writer(path)==INVALID_HANDLE_VALUE) {
+                err="cannot open individual LNT for writing: "+path;return false;
+            }
+        }
+    }
+    if (!preview_only && !rd.is_collection()) {
         wf = idx.writer(rd.path());
         if (wf == INVALID_HANDLE_VALUE) {
             err = "cannot open '" + rd.path() + "' for writing";
@@ -343,7 +355,12 @@ inline bool section_set_classes(Reader& rd, SectionEditIndex& idx, std::shared_m
         if (preview_only) return true;
         std::unique_lock<std::shared_mutex> guard;
         if (io) guard = std::unique_lock<std::shared_mutex>(*io);
-        uint64_t off = e.byte_offset + lo * sizeof(LNTPoint);
+        std::string physical_path;
+        uint64_t physical_offset = 0;
+        if (!rd.physical_location(e, physical_path, physical_offset)) { err = "missing individual LNT write route"; return false; }
+        wf = idx.writer(physical_path);
+        if (wf == INVALID_HANDLE_VALUE) { err = "cannot write individual LNT: " + physical_path; return false; }
+        uint64_t off = physical_offset + lo * sizeof(LNTPoint);
         const char* src = reinterpret_cast<const char*>(chunk.data() + lo);
         uint64_t left = (hi - lo + 1) * sizeof(LNTPoint);
         while (left) {
