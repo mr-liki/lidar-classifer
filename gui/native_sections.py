@@ -203,6 +203,13 @@ class SectionCanvas(QWidget):
         self._mesh_build_count = 0
         self._mesh_recolor_count = 0
         self._indices_sorted = True
+        # Sparse classification row -> canvas-position lookup.  The section
+        # store accumulates regions, so later section queries are not guaranteed
+        # to return monotonically increasing store rows.  Falling back to a full
+        # million-row compare whenever that happened was a major long-session
+        # regression.  Build a sorted inverse lazily only for unsorted views.
+        self._index_lookup_values = None
+        self._index_lookup_pos = None
         self._dirty = True
         self._closed = False
         self._cut_preview = None
@@ -287,6 +294,8 @@ class SectionCanvas(QWidget):
         self.local = np.ascontiguousarray(local, dtype=np.float64)
         self.indices = np.asarray(indices, dtype=np.int64)
         self._indices_sorted = bool(len(self.indices) < 2 or np.all(np.diff(self.indices) > 0))
+        self._index_lookup_values = None
+        self._index_lookup_pos = None
         self.axis = axis
         if not self.start():
             return
@@ -342,12 +351,98 @@ class SectionCanvas(QWidget):
         self._surface_loaded = self._surface_resident = False
         self._dirty = True
 
+    def positions_for_store_rows(self, rows):
+        """Canvas positions for store-row ids, ``-1`` for rows not in this view.
+
+        Fast path is a direct search on already sorted section indices.  For a
+        later/overlapping section whose store rows arrive out of order, create one
+        lazy sorted inverse and reuse it for every classification, brush frame,
+        undo and redo.
+        """
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        out = np.full(rows.size, -1, dtype=np.int64)
+        if not rows.size or not len(self.indices):
+            return out
+        if self._indices_sorted:
+            at = np.searchsorted(self.indices, rows)
+            hit = at < len(self.indices)
+            if np.any(hit):
+                valid = np.flatnonzero(hit)
+                exact = self.indices[at[valid]] == rows[valid]
+                valid = valid[exact]
+                out[valid] = at[valid]
+            return out
+
+        values = self._index_lookup_values
+        order = self._index_lookup_pos
+        if values is None or order is None or len(values) != len(self.indices):
+            order64 = np.argsort(self.indices, kind='stable')
+            values = np.ascontiguousarray(self.indices[order64], dtype=np.int64)
+            order = np.asarray(order64, dtype=(np.int32 if len(self.indices) < 2**31 else np.int64))
+            self._index_lookup_values = values
+            self._index_lookup_pos = order
+        at = np.searchsorted(values, rows)
+        hit = at < len(values)
+        if np.any(hit):
+            valid = np.flatnonzero(hit)
+            exact = values[at[valid]] == rows[valid]
+            valid = valid[exact]
+            out[valid] = order[at[valid]]
+        return out
+
     def classes_all_visible(self, app=None):
         """True when a class edit cannot change this view's visibility mask."""
         app = self.owner.app if app is None else app
         if getattr(app, '_import_class_blocked', ()):
             return False
         return not any(not rule.get('show', True) for rule in self.palette.values())
+
+    def _refresh_point_classification(self, classes):
+        """Update classification-dependent point state without re-applying a display preset.
+
+        Classification edits never change RGB/intensity/elevation/depth LUTs, point
+        weights, source-line colours or the selected display mode.  Re-running
+        ``apply_palette`` after every click needlessly re-uploaded those resources.
+        This path uploads the one-byte class stream and, only when class visibility
+        can actually change, recomputes draw ranges.
+        """
+        if self.mode in MESH_MODES:
+            return False
+        if not self.backend._handle:
+            self._dirty = True
+            return True
+        classes = np.ascontiguousarray(classes, dtype=np.uint8).reshape(-1)
+        if classes.size != len(self.indices):
+            return False
+        if not self.backend.set_point_attributes(classification=classes):
+            return False
+
+        app = self.owner.app
+        visibility_can_change = (
+            not self.classes_all_visible(app)
+            or bool(getattr(app, '_import_class_blocked', ()))
+        )
+        if visibility_can_change:
+            from gui.flight_line_filter import flight_line_visibility_for_slot
+            store = get_store(app)
+            source = store.data.get('point_source_id') if store is not None else None
+            source_ids = (source[self.indices]
+                          if source is not None and store is not None
+                          and len(source) == len(store.data['xyz'])
+                          else self._source_ids)
+            lines = flight_line_visibility_for_slot(app, self.slot)
+            if source_ids is None and (self.mode == 'line' or any(not shown for shown in lines.values())):
+                return False
+            mask = visibility(
+                classes, self._render_palette, getattr(app, '_import_class_blocked', ()),
+                source_ids, lines
+            )
+            firsts, counts = draw_ranges(mask)
+            self.backend.set_point_draw_ranges(firsts, counts)
+            self.backend.set_point_cloud_visible(bool(np.any(mask)))
+
+        self._dirty = True
+        return True
 
     def _mesh_options(self, app, mode):
         return dict(
@@ -1444,18 +1539,32 @@ class NativeSections:
             controller.is_cut_view_active = True
         self.app.statusBar().showMessage(f'Cut: {selected.sum():,} records, depth {depth:.3f} m', 5000)
 
-    def refresh_edits(self, force=False, changed=None):
+    def refresh_edits(self, force=False, changed=None, show_main=True):
         store = get_store(self.app)
         if store is None:
             return
-        if changed is not None:
-            store.show(*changed)             # main view recolours now; the write follows
+        if changed is not None and show_main:
+            store.show(*changed)             # main view recolours now; sparse write follows
         # Each tick would gather every view's classes (millions of records on
         # a large section); only do it when the store saw an edit since.
         generation = getattr(store, 'generation', None)
-        if not force and generation is not None and generation == getattr(self, '_seen_generation', None):
-            return
-        self._seen_generation = generation
+        if not force:
+            # A committed classification whose exact rows were already pushed
+            # to every section is waiting only for its debounced LNT write.
+            # Do not let the 500 ms safety timer rescan millions of section rows
+            # during that window.
+            if int(getattr(store, '_dirty_rows_queued', 0) or 0) > 0:
+                return
+            if generation is not None and generation == getattr(self, '_seen_generation', None):
+                return
+        # ``store.show(changed)`` previews the exact rows immediately and its
+        # debounced disk flush increments generation once later.  When we already
+        # consume those exact rows here, anticipate that one persistence-only
+        # generation so the 500 ms section timer does not perform a redundant
+        # full-array gather/compare immediately after the write.
+        self._seen_generation = (generation + 1
+                                 if changed is not None and show_main and generation is not None
+                                 else generation)
         # A gesture knows exactly which rows it changed. Mapping those onto
         # each view (sorted store rows) avoids gathering and comparing every
         # record of every view on each brush stroke.
@@ -1471,28 +1580,26 @@ class NativeSections:
             if not len(canvas.indices):
                 continue
             cache = self._classes.get(slot)
-            if rows is not None and rows.size and canvas._indices_sorted and cache is not None:
+            if rows is not None and rows.size and cache is not None:
                 if len(cache) != len(canvas.indices):
                     cache = None
                 else:
-                    position = np.searchsorted(canvas.indices, rows)
-                    np.minimum(position, len(canvas.indices)-1, out=position)
-                    hit = canvas.indices[position] == rows
+                    position = canvas.positions_for_store_rows(rows)
+                    hit = position >= 0
                     if not hit.any():
                         continue            # this view never saw the edit
                     cache[position[hit]] = new_classes[hit]
-                    if canvas.mode not in MESH_MODES:
-                        canvas.backend.set_point_attributes(classification=cache)
-                    if canvas.mode in MESH_MODES or not canvas.classes_all_visible(self.app):
+                    if not canvas._refresh_point_classification(cache):
+                        # Mesh modes, or an unusual source-line state, keep the
+                        # existing correctness path.  Point modes avoid the full
+                        # palette/LUT/display re-application above.
                         canvas.apply_palette(canvas.palette, canvas.mode, sync=False)
-                    else:
-                        canvas._dirty = True   # colours are in the stream already
                     continue
             current = classes[canvas.indices]
             if not np.array_equal(current, cache):
-                canvas.backend.set_point_attributes(classification=current)
                 self._classes[slot] = current.copy()
-                canvas.apply_palette(canvas.palette, canvas.mode, sync=False)
+                if not canvas._refresh_point_classification(current):
+                    canvas.apply_palette(canvas.palette, canvas.mode, sync=False)
 
     def close(self):
         self._refresh.stop()

@@ -151,6 +151,8 @@ try:
         p0 = QPointF(*canvas.screen_from_section(1.5, -1.5))
         p1 = QPointF(*canvas.screen_from_section(4.5, 1.5))
         assert canvas.classifier.press(p0, Qt.LeftButton)
+        canvas.classifier._press_time -= .2  # Deliberate drag beyond BRUSH's tap grace.
+        canvas.classifier.move(p1)
         canvas.classifier.release(p1, Qt.LeftButton)
         frame = present(canvas)
         assert occupied(frame), 'classify tool blanked the shaded viewport'

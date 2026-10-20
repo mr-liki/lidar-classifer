@@ -1658,7 +1658,7 @@ class DisplayModeDialog(QDialog):
 
                     wt_item = self.table.item(row, 6)
                     if wt_item:
-                        wt_item.setText(f"{info.get('weight', default_weight):.1f}")
+                        wt_item.setText(f"{info.get('weight', default_weight):.2f}")
                 except Exception:
                     continue
         finally:
@@ -2915,6 +2915,51 @@ class DisplayModeDialog(QDialog):
             if chk:
                 chk.setChecked(False)
 
+    def sync_applied_palette(self, slot_idx, palette, mode):
+        """Refresh shortcut results without saving stale widgets or re-applying."""
+        self.view_palettes[slot_idx] = clone_palette(palette)
+        self.slot_shows[slot_idx] = {
+            int(code): bool(info.get("show", True))
+            for code, info in palette.items()
+        }
+        if slot_idx == 0 and getattr(self, "_class_mode_vis_slot0", None) is not None:
+            self._class_mode_vis_slot0 = dict(self.slot_shows[0])
+        if not hasattr(self, "view_color_modes"):
+            self.view_color_modes = {}
+        mode_idx = {"class": 0, "shaded_class": 1, "shaded": 1, "depth": 2,
+                    "intensity": 3, "rgb": 4, "elevation": 5,
+                    "surface": 6, "line": 7}.get(mode, 0)
+        self.view_color_modes[slot_idx] = mode_idx
+        if self.current_slot != slot_idx:
+            return
+        blocked = self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                code_item = self.table.item(row, 1)
+                if code_item is None:
+                    continue
+                info = palette.get(int(code_item.text()))
+                if info is None:
+                    continue
+                check = self.table.cellWidget(row, 0)
+                if check is not None:
+                    check_blocked = check.blockSignals(True)
+                    try:
+                        check.setChecked(bool(info.get("show", True)))
+                    finally:
+                        check.blockSignals(check_blocked)
+                weight = self.table.item(row, 6)
+                if weight is not None:
+                    weight.setText(f"{float(info.get('weight', 1.0 if slot_idx == 0 else 0.5)):.2f}")
+        finally:
+            self.table.blockSignals(blocked)
+        blocked = self.color_mode.blockSignals(True)
+        try:
+            self.color_mode.setCurrentIndex(mode_idx)
+        finally:
+            self.color_mode.blockSignals(blocked)
+        self._sync_color_mode_state()
+
     def sync_with_app_state(self):
         """
         Synchronize the dialog's widgets with the application's actual current state
@@ -2936,6 +2981,7 @@ class DisplayModeDialog(QDialog):
         _MODE_TO_IDX = {
             "class":        0,
             "shaded_class": 1,
+            "shaded":       1,
             "depth":        2,
             "intensity":    3,
             "rgb":          4,
@@ -2944,6 +2990,12 @@ class DisplayModeDialog(QDialog):
             "line":         7,
         }
         target_idx = _MODE_TO_IDX.get(current_mode, 0)
+
+        # Remember Main View changes even while a different slot is selected.
+        # Otherwise returning to Main View restores its stale pre-switch mode.
+        if not hasattr(self, "view_color_modes"):
+            self.view_color_modes = {}
+        self.view_color_modes[0] = target_idx
 
         # Sync color_mode combo box index. app.display_mode is the Main View's
         # own mode flag — only apply it while Main View (slot 0) is selected,

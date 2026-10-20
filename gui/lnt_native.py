@@ -431,9 +431,14 @@ class NativeView:
         lib().lnt_query_release(c_void_p(self.h))
         return out
 
-    def set_classes(self, node, local, classification):
-        """Write classification values for points identified by query_points()'s node/local
-        arrays into the .lnt file, and refresh the view. Returns True on success."""
+    def set_classes(self, node, local, classification, old_classification=None):
+        """Write classification values identified by ``node/local`` into the .lnt.
+
+        ``old_classification`` is optional and is used only by the live class-count
+        tracker.  Supplying the section store's known pre-write bytes avoids a
+        second file lookup on the interactive classification path; the native write
+        itself is unchanged.
+        """
         import numpy as np
         self.last_error = ""
         if not self.has_section_api():
@@ -449,7 +454,8 @@ class NativeView:
             return True
         # Live class histogram (gui/lnt_class_counts.py): old bytes before, delta after.
         counts = getattr(self, "class_counts", None)
-        token = counts.before_write(node, local, cls) if counts is not None else None
+        token = (counts.before_write(node, local, cls, old_classification)
+                 if counts is not None else None)
         err = create_string_buffer(256)
         ok = lib().lnt_set_classes(c_void_p(self.h), c_void_p(node.ctypes.data),
                                    c_void_p(local.ctypes.data), c_void_p(cls.ctypes.data),

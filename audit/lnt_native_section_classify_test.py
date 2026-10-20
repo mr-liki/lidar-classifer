@@ -215,6 +215,9 @@ try:
     canvas.classifier.press(QPointF(x1, y1), Qt.LeftButton)
     assert all(s[0] == 'brush_cursor_px' for s in canvas.classifier.overlay.shapes)
     for h in np.linspace(2, 6, 40):
+        # Simulate moves across BRUSH's 30 Hz query batches rather than
+        # compressing the entire stroke into one synchronous test instant.
+        canvas.classifier._brush_last_query_time -= .04
         canvas.classifier.move(QPointF(*canvas.screen_from_section(h, 2)))
         assert all(s[0] == 'brush_cursor_px' for s in canvas.classifier.overlay.shapes), 'no painted trail'
     assert changed() == {at(h, 2) for h in range(2, 7)}, 'brush must paint live before release'

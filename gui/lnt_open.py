@@ -93,7 +93,7 @@ def _source_cache_current(source, lnt):
 
 
 def _class_semantics_path(lnt):
-    return lnt + '.class-semantics'
+    return os.fspath(lnt) + '.class-semantics'
 
 
 def _has_current_class_semantics(lnt):
@@ -529,17 +529,17 @@ class _InputFilter(QObject):
             elif k == Qt.Key_D:
                 self.view.set_2d(not self.view.mode_2d)
             elif k == Qt.Key_1:
-                self.view.apply_shading("class")
+                self.view.set_app_display_mode("class")
             elif k == Qt.Key_2:
-                self.view.apply_shading("intensity")
+                self.view.set_app_display_mode("intensity")
             elif k == Qt.Key_3:
-                self.view.apply_shading("elevation")
+                self.view.set_app_display_mode("elevation")
             elif k == Qt.Key_4:
-                self.view.apply_shading("rgb")
+                self.view.set_app_display_mode("rgb")
             elif k == Qt.Key_5:
-                self.view.apply_shading("shaded")
+                self.view.set_app_display_mode("shaded_class")
             elif k == Qt.Key_6:
-                self.view.apply_shading("surface")
+                self.view.set_app_display_mode("surface")
             elif k in (Qt.Key_BracketRight, Qt.Key_Up):
                 self.view.adjust_sse(+1)
             elif k in (Qt.Key_BracketLeft, Qt.Key_Down):
@@ -959,6 +959,10 @@ class LntMainView(QObject):
             self.app.display_mode = normalized
         except Exception:   # noqa: BLE001
             pass
+        dialog = (getattr(self.app, "display_mode_dialog", None)
+                  or getattr(self.app, "display_dialog", None))
+        if dialog is not None:
+            dialog.sync_with_app_state()
         print(f"[LNT] display mode -> {normalized} (native Vulkan)")
         return True
 
