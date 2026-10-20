@@ -1170,7 +1170,7 @@ class DisplayModeDialog(QDialog):
         self.border_setting_btn.setFixedWidth(26)
         self.border_setting_btn.setFocusPolicy(Qt.NoFocus)
 
-        self.border_setting_menu = QMenu(self)
+        self.border_setting_menu = QMenu(self.border_setting_btn)
         self.border_logic_point = QAction("Per-Point", self.border_setting_menu)
         self.border_logic_point.setCheckable(True)
         self.border_logic_point.setChecked(False)
@@ -1196,13 +1196,7 @@ class DisplayModeDialog(QDialog):
         self.border_logic_object.triggered.connect(lambda _=False: self._select_border_mode(1))
         self.border_logic_hybrid.triggered.connect(lambda _=False: self._select_border_mode(2))
 
-        self.border_setting_btn.clicked.connect(
-            lambda: self.border_setting_menu.exec(
-                self.border_setting_btn.mapToGlobal(
-                    self.border_setting_btn.rect().bottomLeft()
-                )
-            )
-        )
+        self.border_setting_btn.clicked.connect(self._show_border_menu)
 
         table_card = QFrame()
         table_card.setObjectName("displayTableCard")
@@ -1589,6 +1583,23 @@ class DisplayModeDialog(QDialog):
                 slot_pal.setdefault(code, {}).update({'show': show, 'weight': weight})
             except Exception:
                 continue
+
+    def _show_border_menu(self):
+        # popup() leaves the normal event loop in control. A blocking exec()
+        # could leave this menu alive while its independent dialog moved/hid.
+        from PySide6.QtCore import QPoint
+        button = self.border_setting_btn
+        if self.isVisible() and button.isVisible():
+            self.border_setting_menu.popup(button.mapToGlobal(QPoint(0, button.height())))
+
+    def _dismiss_border_menu(self):
+        menu = getattr(self, 'border_setting_menu', None)
+        if menu is not None:
+            menu.hide()
+
+    def resizeEvent(self, event):
+        self._dismiss_border_menu()
+        super().resizeEvent(event)
 
     def _select_border_mode(self, mode_val: int, push_gpu: bool = True) -> None:
         """
@@ -3626,6 +3637,7 @@ class DisplayModeDialog(QDialog):
         self._weight_popup.show_at(global_pos)
 
     def moveEvent(self, event):
+        self._dismiss_border_menu()
         super().moveEvent(event)
         if hasattr(self, '_weight_popup') and self._weight_popup.isVisible():
             delta = event.pos() - event.oldPos()
@@ -3644,6 +3656,7 @@ class DisplayModeDialog(QDialog):
         self.hide()
 
     def hideEvent(self, event):
+        self._dismiss_border_menu()
         self.save_global_settings()
         super().hideEvent(event)
 
@@ -3764,6 +3777,10 @@ class DisplayModeDialog(QDialog):
         try:
             for child in self.findChildren(QWidget):
                 if not child.isWindow() or not child.isVisible():
+                    continue
+                # Qt owns transient popup focus/stacking. Raising these after
+                # owner activation could resurrect a detached border menu.
+                if child.windowType() in (Qt.Popup, Qt.ToolTip):
                     continue
                 if child.windowState() & Qt.WindowMinimized:
                     continue
