@@ -309,6 +309,23 @@ UploadStats SurfaceRenderer::UploadMesh(const float* positions, const float* nor
     return stats;
 }
 
+bool SurfaceRenderer::UpdateFaceColors(const uint8_t* rgb, std::size_t faceCount) {
+    if (!initialized_ || !rgb || active_ || pending_ || tilesActive_ ||
+        crispHybridActive_ || !colors_.IsValid() || faceCount != triangleCount_ ||
+        vertexCount_ != faceCount * 3) return false;
+    const std::size_t bytes = faceCount * 3 * 4;
+    auto* dst = renderer_->GetUploadContext().Stage(bytes);
+    if (!dst) return false;
+    for (std::size_t f = 0; f < faceCount; ++f) {
+        for (std::size_t v = 0; v < 3; ++v) {
+            auto* c = dst + (f * 3 + v) * 4;
+            c[0] = rgb[f*3]; c[1] = rgb[f*3+1]; c[2] = rgb[f*3+2]; c[3] = 255;
+        }
+    }
+    return renderer_->GetUploadContext().Execute(
+        {{colors_.buffer, 0, 0, bytes}}, 0.0, 0.0).bytes == bytes;
+}
+
 UploadStats SurfaceRenderer::UploadShadedClassMesh(
         const float* basePositions, const float* baseNormals, const uint8_t* baseColorsRGB,
         std::size_t baseVertexCount, const uint32_t* baseIndices, std::size_t baseIndexCount,
@@ -1222,6 +1239,15 @@ std::size_t SurfaceRenderer::GetTriangleCount() const {
     if (active_) return active_->triangleCount;
     return triangleCount_;
 }
+void SurfaceRenderer::Clear() {
+    vertexCount_ = 0;
+    triangleCount_ = 0;
+    indexCount_ = 0;
+    overlayIndexCount_ = 0;
+    crispIndexedActive_ = false;
+    crispHybridActive_ = false;
+}
+
 bool SurfaceRenderer::IsLoaded() const {
     return (active_ && active_->IsValid()) || vertexCount_ > 0 || crispIndexedActive_;
 }
@@ -1899,7 +1925,7 @@ void SurfaceRenderer::RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot) {
     renderer_->GetLastMvp(mvp);
     FrustumPlanes fr;
     ExtractFrustumPlanes(mvp, fr);
-    std::vector<std::pair<uint64_t, uint64_t>> faces, coverage;   // absolute (first, count)
+    std::vector<std::pair<uint64_t, uint64_t>> faces, coverage, underlay;   // absolute (first, count)
     faces.reserve(tileDraw_.size());
     for (const TileDrawItem& item : tileDraw_) {
         auto it = tileSlots_.find(item.key);
@@ -1907,7 +1933,7 @@ void SurfaceRenderer::RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot) {
         const TileSlot& s = it->second;
         if (!AabbVisible(fr, s.bmin, s.bmax)) continue;
         if (item.faceCount && uint64_t(item.firstFace) + item.faceCount <= s.fcount)
-            faces.push_back({s.fbase + item.firstFace, item.faceCount});
+            (item.pad & 1u ? underlay : faces).push_back({s.fbase + item.firstFace, item.faceCount});
         if (item.coverage && s.ccount) coverage.push_back({s.cbase, s.ccount});
         if (item.coverage) ++tileDrawnTiles_;
     }
@@ -1922,8 +1948,9 @@ void SurfaceRenderer::RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot) {
     };
     merge(faces);
     merge(coverage);
+    merge(underlay);
     VkDeviceSize offsets[] = {0, 0};
-    if (!faces.empty()) {
+    if (!faces.empty() || !underlay.empty()) {
         VkDescriptorSet sets[2] = {renderer_->GetFrameDescriptorSet(), crispIdxSet_};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, crispIdxPipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, crispIdxLayout_, 0, 2, sets, 0, nullptr);
@@ -1940,6 +1967,17 @@ void SurfaceRenderer::RecordTiles(VkCommandBuffer cmd, uint32_t frameSlot) {
             tileDrawnFaces_ += r.second;
             ++tileDraws_;
             drawCalls_++;
+        }
+        // Keep sparse ground covered, behind every detailed surface fragment.
+        if (!underlay.empty()) {
+            vp.minDepth = vp.maxDepth = 0.99999994f;
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+            for (const auto& r : underlay) {
+                vkCmdDrawIndexed(cmd, uint32_t(r.second * 3), 1, uint32_t(r.first * 3), 0, uint32_t(r.first));
+                tileDrawnFaces_ += r.second; ++tileDraws_; ++drawCalls_;
+            }
+            vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+            vkCmdSetViewport(cmd, 0, 1, &vp);
         }
     }
     if (!coverage.empty() && coveragePipeline_ != VK_NULL_HANDLE) {

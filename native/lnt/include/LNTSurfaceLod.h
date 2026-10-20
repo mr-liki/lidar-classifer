@@ -55,7 +55,7 @@
 namespace lnt { namespace surface_lod {
 using surface_archive::Digest;
 
-constexpr uint32_t kAlgorithm = 1;
+constexpr uint32_t kAlgorithm = 2;
 constexpr uint32_t kFlagExact = 1;
 constexpr unsigned kMaxDepth = 27;
 
@@ -72,6 +72,9 @@ inline uint32_t key_y(uint64_t k) { return uint32_t((k >> 28) & 0xfffffffu); }
 class Quadtree {
 public:
     bool build(const Reader& rd) {
+        collection_ = rd.is_collection();
+        total_leaf_points_ = 0;
+        if (collection_) return build_collection(rd);
         nodes_ = &rd.nodes();
         for (int a = 0; a < 3; ++a) origin_[a] = rd.origin(a);
         side_ = rd.header().bounds_max[0] - rd.header().bounds_min[0];
@@ -122,6 +125,7 @@ public:
     // node's own footprint: a record on (or float-rounded across) the node's border
     // stays in a cell that gathers this node, so no record is ever lost or doubled.
     void record_cell(uint32_t idx, double x, double y, unsigned d, uint32_t& ix, uint32_t& iy) const {
+        if (collection_) { ix = cell_of(x, 0, d); iy = cell_of(y, 1, d); return; }
         const LNTNodeEntry& n = (*nodes_)[idx];
         const unsigned l = std::min<unsigned>(n.tree_level, d);
         const uint64_t span = uint64_t(1) << (d - l);
@@ -200,6 +204,57 @@ public:
     }
 
 private:
+    bool collection_ = false;
+    bool build_collection(const Reader& rd) {
+        nodes_ = &rd.nodes();
+        for (int a=0;a<3;++a) origin_[a] = rd.origin(a);
+        side_ = rd.header().bounds_max[0] - rd.header().bounds_min[0];
+        if (!(side_ > 0.0) || nodes_->empty()) return false;
+        at_.clear(); inside_.clear(); max_level_ = 0;
+        std::unordered_map<uint64_t,unsigned> resolution;
+        for (const auto& n : *nodes_) {
+            const double ratio = side_ / std::max(2.0 * double(n.half_size), 1e-12);
+            resolution[n.node_id] = unsigned(std::max(0.0, std::min(double(kMaxDepth), std::floor(std::log2(ratio) + 1e-9))));
+        }
+        auto cells = [&](const BoundingBox& b, unsigned d, auto emit) {
+            const uint32_t x0=cell_of(b.min[0],0,d), y0=cell_of(b.min[1],1,d);
+            const uint32_t x1=cell_of(std::nextafter(b.max[0],-HUGE_VAL),0,d);
+            const uint32_t y1=cell_of(std::nextafter(b.max[1],-HUGE_VAL),1,d);
+            for(uint32_t y=y0;y<=y1;++y) for(uint32_t x=x0;x<=x1;++x) emit(make_key(d,x,y));
+        };
+        double lo[2]={1e300,1e300}, hi[2]={-1e300,-1e300};
+        for (uint32_t i=0;i<nodes_->size();++i) {
+            const auto& n=(*nodes_)[i];
+            const auto parent=resolution.find(n.node_id >> 3);
+            const unsigned first = parent==resolution.end() ? 0 : std::min(kMaxDepth,parent->second+1);
+            const unsigned last = is_leaf_node(n) ? first : std::max(first,resolution[n.node_id]);
+            max_level_=std::max(max_level_,last);
+            const BoundingBox box=node_bounds(n,origin_);
+            for(unsigned d=first;d<=last;++d) cells(box,d,[&](uint64_t k){at_[k].push_back(i);});
+            if(is_leaf_node(n)) {
+                total_leaf_points_+=n.point_count;
+                for(int a=0;a<2;++a){lo[a]=std::min(lo[a],box.min[a]);hi[a]=std::max(hi[a],box.max[a]);}
+                for(unsigned d=0;d<=first;++d) {
+                    // Directory-only estimates for coarse cuts. Exact builds
+                    // replace these estimates with the actual gathered count.
+                    uint64_t assigned=0, first_key=0; bool have=false;
+                    cells(box,d,[&](uint64_t k){
+                        if(!have){first_key=k;have=true;}
+                        double mn[2],mx[2];cell_xy(k,mn,mx);
+                        const double ax=std::max(0.0,std::min(mx[0],box.max[0])-std::max(mn[0],box.min[0]));
+                        const double ay=std::max(0.0,std::min(mx[1],box.max[1])-std::max(mn[1],box.min[1]));
+                        const double full=std::max(box.extent(0)*box.extent(1),1e-24);
+                        const uint64_t count=std::min<uint64_t>(n.point_count-assigned,uint64_t(n.point_count*(ax*ay/full)));
+                        inside_[k]+=count;assigned+=count;
+                    });
+                    if(have)inside_[first_key]+=n.point_count-assigned;
+                }
+            }
+        }
+        xy_extent_=std::max(hi[0]-lo[0],hi[1]-lo[1]);
+        if(!(xy_extent_>0))xy_extent_=side_;
+        return true;
+    }
     uint32_t cell_of_offset(float offset, unsigned l) const {
         const double c = std::floor(double(offset) / side_ * double(uint64_t(1) << l));
         return uint32_t(std::min(std::max(c, 0.0), double((uint64_t(1) << l) - 1)));
@@ -562,7 +617,13 @@ inline bool gather_tile(const BuildIo& io, uint64_t k, SurfaceTile& out, KeptNod
     for (uint32_t i : col) {
         auto v = io.points->get(i, *io.rd, nodes, io.generation, io.io_lock, error);
         if (!v) return false;
-        for (const auto& p : *v) { out.point_refs.push_back(&p); out.classes.set(p.cls); }
+        for (const auto& p : *v) {
+            if (io.rd->is_collection()) {
+                uint32_t cx,cy;qt.record_cell(i,p.x,p.y,d,cx,cy);
+                if(cx!=key_x(k)||cy!=key_y(k))continue;
+            }
+            out.point_refs.push_back(&p); out.classes.set(p.cls);
+        }
         keep.emplace_back(i, std::move(v));
     }
     for (uint32_t i : sh) {
@@ -581,7 +642,14 @@ inline bool gather_tile(const BuildIo& io, uint64_t k, SurfaceTile& out, KeptNod
     return true;
 }
 
-inline bool build_tile(const BuildIo& io, uint64_t k, const SurfaceParams& P, TileData& out, std::string* err) {
+inline bool build_tile(const BuildIo& io, uint64_t k, const SurfaceParams& input, TileData& out, std::string* err) {
+    SurfaceParams P = input;
+    if (key_level(k) == 0) {
+        // The root is also the continuous interpolation underlay. Keeping its
+        // Delaunay faces fills sparse interiors after the cut refines.
+        P.max_edge_abs = -1.0;
+        P.min_area = P.min_aspect = 0.0;
+    }
     const Quadtree& qt = *io.qt;
     const unsigned d = key_level(k);
     const int64_t n = int64_t(1) << d;
@@ -612,6 +680,7 @@ inline bool build_tile(const BuildIo& io, uint64_t k, const SurfaceParams& P, Ti
     out.key = k;
     out.flags = qt.exact(k) ? kFlagExact : 0;
     out.source_points = qt.leaf_points_inside(k) + shallow;
+    if (io.rd->is_collection() && qt.exact(k)) out.source_points = cells[size_t(self)].point_count();
     std::vector<const SurfaceTile*> refs;
     for (const auto& c : cells) refs.push_back(&c);
     const detail::TileXIndex xindex(refs);
@@ -774,7 +843,8 @@ public:
         if (!qt_.build(rd)) { if (err) *err = "surface LOD: empty or degenerate directory"; return false; }
         points_ = std::make_unique<NodePoints>(config.node_bytes);
         points_->clear(source_gen_);
-        read_archive();
+        if (rd.is_collection()) { config.persist = false; w_disabled_ = true; }
+        else read_archive();
         const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
         const unsigned n = config.workers ? config.workers : std::min(6u, std::max(2u, hw / 2));
         stop_ = false;
@@ -1117,9 +1187,19 @@ public:
                 first += count;
             }
         }
+        const uint64_t root = make_key(0, 0, 0);
+        auto background = gpu_.find(root);
+        if (!drawn.count(root) && background != gpu_.end()) {
+            auto& g = background->second;
+            g.last_frame = frame_;
+            if (!g.empty && g.groups[0]) {
+                items.push_back({root, 0, g.groups[0], 0, 1});
+                tris += g.groups[0];
+            }
+        }
         const bool changed = items.size() != last_draw_.size() ||
             !std::equal(items.begin(), items.end(), last_draw_.begin(), [](const auto& a, const auto& b) {
-                return a.key == b.key && a.first_face == b.first_face && a.face_count == b.face_count && a.coverage == b.coverage;
+                return a.key == b.key && a.first_face == b.first_face && a.face_count == b.face_count && a.coverage == b.coverage && a._pad == b._pad;
             });
         if (changed) {
             eng.surface_tiles_set_draw_list(items);
@@ -1590,6 +1670,11 @@ private:
         std::unordered_set<uint64_t> refined_now;
         cover(make_key(0, 0, 0), cam, corridor, refined_now);
         refined_.swap(refined_now);
+        // Keep the coarse continuous TIN resident under the detailed cut. It
+        // is drawn at background depth and cannot cover a detailed fragment.
+        const uint64_t root = make_key(0, 0, 0);
+        if (!gpu_.count(root) && !failed_.count(root))
+            wanted_.push_back({-1.0, root});
         std::sort(wanted_.begin(), wanted_.end());
         wanted_missing_ = wanted_.size();
     }
@@ -1668,6 +1753,7 @@ private:
         for (int i = 0; i < 3; ++i) over |= used[i] + need[i] > gpu_caps_[i] * 9 / 10;
         if (!over) return;
         std::unordered_set<uint64_t> keep(drawn_.begin(), drawn_.end());
+        keep.insert(make_key(0, 0, 0)); // Continuous interpolation underlay.
         std::vector<std::pair<uint64_t, uint64_t>> lru;
         for (const auto& g : gpu_) if (!keep.count(g.first)) lru.push_back({g.second.last_frame, g.first});
         std::sort(lru.begin(), lru.end());
@@ -1697,6 +1783,7 @@ private:
     void evict_cpu() {
         if (cpu_bytes_ <= config.cpu_bytes) return;
         std::unordered_set<uint64_t> pending(drawn_.begin(), drawn_.end());   // drawn: class edits patch them
+        pending.insert(make_key(0, 0, 0)); // Keep its CPU copy for class patches.
         for (const auto& w : wanted_) if (!gpu_.count(w.second)) pending.insert(w.second);
         std::vector<std::pair<uint64_t, uint64_t>> lru;
         for (const auto& c : cpu_) if (!pending.count(c.first)) lru.push_back({c.second.last_frame, c.first});

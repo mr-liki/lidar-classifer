@@ -1958,6 +1958,13 @@ class NakshaApp(QMainWindow):
         """Return de-duplicated loaded source paths in display priority order."""
         paths = []
         seen = set()
+        if getattr(self, '_lnt_main_view', None) is not None:
+            for value in getattr(self, '_lnt_source_paths', ()):
+                path = os.path.normpath(str(value))
+                key = os.path.normcase(path)
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(path)
 
         for store_name in ("snt_attachments", "dxf_attachments"):
             for attachment in getattr(self, store_name, []) or []:
@@ -7056,9 +7063,11 @@ class NakshaApp(QMainWindow):
         for i, f in enumerate(filenames):
             print(f"   {i+1}. {os.path.basename(f)}")
 
-        if len(filenames) == 1 and os.path.splitext(filenames[0])[1].lower() in (".las", ".laz", ".lnt"):
+        native_single = len(filenames) == 1 and os.path.splitext(filenames[0])[1].lower() in (".las", ".laz", ".lnt", ".lntset")
+        native_batch = len(filenames) > 1 and all(os.path.splitext(path)[1].lower() in (".las", ".laz", ".lnt") for path in filenames)
+        if native_single or native_batch:
             from gui.lnt_open import open_with_lnt
-            open_with_lnt(self, filenames[0])
+            open_with_lnt(self, filenames if native_batch else filenames[0])
             return
 
         # ── STEP 2.5: Memory safety check ─────────────────────────────
