@@ -667,14 +667,16 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
             sections.apply_sync_map(mapping)
         else:
             app.open_sync_views_dialog()
-    elif name == 'DisplayMode':
+    elif name == 'DisplayMode' or (name == 'Surface' and (preset or {}).get('views')):
         if not preset:
             app.open_display_mode()
             return True
         from gui.shortcut_manager import rebase_display_preset_to_current_ptc
         rebased = rebase_display_preset_to_current_ptc(preset, app)
+        mode = str(rebased.get('display_mode', 'surface' if name == 'Surface' else 'class')
+                   or 'class').strip().lower()
         for slot, palette in rebased.get('views', {}).items():
-            _apply_display(app, view, sections, int(slot), palette, 'class', status)
+            _apply_display(app, view, sections, int(slot), palette, mode, status)
     else:
         mode = 'shaded_class' if name == 'ShadingMode' else DISPLAY_MODES[name]
         slot = int((preset or {}).get('target_view', (preset or {}).get('slot',

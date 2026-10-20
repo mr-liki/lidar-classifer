@@ -1658,7 +1658,7 @@ class DisplayModeDialog(QDialog):
 
                     wt_item = self.table.item(row, 6)
                     if wt_item:
-                        wt_item.setText(f"{info.get('weight', default_weight):.1f}")
+                        wt_item.setText(f"{info.get('weight', default_weight):.2f}")
                 except Exception:
                     continue
         finally:
