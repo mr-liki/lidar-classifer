@@ -3212,7 +3212,7 @@ _SHADING_DELTA_JOURNAL_MAX_POINTS = 5_000_000
 #         edge_key = "auto" if single_class_max_edge is None else round(float(single_class_max_edge), 6)
 #         mode_key = ("single", edge_key, quality_key)
 #     else:
-#         mode_key = ("multi", quality_key)
+#         mode_key = ("multi", round(float(single_class_max_edge or 0.0), 6), quality_key)
 #     return (_compute_xyz_hash(xyz), _normalize_visible_classes(visible_classes), mode_key)
 
 # _cache_store = OrderedDict()
@@ -8746,7 +8746,7 @@ _MAX_STORED_REPRESENTATIVE_CACHES = 4
 _ADAPTIVE_SHADING_VERSION = 1
 _ADAPTIVE_DEFAULT_TARGET = 3_000_000
 _SHADING_FAST_TARGET = 1_000_000
-_FEATURE_AWARE_VERSION = 1
+_FEATURE_AWARE_VERSION = 2
 _SHADING_LINE_FILTER_VERSION = 2
 
 # Multi-class classification refresh must keep the enormous base shaded mesh
@@ -9576,7 +9576,7 @@ def _feature_aware_filter_faces(faces, xyz_unique, representative_boundary, spac
     original mesh when thresholds would remove too much topology.
     """
     t0 = time.perf_counter()
-    enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "1").strip().lower() not in ("0", "false", "off", "no")
+    enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "0").strip().lower() not in ("0", "false", "off", "no")
     meta = {
         "enabled": False, "reason": "disabled", "input_faces": int(len(faces)),
         "output_faces": int(len(faces)), "removed": 0, "elapsed": 0.0,
@@ -9876,22 +9876,10 @@ def _compute_shading_geometry_backend(
     checkpoint("delaunay")
 
     if len(faces) > 0:
-        # Slow means fidelity, not geometric simplification. The historical
-        # spacing/aspect thresholds reject skinny but valid triangles and can
-        # orphan LiDAR samples around poles, wires, roof edges and vertical
-        # returns. Slow only rejects numerical zero-area triangles; Fast and
-        # Normal retain the established thresholds unchanged.
-        slow_numeric_only = str(quality_mode or "normal").lower() == "slow"
-        if slow_numeric_only:
-            min_area = 1e-12
-            min_aspect = 1e-10
-            print(
-                "SHADING_DEGENERATE_POLICY mode=slow policy=numeric_only "
-                f"min_area={min_area:.1e} min_aspect={min_aspect:.1e}"
-            )
-        else:
-            min_area = (spacing * 0.1) ** 2
-            min_aspect = 0.001
+        # Valid skinny faces belong to the Delaunay coverage. Spacing and
+        # shape thresholds punch holes in irregularly sampled surfaces.
+        min_area = 0.0
+        min_aspect = 0.0
         if HAS_NUMBA:
             keep = _numba_degenerate_filter(
                 faces, xy, float(min_area), float(min_aspect)
@@ -9914,44 +9902,11 @@ def _compute_shading_geometry_backend(
                 faces = faces[nd]
     checkpoint("degenerate_filter")
 
-    if len(faces) > 0:
-        if is_sc:
-            me = single_class_max_edge if single_class_max_edge else data_extent * 0.2
-            faces = _filter_edges_by_absolute(faces, xy, me)
-        else:
-            mea = data_extent * 0.10
-            if bool(line_filter_active):
-                # A selected subset of LAS Point Source IDs can leave large XY
-                # gaps between swaths.  A global Delaunay otherwise bridges those
-                # gaps with long/steep triangles, which appears as black scan-line
-                # hatching in Shaded Classification.  Tighten ONLY this filtered
-                # mesh; the normal all-lines Shading threshold is unchanged.
-                line_edge_factor = max(
-                    2.0,
-                    float(os.environ.get(
-                        "NAKSHA_SHADING_LINE_MAX_EDGE_FACTOR", "12.0"
-                    )),
-                )
-                line_min_edge = max(
-                    0.25,
-                    float(os.environ.get(
-                        "NAKSHA_SHADING_LINE_MIN_EDGE", "1.5"
-                    )),
-                )
-                guarded_edge = max(spacing * line_edge_factor, line_min_edge)
-                mea = min(mea, guarded_edge)
-                before_line_edge = len(faces)
-                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
-                print(
-                    "SHADING_LINE_EDGE_GUARD "
-                    f"status=enabled max_edge={mea:.3f} spacing={spacing:.4f} "
-                    f"factor={line_edge_factor:.2f} "
-                    f"faces_before={before_line_edge} faces_after={len(faces)} "
-                    f"removed={before_line_edge-len(faces)}"
-                )
-            else:
-                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
-            max_edge_factor = mea / max(spacing, 1e-9)
+    # Keep continuous coverage unless the user explicitly requests a limit.
+    explicit_edge = float(single_class_max_edge or 0.0)
+    if len(faces) > 0 and explicit_edge > 0.0:
+        faces = _filter_edges_by_absolute(faces, xy, explicit_edge)
+        max_edge_factor = explicit_edge / max(spacing, 1e-9)
     checkpoint("edge_filter")
 
     faces, feature_meta = _feature_aware_filter_faces(
@@ -12832,7 +12787,7 @@ def _build_cache_key(xyz, visible_classes, single_class_max_edge=None, quality_m
     else:
         adaptive_target = int(os.environ.get("NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)))
     adaptive_ratio = round(float(os.environ.get("NAKSHA_SHADING_ADAPTIVE_FINE_RATIO", "0.55")), 4)
-    feature_enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "1").strip().lower() not in ("0", "false", "off", "no")
+    feature_enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "0").strip().lower() not in ("0", "false", "off", "no")
     feature_key = (
         _FEATURE_AWARE_VERSION, int(feature_enabled),
         round(float(os.environ.get("NAKSHA_SHADING_FEATURE_EDGE_FACTOR", "3.0")), 4),
@@ -12846,7 +12801,7 @@ def _build_cache_key(xyz, visible_classes, single_class_max_edge=None, quality_m
         edge_key = "auto" if single_class_max_edge is None else round(float(single_class_max_edge), 6)
         mode_key = ("single", edge_key, quality_key)
     else:
-        mode_key = ("multi", quality_key)
+        mode_key = ("multi", round(float(single_class_max_edge or 0.0), 6), quality_key)
     return (_compute_xyz_hash(xyz), _normalize_visible_classes(visible_classes), mode_key)
 
 _cache_store = OrderedDict()
@@ -18924,7 +18879,7 @@ class ShadingControlPanel(QWidget):
         super().__init__(); self.app=app; self.setWindowTitle('Shading')
         layout=QVBoxLayout()
         rows=[
-            ('Max edge (m):','max_edge',(1,1000),100,10),
+            ('Max edge (m, 0 = unlimited):','max_edge',(0,1000),0,10),
             ('Azimuth:','az',(0,360),45,5),
             ('Sharpness:','el',(0,999),45,5),
             ('Ambient (brightness):','amb',(0,1),0.25,0.05),

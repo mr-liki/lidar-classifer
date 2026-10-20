@@ -56,6 +56,9 @@ def test_lnt_laz_bridge_promotes_legacy_packed_class_51(tmp_path):
     las.z = [1.0, 2.0, 3.0]
     las.classification = np.asarray([19, 19, 7], dtype=np.uint8)
     las.synthetic = np.asarray([1, 0, 0], dtype=bool)
+    las.red = np.asarray([65535, 0, 0], dtype=np.uint16)
+    las.green = np.zeros(3, dtype=np.uint16)
+    las.blue = np.zeros(3, dtype=np.uint16)
     try:
         las.write(source)
     except laspy.LaspyException as exc:
@@ -66,8 +69,12 @@ def test_lnt_laz_bridge_promotes_legacy_packed_class_51(tmp_path):
     )
     loaded = laspy.read(promoted)
 
-    assert loaded.header.point_format.id == 6
+    # Format 7 is format 6 plus RGB: the promotion must keep the legacy
+    # colour channels, not only the packed class byte.
+    assert loaded.header.point_format.id == 7
     assert np.asarray(loaded.classification).tolist() == [51, 19, 7]
+    assert np.asarray(loaded.red).tolist() == [65535, 0, 0]
+    assert np.asarray(loaded.green).tolist() == [0, 0, 0]
 
 
 def test_buffer_polygon_contains_primary_and_requested_neighbor_strip():

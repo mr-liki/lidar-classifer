@@ -7,7 +7,8 @@ constructs VTK datasets, actors, cameras or interactors.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPoint, Qt, QTimer
+from concurrent.futures import ThreadPoolExecutor
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QWidget, QDockWidget, QVBoxLayout, QLabel, QMessageBox
 from PySide6.QtWidgets import QComboBox, QDialog
@@ -16,6 +17,11 @@ from gui.render_backend import VulkanRenderBackend
 from gui.lnt_section_bridge import get_store, LntCrossPicker
 from gui.native_section_classify import SectionClassifier
 from gui.native_pan import NativePanGesture, disarm_pan
+from gui.native_section_display import (MESH_MODES, POINT_MODES, build_mesh_data, recolor_mesh,
+                                       rainbow, visibility, draw_ranges, line_colors,
+                                       depth_colors, color_range)
+
+_mesh_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='section_mesh')
 
 CROSS_SECTION_COUNT = 8
 CUT_SLOT = 9
@@ -152,6 +158,9 @@ def section_geometry(xyz, p1, p2, half_width, buffer, bounds=False):
 
 
 class SectionCanvas(QWidget):
+    mesh_ready = Signal(int, object, str)
+    lines_ready = Signal(int, object, str)
+
     def __init__(self, owner, slot, parent):
         super().__init__(parent)
         self.owner, self.slot = owner, slot
@@ -174,7 +183,26 @@ class SectionCanvas(QWidget):
         self.cut_source = None
         self.mode = 'class'
         self.palette = {}
+        self._render_palette = {}      # the same palette keyed by stored slot
         self.shading_parameters = (45., 45., .25)
+        self._display_revision = 0
+        self._mesh_future = None
+        self.mesh_ready.connect(self._finish_mesh, Qt.QueuedConnection)
+        self.lines_ready.connect(self._finish_lines, Qt.QueuedConnection)
+        self._source_ids = None
+        # Geometry/shade cache for classification-only edits: recolouring an
+        # existing mesh must never clear the viewport or re-triangulate.
+        self._mesh_data = None
+        self._mesh_mask = None
+        self._mesh_key = None
+        self._pending_mesh_revision = -1
+        self._pending_mesh_mask = None
+        self._pending_mesh_key = None
+        self._surface_loaded = False      # the resident mesh matches the request
+        self._surface_resident = False    # the engine holds a mesh on the GPU
+        self._mesh_build_count = 0
+        self._mesh_recolor_count = 0
+        self._indices_sorted = True
         self._dirty = True
         self._closed = False
         self._cut_preview = None
@@ -244,8 +272,15 @@ class SectionCanvas(QWidget):
         super().resizeEvent(event)
 
     def set_points(self, local, indices, axis=0, fit=True, bounds=None):
+        if not np.array_equal(self.indices, indices):
+            self._source_ids = None
+        # New records/axis: any cached triangulation is no longer valid, and a
+        # mesh from the previous corridor must not float over the new points.
+        self._drop_mesh_cache()
+        self._retire_mesh()
         self.local = np.ascontiguousarray(local, dtype=np.float64)
         self.indices = np.asarray(indices, dtype=np.int64)
+        self._indices_sorted = bool(len(self.indices) < 2 or np.all(np.diff(self.indices) > 0))
         self.axis = axis
         if not self.start():
             return
@@ -253,6 +288,7 @@ class SectionCanvas(QWidget):
             # Nothing in the corridor/cut: show an empty view (the engine
             # refuses a zero-point upload) and keep the old buffer hidden.
             self.backend.set_point_cloud_visible(False)
+            self.apply_palette(self.palette, self.mode, sync=False)
             self.classifier.cancel()
             self._dirty = True
             return
@@ -282,45 +318,328 @@ class SectionCanvas(QWidget):
             self.fit(sync=False)
         self._dirty = True
 
+    # ---- mesh refresh (classification edits must never flash the viewport) --
+    def _drop_mesh_cache(self):
+        self._mesh_data = self._mesh_mask = self._mesh_key = None
+        self._pending_mesh_revision = -1
+        self._pending_mesh_mask = self._pending_mesh_key = None
+
+    def _retire_mesh(self):
+        """Remove the resident mesh (leaving a mesh mode / new dataset)."""
+        self._drop_mesh_cache()
+        if getattr(self, '_closed', False):
+            self._surface_loaded = self._surface_resident = False
+            return
+        if getattr(self, '_surface_loaded', False) or getattr(self, '_surface_resident', False):
+            if not self.backend.clear_surface():
+                raise RuntimeError('Could not clear the previous section mesh')
+        self._surface_loaded = self._surface_resident = False
+        self._dirty = True
+
+    def classes_all_visible(self, app=None):
+        """True when a class edit cannot change this view's visibility mask."""
+        app = self.owner.app if app is None else app
+        if getattr(app, '_import_class_blocked', ()):
+            return False
+        return not any(not rule.get('show', True) for rule in self.palette.values())
+
+    def _mesh_options(self, app, mode):
+        return dict(
+            light=(float(getattr(app, 'last_shade_azimuth', 45.)),
+                   float(getattr(app, 'last_shade_angle', 45.)),
+                   float(getattr(app, 'shade_ambient', .25))),
+            quality=getattr(app, 'shading_quality' if mode == 'shaded_class' else 'surface_quality', 'normal'),
+            precision=float(getattr(app, 'surface_dedup_precision', 0.) or 0.),
+            max_edge=float(getattr(app, 'surface_max_edge', 0.) or 0.),
+            ramp=getattr(app, 'surface_color_ramp', None) or getattr(app, 'elevation_color_ramp', None))
+
+    @staticmethod
+    def _mesh_signature(mode, options):
+        """Everything a triangulation depends on, except the record mask."""
+        ramp = options.get('ramp') or ()
+        try:
+            ramp = tuple((float(stop[0]), tuple(int(c) for c in stop[1]))
+                         for stop in sorted(ramp, key=lambda stop: stop[0]))
+        except (TypeError, ValueError):
+            ramp = repr(ramp)
+        return (mode, options['quality'], options['light'], options['precision'],
+                options['max_edge'], ramp)
+
+    def _update_mesh(self, store, mask, classes):
+        """Keep a shaded/surface mesh on screen across classification edits.
+
+        A class edit normally changes only class ids, never the triangulation,
+        so the resident mesh is recoloured from cached geometry (Surface bakes
+        elevation, so it needs no upload at all). Only a real geometry change
+        starts a worker, and the previous mesh stays visible until the new one
+        is uploaded - the viewport is never cleared between the two.
+        """
+        app = self.owner.app
+        options = self._mesh_options(app, self.mode)
+        signature = self._mesh_signature(self.mode, options)
+        cached = (self._mesh_data is not None and self._mesh_key == signature
+                  and self._mesh_mask is not None and self._mesh_mask.shape == mask.shape
+                  and bool(np.all(self._mesh_mask == mask)))
+        if cached:
+            if self._mesh_future is not None:
+                self._mesh_future.cancel()
+                self._mesh_future = None
+            if self._recolor_resident(classes[mask]):
+                return
+        pending = (self._mesh_future is not None
+                   and self._pending_mesh_revision == self._display_revision
+                   and self._pending_mesh_key == signature
+                   and self._pending_mesh_mask is not None
+                   and bool(np.all(self._pending_mesh_mask == mask)))
+        if pending:
+            return
+        if not np.any(mask):
+            self._retire_mesh()
+            return
+        idx = self.indices
+        xyz = np.ascontiguousarray(store.data['xyz'][idx][mask], dtype=np.float64)
+        options['z_bounds'] = tuple(np.percentile(xyz[:, 2], [1., 99.]))
+        display = self.local if self.axis == 0 else self.local[:, [1, 0, 2]]
+        # Workers receive snapshots only. All renderer mutations happen in
+        # _finish_mesh on the GUI thread, guarded by a display revision.
+        revision = self._display_revision
+        future = _mesh_workers.submit(build_mesh_data, xyz, np.ascontiguousarray(display[mask]),
+                                      classes[mask].copy(), self._render_palette, self.mode, options)
+        self._mesh_future = future
+        self._pending_mesh_revision = revision
+        self._pending_mesh_key = signature
+        self._pending_mesh_mask = np.ascontiguousarray(mask)
+        # The old mesh (or the point cloud, on first entry) stays on screen.
+        self._surface_loaded = False
+        self._dirty = True
+        def complete(done):
+            if done.cancelled():
+                return
+            try:
+                result, error = done.result(), ''
+            except Exception as exc:
+                result, error = None, str(exc)
+            try:
+                self.mesh_ready.emit(revision, result, error)
+            except RuntimeError:
+                pass  # the dock was destroyed while its worker completed
+        future.add_done_callback(complete)
+        app.statusBar().showMessage(f'Building section {self.slot} {self.mode.replace("_", " ")}...', 3000)
+
+    def _recolor_resident(self, classes_masked):
+        """Re-bake the resident mesh's face colours; geometry is untouched."""
+        data = self._mesh_data
+        if data is None:
+            return False
+        if self.mode == 'surface':
+            # Surface colours bake elevation and light only: a class edit
+            # cannot change a single pixel.
+            self._surface_loaded = self._surface_resident = True
+            self._dirty = True
+            return True
+        colors = recolor_mesh(data, classes_masked, self._render_palette)
+        if colors is None:
+            return False
+        update = getattr(self.backend, 'update_surface_colors', None)
+        if update is None or not update(colors):
+            # Compatibility with older engine DLLs.
+            if not self.backend.set_surface(data['positions'], data['faces'], colors):
+                return False
+        data['colors'] = colors
+        self._mesh_recolor_count += 1
+        self._present_mesh()
+        return True
+
+    def _present_mesh(self):
+        """Show a resident mesh: flat pass-through colours, points hidden."""
+        self.backend.set_display_mode(1)
+        self.backend.set_shading_parameters(0, 45., 45., 1.)
+        self.backend.set_point_cloud_visible(False)
+        self._surface_loaded = self._surface_resident = True
+        self._dirty = True
+
     def apply_palette(self, palette, mode='class', sync=False):
-        self.palette, self.mode = dict(palette or {}), mode
+        if mode not in POINT_MODES and mode not in MESH_MODES:
+            raise ValueError(f'Unknown section display mode: {mode}')
+        self.palette = {int(k): dict(v) for k, v in (palette or {}).items()}
+        self.mode = mode
+        # Native tables are keyed by the stored one-byte class slot, so user
+        # numbers above 255 keep their colour, weight and visibility.
+        from gui.class_slots import stored_palette
+        self._render_palette = stored = stored_palette(self.owner.app, self.palette)
+        self._display_revision += 1
+        if self._mesh_future is not None:
+            self._mesh_future.cancel()
+            self._mesh_future = None
         if not self.backend._handle:
             return
+        if not len(self.indices):
+            self._retire_mesh()
+            self._dirty = True
+            return
+        store = get_store(self.owner.app)
+        app = self.owner.app
+        idx = self.indices
+        classes = np.asarray(store.data['classification'][idx], dtype=np.uint8)
+        from gui.flight_line_filter import flight_line_visibility_for_slot
+        source = store.data.get('point_source_id')
+        source_ids = source[idx] if source is not None and len(source) == len(store.data['xyz']) else None
+        if source_ids is None:
+            source_ids = self._source_ids
+        lines = flight_line_visibility_for_slot(app, self.slot)
+        if source_ids is None and (mode == 'line' or any(not shown for shown in lines.values())):
+            self._load_source_lines(store)
+            return
+        mask = visibility(classes, stored, getattr(app, '_import_class_blocked', ()), source_ids, lines)
+        if mode == 'surface':
+            for code, entry in stored.items():
+                support = entry.get('surface', entry.get('surface_support', True))
+                if support is not None and not support:
+                    mask &= classes != code
+        if mode in MESH_MODES:
+            # The mesh owns the viewport; _update_mesh keeps whatever is on
+            # screen until the replacement is uploaded, so an edit or a mode
+            # switch never blanks the view.
+            self._update_mesh(store, mask, classes)
+            return
+        self._retire_mesh()
+        self.backend.set_point_attributes(classification=classes)
+        firsts, counts = draw_ranges(mask)
+        self.backend.set_point_draw_ranges(firsts, counts)
+        if not np.any(mask):
+            # An empty range list tells the engine to draw the whole buffer,
+            # so hiding every class must hide the cloud (and its border
+            # shells) explicitly - otherwise the view shows everything.
+            self.backend.set_point_cloud_visible(False)
+            self._dirty = True
+            return
+        display = self.local if self.axis == 0 else self.local[:, [1, 0, 2]]
         colors = np.full((256, 3), 128, dtype=np.uint8)
-        visible = np.ones(256, dtype=np.uint8)
-        # Per-class point weights (Display Mode "Weight" column). Mirrors the
-        # VTK weight_lut: gl_PointSize = the view's fixed pixel size * weight.
-        # Strictly per-view: this pushes to THIS view's renderer only, so
-        # growing a class's points here never touches a synced sibling view.
         weights = np.ones(256, dtype=np.float32)
-        from gui.class_slots import stored_palette
-        for code, rule in stored_palette(self.owner.app, palette).items():
-            if 0 <= code < 256:          # stored slot (user numbers > 255 mapped)
+        for code, rule in stored.items():   # stored slot (user > 255 mapped)
+            if 0 <= code < 256:
                 colors[code] = rule.get('color', (128, 128, 128))
-                visible[code] = bool(rule.get('show', True))
                 try:
-                    raw = float(rule.get('weight', 1.0))
-                except (TypeError, ValueError):
-                    raw = 1.0
-                weights[code] = np.float32(max(0.1, min(raw, 12.0)))
-        self.backend.set_point_luts(class_rgb=colors)
-        self.backend.set_class_visibility(visible)
-        if hasattr(self.backend, 'set_class_weights'):
-            self.backend.set_class_weights(weights)
-        modes = {'rgb': 0, 'class': 1, 'intensity': 2, 'elevation': 3,
-                 'shaded_class': 4, 'depth': 6}
-        # Sections are projected point views. Native instant lighting shades
-        # these records without constructing a terrain TIN across vertical faces.
-        self.backend.set_display_mode(modes.get(mode, 1))
+                    weights[code] = max(.1, min(float(rule.get('weight', 1.)), 12.))
+                except (ValueError, TypeError):
+                    pass
+        self.backend.set_point_luts(class_rgb=colors,
+            elevation_rgb=rainbow(np.linspace(0, 1, 256), getattr(app, 'elevation_color_ramp', None)),
+            intensity_rgb=np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1))
+        # Visibility already narrowed the draw ranges above, so every class
+        # left in them is shown; slots keep the LUT/resolution consistent.
+        self.backend.set_class_visibility(np.ones(256, dtype=np.uint8))
+        self.backend.set_class_weights(weights)
+        # Line mode uses source IDs, never classification IDs. Restore original
+        # RGB when leaving Line so Line colours cannot leak into RGB mode.
+        if mode in ('line', 'depth') or getattr(self, '_point_colors_mode', '') in ('line', 'depth'):
+            if mode == 'line' and source_ids is None:
+                app.statusBar().showMessage('Line mode needs Point Source ID attributes; this LNT section has none.', 8000)
+                return
+            if mode == 'line':
+                rgb = line_colors(source_ids, getattr(app, 'flight_line_colors', {}))
+            elif mode == 'depth':
+                rgb = depth_colors(display[:, 1], app)
+            else:
+                rgb8 = getattr(store, 'rgb8', None)
+                rgb = rgb8[idx] if rgb8 is not None else np.clip(store.data['rgb'][idx] * 255. + .5, 0, 255).astype(np.uint8)
+            if not self.backend.set_point_cloud(np.ascontiguousarray(display), rgb=rgb,
+                    classification=classes, intensity=store.data['intensity'][idx]):
+                raise RuntimeError('Could not upload section flight-line colours')
+            self.backend.set_point_draw_ranges(firsts, counts)
+        self._point_colors_mode = mode
+        z = self.local[mask, 2]
+        lo, hi = color_range(z, float(getattr(app, 'elevation_clip_low', 1.)),
+                            float(getattr(app, 'elevation_clip_high', 99.)))
+        self.backend.set_point_elevation_range(float(lo), max(float(hi), float(lo) + 1e-6))
+        intensity = store.data['intensity'][idx][mask]
+        lo, hi = color_range(intensity, float(getattr(app, 'intensity_clip_low', .5)),
+                            float(getattr(app, 'intensity_clip_high', 99.8)), ignore_zero=True)
+        self.backend.set_point_intensity_range(float(lo), max(float(hi), float(lo) + 1e-6),
+            float(getattr(app, 'intensity_contrast', 1.)), float(getattr(app, 'intensity_gamma', 1.35)))
+        self.backend.set_display_mode(0 if mode == 'depth' else POINT_MODES[mode])
+        self.backend.set_point_cloud_visible(True)
         from gui.native_border import apply_border
         apply_border(self.owner.app, self.slot)
-        if mode == 'shaded_class':
-            self.backend.set_instant_shading_parameters(*self.shading_parameters)
-        if len(self.local):
-            self.backend.set_point_elevation_range(float(self._lo[2]), float(self._hi[2]) + 1e-6)
         self._dirty = True
-        if sync:
-            self.owner.sync_from(self.slot, display=True)
+
+    @Slot(int, object, str)
+    def _finish_lines(self, revision, result, error):
+        if self._closed or revision != self._display_revision:
+            return
+        if error:
+            self.owner.app.statusBar().showMessage(f'Section {self.slot} Line mode: {error}', 10000)
+            return
+        self._source_ids = result
+        self.apply_palette(self.palette, self.mode, sync=False)
+        dialog = getattr(self.owner.app, 'display_mode_dialog', None)
+        if getattr(self, '_open_lines_when_ready', False):
+            self._open_lines_when_ready = False
+            if dialog is not None and dialog.current_slot == self.slot:
+                QTimer.singleShot(0, dialog._open_lines_dialog)
+
+    def _load_source_lines(self, store):
+        import os
+        from gui.native_section_display import source_line_ids
+        from gui.lnt_class_counts import read_directory
+        app = self.owner.app
+        path = str(getattr(app, '_lnt_source_path', '') or '')
+        if not path or not os.path.isfile(path) or not path.lower().endswith(('.las', '.laz', '.lntset')):
+            app.statusBar().showMessage('Line mode requires the original LAS/LAZ; LNT v2 does not store Point Source IDs.', 10000)
+            return
+        # Bound reconstruction error using the selected nodes' 16-bit cell step.
+        lnt_path = app._lnt_main_view.lnt_path
+        _, directory = read_directory(lnt_path)
+        half = float(directory['half_size'][store.node[self.indices]].max())
+        tolerance = 2. * half / 65535. * np.sqrt(3.) * .501
+        if path.lower().endswith('.lntset'):
+            # Collection directory centres share a common float32 origin.
+            centres = directory['center'][store.node[self.indices]]
+            tolerance += float(np.abs(np.spacing(centres)).max()) * np.sqrt(3.) * .501
+        xyz = np.ascontiguousarray(store.data['xyz'][self.indices], dtype=np.float64)
+        revision = self._display_revision
+        future = _mesh_workers.submit(source_line_ids, path, xyz, tolerance,
+                                      getattr(app, '_lnt_render_crs_wkt', None))
+        self._mesh_future = future
+        def complete(done):
+            if done.cancelled():
+                return
+            try:
+                result, error = done.result(), ''
+            except Exception as exc:
+                result, error = None, str(exc)
+            try:
+                self.lines_ready.emit(revision, result, error)
+            except RuntimeError:
+                pass
+        future.add_done_callback(complete)
+        app.statusBar().showMessage(f'Reading source flight lines for section {self.slot}...', 3000)
+
+    @Slot(int, object, str)
+    def _finish_mesh(self, revision, result, error):
+        if self._closed or revision != self._display_revision:
+            return
+        if error:
+            self._retire_mesh()
+            self.backend.set_point_cloud_visible(True)
+            self.owner.app.statusBar().showMessage(f'Section {self.slot} mesh failed: {error}', 8000)
+        elif result is None:
+            self._retire_mesh()
+            self.backend.set_point_cloud_visible(True)
+            self.owner.app.statusBar().showMessage(f'Section {self.slot}: no triangles for the selected points.', 5000)
+        elif not self.backend.set_surface(result['positions'], result['faces'], result['colors']):
+            self._retire_mesh()
+            self.backend.set_point_cloud_visible(True)
+            self.owner.app.statusBar().showMessage(f'Section {self.slot}: Vulkan mesh upload failed.', 8000)
+        else:
+            self._mesh_data = result
+            self._mesh_mask = self._pending_mesh_mask
+            self._mesh_key = self._pending_mesh_key
+            self._mesh_build_count += 1
+            # Colours already include the exact legacy lighting formula, and
+            # the swap above is atomic - the old frame was never blanked.
+            self._present_mesh()
+        self._dirty = True
 
     def fit(self, sync=True):
         if not len(self.local):
@@ -365,6 +684,10 @@ class SectionCanvas(QWidget):
         f = max(self.world_per_pixel(), 1e-300)
         return ((h-self.centre[0])/f + self.width()*.5,
                 (self.centre[2]-z)/f + self.height()*.5)
+
+    def selection_points(self):
+        """Horizontal/elevation view of the records, without a per-gesture copy."""
+        return self.local[:, ::2] if self.axis == 0 else self.local[:, 1:]
 
     def visible_extent(self):
         half_w = self.width()*.5*self.world_per_pixel()
@@ -432,7 +755,7 @@ class SectionCanvas(QWidget):
         """Armed Pan shortcut (Left - Click / Tap - Tap); tools keep their clicks."""
         measurement = getattr(self, 'measurement', None)
         if (self.cut_armed or self.classifier.active()
-                or (measurement is not None and measurement.active)):
+                or (measurement is not None and getattr(measurement, 'active', False))):
             self.pan_gesture.finish()
             return False
         return self.pan_gesture.handle(self.owner.app, event, self)
@@ -552,6 +875,13 @@ class SectionCanvas(QWidget):
 
     def shutdown(self):
         self._closed = True
+        self._display_revision += 1
+        if self._mesh_future is not None:
+            self._mesh_future.cancel()
+            self._mesh_future = None
+        # The engine (and its GPU mesh) is gone with the handle.
+        self._drop_mesh_cache()
+        self._surface_loaded = self._surface_resident = False
         self.timer.stop()
         measurement = getattr(self, 'measurement', None)
         if measurement is not None:
@@ -962,8 +1292,6 @@ class NativeSections:
             self.finalize(p1, p2, width, slot-1, value)
 
     def apply(self, slot, palette, mode):
-        if mode in ('surface', 'line'):
-            raise ValueError('Native section views support Class, Shaded Class, Depth, Intensity, RGB and Elevation')
         self._pending_display[slot] = (dict(palette), mode)
         # Display Mode Apply is strictly per-view: never mirror the palette or
         # the color mode into synced peers (sync carries data and camera only).
@@ -1106,14 +1434,43 @@ class NativeSections:
         if not force and generation is not None and generation == getattr(self, '_seen_generation', None):
             return
         self._seen_generation = generation
+        # A gesture knows exactly which rows it changed. Mapping those onto
+        # each view (sorted store rows) avoids gathering and comparing every
+        # record of every view on each brush stroke.
+        rows = new_classes = None
+        if changed is not None:
+            try:
+                rows = np.asarray(changed[0], dtype=np.int64).reshape(-1)
+                new_classes = np.asarray(store.data['classification'][rows], dtype=np.uint8)
+            except Exception:  # noqa: BLE001 - any odd payload falls back to the full scan
+                rows = new_classes = None
+        classes = np.asarray(store.data['classification'])
         for slot, canvas in self.views.items():
             if not len(canvas.indices):
                 continue
-            current = store.data['classification'][canvas.indices]
-            if not np.array_equal(current, self._classes.get(slot)):
+            cache = self._classes.get(slot)
+            if rows is not None and rows.size and canvas._indices_sorted and cache is not None:
+                if len(cache) != len(canvas.indices):
+                    cache = None
+                else:
+                    position = np.searchsorted(canvas.indices, rows)
+                    np.minimum(position, len(canvas.indices)-1, out=position)
+                    hit = canvas.indices[position] == rows
+                    if not hit.any():
+                        continue            # this view never saw the edit
+                    cache[position[hit]] = new_classes[hit]
+                    if canvas.mode not in MESH_MODES:
+                        canvas.backend.set_point_attributes(classification=cache)
+                    if canvas.mode in MESH_MODES or not canvas.classes_all_visible(self.app):
+                        canvas.apply_palette(canvas.palette, canvas.mode, sync=False)
+                    else:
+                        canvas._dirty = True   # colours are in the stream already
+                    continue
+            current = classes[canvas.indices]
+            if not np.array_equal(current, cache):
                 canvas.backend.set_point_attributes(classification=current)
                 self._classes[slot] = current.copy()
-                canvas._dirty = True
+                canvas.apply_palette(canvas.palette, canvas.mode, sync=False)
 
     def close(self):
         self._refresh.stop()

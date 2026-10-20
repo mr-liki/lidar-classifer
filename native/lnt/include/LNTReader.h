@@ -35,6 +35,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -245,6 +247,19 @@ public:
     const std::string& error() const { return error_; }
     const std::string& path() const { return path_; }
     const std::string& last_error() const { return last_error_; }
+    bool is_collection() const { return !source_paths_.empty(); }
+    bool is_root_node(const LNTNodeEntry& n) const {
+        if (!is_collection()) return n.tree_level == 0;
+        auto it = routes_.find(n.byte_offset);
+        return it != routes_.end() && it->second.root;
+    }
+    bool physical_location(const LNTNodeEntry& n, std::string& path, uint64_t& offset) const {
+        if (!is_collection()) { path = path_; offset = n.byte_offset; return true; }
+        auto it = routes_.find(n.byte_offset);
+        if (it == routes_.end()) return false;
+        path = source_paths_[it->second.source]; offset = it->second.offset; return true;
+    }
+
 
     // ---- what the file says ---------------------------------------------
     const LNTHeader& header() const { return hdr_; }
@@ -316,6 +331,12 @@ public:
 
 private:
     bool fail(const std::string& msg);
+    bool open_collection();
+    struct Route { uint32_t source; uint64_t offset; uint8_t root; };
+    std::vector<std::string> source_paths_;
+    std::vector<std::ifstream> source_files_;
+    std::unordered_map<uint64_t, Route> routes_;
+
 
     std::ifstream f_;
     std::string path_;
@@ -363,6 +384,7 @@ inline bool Reader::fail(const std::string& msg) {
 
 inline void Reader::close() {
     f_.close();
+    source_files_.clear(); source_paths_.clear(); routes_.clear();
     nodes_.clear();
     index_.clear();
     hdr_ = LNTHeader{};
@@ -377,7 +399,7 @@ inline bool Reader::open(const std::string& path) {
     last_error_.clear();
     path_ = path;
 
-    f_.open(path, std::ios::binary);
+    f_.open(std::filesystem::u8path(path), std::ios::binary);
     if (!f_.good()) return fail("cannot open '" + path + "'");
 
     f_.seekg(0, std::ios::end);
@@ -386,6 +408,10 @@ inline bool Reader::open(const std::string& path) {
     file_bytes_ = static_cast<uint64_t>(end);
     if (file_bytes_ < kHeaderBytes)
         return fail("file is smaller than the 64-byte header");
+
+    char collection_magic[8]{};
+    f_.seekg(0, std::ios::beg); f_.read(collection_magic, 8);
+    if (std::memcmp(collection_magic, "LNTSET1", 8) == 0) return open_collection();
 
     // ---- header ----------------------------------------------------------
     f_.seekg(0, std::ios::beg);
@@ -442,6 +468,80 @@ inline bool Reader::open(const std::string& path) {
     return true;
 }
 
+inline bool Reader::open_collection() {
+    // The collection is a directory/route table only. No point bytes are copied.
+    uint32_t count = 0;
+    f_.read(reinterpret_cast<char*>(&count), 4);
+    if (!f_ || !count || count > 4096) return fail("invalid LNT collection file count");
+    std::vector<uint64_t> payload_ends;
+    std::vector<std::unordered_map<uint64_t,LNTNodeEntry>> source_directories(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t length = 0; f_.read(reinterpret_cast<char*>(&length), 4);
+        if (!f_ || !length || length > 32768) return fail("invalid LNT collection path length");
+        std::string path(length, '\0'); f_.read(&path[0], length);
+        if (!f_) return fail("truncated LNT collection path");
+        source_files_.emplace_back(std::filesystem::u8path(path), std::ios::binary);
+        if (!source_files_.back()) return fail("cannot open individual LNT: " + path);
+        LNTHeader h{};
+        source_files_.back().read(reinterpret_cast<char*>(&h), sizeof(h));
+        if (!source_files_.back() || !magic_matches(h.magic) || h.version != kFormatVersion)
+            return fail("invalid individual LNT: " + path);
+        auto& source = source_files_.back();
+        source.seekg(0,std::ios::end); const auto physical_size=source.tellg();
+        if(physical_size<0 || h.index_offset<kHeaderBytes || h.index_offset>uint64_t(physical_size))
+            return fail("invalid individual LNT index: " + path);
+        source.seekg(static_cast<std::streamoff>(h.index_offset),std::ios::beg);
+        LNTDirectoryHeader directory{};source.read(reinterpret_cast<char*>(&directory),sizeof(directory));
+        if(!source || directory.total_nodes > (uint64_t(physical_size)-h.index_offset)/kNodeEntryBytes)
+            return fail("invalid individual LNT directory: " + path);
+        for(uint64_t j=0;j<directory.total_nodes;++j){
+            LNTNodeEntry original{};source.read(reinterpret_cast<char*>(&original),sizeof(original));
+            if(!source || !source_directories[i].emplace(original.byte_offset,original).second)
+                return fail("invalid individual LNT node table: " + path);
+        }
+        source_paths_.push_back(path); payload_ends.push_back(h.index_offset);
+    }
+    f_.read(reinterpret_cast<char*>(&hdr_), sizeof(hdr_));
+    f_.read(reinterpret_cast<char*>(&dir_), sizeof(dir_));
+    if (!f_ || !magic_matches(hdr_.magic) || hdr_.version != kFormatVersion ||
+        !dir_.total_nodes || dir_.total_nodes > 0xffffffffu ||
+        dir_.total_nodes > file_bytes_ / (kNodeEntryBytes + 13))
+        return fail("invalid LNT collection directory");
+    nodes_.resize(static_cast<size_t>(dir_.total_nodes));
+    f_.read(reinterpret_cast<char*>(nodes_.data()), nodes_.size() * sizeof(LNTNodeEntry));
+    if (!f_) return fail("truncated LNT collection node table");
+    for (const auto& n : nodes_) {
+        Route r{};
+        f_.read(reinterpret_cast<char*>(&r.source), 4);
+        f_.read(reinterpret_cast<char*>(&r.offset), 8);
+        f_.read(reinterpret_cast<char*>(&r.root), 1);
+        if (!f_ || r.source >= count || r.offset < kHeaderBytes ||
+            uint64_t(n.byte_length) > payload_ends[r.source] ||
+            r.offset > payload_ends[r.source] - uint64_t(n.byte_length) ||
+            n.byte_length != uint64_t(n.point_count) * kPointBytes)
+            return fail("invalid LNT collection payload route");
+        auto original=source_directories[r.source].find(r.offset);
+        if(original==source_directories[r.source].end() || original->second.point_count!=n.point_count ||
+           original->second.byte_length!=n.byte_length || original->second.half_size!=n.half_size ||
+           original->second.children_mask!=n.children_mask || (original->second.tree_level==0)!=(r.root!=0))
+            return fail("collection route does not match its individual LNT node");
+        source_directories[r.source].erase(original); // one route per source record identity
+        if (!routes_.emplace(n.byte_offset, r).second || !index_.emplace(n.node_id,n).second)
+            return fail("duplicate node identity in LNT collection");
+    }
+    uint64_t payload_end=kHeaderBytes;
+    for(const auto& n:nodes_) {
+        if(n.byte_offset!=payload_end || uint64_t(n.byte_length)>UINT64_MAX-payload_end)
+            return fail("invalid virtual LNT payload ordering");
+        payload_end+=n.byte_length;
+    }
+    if(payload_end!=hdr_.index_offset)return fail("invalid virtual LNT index offset");
+    for(const auto& remaining:source_directories)
+        if(!remaining.empty())return fail("LNT collection omitted source nodes");
+    file_bytes_ = hdr_.index_offset + kDirHeaderBytes + nodes_.size() * kNodeEntryBytes;
+    ok_ = true; return true;
+}
+
 inline bool Reader::read_node_raw(const LNTNodeEntry& node,
                                   std::vector<LNTPoint>& out_raw) {
     out_raw.clear();
@@ -475,11 +575,17 @@ inline bool Reader::read_node_raw(const LNTNodeEntry& node,
     }
 
     out_raw.resize(node.point_count);
-    f_.clear();
-    f_.seekg(static_cast<std::streamoff>(lo), std::ios::beg);
-    f_.read(reinterpret_cast<char*>(out_raw.data()),
-            static_cast<std::streamsize>(node.byte_length));
-    if (f_.gcount() != static_cast<std::streamsize>(node.byte_length)) {
+    std::ifstream* stream = &f_;
+    uint64_t offset = lo;
+    if (is_collection()) {
+        auto route = routes_.find(lo);
+        if (route == routes_.end()) { last_error_ = "missing collection payload route"; out_raw.clear(); return false; }
+        stream = &source_files_[route->second.source]; offset = route->second.offset;
+    }
+    stream->clear();
+    stream->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    stream->read(reinterpret_cast<char*>(out_raw.data()), static_cast<std::streamsize>(node.byte_length));
+    if (stream->gcount() != static_cast<std::streamsize>(node.byte_length)) {
         last_error_ = "node " + std::to_string(node.node_id) + ": short payload read";
         out_raw.clear();
         return false;

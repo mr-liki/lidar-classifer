@@ -353,6 +353,10 @@ NKV_API int nkv_set_surface(NkvHandle handle,
                              const int32_t* faces, uint64_t face_count,
                              const uint8_t* face_colors_rgb);
 
+/* Colour-only edit of the legacy face-coloured mesh; geometry stays resident. */
+NKV_API int nkv_update_surface_colors(NkvHandle handle, const uint8_t* rgb, uint64_t faces);
+NKV_API int nkv_clear_surface(NkvHandle handle);
+
 /* ---- Tiled surface, LOD, culling and atomic swap ---------------------------
  *
  * Everything below is ADDITIVE: the legacy nkv_set_surface entry point still
@@ -595,7 +599,7 @@ typedef struct NkvSurfaceTileDesc {
 typedef struct NkvSurfaceTileDraw {
     uint64_t key;
     uint32_t first_face, face_count;    /* tile-local triangle range */
-    uint32_t coverage, _pad;            /* 1 = also draw the tile's coverage points */
+    uint32_t coverage, _pad;            /* coverage: points; _pad bit 0: background interpolation */
 } NkvSurfaceTileDraw;
 NKV_API int nkv_surface_tiles_configure(NkvHandle handle, uint64_t vertex_capacity,
                                         uint64_t face_capacity, uint64_t coverage_capacity);
