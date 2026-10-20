@@ -1105,6 +1105,32 @@ class NakshaApp(QMainWindow):
     # Phase 4: Global signal bus
     classification_finished = Signal(object)  # emits changed_mask (numpy array or None)
 
+    # Classification tools that own the canvas click (VTK and native alike).
+    _CLICK_CLASSIFY_TOOLS = frozenset((
+        "above_line", "below_line", "parallel_line", "rectangle", "circle",
+        "polygon", "freehand", "brush", "point",
+    ))
+
+    @property
+    def active_classify_tool(self):
+        """The armed classification tool name, or None."""
+        return getattr(self, "_active_classify_tool_value", None)
+
+    @active_classify_tool.setter
+    def active_classify_tool(self, tool):
+        # Every classification entry point (ribbon, shortcut, ClassPicker,
+        # right-click reactivation) sets this, so arming a classify tool here
+        # turns the latched click tools (Pan, footer Identify ...) off.
+        previous = getattr(self, "_active_classify_tool_value", None)
+        self._active_classify_tool_value = tool
+        if tool in self._CLICK_CLASSIFY_TOOLS and tool != previous:
+            deactivate = getattr(self, "_deactivate_transient_click_tools", None)
+            if callable(deactivate):
+                try:
+                    deactivate(reason=f"{tool} classification activated")
+                except Exception as exc:
+                    print(f"⚠️ Classification stand-down of latched tools failed: {exc}")
+
     @property
     def _left_pan_shortcut_active(self):
         """True while the Pan shortcut tool (Left - Click / Tap - Tap) is armed."""
@@ -2563,7 +2589,7 @@ class NakshaApp(QMainWindow):
             # footer Identify / Identify Layer tools step aside.
             # (Axis guides are a display aid, not a click tool.)
             if tool_name not in ("point_target_sync", "snt_layer_pick", "axis_guides"):
-                self._deactivate_footer_pick_tools(reason=f"{tool_name or 'tool'} activated")
+                self._deactivate_transient_click_tools(reason=f"{tool_name or 'tool'} activated")
             if tool_name:
                 self._active_tools.add(tool_name)
             self._cursor_state = True
@@ -3444,7 +3470,7 @@ class NakshaApp(QMainWindow):
         if enabled:
             # Only one click tool at a time: Identify Layer, ribbon tools,
             # sections, classification, measurement and drawing stand down.
-            self._release_tools_for_footer_pick("point_sync_tool")
+            self._release_other_click_tools("point_sync_tool")
             self.point_sync_tool.activate()
             self.statusBar().showMessage("🎯 Point target sync enabled", 2000)
         else:
@@ -3472,7 +3498,7 @@ class NakshaApp(QMainWindow):
             return
 
         if enabled:
-            self._release_tools_for_footer_pick("snt_layer_pick_tool")
+            self._release_other_click_tools("snt_layer_pick_tool")
             self.snt_layer_pick_tool.activate()
             self.statusBar().showMessage("🎯 Identify Layer activated (click SNT, DXF, or GIS features in main view). Click again or press Esc to deactivate.", 2500)
         else:
@@ -4787,16 +4813,26 @@ class NakshaApp(QMainWindow):
     # Footer click tools: Identify (point target sync) and Identify Layer.
     _FOOTER_PICK_TOOLS = ("point_sync_tool", "snt_layer_pick_tool")
 
-    def _deactivate_footer_pick_tools(self, keep=None, reason="another tool activated"):
-        """Turn off the footer Identify / Identify Layer tools (except ``keep``).
+    def _deactivate_transient_click_tools(self, keep=None, reason="another tool activated",
+                                          source=None):
+        """Turn off the latched click tools another tool is taking over from.
 
-        Called whenever another tool takes over the canvas click so only one
-        click tool is ever live; each tool's deactivate() also unchecks its
-        footer button. Returns True when anything was turned off.
+        Those are the footer Identify / Identify Layer tools, the Pan shortcut
+        tool and the Identify-ribbon tools (Identify / Zoom / Select). ``keep``
+        is the tool being activated ("point_sync_tool", "snt_layer_pick_tool"
+        or "pan"); ``source`` "IdentificationRibbon" leaves that ribbon's own
+        tools to its handlers. Called from every activation chokepoint (ribbon
+        buttons, shortcuts, canvas-cursor owners, right-click reactivation).
+        Returns True when anything was turned off.
         """
-        if getattr(self, "_releasing_for_footer_pick", False):
+        if getattr(self, "_releasing_click_tools", False):
             return False
         disabled = False
+        if keep != "pan" and self._disarm_pan_tool(reason):
+            disabled = True
+        if source != "IdentificationRibbon" and self._identify_tab_tool_active():
+            self._deactivate_identify_tab_tools()
+            disabled = True
         for tool_name in self._FOOTER_PICK_TOOLS:
             if tool_name == keep:
                 continue
@@ -4811,34 +4847,75 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Could not deactivate footer {tool_name}: {exc}")
         return disabled
 
-    def _release_tools_for_footer_pick(self, owner):
-        """Stand down every other click tool before a footer pick tool takes over.
+    def _identify_tab_tool_active(self):
+        """True while an Identify-ribbon tool (Identify / Zoom / Select) is armed."""
+        ribbon = getattr(getattr(self, "ribbon_manager", None), "ribbons", {}).get("identify")
+        return bool(ribbon is not None and (
+            getattr(ribbon, "identify_active", False)
+            or getattr(ribbon, "zoom_rectangle_active", False)
+            or getattr(ribbon, "select_rectangle_active", False)
+        ))
 
-        ``owner`` is the footer tool being activated ("point_sync_tool" or
-        "snt_layer_pick_tool"). Completed cross/cut docks and finished
-        measurements/drawings stay; only the tools that own left-click
-        (VTK and native .lnt) are released and their ribbon buttons unchecked.
+    def _disarm_pan_tool(self, reason="another tool activated"):
+        """Turn the Pan shortcut tool (Left - Click / Tap - Tap) off.
+
+        Restores the persistent panning-button preference the shortcut
+        overrode and ends any pan in progress in the native main and
+        cross/cut canvases. Returns True when Pan was armed.
         """
-        self._releasing_for_footer_pick = True
+        if not self._left_pan_shortcut_active:
+            return False
         try:
-            for tool_name in self._FOOTER_PICK_TOOLS:
-                tool = getattr(self, tool_name, None)
-                if tool_name != owner and tool is not None and getattr(tool, "active", False):
-                    try:
-                        tool.deactivate()
-                    except Exception:
-                        pass
+            from gui.execute_tool import _deactivate_pan_navigation_safely
+            _deactivate_pan_navigation_safely(self)   # flag off + panning button restored
+        except Exception as exc:
+            self._left_pan_shortcut_active = False
+            print(f"⚠️ Pan stand-down incomplete: {exc}")
+        gestures = []
+        view = getattr(self, "_lnt_main_view", None)
+        gestures.append(getattr(getattr(view, "_filter", None), "_pan", None))
+        try:
+            from gui.native_sections import manager
+            sections = manager(self, create=False)
+            if sections is not None:
+                gestures.extend(getattr(c, "pan_gesture", None) for c in sections.views.values())
+        except Exception:
+            pass
+        for gesture in gestures:
+            if gesture is not None:
+                try:
+                    gesture.finish()
+                except Exception:
+                    pass
+        print(f"[PAN] tool disarmed ({reason})")
+        try:
+            self.statusBar().showMessage(f"Pan deactivated ({reason})", 2500)
+        except Exception:
+            pass
+        return True
 
+    def _release_other_click_tools(self, owner):
+        """Stand down every other click tool before ``owner`` takes the canvas.
+
+        ``owner`` is the tool being activated: a footer pick tool
+        ("point_sync_tool" / "snt_layer_pick_tool") or "pan". Completed
+        cross/cut docks and finished measurements/drawings stay; only the
+        tools that own left-click (VTK and native .lnt) are released and
+        their ribbon buttons unchecked.
+        """
+        self._deactivate_transient_click_tools(keep=owner, reason=f"{owner} activated")
+        self._releasing_click_tools = True
+        try:
             # Identify ribbon (Identify / Zoom / Select).
             self._deactivate_identify_tab_tools()
-            self._deactivate_selection_tools("footer pick tool activated")
+            self._deactivate_selection_tools(f"{owner} activated")
 
             # Cross / Cut placement (completed docks stay open).
             if getattr(self, "cross_section_active", False):
                 cancel_cross = getattr(self, "_cancel_cross_section_tool_only", None)
                 if callable(cancel_cross):
                     cancel_cross()
-            self._deactivate_pending_cut_section_tool("footer pick tool activated")
+            self._deactivate_pending_cut_section_tool(f"{owner} activated")
 
             # Classification.
             if getattr(self, "active_classify_tool", None) is not None or getattr(
@@ -4849,7 +4926,7 @@ class NakshaApp(QMainWindow):
                 try:
                     self.deactivate_classification_tool(preserve_cross_section=True)
                 except Exception as exc:
-                    print(f"⚠️ Footer pick: classification stand-down failed: {exc}")
+                    print(f"⚠️ {owner}: classification stand-down failed: {exc}")
                 self.active_classify_tool = None
 
             # Measurement, temp fence, draw/AccuDraw, curve, coordinate pick.
@@ -4857,8 +4934,8 @@ class NakshaApp(QMainWindow):
                 _deactivate_measurement_tool_safely,
                 _deactivate_temp_fence_safely,
             )
-            _deactivate_measurement_tool_safely(self, "footer pick tool activated")
-            _deactivate_temp_fence_safely(self, "footer pick tool activated")
+            _deactivate_measurement_tool_safely(self, f"{owner} activated")
+            _deactivate_temp_fence_safely(self, f"{owner} activated")
             self._deactivate_digitize_tool()
             curve_tool = getattr(self, "curve_tool", None)
             if curve_tool is not None:
@@ -4871,7 +4948,7 @@ class NakshaApp(QMainWindow):
                     if getattr(curve_tool, "_select_mode", False):
                         curve_tool.deactivate_select_mode()
                 except Exception as exc:
-                    print(f"⚠️ Footer pick: curve stand-down failed: {exc}")
+                    print(f"⚠️ {owner}: curve stand-down failed: {exc}")
             coordinate_pick = getattr(self, "coordinate_pick_tool", None)
             if coordinate_pick is not None and getattr(coordinate_pick, "active", False):
                 try:
@@ -4886,7 +4963,7 @@ class NakshaApp(QMainWindow):
             if xs_btn is not None and xs_btn.isChecked():
                 xs_btn.setChecked(False)
 
-            self._release_native_tools_for_footer_pick()
+            self._release_native_click_tools()
 
             ribbon_manager = getattr(self, "ribbon_manager", None)
             if ribbon_manager is not None:
@@ -4897,11 +4974,11 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
         except Exception as exc:
-            print(f"⚠️ Footer pick tool stand-down failed: {exc}")
+            print(f"⚠️ {owner}: tool stand-down failed: {exc}")
         finally:
-            self._releasing_for_footer_pick = False
+            self._releasing_click_tools = False
 
-    def _release_native_tools_for_footer_pick(self):
+    def _release_native_click_tools(self):
         """Cancel native (.lnt / SNT viewport) gesture owners, like a native shortcut does."""
         try:
             from gui.native_shortcuts import cancel_native_measurements
@@ -4918,7 +4995,7 @@ class NakshaApp(QMainWindow):
             sections.cancel_cross()
             owners = [view] + list(sections.views.values())
         except Exception as exc:
-            print(f"⚠️ Footer pick: native section stand-down failed: {exc}")
+            print(f"⚠️ Native section stand-down failed: {exc}")
             owners = [view]
         for owner in owners:
             for attr in ("classifier", "measurement", "drawing"):
@@ -10423,8 +10500,9 @@ class NakshaApp(QMainWindow):
         self._right_click_reactivation_in_progress = True
         self._right_click_reactivating = True
         try:
-            # Release transient pan ownership first.
-            self._left_pan_shortcut_active = False
+            # Release transient pan ownership first (restores the panning
+            # button preference the Pan shortcut overrode).
+            self._disarm_pan_tool("classification reactivated")
             try:
                 pan_gesture = getattr(focus_widget, "pan_gesture", None)
                 if pan_gesture is not None and hasattr(pan_gesture, "finish"):
@@ -10440,7 +10518,7 @@ class NakshaApp(QMainWindow):
                     cancel_cross()
 
             # Footer Identify / Identify Layer would compete for the click.
-            self._deactivate_footer_pick_tools(reason="classification reactivated")
+            self._deactivate_transient_click_tools(reason="classification reactivated")
 
             # Temp Fence can otherwise leave competing click observers alive.
             try:
