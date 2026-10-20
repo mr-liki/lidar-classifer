@@ -2,7 +2,9 @@
 from PySide6.QtWidgets import QApplication
 
 from gui.native_sections import manager, CUT_SLOT
-from gui.native_section_classify import DRAWABLE_TOOLS
+from gui.native_section_classify import (
+    DRAWABLE_TOOLS, notify_native_classification_activation,
+)
 
 
 TOOL_NAMES = {
@@ -61,6 +63,10 @@ def _sync_class_picker_for_native_shortcut(app, tool_name, from_cls, to_cls):
     app.from_classes = normalized_from
     app.to_class = to_cls
     app.active_classify_tool = tool_name
+    # Native canvases have no VTK attach event.  Publish an explicit activation
+    # so a repeated Brush shortcut/right-click re-arms its cursor after the prior
+    # stroke intentionally hid it.
+    notify_native_classification_activation(app, tool_name)
 
     # Keep right-click reactivation/history helpers aligned with the shortcut
     # that was just armed instead of retaining the previous manual tool state.

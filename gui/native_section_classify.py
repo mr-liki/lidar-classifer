@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QCursor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
 from gui.native_measure_geometry import measurement_labels, measurement_text
 
@@ -28,6 +28,11 @@ DRAWABLE_TOOLS = ("rectangle", "circle", "polygon", "freehand", "brush", "point"
 _TWO_CLICK = ("rectangle", "circle", "above_line", "below_line", "parallel_line")
 LINE_TOOLS = ("above_line", "below_line", "parallel_line")
 _CLICK_SLOP_PX = 4.0
+# Two-point tools use tap-tap by default.  A press becomes a drag only after
+# the cursor crosses the threshold *after* the short settle window.  These
+# values deliberately mirror the proven VTK ClassificationInteractor path.
+_TAP_GRACE_SEC = 0.12
+_TAP_DRAG_THRESHOLD_PX = 6.0
 # Two-point tools use tap-tap by default.  A press becomes a drag only after
 # the cursor crosses the threshold *after* the short settle window.  These
 # values deliberately mirror the proven VTK ClassificationInteractor path.
@@ -1087,22 +1092,8 @@ class SectionClassifier:
         if key in (Qt.Key_Return, Qt.Key_Enter) and self.tool() == "polygon" and len(self.points) >= 3:
             self._finish_polygon()
             return True
-        if key == Qt.Key_Escape and (self.points or self._brush_tx_active):
-            if self._brush_tx_active:
-                self.cancel_pending_brush_transaction(reason="escape")
-                # Escape terminates Brush, rather than merely hiding a partially
-                # painted stroke and leaving the classifier armed.
-                try:
-                    QTimer.singleShot(
-                        0,
-                        lambda: self.app.deactivate_classification_tool(
-                            cancel_pending_brush=True
-                        ),
-                    )
-                except Exception:
-                    pass
-            else:
-                self.cancel()
+        if key == Qt.Key_Escape and self.points:
+            self.cancel()
             return True
         return False
 

@@ -226,6 +226,12 @@ class SectionCanvas(QWidget):
         # armed Pan tool must be disarmed here too.
         self.pan_gesture.finish()
         disarm_pan(self.owner.app)
+        # QShortcut activation bypasses keyPressEvent and the global KeyPress
+        # filter. Route classification through its full Escape handler here as
+        # well, including when the armed tool has no unfinished gesture.
+        if self.classifier.active():
+            self.classifier.key(Qt.Key_Escape)
+            return
         if self.classifier.busy():
             self.classifier.cancel()
         else:

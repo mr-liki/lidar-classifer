@@ -10474,11 +10474,18 @@ class NakshaApp(QMainWindow):
         active_tool = getattr(self, "active_classify_tool", None)
         if active_tool in drawable:
             if native:
+                # Native Brush is persistent across completed strokes. A hidden
+                # cursor means "idle, waiting for the next LEFT press", not
+                # "needs reactivation". Therefore an already-selected native
+                # classifier owns the view and right-click must not re-arm it or
+                # create a preview. Reactivation is only for genuinely inactive
+                # classification after the user switched to another tool.
                 return False
-            if target == "cross" and bool(getattr(self, "classify_interactors", None)):
-                return False
-            if target == "cut" and getattr(self, "cut_classify_interactor", None) is not None:
-                return False
+            else:
+                if target == "cross" and bool(getattr(self, "classify_interactors", None)):
+                    return False
+                if target == "cut" and getattr(self, "cut_classify_interactor", None) is not None:
+                    return False
 
         # Measurements own right-click until their own handler releases them.
         xs_measure = getattr(self, "cross_section_measurement_tool", None)
@@ -10630,6 +10637,11 @@ class NakshaApp(QMainWindow):
                     print(f"⚠️ Temp fence stand-down failed: {_e}")
 
                 self.active_classify_tool = None
+                try:
+                    from gui.native_section_classify import notify_native_classification_activation
+                    notify_native_classification_activation(self, None)
+                except Exception:
+                    pass
                 if hasattr(self, 'skip_main_view_refresh'):
                     self.skip_main_view_refresh = False
                 self._hide_class_picker_safely()
@@ -10813,6 +10825,12 @@ class NakshaApp(QMainWindow):
    
             self.skip_main_view_refresh = False
             self.active_classify_tool = tool_name
+            if _lnt_view is not None:
+                try:
+                    from gui.native_section_classify import notify_native_classification_activation
+                    notify_native_classification_activation(self, tool_name)
+                except Exception as _native_preview_exc:
+                    print(f"⚠️ Native classification activation sync failed: {_native_preview_exc}")
 
             # Track the last drawable classification tool so right-click in
             # cross/cut section windows can reactivate it after deactivation.
@@ -11030,6 +11048,19 @@ class NakshaApp(QMainWindow):
         print(f"\n{'='*60}")
         print(f"🛑 DEACTIVATING CLASSIFICATION TOOL")
         print(f"{'='*60}")
+
+        # Native Vulkan Brush is transactional.  If classification is being
+        # terminated while the physical left-button stroke is incomplete, it
+        # must roll back rather than becoming an implicit classification.  A
+        # normally released stroke has already finalized and this is a no-op.
+        if self.active_classify_tool == "brush":
+            try:
+                from gui.native_section_classify import cancel_native_brush_transaction
+                cancel_native_brush_transaction(
+                    self, reason="classification_deactivate"
+                )
+            except Exception as exc:
+                print(f"⚠️ Native pending brush rollback failed: {exc}")
 
         # Escape means cancel, not commit. Brush painting updates the canonical
         # class array continuously, so restore the active stroke before cleanup()
@@ -16772,6 +16803,15 @@ class NakshaApp(QMainWindow):
         print(f"\n{'='*60}")
         print(f"🛑 DEACTIVATING CLASSIFICATION TOOL (deactivate_classification)")
         print(f"{'='*60}")
+
+        if self.active_classify_tool == "brush":
+            try:
+                from gui.native_section_classify import cancel_native_brush_transaction
+                cancel_native_brush_transaction(
+                    self, reason="classification_deactivate"
+                )
+            except Exception as exc:
+                print(f"⚠️ Native pending brush rollback failed: {exc}")
 
         if self.active_classify_tool == "brush":
             self._finalize_pending_classification_stroke_for_history()

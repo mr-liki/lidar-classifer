@@ -644,6 +644,38 @@ class GlobalShortcutFilter(QObject):
             if self._is_runtime_shortcut_suspended():
                 return False
 
+            # Classification Escape must run before dialog/focus guards.  The
+            # Display Mode window and ClassPicker controls are intentionally
+            # allowed to own ordinary keys, but they must never swallow Escape
+            # while a classification tool is armed.  Otherwise only the current
+            # gesture (or the dialog itself) is cancelled and the tool remains
+            # active on the canvas.
+            _active_classify_tool = getattr(
+                self.app_window, "active_classify_tool", None
+            )
+            if (
+                event.key() == Qt.Key_Escape
+                and event.modifiers() == Qt.NoModifier
+                and _active_classify_tool is not None
+                and _active_classify_tool != "temp_fence"
+            ):
+                deactivate_classification = getattr(
+                    self.app_window, "deactivate_classification_tool", None
+                )
+                if callable(deactivate_classification):
+                    print(
+                        "ESC_CLASSIFICATION_DEACTIVATE "
+                        f"tool={_active_classify_tool} route=global_pre_dialog"
+                    )
+                    deactivate_classification(
+                        preserve_cross_section=True,
+                        cancel_pending_brush=True,
+                    )
+                else:
+                    self.app_window.active_classify_tool = None
+                event.accept()
+                return True
+
             # Generic guard: any input popup (block creation, custom backup,
             # PRJ/Display sub-dialogs, …) owns the key presses while open.
             if self._is_input_popup_open():
