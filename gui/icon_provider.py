@@ -112,6 +112,11 @@ def _resolve_ribbon_icon_color(
     normalized_section = _normalize_lookup_text(section_title)
     normalized_button = _normalize_lookup_text(button_text)
 
+    if (normalized_scope, normalized_section, normalized_button) == (
+        "toolsribbon", "selection", "shortcuts"
+    ):
+        return "#29b6f6"
+
     contextual_map = {
         # File
         ("fileribbon", "file", "open"): "icon_open",
@@ -617,6 +622,7 @@ _EXTERNAL_RIBBON_ICON_FILES = {
     ("sections", "width"): "width.svg",
     ("sync", "views"): "sync-view.svg",
     ("selection", "config"): "shortcut-config.svg",
+    ("selection", "shortcuts"): "shortcut-config.svg",
     ("settings", "backup"): "backup-settings.svg",
     ("settings", "preference"): "cross-section-pref.svg",
     ("settings", "preferences"): "cross-section-pref.svg",
