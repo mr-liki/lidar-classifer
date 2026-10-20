@@ -46,6 +46,7 @@ native/lnt/main
 native/lnt/*.exe
 native/lnt/*.dll
 !native/lnt/main_display_modes_zoom.dll
+!native/lnt/main_display_modes_lighting.dll
 native/lnt/*.lnt*
 native/lnt/*.o
 native/lnt/*.obj
@@ -115,6 +116,7 @@ native/naksha_vulkan/build_msvc/*
 !native/naksha_vulkan/build_msvc/native_build_stamp.json
 
 # Keep root compiled point shaders
+!native/naksha_vulkan/build_msvc/*.spv
 !native/naksha_vulkan/build_msvc/point.vert.spv
 !native/naksha_vulkan/build_msvc/point.frag.spv
 
