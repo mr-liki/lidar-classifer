@@ -323,7 +323,7 @@ class NativeSelectRect:
         try:
             sections = getattr(self.app, "_native_sections", None)
             if sections is not None:
-                sections.refresh_edits(force=True)
+                sections.refresh_edits(force=True, changed=(rows, old), show_main=False)
         except Exception:
             pass
         self.selected_rows = np.empty(0, dtype=np.int64)
