@@ -123,8 +123,17 @@ def ensure_sidecars(view, cancelled=lambda:False):
                 xyz[at:at+n]=origin+node['center']-half+raw['rel']*(2*half/65535.)
                 tolerance=max(tolerance,2*half/65535.*np.sqrt(3)*.501)
             del data
-            ids=source_line_ids(source,xyz,tolerance,getattr(view.app,'_lnt_render_crs_wkt',None))
-            del xyz
+            from gui.lnt_open import lnt_path_for
+            if os.path.normcase(os.path.abspath(str(path)))!=os.path.normcase(os.path.abspath(lnt_path_for(str(source)))):
+                # A project-CRS variant stores reprojected coordinates rounded
+                # to the LAS scale, which is coarser than the LNT cell step.
+                import laspy
+                with laspy.open(source) as reader: scale=float(max(reader.header.scales))
+                tolerance+=.5*scale*np.sqrt(3)*1.01
+            try:
+                ids=source_line_ids(source,xyz,tolerance,getattr(view.app,'_lnt_render_crs_wkt',None))
+            finally:
+                xyz.flush(); del xyz
             staged=Path(work)/'lines'
             with open(staged,'wb') as f:
                 f.write(struct.pack('<8sQ',b'LNTLINE1',count)); f.write(ids.astype('<u2').tobytes())

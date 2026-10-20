@@ -91,4 +91,22 @@ with tempfile.TemporaryDirectory(dir=ROOT/'audit') as work:
     assert set(recovered.unique())=={101,202}
     recovered.close()
     print('PASS coincident returns retain distinct original flight lines during old-cache recovery',flush=True)
+with tempfile.TemporaryDirectory(dir=ROOT/'audit') as work:
+    from pyproj import CRS
+    folder=Path(work); mixed=[]
+    for number,epsg in enumerate((32643,32644)):
+        p=folder/f'zone{number}.laz'; mixed.append(p)
+        h=laspy.LasHeader(point_format=3,version='1.2')
+        h.offsets=[500000.,4000000.,0.]; h.scales=[.001]*3; h.add_crs(CRS.from_epsg(epsg))
+        a=laspy.LasData(h); n=2000; rng=np.random.default_rng(number)
+        a.x=rng.uniform(0,50,n)+500000.; a.y=rng.uniform(0,50,n)+4000000.; a.z=rng.uniform(10,20,n)
+        a.point_source_id=np.full(n,21+number,np.uint16); a.classification=np.full(n,2,np.uint8)
+        a.write(p)
+    wkt=CRS.from_epsg(32643).to_wkt()
+    _,index=build_batch(mixed,target_crs_wkt=wkt)
+    for side in folder.glob('*.lines'): side.unlink()
+    recovered=ensure_sidecars(SimpleNamespace(lnt_path=index,app=SimpleNamespace(_lnt_source_path=index,_lnt_render_crs_wkt=wkt)))
+    assert set(recovered.unique())=={21,22}
+    recovered.close()
+    print('PASS mixed-CRS collection recovers every flight line from old caches',flush=True)
 print('ALL FLIGHT LINE CHECKS PASSED',flush=True)
