@@ -607,8 +607,8 @@ RIBBON_TOOLTIP_META = {
         "description": "Customise measurement line colour, width, and label font size.",
     },
     ("DrawRibbon", "Utilities", "Clear"): {
-        "title": "Clear Drawings",
-        "description": "Remove all drawings from the scene.",
+        "title": "Clear Selected Drawings",
+        "description": "Choose specific user-drawn shapes to delete; Undo restores them.",
     },
     ("DrawRibbon", "Utilities", "Settings"): {
         "title": "Draw Tool Settings",
@@ -2991,85 +2991,9 @@ class DrawRibbon(QWidget):
         dialog.hide()
 
     def _handle_clear_click(self):
-        main_window = self.window()
-        # An open LNT view owns its Draw figures in the native drawing layer.
-        # Clear that layer directly and stop here: the legacy path below also
-        # knows about classified fences, VTK curves and text actors, none of
-        # which belong to the Draw-tab Clear operation in the native viewport.
-        from gui.native_draw import get_native_draw
-        native_draw = get_native_draw(main_window)
-        if native_draw is not None:
-            native_draw.clear()
-            try:
-                main_window.statusBar().showMessage('Draw figures cleared', 2500)
-            except Exception:
-                pass
-            return
-        if not hasattr(main_window, "digitizer") or not main_window.digitizer:
-            return
-
-        digitizer = main_window.digitizer
-
-        try:
-            accudraw_tool = getattr(digitizer, "accudraw_tool", None)
-            if accudraw_tool is not None:
-                if getattr(accudraw_tool, "active", False):
-                    accudraw_tool.deactivate(cancel=True)
-                if hasattr(accudraw_tool, "reset_after_external_clear"):
-                    accudraw_tool.reset_after_external_clear()
-        except Exception as e:
-            print(f"⚠️ AccuDraw clear cleanup failed: {e}")
-
-        curve_tool = getattr(main_window, "curve_tool", None)
-        classified_fences = [d for d in digitizer.drawings if d.get("classified_fence", False)]
-        has_curves = bool(curve_tool and getattr(curve_tool, "finalized_actors", None))
-        has_non_classified_drawings = any(
-            not drawing.get("classified_fence", False) for drawing in digitizer.drawings
-        )
-
-        dialog = self._get_clear_fence_dialog()
-        if (
-            classified_fences
-            and dialog is not None
-            and (dialog.isVisible() or dialog.windowState() & Qt.WindowMinimized)
-            and not has_curves
-            and not has_non_classified_drawings
-        ):
-            print("🗂️ Clear: reusing existing classified fence picker...")
-            self._show_clear_fence_dialog(digitizer, classified_fences)
-            return
-
-        if has_curves or digitizer.drawings:
-            digitizer._save_state()
-
-        clear_text = True
-        if digitizer._has_hidden_texts():
-            from PySide6.QtWidgets import QMessageBox
-            reply = QMessageBox.question(
-                self,
-                "Hidden Texts Warning",
-                "Hidden texts are getting cleared.\nDO YOU WANT TO CONTINUE?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                clear_text = False
-                print("🗑️ Clear: user chose to preserve hidden texts")
-
-        if not classified_fences:
-            if curve_tool:
-                curve_tool.clear_all_curves()
-            digitizer.clear_drawings(clear_classified=True, record_undo=False, preserve_committed=True, clear_text=clear_text)
-            print("🗑️ Clear: all drawings cleared (no classified fences)")
-        else:
-            # Has classified fences — clear non-classified drawings and curves only,
-            # then show the dialog. curve_tool.clear_all_curves() skips classified
-            # fence curves so they remain visible for the picker.
-            if curve_tool:
-                curve_tool.clear_all_curves()
-            digitizer.clear_drawings(clear_classified=False, record_undo=False, preserve_committed=True, clear_text=clear_text)
-            print("🗑️ Clear: non-classified drawings cleared, showing fence picker...")
-            self._show_clear_fence_dialog(digitizer, classified_fences)
+        """Draw > Clear: choose user drawings, never clear classifications."""
+        from gui.draw_clear_dialog import show_draw_clear_dialog
+        return show_draw_clear_dialog(self.window())
 
     def _show_clear_fence_dialog(self, digitizer, classified_fences):
         """Show a popup letting user choose which classified fences to keep or delete."""
@@ -5054,9 +4978,8 @@ def _get_fence_identity(shape):
     """Return a stable identity for digitizer and curve-tool fences."""
     if not isinstance(shape, dict):
         return id(shape)
-    if shape.get("source") == "curve_tool":
-        return id(shape.get("curve_data", shape))
-    return id(shape)
+    from gui.native_byclass_fences import fence_identity
+    return fence_identity(shape)
 
 
 def _prepare_fence_shape(shape):
@@ -5102,32 +5025,12 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     digitize = getattr(owner.app, "digitizer", None)
     curve_tool = getattr(owner.app, "curve_tool", None)
 
-    valid_shapes = []
-    if digitize:
-        drawings = getattr(digitize, "drawings", [])
-        if drawings:
-            valid_shapes = [
-                drawing
-                for drawing in drawings
-                if drawing.get("type") in [
-                    "rectangle",
-                    "circle",
-                    "polygon",
-                    "freehand",
-                    "line",
-                    "smart_line",
-                    "polyline",
-                    "smartline",
-                ]
-                # Cell circles belong to Create > Cell — never fences.
-                and not digitize.is_cell_creation_drawing(drawing)
-            ]
-
-    curve_fences = []
-    if curve_tool and hasattr(curve_tool, "get_curves_as_fences"):
-        curve_fences = curve_tool.get_curves_as_fences()
-
-    all_fences = valid_shapes + curve_fences
+    # Both the main By Class ribbon and embedded LiDAR menus must enumerate
+    # the SAME validated original drawings, with stable IDs on refresh.
+    from gui.native_fence_selection import collect_fence_candidates
+    all_fences = collect_fence_candidates(owner.app)
+    curve_fences = [f for f in all_fences if f.get('source') == 'curve_tool']
+    valid_shapes = [f for f in all_fences if f.get('source') != 'curve_tool']
     if not all_fences:
         QMessageBox.warning(
             owner,
@@ -5138,7 +5041,9 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         )
         return
 
-    if not digitize and not curve_tool:
+    if not digitize and not curve_tool and not any(
+        s.get("source") == "native_draw" for s in valid_shapes
+    ):
         QMessageBox.warning(
             owner,
             "No Tools Available",
@@ -5191,6 +5096,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             pass
 
     def _make_highlight_actor(coords, color, width):
+        if use_native_picker:
+            return None
         try:
             import vtk
 
@@ -5244,8 +5151,18 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
 
     current_hover_actor = [None]
     selection_highlight_actors = {}
+    native_picker_selected = {}
+    from gui.native_fence_selection import (
+        sync_native_fence_highlights, clear_native_fence_highlights,
+    )
+    # VTK actors are not visible above the Vulkan main viewport.
+    from gui.native_draw import get_native_draw
+    use_native_picker = get_native_draw(owner.app, create=True) is not None
+
 
     def highlight_fence_in_3d(shape):
+        if use_native_picker:
+            return  # Hover never changes selected-fence cyan state.
         if current_hover_actor[0] is not None:
             _remove_actor_from_renderer(current_hover_actor[0])
             current_hover_actor[0] = None
@@ -5262,6 +5179,10 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             _render_view()
 
     def add_selection_highlight(shape):
+        if use_native_picker:
+            native_picker_selected[_get_fence_identity(shape)] = shape
+            sync_native_fence_highlights(dialog, native_picker_selected.values())
+            return
         coords = shape.get("coords", [])
         if not coords:
             return
@@ -5272,6 +5193,10 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             _render_view()
 
     def remove_selection_highlight(shape):
+        if use_native_picker:
+            native_picker_selected.pop(_get_fence_identity(shape), None)
+            sync_native_fence_highlights(dialog, native_picker_selected.values())
+            return
         actor = selection_highlight_actors.pop(_get_fence_identity(shape), None)
         if actor is not None:
             _remove_actor_from_renderer(actor)
@@ -5296,6 +5221,7 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         )
 
     dialog = QDialog(owner, Qt.Dialog)
+    dialog.app = owner.app
     owner._fence_selection_dialog = dialog
     _apply_dialog_theme(dialog)
     dialog.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -5358,7 +5284,9 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             if is_curve
             else f"#{index + 1}: {shape_type.replace('_', ' ').title()}"
         )
-        source_tag = "Curve Tool" if is_curve else "Digitizer"
+        source_tag = ("Curve Tool" if is_curve else
+                      "Vulkan Draw" if fence.get('source') == 'native_draw'
+                      else "Digitizer")
 
         size_text = ""
         try:
@@ -5458,7 +5386,7 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
 
             item_widget.mousePressEvent = make_curve_click(checkbox, list_item)
 
-        class HoverEventFilter(QWidget):
+        class HoverEventFilter(QObject):
             def __init__(self, parent, shape_data):
                 super().__init__(parent)
                 self.shape_data = shape_data
@@ -5477,32 +5405,9 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         dialog = getattr(owner, "_fence_selection_dialog", None)
         if dialog is None or not dialog.isVisible():
             return
-        digitize_live = getattr(owner.app, "digitizer", None)
-        curve_tool_live = getattr(owner.app, "curve_tool", None)
-        live_valid = []
-        if digitize_live:
-            drawings = getattr(digitize_live, "drawings", []) or []
-            if drawings:
-                live_valid = [
-                    drawing
-                    for drawing in drawings
-                    if drawing.get("type") in [
-                        "rectangle",
-                        "circle",
-                        "polygon",
-                        "freehand",
-                        "line",
-                        "smart_line",
-                        "polyline",
-                        "smartline",
-                    ]
-                    # Cell circles belong to Create > Cell — never fences.
-                    and not digitize_live.is_cell_creation_drawing(drawing)
-                ]
-        live_curve_fences = []
-        if curve_tool_live and hasattr(curve_tool_live, "get_curves_as_fences"):
-            live_curve_fences = curve_tool_live.get_curves_as_fences()
-        live_ids = {_get_fence_identity(fence) for fence in (live_valid + live_curve_fences)}
+        from gui.native_fence_selection import collect_fence_candidates
+        live_valid = collect_fence_candidates(owner.app)
+        live_ids = {_get_fence_identity(fence) for fence in live_valid}
         if live_ids == live_source_ids:
             return
         try:
@@ -5583,6 +5488,9 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             seen_ids.add(fence_id)
 
         owner.selected_fences = prepared_shapes
+        if use_native_picker:
+            sync_native_fence_highlights(owner, owner.selected_fences)
+            clear_native_fence_highlights(dialog)
 
         owner._selection_highlight_actors = list(selection_highlight_actors.values())
         owner.update_fence_display()
@@ -5625,6 +5533,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     layout.addLayout(footer)
 
     def on_dialog_finished(result):
+        if use_native_picker:
+            clear_native_fence_highlights(dialog)
         highlight_fence_in_3d(None)
         if not applied[0]:
             for actor in list(selection_highlight_actors.values()):
@@ -5903,6 +5813,12 @@ class ByClassRibbon(QWidget):
         
         
     def perform_classification_undo(self):
+        from gui.native_draw import get_native_draw
+        drawing = get_native_draw(self.app, create=False)
+        if drawing is not None:
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, drawing, redo=False)
+            return
         # ✅ Temp Fence drawing: Ctrl+Z removes the last fence vertex
         try:
             _tft = getattr(self.app, "temp_fence_tool", None)
@@ -5955,6 +5871,12 @@ class ByClassRibbon(QWidget):
             self.update_status("❌ Undo failed", "error")
             
     def perform_classification_redo(self):
+        from gui.native_draw import get_native_draw
+        drawing = get_native_draw(self.app, create=False)
+        if drawing is not None:
+            from gui.native_history_routing import route_native_history
+            route_native_history(self.app, drawing, redo=True)
+            return
         """
         ✅ Application-level CLASSIFICATION redo
         Works even when dialogs are closed
@@ -6580,6 +6502,8 @@ class ByClassDialog(QDialog):
         layout.addWidget(from_note)
 
         self.from_list = QListWidget()
+        from gui.class_source_selection import bind_any_class_selection
+        bind_any_class_selection(self.from_list)
         self.from_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.from_list.setMinimumHeight(90)
         self.from_list.setStyleSheet("QListWidget::item { border-bottom: none; padding: 4px; }")
@@ -6658,6 +6582,9 @@ class ByClassDialog(QDialog):
     
     def perform_conversion(self):
         """Perform the class conversion with visibility-aware refresh"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'convert', preview=False):
+            return
         # Get selected From classes
         selected_items = self.from_list.selectedItems()
         if not selected_items:
@@ -6716,8 +6643,7 @@ class ByClassDialog(QDialog):
             _palette = getattr(self.app, 'class_palette', None)
             if isinstance(_palette, dict) and _palette:
                 _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
-                if _vis:
-                    mask &= np.isin(classification, _vis)
+                mask &= np.isin(classification, _vis)
             converted_count = int(np.count_nonzero(mask))
             
             if converted_count == 0:
@@ -7371,12 +7297,17 @@ class ClosedByClassDialog(QDialog):
         return InsideFenceDialog._highlight_selected_fences_in_3d(self, fence_list)
 
     def _clear_fence_highlights(self):
+        from gui.native_fence_selection import clear_native_fence_highlights
+        clear_native_fence_highlights(self)
         return InsideFenceDialog._clear_fence_highlights(self)
 
     def _highlight_classified_fences(self):
         return InsideFenceDialog._highlight_classified_fences(self)
 
     def _restore_highlights_from_data(self):
+        from gui.native_fence_selection import sync_native_fence_highlights
+        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+            return
         return InsideFenceDialog._restore_highlights_from_data(self)
 
     def _points_inside_polygon(self, points, polygon_coords):
@@ -7658,6 +7589,8 @@ class ClosedByClassDialog(QDialog):
         body.addWidget(from_lbl)
 
         self.from_list = QListWidget()
+        from gui.class_source_selection import bind_any_class_selection
+        bind_any_class_selection(self.from_list)
         self.from_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.from_list.setMinimumHeight(90)
         self.from_list.setStyleSheet("QListWidget::item { border-bottom: none; padding: 4px; }")
@@ -7881,6 +7814,9 @@ class ClosedByClassDialog(QDialog):
     
     def preview_conversion(self):
         """Preview which points would be converted"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'close', preview=True):
+            return
         from_classes = self._get_selected_from_classes()
         if from_classes == []:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
@@ -7946,6 +7882,9 @@ class ClosedByClassDialog(QDialog):
     
     def perform_conversion(self):
         """Perform the conversion"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'close', preview=False):
+            return
         
         if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
             active_sections = [k for k, v in self.app.section_vtks.items() if v is not None]
@@ -8109,8 +8048,7 @@ class ClosedByClassDialog(QDialog):
         _palette = getattr(self.app, 'class_palette', None)
         if isinstance(_palette, dict) and _palette:
             _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
-            if _vis:
-                section_mask &= np.isin(classification, _vis)
+            section_mask &= np.isin(classification, _vis)
 
         if self.selected_fences:
             combined_inside_mask = np.zeros(len(classification), dtype=bool)
@@ -9355,6 +9293,8 @@ class ByClassHeightDialog(QDialog):
         body.addWidget(from_lbl)
 
         self.from_list = QListWidget()
+        from gui.class_source_selection import bind_any_class_selection
+        bind_any_class_selection(self.from_list)
         self.from_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.from_list.setMinimumHeight(90)
         self.from_list.setStyleSheet("QListWidget::item { border-bottom: none; padding: 4px; }")
@@ -9495,6 +9435,8 @@ class ByClassHeightDialog(QDialog):
 
 
     def _clear_fence_highlights(self, remove_classified=True):
+        from gui.native_fence_selection import clear_native_fence_highlights
+        clear_native_fence_highlights(self)
         # Remove hover highlight (yellow)
         if hasattr(self, '_hover_highlight_actor') and self._hover_highlight_actor:
             try:
@@ -9550,13 +9492,14 @@ class ByClassHeightDialog(QDialog):
         if not fence_shapes:
             return
 
-        existing_ids = {id(f) for f in self.selected_fences}
+        from gui.native_byclass_fences import fence_identity
+        existing_ids = {fence_identity(f) for f in self.selected_fences}
         added = 0
         for shape in fence_shapes:
-            coords = shape.get('coords', [])
-            if not coords:
+            coords = shape.get('coords')
+            if coords is None or len(coords) == 0:
                 continue
-            fence_id = id(shape)
+            fence_id = fence_identity(shape)
             if fence_id in existing_ids:
                 continue
             s = dict(shape)
@@ -9564,7 +9507,7 @@ class ByClassHeightDialog(QDialog):
                 c = s.get('coords', [])
                 if not isinstance(c, np.ndarray):
                     c = np.array(c)
-                if len(c) > 0 and not np.allclose(c[0], c[-1]):
+                if len(c) > 0 and not np.array_equal(c[0], c[-1]):
                     s['coords'] = list(np.vstack([c, c[0]]))
             self.selected_fences.append(s)
             existing_ids.add(fence_id)
@@ -9586,12 +9529,16 @@ class ByClassHeightDialog(QDialog):
             )
 
         self.update_fence_display()
+        self._restore_highlights_from_data()
         self.show()
         self.raise_()
         self.activateWindow()
         print(f"🔷 Height dialog: {added} fence(s) pre-loaded from selection")
 
     def _restore_highlights_from_data(self):
+        from gui.native_fence_selection import sync_native_fence_highlights
+        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+            return
         try:
             if hasattr(self, '_selection_highlight_actors'):
                 for actor in self._selection_highlight_actors:
@@ -9864,9 +9811,22 @@ class ByClassHeightDialog(QDialog):
         print(f"   📐 Reference class: {ground_class} ({ref_class_text})")
         # ─────────────────────────────────────────────────────────────────────
 
-        classification = self.app.data.get("classification")
-        xyz = self.app.data.get("xyz")
-        if classification is None or xyz is None:
+        # Native Vulkan/LNT sessions do not populate app.data. Read a complete,
+        # verified native snapshot for ANALYSIS ONLY; preserve the VTK arrays
+        # and algorithm below when the original VTK renderer owns the cloud.
+        try:
+            from gui.native_byclass_height_analysis import height_analysis_points
+            self.height_info_label.setText("Reading point data for Height analysis...")
+            QApplication.processEvents()  # paint status before the exact LNT query
+            xyz, classification, native_height = height_analysis_points(self.app)
+            print(f"[By Class Height] Analyze Heights input: "
+                  f"{'native LNT' if native_height else 'VTK'} "
+                  f"records={len(xyz):,}")
+        except Exception as exc:
+            error = str(exc)
+            self.height_info_label.setText(f"Height analysis unavailable: {error}")
+            print(f"[By Class Height] Analyze Heights failed: {error}")
+            QMessageBox.warning(self, "Height Analysis Unavailable", error)
             return
 
         # Validate: reference class must differ from the From class
@@ -9944,13 +9904,31 @@ class ByClassHeightDialog(QDialog):
             ReferenceSurfaceError, heights_above_reference_tin,
         )
         max_triangle = self.max_triangle_spin.value()
+        # TIN construction can take a few seconds on large LNT clouds.
+        # Show work in progress, then close it before any result/error popup.
+        from PySide6.QtWidgets import QProgressDialog
+        working = QProgressDialog(self)
+        working.setWindowTitle("Analyzing Heights")
+        working.setLabelText("Building reference surface and analyzing point heights...")
+        working.setCancelButton(None)
+        working.setRange(0, 0)
+        working.setMinimumDuration(0)
+        working.show()
+        QApplication.processEvents()
         try:
             all_heights, supported, surface_info = heights_above_reference_tin(
                 ground_xyz, from_class_xyz, max_triangle,
             )
         except ReferenceSurfaceError as exc:
+            working.close()
             QMessageBox.warning(self, "Reference Surface Failed", str(exc))
             return
+        except Exception as exc:
+            working.close()
+            QMessageBox.warning(self, "Height Analysis Failed", str(exc))
+            return
+        finally:
+            working.close()
         unsupported_count = int(np.count_nonzero(~supported))
         heights = all_heights[supported]
         if not len(heights):
@@ -10044,6 +10022,9 @@ class ByClassHeightDialog(QDialog):
         
     def preview_conversion(self):
         """Preview conversion"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'height', preview=True):
+            return
         selected_items = self.from_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
@@ -10059,7 +10040,10 @@ class ByClassHeightDialog(QDialog):
             from_display = ", ".join(str(c) for c in from_classes)
 
         to_class = self.to_combo.currentData()
-        ground_class = self.ref_class_combo.currentData() or 1
+        ground_class = self.ref_class_combo.currentData()
+        if ground_class is None:
+            QMessageBox.warning(self, "No Selection", "Please select a reference class")
+            return
         ref_class_text = self.ref_class_combo.currentText()
         min_height = self.min_height_spin.value()
         max_height = self.max_height_spin.value()
@@ -10101,6 +10085,9 @@ class ByClassHeightDialog(QDialog):
     
     def perform_conversion(self):
         """Perform conversion"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'height', preview=False):
+            return
         selected_items = self.from_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
@@ -10116,7 +10103,10 @@ class ByClassHeightDialog(QDialog):
             from_display = ", ".join(str(c) for c in from_classes)
 
         to_class = self.to_combo.currentData()
-        ground_class = self.ref_class_combo.currentData() or 1
+        ground_class = self.ref_class_combo.currentData()
+        if ground_class is None:
+            QMessageBox.warning(self, "No Selection", "Please select a reference class")
+            return
         ref_class_text = self.ref_class_combo.currentText()
         min_height = self.min_height_spin.value()
         max_height = self.max_height_spin.value()
@@ -10285,8 +10275,7 @@ class ByClassHeightDialog(QDialog):
         _palette = getattr(self.app, 'class_palette', None)
         if isinstance(_palette, dict) and _palette:
             _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
-            if _vis:
-                from_class_mask &= np.isin(classification, _vis)
+            from_class_mask &= np.isin(classification, _vis)
 
         from_class_count = np.sum(from_class_mask)
         
@@ -11768,6 +11757,9 @@ class InsideFenceDialog(QDialog):
         
     def _restore_highlights_from_data(self):
         """Rebuilds blue highlight actors directly from the selected_fences array"""
+        from gui.native_fence_selection import sync_native_fence_highlights
+        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+            return
         try:
             # Clear old garbage
             if hasattr(self, '_selection_highlight_actors'):
@@ -12022,6 +12014,8 @@ class InsideFenceDialog(QDialog):
         body.addWidget(from_lbl)
 
         self.from_list = QListWidget()
+        from gui.class_source_selection import bind_any_class_selection
+        bind_any_class_selection(self.from_list)
         self.from_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.from_list.setMinimumHeight(90)
         self.from_list.setStyleSheet("QListWidget::item { border-bottom: none; padding: 4px; }")
@@ -12222,6 +12216,8 @@ class InsideFenceDialog(QDialog):
         
     def _clear_fence_highlights(self):
         """Remove selection/hover highlight actors — keep classified (cyan) actors intact"""
+        from gui.native_fence_selection import clear_native_fence_highlights
+        clear_native_fence_highlights(self)
         print("   🧹 Clearing fence highlights...")
         
         # Remove hover highlight (yellow)
@@ -12472,8 +12468,7 @@ class InsideFenceDialog(QDialog):
                 int(c) for c, info in palette.items()
                 if isinstance(info, dict) and info.get("show", True)
             ]
-            if visible:
-                keep &= np.isin(cand_cls, visible)
+            keep &= np.isin(cand_cls, visible)
 
         final_convert_indices = inside_indices[keep]
         if final_convert_indices.size == 0:
@@ -12583,20 +12578,21 @@ class InsideFenceDialog(QDialog):
         if not fence_shapes:
             return
 
+        from gui.native_byclass_fences import fence_identity
         existing_ids = set()
         for f in self.selected_fences:
             if f.get('source') == 'curve_tool':
-                existing_ids.add(id(f.get('curve_data', f)))
+                existing_ids.add(fence_identity(f))
             else:
-                existing_ids.add(id(f))
+                existing_ids.add(fence_identity(f))
 
         added = 0
         for shape in fence_shapes:
-            coords = shape.get('coords', [])
-            if not coords:
+            coords = shape.get('coords')
+            if coords is None or len(coords) == 0:
                 continue
 
-            fence_id = id(shape)
+            fence_id = fence_identity(shape)
             if fence_id in existing_ids:
                 continue
 
@@ -12644,6 +12640,12 @@ class InsideFenceDialog(QDialog):
             
             
     def _highlight_selected_fences_in_3d(self, fence_list):
+        from gui.native_fence_selection import sync_native_fence_highlights
+        if sync_native_fence_highlights(
+            self, [item.data(Qt.UserRole) for item in fence_list.selectedItems()
+                   if isinstance(item.data(Qt.UserRole), dict)]
+        ):
+            return
         """Highlight selected fences in blue in the 3D view"""
         try:
             # Remove old selection highlights
@@ -12916,6 +12918,9 @@ class InsideFenceDialog(QDialog):
 
     def preview_conversion(self):
         """Preview how many points would be converted"""
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'fence', preview=True):
+            return
         # ✅ CHANGED: Check plural fences
         if not self.selected_fences:
             QMessageBox.warning(self, "No Fence", "Please select at least one fence first")
@@ -12989,6 +12994,9 @@ class InsideFenceDialog(QDialog):
         ✅ FIXED: Fast GPU injection when target class is visible (~100ms)
         Only rebuilds mesh when target class is HIDDEN from shading.
         """
+        from gui.native_byclass_parity import route_convert_dialog
+        if route_convert_dialog(self, 'fence', preview=False):
+            return
         if self._conversion_in_progress:
             QMessageBox.information(
                 self,

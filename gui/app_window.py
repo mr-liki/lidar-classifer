@@ -15802,13 +15802,8 @@ class NakshaApp(QMainWindow):
 
             draw_ribbon.draw_tool_selected.connect(on_draw_tool_selected)
             def clear_drawings():
-                from gui.native_draw import get_native_draw
-                native = get_native_draw(self)
-                if native is not None:
-                    native.clear()
-                    self.statusBar().showMessage('Native drawings cleared', 2500)
-                    return
-                self.digitizer.clear_drawings(record_undo=True, preserve_committed=True)
+                from gui.draw_clear_dialog import show_draw_clear_dialog
+                show_draw_clear_dialog(self)
             draw_ribbon.clear_requested.connect(clear_drawings)
             if hasattr(draw_ribbon, "curve_tool_selected"):
                 draw_ribbon.curve_tool_selected.connect(self.on_curve_button_clicked)
