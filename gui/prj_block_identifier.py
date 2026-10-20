@@ -7354,6 +7354,14 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         self._highlight_identify_id = 0
         self._highlight_auto_clear_timer = None
 
+        # "Use PRJ coordinates" mode: a block is identified from its PRJ
+        # boundary and its point file is matched by XY coordinates.
+        # _identified_spatial_files maps a block label to the spatially matched
+        # file (None = explicitly unresolved); _prj_lidar_candidates holds every
+        # point cloud found in the PRJ directory tree.
+        self._identified_spatial_files: dict = {}
+        self._prj_lidar_candidates: list = []
+
         # Fence-selection state
         self._fence_active = False
         self._fence_start_screen = None   # (vtk_x, vtk_y) on left-button down
@@ -7681,6 +7689,16 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         self.dxf_label.setObjectName("prjInfoLabel")
         info_layout.addWidget(self.dxf_label)
         info_layout.addStretch()
+        # Identify a block from its PRJ boundary and match its point file by
+        # XY coordinates instead of by name.
+        from PySide6.QtWidgets import QCheckBox
+        self.use_prj_coordinates = QCheckBox("Use PRJ coordinates")
+        self.use_prj_coordinates.setToolTip(
+            "For mismatched block names: identify selected rows from their PRJ "
+            "boundaries and match point files by XY coordinates. "
+            "Uncheck to use the existing SNT/name workflow."
+        )
+        info_layout.addWidget(self.use_prj_coordinates)
         layout.addWidget(info_card)
 
         self.table = QTableWidget()
@@ -8170,6 +8188,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             # ✅ Store the PRJ file path (prevents deletion)
             self.current_prj_path = file_path
             self.current_directory = os.path.dirname(file_path)
+            # A fresh PRJ invalidates any coordinate match from the previous one.
+            self._identified_spatial_files = {}
             # Any previous backend working copy is stale once a fresh file loads
             self._discard_working()
             prj_filename = os.path.basename(file_path)
@@ -8266,6 +8286,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             # viewport geometry/highlighting, but cannot change which point-cloud
             # files the PRJ table reports as available.
             prj_lidar_index = {}
+            prj_lidar_candidates = set()
             prj_root = None
             if self.current_directory:
                 try:
@@ -8281,8 +8302,13 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     for dirpath, _dirnames, filenames in os.walk(str(prj_root), onerror=_walk_error):
                         for fname in filenames:
                             if fname[-4:].lower() in ('.laz', '.las'):
+                                full_path = str(Path(dirpath) / fname)
                                 prj_lidar_index.setdefault(
-                                    _lidar_block_key(fname), str(Path(dirpath) / fname))
+                                    _lidar_block_key(fname), full_path)
+                                # Every point cloud in the PRJ tree is a candidate
+                                # for the coordinate-based match ("Use PRJ
+                                # coordinates"), not only the name-matched ones.
+                                prj_lidar_candidates.add(full_path)
 
                     print(
                         f"  ✅ PRJ-local point-cloud index: "
@@ -8292,6 +8318,10 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     print(f"  ⚠️ PRJ point-cloud discovery failed: {exc}")
             else:
                 print("  ⚠️ PRJ directory unavailable; point-cloud lookup disabled")
+
+            # Candidate pool for the coordinate-based match ("Use PRJ
+            # coordinates"): every point cloud in the PRJ directory tree.
+            self._prj_lidar_candidates = sorted(prj_lidar_candidates)
 
             # Populate table
             # Populate table + master sort list
@@ -8542,6 +8572,10 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         matches_found = []
         selected_grid_blocks = []
         prj_geometry_blocks = []
+        # "Use PRJ coordinates": identify the blocks from their PRJ boundaries
+        # and match their point files by XY coordinates, never by name.
+        coordinate_mode = bool(self.use_prj_coordinates.isChecked())
+        self._identified_spatial_files = {}
 
         for row in rows:
             # ← CHANGED: read original prj_data index from UserRole (survives sorting)
@@ -8553,6 +8587,34 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             block_data = self.prj_data[prj_idx]   # ← was: self.prj_data[row]
             block_label = block_data['label']
             print(f"\n🔍 Searching for block: '{block_label}'")
+            if label_item is not None:
+                label_item.setToolTip("")
+
+            if coordinate_mode:
+                from gui.prj_spatial_matcher import find_spatial_lidar_file
+                identify_data = dict(block_data)
+                identify_data['identify_source'] = 'PRJ'
+                resolved_path = find_spatial_lidar_file(
+                    getattr(self, '_prj_lidar_candidates', []),
+                    block_data.get('boundary_coords') or [],
+                )
+                self._identified_spatial_files[block_label] = resolved_path
+                if label_item is not None:
+                    label_item.setToolTip(
+                        f"PRJ coordinate match: {resolved_path}" if resolved_path else
+                        "PRJ boundary identified; no unique point file matches its "
+                        "coordinates."
+                    )
+                selected_grid_blocks.append(identify_data)
+                prj_geometry_blocks.append(block_label)
+                print(
+                    f"  ✅ MATCH (PRJ coordinates): '{block_label}'; "
+                    + (f"point file '{resolved_path}'" if resolved_path
+                       else "no unique point file matches its coordinates")
+                )
+                # Do not consult label actors or replace the PRJ polygon with
+                # a same-name SNT boundary: those are unreliable in this mode.
+                continue
 
             # Use the block actor that is actually rendered in the viewport.
             # The cached SNT/PRJ index is only a fallback: its polygon can be
@@ -8823,6 +8885,19 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 20000, _guarded_prj_auto_clear
             )
             if hasattr(self.app, "statusBar"):
+                if coordinate_mode:
+                    matched_count = sum(
+                        path is not None
+                        for path in self._identified_spatial_files.values()
+                    )
+                    self.app.statusBar().showMessage(
+                        f"Identified {len(selected_grid_blocks)} PRJ boundaries by "
+                        f"coordinates; {matched_count} point file(s) matched "
+                        f"spatially; {len(selected_grid_blocks) - matched_count} "
+                        "unresolved. Hover a block label for its matched file.",
+                        10000,
+                    )
+                    return
                 snt_count = sum(
                     block.get('identify_source') == 'SNT'
                     for block in selected_grid_blocks

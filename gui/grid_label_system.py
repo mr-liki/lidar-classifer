@@ -5693,6 +5693,7 @@ class GridLabelManager:
                 getattr(prj_dialog, "current_prj_path", None) or "",
                 id(prj_data),
                 frozenset(identified_labels),
+                tuple(sorted(getattr(prj_dialog, "_identified_spatial_files", {}).items())),
             )
             cached = getattr(self, "_prj_block_polygons_cache", None)
             if cached is not None and getattr(self, "_prj_block_polygons_cache_key", None) == cache_key:
@@ -5745,7 +5746,12 @@ class GridLabelManager:
                     continue
 
                 file_path = None
-                if avail:
+                spatial_files = getattr(prj_dialog, "_identified_spatial_files", {})
+                if label in spatial_files:
+                    # None is an explicit unresolved spatial match. Never replace
+                    # it with a filename guess, including a same-name LAZ.
+                    file_path = spatial_files[label]
+                elif avail:
                     fp = avail.get(label.upper())
                     if fp:
                         file_path = os.path.abspath(fp)
@@ -5756,6 +5762,7 @@ class GridLabelManager:
                     "block_file": label,
                     "alt_names": [],
                     "file_path": file_path,
+                    "coordinate_match": label in spatial_files,
                     "source": "prj_boundary",
                     "snt_filename": prj_path,
                     "poly_layer": "PRJ",
@@ -6380,6 +6387,10 @@ class GridLabelManager:
                     candidate_names.append(alt_name)
             for candidate_name in candidate_names:
                 if laz_file is not None:
+                    break
+                if blk.get("coordinate_match"):
+                    # The file was matched by coordinates; a same-name LAS
+                    # would be a different block.
                     break
                 if not candidate_name:
                     continue
