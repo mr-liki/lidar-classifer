@@ -427,6 +427,13 @@ class PointCountWidget(QWidget):
             self._add_note("Counting points per class…" if counter is not None
                            else "Per-class counts are unavailable for this file.")
             return
+        # Read points "Load selected classifications" (native GPU class filter):
+        # only the loaded classes carry points; the Total is theirs alone.
+        blocked = getattr(self.app, "_import_class_blocked", None)
+        if blocked:
+            point_counts = {code: (0 if code in blocked else count)
+                            for code, count in point_counts.items()}
+            self.total_label.setText(f"Total: {sum(point_counts.values()):,}")
         self._render_classes(self.get_class_info_from_ptc(), point_counts)
 
     def _add_note(self, text):
