@@ -7544,6 +7544,10 @@ class GridLabelManager:
             if not (grid_name or file_path):
                 return False
 
+            from gui.shading_context import show_loaded_block_shading
+            if show_loaded_block_shading(self.app, hit_block):
+                return True
+
             menu = QMenu(self.app)
             menu.setStyleSheet("""
                 QMenu {
@@ -7885,6 +7889,10 @@ class GridLabelManager:
 
         print(f"[native-right-click] world XY = ({world_xy[0]:.2f}, {world_xy[1]:.2f})")
         if self._block_polygon_hit_click(None, None, None, world_xy=world_xy):
+            return True
+
+        from gui.shading_context import show_shading_at_world
+        if show_shading_at_world(self.app, world_xy):
             return True
 
         actor = self._native_grid_label_near(world_xy, units_per_pixel)

@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_lighting.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
