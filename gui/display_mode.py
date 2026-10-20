@@ -2926,6 +2926,7 @@ class DisplayModeDialog(QDialog):
         _MODE_TO_IDX = {
             "class":        0,
             "shaded_class": 1,
+            "shaded":       1,
             "depth":        2,
             "intensity":    3,
             "rgb":          4,
@@ -2934,6 +2935,12 @@ class DisplayModeDialog(QDialog):
             "line":         7,
         }
         target_idx = _MODE_TO_IDX.get(current_mode, 0)
+
+        # Remember Main View changes even while a different slot is selected.
+        # Otherwise returning to Main View restores its stale pre-switch mode.
+        if not hasattr(self, "view_color_modes"):
+            self.view_color_modes = {}
+        self.view_color_modes[0] = target_idx
 
         # Sync color_mode combo box index. app.display_mode is the Main View's
         # own mode flag — only apply it while Main View (slot 0) is selected,
