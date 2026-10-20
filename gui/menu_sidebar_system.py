@@ -508,7 +508,7 @@ RIBBON_TOOLTIP_META = {
         "title": "Synchronize Views",
         "description": "Open view synchronization controls for linked navigation.",
     },
-    ("ToolsRibbon", "Selection", "Config"): {
+    ("ToolsRibbon", "Selection", "Shortcuts"): {
         "title": "Shortcut Configuration",
         "description": "Open the shortcut manager to create or edit custom shortcuts.",
     },
@@ -1792,7 +1792,7 @@ class ToolsRibbon(QWidget):
         # )
         # selection.add_button("Select", "🖱️",
         #                      lambda: self.tool_activated.emit("element_selection"))
-        selection.add_button("Config", "⌨️", self._configure_shortcuts)
+        selection.add_button("Shortcuts", "⌨️", self._configure_shortcuts)
         layout.addWidget(selection)
         
         # ------------------------
