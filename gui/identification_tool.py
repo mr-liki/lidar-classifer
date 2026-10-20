@@ -193,8 +193,11 @@ class IdentificationTool(QObject):
 
             rgb = data.get("rgb")
             if rgb is not None and 0 <= point_index < len(rgb):
-                r, g, b = (int(v) for v in rgb[point_index])
-                raw_values["Color RGB"] = f"{r}, {g}, {b}"
+                r, g, b = (float(v) for v in rgb[point_index])
+                if max(r, g, b) <= 1.0:
+                    # The native section store keeps the colours as 0..1 floats.
+                    r, g, b = r * 255.0, g * 255.0, b * 255.0
+                raw_values["Color RGB"] = f"{int(r)}, {int(g)}, {int(b)}"
 
         return {
             label: raw_values[label]

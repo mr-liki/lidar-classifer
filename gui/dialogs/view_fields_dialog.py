@@ -178,7 +178,8 @@ class _TitleCloseButton(QWidget):
 class ViewFieldsDialog(QDialog):
     """Checklist of point-cloud fields available in the loaded file."""
 
-    def __init__(self, filename=None, parent=None, available_dimensions=None):
+    def __init__(self, filename=None, parent=None, available_dimensions=None,
+                 field_specs=None):
         super().__init__(parent)
         self.setProperty("themeStyledDialog", True)
         self.filename = filename
@@ -187,6 +188,9 @@ class ViewFieldsDialog(QDialog):
         self._available_dims.update(
             str(name).casefold() for name in (available_dimensions or ())
         )
+        # A caller may offer a reduced field list (the native .lnt keeps only
+        # part of the LAS attributes); the default is the full LAS list.
+        self._field_specs = list(field_specs) if field_specs else list(FIELD_SPECS)
 
         self.setWindowTitle("View Fields")
         # Frameless + translucent so we can draw our own rounded frame and a
@@ -195,6 +199,7 @@ class ViewFieldsDialog(QDialog):
         self.setWindowFlags(
             Qt.Dialog
             | Qt.FramelessWindowHint
+            | Qt.WindowMaximizeButtonHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self._drag_pos = None
@@ -202,7 +207,9 @@ class ViewFieldsDialog(QDialog):
         if not icon.isNull():
             self.setWindowIcon(icon)
         self.resize(340, 520)
-        self.setMinimumSize(300, 420)
+        # Freely resizable (the size grip in the corner resizes the frameless
+        # window); the list takes whatever space is left.
+        self.setMinimumSize(0, 0)
         self.setSizeGripEnabled(True)
 
         self.setStyleSheet(get_dialog_stylesheet() + self._extra_stylesheet())
@@ -402,7 +409,7 @@ class ViewFieldsDialog(QDialog):
 
         image_dimension = find_image_dimension_name(self._available_dims)
 
-        for label, dims, always_available in FIELD_SPECS:
+        for label, dims, always_available in self._field_specs:
             if label == IMAGE_FIELD_LABEL:
                 available = image_dimension is not None
             else:

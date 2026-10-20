@@ -17610,49 +17610,9 @@ class NakshaApp(QMainWindow):
             print("✅ Display Mode dialog FORCED visible")
 
     def open_fields_panel(self):
-        """Open the MicroStation-style point data table for the loaded cloud."""
-        from PySide6.QtWidgets import QMessageBox
-        from gui.dialogs.view_fields_table import ViewFieldsTableDialog
-
-        if not getattr(self, "loaded_file", None):
-            if not self.data or "xyz" not in self.data:
-                QMessageBox.information(
-                    self,
-                    "View Fields",
-                    "Load a point cloud file first to view its fields.",
-                )
-                return
-
-        if not self.data or "xyz" not in self.data:
-            QMessageBox.information(
-                self,
-                "View Fields",
-                "No point data loaded.",
-            )
-            return
-
-        # Only one table window at a time — if one is already open, just
-        # bring it to the front instead of creating a duplicate.
-        existing = getattr(self, "_view_fields_table_dialog", None)
-        if existing is not None and existing.isVisible():
-            existing.refresh_data(self.loaded_file, self.data)
-            existing.setWindowState(
-                existing.windowState() & ~Qt.WindowMinimized
-                | Qt.WindowActive)
-            existing.raise_()
-            existing.activateWindow()
-            return
-
-        dialog = ViewFieldsTableDialog(
-            filename=self.loaded_file,
-            app_data=self.data,
-            parent=self,
-        )
-        # Keep a reference so the Identification tool can highlight rows here.
-        self._view_fields_table_dialog = dialog
-        dialog.finished.connect(
-            lambda _r: setattr(self, "_view_fields_table_dialog", None))
-        dialog.show()  # non-modal so the user can still interact with the 3D view
+        """Open the full native point-cloud fields table without VTK."""
+        from gui.native_fields import open_native_fields
+        open_native_fields(self)
 
     def load_las_for_grid(self, grid_name):
         """
