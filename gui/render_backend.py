@@ -1449,6 +1449,19 @@ class VulkanRenderBackend(RenderBackend):
         )
         return bool(ok)
 
+    def update_surface_colors(self, colors) -> bool:
+        """Upload face colours only, keeping XYZ, normals and indices resident."""
+        fn = getattr(self._dll, "nkv_update_surface_colors", None) if self._dll else None
+        if not self._handle or fn is None:
+            return False
+        colors = np.ascontiguousarray(colors, dtype=np.uint8)
+        if colors.ndim != 2 or colors.shape[1] != 3:
+            raise ValueError("colors must be (T,3)")
+        fn.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
+        fn.restype = ctypes.c_int
+        return bool(fn(ctypes.c_uint64(self._handle), ctypes.c_void_p(colors.ctypes.data),
+                       ctypes.c_uint64(len(colors))))
+
     def clear_surface(self) -> bool:
         if not self._handle:
             return False

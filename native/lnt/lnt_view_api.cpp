@@ -191,7 +191,7 @@ struct View {
         if (!root_classes_known) {
             root_classes_known = 1;
             for (const auto& n : rd.nodes()) {
-                if (n.tree_level != 0) continue;
+                if (!rd.is_root_node(n)) continue;
                 std::vector<RawPoint> pts;
                 if (rd.read_node_points(n, pts)) for (const auto& q : pts) root_classes.set(q.classification);
             }
@@ -205,7 +205,7 @@ struct View {
         if (lod_failed || (surface_elev && !surface_gpu_elev)) return false;
         if (surface_lod::env_value("NAKSHA_LNT_SURFACE_LOD") == "0") return false;
         if (!eng.has_surface_tiles() || !eng.has_compact_shaded_class_surface()) return false;
-        return visible_root_classes() >= 2;
+        return visible_root_classes() > 0;
     }
     bool ensure_lod() {
         if (lod) return true;
@@ -464,7 +464,7 @@ struct View {
                 job.source_points+=node->point_count;
             }
             // Only whole-file meshes are persisted, independently of point LOD.
-            if(job.source_points==directory->directory().total_points) {
+            if(!directory->is_collection() && job.source_points==directory->directory().total_points) {
                 job.settings_hash=embedded_surface::settings_digest(params,ids);
                 embedded_surface::Digest expected{};bool loaded=false;
                 const auto cache_start=std::chrono::steady_clock::now();
@@ -848,7 +848,7 @@ struct View {
                      crisp ? "crisp-engine-lit" : (pending_surface_method ? "barycentric" : "facet"),
                      (unsigned long long)job.source_points,(unsigned long long)job.mesh.visible_points,
                      (unsigned long long)(job.mesh.coverage_positions.size()/3));
-        if((!job.embedded_hit || job.embedded_legacy) && job.source_points==rd.directory().total_points &&
+        if(!rd.is_collection() && (!job.embedded_hit || job.embedded_legacy) && job.source_points==rd.directory().total_points &&
            (!surface_save.valid() || surface_save.wait_for(std::chrono::seconds(0))==std::future_status::ready)) {
             const auto path=lnt_path;const auto offset=embedded_surface::base_end(rd);
             surface_save=std::async(std::launch::async,[path,offset,job=std::move(job)]() mutable {
@@ -1128,7 +1128,7 @@ __declspec(dllexport) int lnt_view_set_classification_lut(void* h, const uint8_t
     std::memcpy(v->class_lut, rgba1024, sizeof(v->class_lut));
     v->class_lut_uploaded=true;
     if (v->surface_elev) {
-        v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() >= 2;
+        v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() > 0;
         v->eng.set_surface_elevation_color(v->surface_gpu_elev, v->surface_z0, v->surface_z1, v->surface_ramp);
     }
     ++v->surface_gen; // discard any job built with the previous palette/visibility
@@ -1220,9 +1220,9 @@ __declspec(dllexport) int lnt_view_set_surface_elevation(void* h, int on, uint32
     v->surface_ramp = ramp;
     v->surface_z0 = z0;
     v->surface_z1 = z1 > z0 ? z1 : z0 + 1.0;
-    // The single-class Shading path bakes its flat hillshade into cell colours;
-    // retain that same path for Surface too. Multi-class uses the shared tile arena.
-    v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() >= 2;
+    // The tiled path handles elevation colouring for every visible class
+    // count; single-class surfaces need the same continuous coverage.
+    v->surface_gpu_elev = v->eng.has_surface_elevation_color() && v->visible_root_classes() > 0;
     v->eng.set_surface_elevation_color(v->surface_elev && v->surface_gpu_elev, z0, v->surface_z1, ramp);
     if (v->surface_gpu_elev) return 1;
     if (v->surface_job_running) v->surface_cancel->store(true);
@@ -1270,7 +1270,14 @@ __declspec(dllexport) int lnt_view_data_stats(void* h, double* out6) {
     const std::vector<LNTNodeEntry>& ns = v->rd.nodes();
     if (ns.empty()) return 0;
     std::vector<RawPoint> pts;
-    if (!v->rd.read_node_points(ns[0], pts) || pts.empty()) return 0;
+    if (v->rd.is_collection()) {
+        for (const auto& node : ns) if (v->rd.is_root_node(node)) {
+            std::vector<RawPoint> part;
+            if (!v->rd.read_node_points(node, part)) return 0;
+            pts.insert(pts.end(),part.begin(),part.end());
+        }
+        if (pts.empty()) return 0;
+    } else if (!v->rd.read_node_points(ns[0], pts) || pts.empty()) return 0;
     std::vector<double> z(pts.size());
     double imin = 255.0, imax = 0.0;
     for (std::size_t i = 0; i < pts.size(); ++i) {

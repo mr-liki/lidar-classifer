@@ -93,7 +93,7 @@ struct SurfaceParams {
     double single_elevation_deg = 0.0;
     // Filled by plan_surface() for the whole cut, then read by mesh_one_tile():
     double min_area = 0.0, min_aspect = 0.0;   // _numba_degenerate_filter (0 = off)
-    double max_edge_abs = 0.0;          // absolute plan edge limit (0 = legacy median rule)
+    double max_edge_abs = 0.0;          // >0 absolute limit, 0 median rule, <0 continuous
     // false when the engine lights and colours the mesh itself (compact crisp path): the
     // per-face colours and the mixed-face list are then not built, which saves host RAM.
     bool bake_colors = true;
@@ -359,9 +359,9 @@ inline void mesh_one_tile(const std::vector<const SurfaceTile*>& tiles, std::siz
         own.push_back(uint32_t(t));
         longest2.push_back(m2);
     }
-    if (own.empty() && (fringe.empty() || P.max_edge_abs <= 0.0)) return;
+    if (own.empty() && (fringe.empty() || P.max_edge_abs == 0.0)) return;
     double med=0;
-    if(P.max_edge_abs <= 0.0) {
+    if(P.max_edge_abs == 0.0) {
         std::vector<double> sorted = longest2;
         std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
         med = std::sqrt(sorted[sorted.size() / 2]);
@@ -369,7 +369,8 @@ inline void mesh_one_tile(const std::vector<const SurfaceTile*>& tiles, std::siz
     // VTK keeps every triangle up to an ABSOLUTE plan edge (10 % of the cut's extent with
     // several classes, 20 % with one); the legacy native rule is relative to the tile median.
     // Capped at the halo: a longer kept edge could miss its owner's point set (a seam).
-    const double limit = P.max_edge_abs > 0.0 ? std::min(P.max_edge_abs, halo)
+    const double limit = P.max_edge_abs < 0.0 ? std::numeric_limits<double>::infinity()
+                       : P.max_edge_abs > 0.0 ? std::min(P.max_edge_abs, halo)
                                               : P.max_edge_factor * med;
     const double limit2 = limit * limit;
 

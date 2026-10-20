@@ -125,6 +125,9 @@ public:
                            std::size_t vertexCount,
                            const uint32_t* indices, std::size_t indexCount);
 
+    // Recolour the resident legacy triangle soup without uploading geometry.
+    bool UpdateFaceColors(const uint8_t* rgb, std::size_t faceCount);
+
     // ---- State changes (push constants / pipeline switch, no upload) ----
     void SetShadingMode(ShadingMode mode);
     ShadingMode GetShadingMode() const;
@@ -338,7 +341,7 @@ public:
     struct TileDrawItem {
         uint64_t key;
         uint32_t firstFace, faceCount;   // tile-local triangle range
-        uint32_t coverage, pad;
+        uint32_t coverage, pad;          // pad bit 0: background interpolation TIN
     };
     bool ConfigureTiles(uint64_t vertexCapacity, uint64_t faceCapacity, uint64_t coverageCapacity,
                         std::string* error);

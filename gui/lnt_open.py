@@ -5,6 +5,7 @@ laspy+lazrs, then converted by the native C++ builder). Every later open finds t
 .lnt newer than the source and loads it directly.
 """
 import ctypes
+import json
 import os
 import shutil
 import tempfile
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from gui import lnt_native as nat
 from gui.native_pan import NativePanGesture
 
-LNT_SUFFIXES = (".las", ".laz", ".lnt")
+LNT_SUFFIXES = (".las", ".laz", ".lnt", ".lntset")
 
 
 def lnt_path_for(source):
@@ -27,25 +28,60 @@ LNT_FORMAT_VERSION = 2      # 2: points carry a classification byte (11 B/pt)
 
 
 def lnt_file_version(path):
-    """The format version stored in an .lnt header (uint16 at offset 4), or 0."""
+    """Format version of a structurally complete cache, or 0 if truncated."""
     try:
-        with open(path, "rb") as f:
-            head = f.read(8)
-        if head[:3] != b"LNT" or len(head) < 6:
-            return 0
-        return int.from_bytes(head[4:6], "little")
+        with open(path, 'rb') as f:
+            head=f.read(64)
+            if len(head)!=64 or head[:4]!=b'LNT\0': return 0
+            index=int.from_bytes(head[8:16],'little')
+            size=os.fstat(f.fileno()).st_size
+            if index<64 or index>size-16: return 0
+            f.seek(index)
+            directory=f.read(16)
+            nodes=int.from_bytes(directory[8:16],'little')
+            if len(directory)!=16 or not nodes or nodes>(size-index-16)//52: return 0
+            return int.from_bytes(head[4:6],'little')
     except OSError:
         return 0
 
 
+def _source_signature(source):
+    stat = os.stat(source)
+    return dict(source=os.path.normcase(os.path.realpath(source)), size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns, format=LNT_FORMAT_VERSION)
+
+
+def _source_cache_current(source, lnt):
+    if not os.path.isfile(lnt) or lnt_file_version(lnt) != LNT_FORMAT_VERSION:
+        return False
+    try:
+        with open(lnt + '.source.json', encoding='utf-8') as f:
+            return json.load(f) == _source_signature(source)
+    except FileNotFoundError:
+        return os.path.getmtime(lnt) >= os.path.getmtime(source) # compatible older cache
+    except (OSError, ValueError):
+        return False
+
+
+def _publish_source_cache(source, staged, destination, signature):
+    if _source_signature(source) != signature:
+        raise RuntimeError(f'{source} changed while its cache was building')
+    if lnt_file_version(staged) != LNT_FORMAT_VERSION:
+        raise RuntimeError(f'The converter did not produce a valid cache for {source}')
+    # Staging and destination are on the source drive, so replacement is atomic.
+    metadata = os.fspath(staged) + '.source.json'
+    with open(metadata, 'w', encoding='utf-8') as f:
+        json.dump(signature, f, sort_keys=True)
+    os.replace(staged, destination)
+    os.replace(metadata, os.fspath(destination) + '.source.json')
+
+
 def lnt_is_current(source):
-    """True when a usable .lnt of the CURRENT format exists for `source`. An .lnt
-    written by an older build (no classification) is treated as stale and rebuilt."""
-    lnt = lnt_path_for(source)
-    if source.lower().endswith(".lnt"):
+    """Source fingerprints survive classification edits to the cache's mtime."""
+    source = os.fspath(source)
+    if source.lower().endswith('.lnt'):
         return os.path.isfile(source) and lnt_file_version(source) == LNT_FORMAT_VERSION
-    return (os.path.isfile(lnt) and lnt_file_version(lnt) == LNT_FORMAT_VERSION
-            and os.path.getmtime(lnt) >= os.path.getmtime(source))
+    return _source_cache_current(source, lnt_path_for(source))
 
 
 class Cancelled(Exception):
@@ -59,12 +95,13 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
                if laspy.LazBackend.LazrsParallel in backends else None)
     with laspy.open(laz, laz_backend=backend) as src:
         required = (src.header.offset_to_point_data
-                    + src.header.point_count * src.header.point_format.size)
+                    + src.header.point_count * (src.header.point_format.size + 22)
+                    + 8 * 1024**2)
         free = shutil.disk_usage(os.path.dirname(las)).free
         if required > free:
             raise RuntimeError(
-                f"LAZ needs about {required / 1024**3:.1f} GiB of temporary space "
-                f"to decompress; only {free / 1024**3:.1f} GiB is free")
+                f"Not enough free space beside {laz}: need about {required / 1024**3:.2f} GiB "
+                f"for decompression and its LNT; only {free / 1024**3:.2f} GiB is free")
         header = laspy.LasHeader(point_format=src.header.point_format,
                                  version=src.header.version)
         header.scales, header.offsets = src.header.scales, src.header.offsets
@@ -81,32 +118,51 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
                          f"Decompressing LAZ  {done:,}/{total:,} points ({rate:.1f} M/s)")
 
 
-def build_lnt(source, progress, cancelled):
-    """Builds <source>.lnt. progress(percent, text); raises on failure."""
-    lnt = lnt_path_for(source)
-    tmp_las = None
-    tmp_lnt = lnt + ".tmp"
+def _scratch_dir(source):
+    """Require scratch space beside the source; never fall back to system TEMP."""
+    folder = os.path.dirname(os.path.realpath(os.fspath(source)))
     try:
+        fd, probe = tempfile.mkstemp(prefix="naksha_probe_", dir=folder)
+        os.close(fd)
+        os.remove(probe)
+    except OSError as exc:
+        raise OSError(f"Cannot build the cache beside {source}: {exc}. "
+                      "Choose a writable source folder with enough free space.") from exc
+    return folder
+
+
+def build_lnt(source, progress, cancelled):
+    """Build/reuse an individual LNT; all staging lives beside its LAS/LAZ."""
+    source = os.path.realpath(os.fspath(source))
+    if cancelled():
+        raise Cancelled()
+    if lnt_is_current(source):
+        progress(100, f"Using cached {os.path.basename(lnt_path_for(source))}")
+        return lnt_path_for(source)
+    lnt = lnt_path_for(source)
+    signature = _source_signature(source)
+    folder = _scratch_dir(source)
+    if source.lower().endswith('.las'):
+        import laspy
+        with laspy.open(source) as reader:
+            required = reader.header.point_count * 22 + 8 * 1024**2
+        if shutil.disk_usage(folder).free < required:
+            raise OSError(f"Not enough free space beside {source} to build its LNT cache")
+    with tempfile.TemporaryDirectory(prefix="naksha_lnt_", dir=folder) as staging:
+        staged_lnt = os.path.join(staging, "cache.lnt")
         las = source
         if source.lower().endswith(".laz"):
-            fd, tmp_las = tempfile.mkstemp(suffix=".las", prefix="lnt_")
-            os.close(fd)
-            _laz_to_las(source, tmp_las, progress, cancelled)
-            las = tmp_las
+            las = os.path.join(staging, "decompressed.las")
+            _laz_to_las(source, las, progress, cancelled)
         if cancelled():
             raise Cancelled()
-        progress(92, "Building .lnt (octree + LOD)")
-        pts, nodes = nat.convert_las(las, tmp_lnt)
-        os.replace(tmp_lnt, lnt)
-        progress(100, f"Built {os.path.basename(lnt)}: {pts:,} points, {nodes:,} nodes")
-        return lnt
-    finally:
-        for p in (tmp_las, tmp_lnt):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        progress(92, f"Building {os.path.basename(lnt)} (octree + LOD)")
+        pts, nodes = nat.convert_las(las, staged_lnt)
+        if cancelled():
+            raise Cancelled()
+        _publish_source_cache(source, staged_lnt, lnt, signature)
+    progress(100, f"Built {os.path.basename(lnt)}: {pts:,} points, {nodes:,} nodes")
+    return lnt
 
 
 class _BuildWorker(QObject):
@@ -116,6 +172,9 @@ class _BuildWorker(QObject):
     def __init__(self, source):
         super().__init__()
         self.source = source
+        self.sources = [os.fspath(p) for p in (source if isinstance(source, (list, tuple)) else [source])]
+        self.render_source = self.sources[0]
+        self.target_crs_wkt = None
         self._cancel = False
 
     def cancel(self):
@@ -124,8 +183,22 @@ class _BuildWorker(QObject):
     @Slot()
     def run(self):
         try:
-            lnt = build_lnt(self.source, lambda p, t: self.progress.emit(p, t),
-                            lambda: self._cancel)
+            if len(self.sources) > 1:
+                from gui.lnt_batch import build_batch, BatchCancelled
+                try:
+                    self.render_source, lnt = build_batch(self.sources,
+                        lambda p, t: self.progress.emit(p, t), lambda: self._cancel,
+                        target_crs_wkt=self.target_crs_wkt)
+                except BatchCancelled:
+                    raise Cancelled()
+            else:
+                lnt = build_lnt(self.sources[0], lambda p, t: self.progress.emit(p, t),
+                                lambda: self._cancel)
+                if self.target_crs_wkt and not self.sources[0].lower().endswith('.lnt'):
+                    from pyproj import CRS
+                    from gui.lnt_batch import _projected_cache
+                    lnt = _projected_cache(self.sources[0],CRS.from_user_input(self.target_crs_wkt),
+                        lambda p,t:self.progress.emit(p,t),lambda:self._cancel,500_000) or lnt
             self.finished.emit(lnt, "")
         except Cancelled:
             self.finished.emit("", "cancelled")
@@ -848,7 +921,7 @@ class _BuildUi(QObject):
         super().__init__(main_window)
         self.mw, self.source, self.dlg = main_window, source, dlg
         self.thread, self.worker = thread, worker
-        self.name = os.path.basename(source)
+        self.name = ', '.join(os.path.basename(p) for p in worker.sources)
 
     @Slot(float, str)
     def on_progress(self, p, text):
@@ -873,6 +946,9 @@ class _BuildUi(QObject):
                                  f"Could not build the .lnt file:\n\n{error}")
         else:
             print(f"[LNT] built {lnt}")
+            self.mw._lnt_source_path = self.worker.render_source
+            self.mw._lnt_source_paths = list(self.worker.sources)
+            self.mw._lnt_render_crs_wkt = self.worker.target_crs_wkt
             _show(self.mw, lnt, self.name)
 
     @Slot()
@@ -883,11 +959,44 @@ class _BuildUi(QObject):
 def open_with_lnt(main_window, source):
     """Entry point from MainWindow.open_file. Always returns True (handled): on
     failure the user sees the reason; there is deliberately no .naksha fallback."""
-    name = os.path.basename(source)
-    main_window._lnt_source_path = source
-    if lnt_is_current(source):
-        _show(main_window, lnt_path_for(source), name)
+    sources = list(source) if isinstance(source, (list, tuple)) else [source]
+    target_crs_wkt = getattr(main_window,'project_crs_wkt',None)
+    if len(sources)==1 and os.fspath(sources[0]).lower().endswith('.lntset'):
+        from gui.lnt_collection import read_collection
+        try:
+            group=read_collection(sources[0])
+            sources=group['sources']
+            target_crs_wkt=target_crs_wkt or group.get('target_crs')
+            source=sources if len(sources)>1 else sources[0]
+        except (OSError,ValueError) as exc:
+            QMessageBox.critical(main_window,'Open point cloud',f'Cannot read the LNT selection index: {exc}')
+            return True
+    if not sources:
         return True
+    if len(sources) == 1:
+        source = sources[0]
+    name = ', '.join(os.path.basename(p) for p in sources)
+    if len(sources) == 1:
+        from gui.lnt_batch import cached_render_cache
+        try:
+            cached = cached_render_cache(source,target_crs_wkt)
+        except (OSError,ValueError):
+            cached = None
+        if cached:
+            main_window._lnt_source_path = source
+            main_window._lnt_source_paths = sources
+            main_window._lnt_render_crs_wkt = target_crs_wkt
+            _show(main_window, cached, name)
+            return True
+
+    # Rebuilding a source cache must release readers/writers of that same
+    # individual LNT first (Windows denies replacing an open cache file).
+    current = getattr(main_window, '_lnt_main_view', None)
+    previous = {os.path.normcase(os.path.realpath(p)) for p in getattr(main_window, '_lnt_source_paths', ())}
+    if current is not None and any(
+            os.path.normcase(os.path.realpath(p)) in previous and not lnt_is_current(p)
+            for p in sources):
+        close_lnt_view(main_window, reopening=True)
 
     dlg = QProgressDialog(f"Building .lnt for {name} (first open only)...", "Cancel", 0, 100,
                           main_window)
@@ -900,6 +1009,7 @@ def open_with_lnt(main_window, source):
 
     thread = QThread(main_window)
     worker = _BuildWorker(source)
+    worker.target_crs_wkt = target_crs_wkt
     worker.moveToThread(thread)
     ui = _BuildUi(main_window, source, dlg, thread, worker)
     main_window._lnt_build = (thread, worker, dlg, ui)      # keep alive

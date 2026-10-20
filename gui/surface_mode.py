@@ -829,12 +829,9 @@ def _compute_surface_geometry_backend(
     if len(faces) == 0:
         return {"empty": True, "profile_timings": timings}
 
-    data_extent = max(float(np.ptp(xy[:, 0])), float(np.ptp(xy[:, 1])), 1.0)
     max_edge = float(max_edge or 0.0)
-    if max_edge <= 0.0:
-        max_edge = max(data_extent * 0.10, spacing * 100.0)
-
-    _emit(75, "Cleaning long Surface triangles...")
+    # Zero means continuous coverage; only an explicit edge limit clips faces.
+    _emit(75, "Finalizing Surface triangles...")
     faces = _filter_long_edges(faces, xy, max_edge)
     _checkpoint("edge_filter")
     if len(faces) == 0:

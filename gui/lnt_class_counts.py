@@ -28,6 +28,10 @@ _CLASS_BYTE = 10
 
 def read_directory(path):
     """(total_points, node entries) of an .lnt file."""
+    from gui.lnt_collection import is_collection, read_collection
+    if is_collection(path):
+        group = read_collection(path)
+        return int(group['total']), group['entries']
     with open(path, "rb") as f:
         magic, _version, _reserved, index_offset = _HEADER.unpack(f.read(_HEADER.size))
         if magic != b"LNT\0":
@@ -42,6 +46,14 @@ def read_directory(path):
 
 def scan_class_histogram(path, entries=None, cancelled=lambda: False):
     """int64[256] point count per class code over every leaf record, or None if cancelled."""
+    from gui.lnt_collection import is_collection, read_collection
+    if is_collection(path):
+        hist = np.zeros(256, dtype=np.int64)
+        for source in read_collection(path)['paths']:
+            part = scan_class_histogram(source, cancelled=cancelled)
+            if part is None: return None
+            hist += part
+        return hist
     if entries is None:
         _total, entries = read_directory(path)
     hist = np.zeros(256, dtype=np.int64)
@@ -69,6 +81,8 @@ class LntClassCounts(QObject):
         super().__init__(parent)
         self.path = path
         self.total_points, self._entries = read_directory(path)
+        from gui.lnt_collection import is_collection, read_collection
+        self._collection = read_collection(path) if is_collection(path) else None
         self._hist = None            # file histogram, exact once the scan finished
         self._lock = threading.Lock()
         self._scanning = False
@@ -123,11 +137,8 @@ class LntClassCounts(QObject):
             node, local, new = node[pick], local[pick], new[pick]
             pos = (self._entries["byte_offset"][node].astype(np.int64)
                    + local * _POINT_BYTES + _CLASS_BYTE)
-            mm = np.memmap(self.path, dtype=np.uint8, mode="r")
-            try:
-                old = np.array(mm[pos])
-            finally:
-                del mm
+            from gui.lnt_collection import payload_bytes
+            old = payload_bytes(self.path, pos, self._collection)
             return old, new
         except Exception as exc:     # noqa: BLE001
             print(f"[LNT] class count delta unavailable ({exc}); recounting")
