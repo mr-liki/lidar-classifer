@@ -8711,6 +8711,14 @@ class GridLabelManager:
         las_file = Path(las_file)
         if las_file.suffix.lower() not in LNT_SUFFIXES:
             return False
+        # "Read points" dialog first (LAS/LAZ only; the Load Block/Grid
+        # shortcut skips it). Cancel leaves the current cloud untouched.
+        import_options = self.app._prompt_lidar_import_options_for_files([las_file])
+        if import_options is None:
+            print(f"[block-load] '{grid_name}' cancelled in Read points")
+            return True
+        from gui.lnt_open import set_import_class_filter
+        set_import_class_filter(self.app, import_options)
         self.loaded_grids.clear()
         self.grid_aliases.clear()
         self.app._lnt_block_grid_name = grid_name
