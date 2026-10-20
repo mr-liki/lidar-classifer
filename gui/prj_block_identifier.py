@@ -8418,9 +8418,24 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Failed to clear highlight for {block_label}: {e}")
 
 
+    def _clear_native_prj_highlight(self):
+        self._prj_blink_token = None
+        from gui.native_highlight import clear_highlight_group
+        clear_highlight_group(self.app, 'prj-identify')
+
+
     def _auto_clear_highlights(self):
         """Auto-clear all highlight circles and restore text colors after timeout."""
+        self._clear_native_prj_highlight()
         if not hasattr(self, '_highlight_actors') or not self._highlight_actors:
+            return
+
+        from gui.native_highlight import HighlightHandle
+        if all(isinstance(handle, HighlightHandle) for handle in self._highlight_actors):
+            self._highlight_actors = []
+            self._highlighted_labels = []
+            self._highlighted_blocks = {}
+            self._identified_prj_block_labels = set()
             return
 
         try:
@@ -8503,6 +8518,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
         print(f"\n🔍 Searching for {len(rows)} selected blocks...")
 
+        self._clear_native_prj_highlight()
         # Clear previous highlight actors and restore text colors before starting fresh
         if hasattr(self.app, 'vtk_widget') and self.app.vtk_widget:
             renderer = self.app.vtk_widget.renderer
@@ -8983,26 +8999,39 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     def _highlight_prj_boundaries(self, blocks):
         """Draw selected PRJ polygons and return their combined XY bounds."""
-        from gui.native_attachments import is_native_main, render_entities
-        if is_native_main(self.app):
-            entities = []
-            all_x, all_y = [], []
+        from gui.native_highlight import highlight_overlay_for, ring_shape
+        overlay = highlight_overlay_for(self.app)
+        if overlay is not None:
+            shapes, all_x, all_y = [], [], []
             for block in blocks:
                 coords = block.get('boundary_coords') or []
                 if len(coords) < 3:
                     continue
-                ring = [(float(x), float(y), 0.0) for x, y in coords]
-                entities.append({'type': 'polyline', 'points': ring, 'closed': True,
-                                 'layer': 'PRJ selection', 'color': (255, 38, 0)})
-                all_x.extend(point[0] for point in ring)
-                all_y.extend(point[1] for point in ring)
-            if not entities:
+                shape = ring_shape(coords, (0, 120, 255), 6)
+                if shape is None:
+                    continue
+                shapes.append(shape)
+                all_x.extend(point[0] for point in shape[1])
+                all_y.extend(point[1] for point in shape[1])
+            if not shapes:
                 return None
-            cache = render_entities(self.app, 'prj', {
-                'filename': '__selection__', 'full_path': '__selection__',
-                'entities': entities,
-            }) or {}
-            self._highlight_actors = [handle for group in cache.values() for handle in group]
+            self._prj_blink_token = token = object()
+            handle = overlay.set_group('prj-identify', shapes)
+            self._highlight_actors = [handle]
+
+            def toggle(visible):
+                if (getattr(self, '_prj_blink_token', None) is not token
+                        or handle not in self._highlight_actors
+                        or getattr(self.app, '_shutdown_in_progress', False)):
+                    return
+                from gui.native_highlight import highlight_overlay_for
+                current = highlight_overlay_for(self.app)
+                if current is not None:
+                    current.set_group('prj-identify', shapes if visible else [])
+
+            # Three off/on cycles, followed by the normal highlight timeout.
+            for step in range(1, 7):
+                QTimer.singleShot(step * 200, lambda visible=(step % 2 == 0): toggle(visible))
             return min(all_x), min(all_y), max(all_x), max(all_y)
 
         vtk_widget = getattr(self.app, "vtk_widget", None)
@@ -12211,6 +12240,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             self._highlighted_blocks = {}
 
             # Cancel pending auto-clear timer
+            self._clear_native_prj_highlight()
             self._highlight_identify_id += 1
             
             # Update status label
