@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
     QSizePolicy, QWidget, QScrollArea, QTabWidget, QLineEdit, QFileDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal, QRect, QTimer, QEvent, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QRect, QTimer, QEvent, QSize, QObject
 from PySide6.QtGui import QColor, QPixmap, QIcon, QPainter, QBrush, QPen
 from gui.app_icon import load_app_icon
 from gui.block_creation_settings_dialog import _is_snt_selectable_line_entity
@@ -831,6 +831,9 @@ class ClassSelectorDialog(QDialog):
         
         self.list_widget = QListWidget()
         self.list_widget.setSpacing(2)
+        if multi:
+            from gui.class_source_selection import bind_any_class_selection
+            bind_any_class_selection(self.list_widget)
         
         if multi:
             # Switch back to ExtendedSelection for Ctrl+click support as requested
@@ -887,6 +890,12 @@ class ClassSelectorDialog(QDialog):
             return [None]
         return selected
 
+    def accept(self):
+        if not self.selected_codes():
+            QMessageBox.warning(self, "Select Classes", "Select at least one class or Any Class.")
+            return
+        super().accept()
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════
@@ -919,6 +928,19 @@ def _multi_class_label(codes):
     if len(codes) > 1 and codes == list(range(codes[0], codes[-1] + 1)):
         return f"Classes {codes[0]}-{codes[-1]}"
     return ", ".join(str(c) for c in codes)
+
+
+class _ClassRowOverlayFilter(QObject):
+    """Keep the entire class display clickable after Qt lays out the dialog."""
+    def __init__(self, display, overlay):
+        super().__init__(display)
+        self.overlay = overlay
+        display.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Resize, QEvent.Show):
+            self.overlay.setGeometry(obj.rect())
+        return False
 
 
 def _make_class_row(app, default_codes, multi=True, single_default=None,
@@ -995,12 +1017,7 @@ def _make_class_row(app, default_codes, multi=True, single_default=None,
         display_overlay.setStyleSheet("background: transparent; border: none;")
         display_overlay.clicked.connect(_open)
 
-        display.installEventFilter(app)
-        def _resize_overlay(event):
-            if event.type() == QEvent.Resize:
-                display_overlay.setGeometry(0, 0, event.size().width(), event.size().height())
-            return False
-        display.eventFilter = lambda o, e: _resize_overlay(e)
+        display._click_overlay_filter = _ClassRowOverlayFilter(display, display_overlay)
 
         arrow.clicked.connect(_open)
         row.addWidget(display); row.addWidget(arrow)
@@ -1017,8 +1034,11 @@ def _make_class_row(app, default_codes, multi=True, single_default=None,
             # Fetch fresh colors every time
             current_colors = _get_class_colors(app)
             
-            if not codes or codes == [None]:
+            if codes == [None]:
                 display.addItem("Any Class")
+                return
+            if not codes:
+                display.addItem("No classes selected")
                 return
             
             icon = _make_multi_class_icon(codes, current_colors)
@@ -1063,12 +1083,7 @@ def _make_class_row(app, default_codes, multi=True, single_default=None,
         display_overlay.clicked.connect(_open)
         
         # Ensure overlay resizes with combo
-        display.installEventFilter(app) 
-        def _resize_overlay(event):
-            if event.type() == QEvent.Resize:
-                display_overlay.setGeometry(0, 0, event.size().width(), event.size().height())
-            return False
-        display.eventFilter = lambda o, e: _resize_overlay(e)
+        display._click_overlay_filter = _ClassRowOverlayFilter(display, display_overlay)
         
         arrow.clicked.connect(_open)
         row.addWidget(display); row.addWidget(arrow)
@@ -1155,7 +1170,7 @@ class FenceSelectorWidget(QWidget):
         include_curve_fences=True,
         allowed_shape_types=None,
         allow_permanent_mode=True,
-        picker_as_tool_window=False,
+        picker_as_tool_window=True,
         empty_status_text="No fence — runs on all points",
         no_shapes_message=None,
     ):
@@ -1169,10 +1184,8 @@ class FenceSelectorWidget(QWidget):
         self.empty_status_text    = str(empty_status_text or "No fence — runs on all points")
 
         if allowed_shape_types is None:
-            allowed_shape_types = [
-                'rectangle', 'circle', 'polygon', 'freehand',
-                'line', 'smart_line', 'polyline', 'smartline',
-            ]
+            from gui.native_byclass_fences import NATIVE_FENCE_TYPES
+            allowed_shape_types = NATIVE_FENCE_TYPES
         self.allowed_shape_types = {
             str(shape_type).strip().lower()
             for shape_type in (allowed_shape_types or [])
@@ -1252,6 +1265,14 @@ class FenceSelectorWidget(QWidget):
             if drawings is not None:
                 drawing_ids = {id(d) for d in drawings}
 
+        # Native fences use their original editor object's ID, not the ID
+        # of the temporary expanded polygon wrapper.
+        try:
+            from gui.native_byclass_fences import native_fence_records, fence_identity
+            drawing_ids.update(fence_identity(f) for f in native_fence_records(self.app))
+        except Exception as exc:
+            print(f'[Native By Class] selected-fence validity check failed: {exc}')
+
         curve_tool = getattr(self.app, 'curve_tool', None)
         curve_ids = set()
         if curve_tool:
@@ -1276,6 +1297,11 @@ class FenceSelectorWidget(QWidget):
                     is_valid = True
                 else:
                     # Curve was removed - get actor ID for cleanup
+                    removed_actor_ids.add(id(fence))
+            elif fence.get('source') == 'native_draw':
+                native_ref = fence.get('native_ref')
+                is_valid = native_ref is not None and id(native_ref) in drawing_ids
+                if not is_valid:
                     removed_actor_ids.add(id(fence))
             elif fence.get('_selection_panel_fence'):
                 # Fence was injected via the Element Selection panel — it is a
@@ -1342,6 +1368,8 @@ class FenceSelectorWidget(QWidget):
         """Read fence vertices from live and restored drawing formats."""
         if not isinstance(shape, dict):
             return []
+        if shape.get('source') == 'native_draw':
+            return shape.get('coords', [])
         digitizer = getattr(self.app, "digitizer", None)
         getter = getattr(digitizer, "_get_drawing_coords", None)
         if callable(getter):
@@ -1406,7 +1434,7 @@ class FenceSelectorWidget(QWidget):
         # 2. Exact Polygon Check ONLY on points inside the bounding box
         if np.any(bbox_mask):
             # Close polygon if not already closed
-            if not np.allclose(poly_xy[0], poly_xy[-1]):
+            if not np.array_equal(poly_xy[0], poly_xy[-1]):
                 poly_xy = np.vstack([poly_xy, poly_xy[0]])
             
             poly_path = Path(poly_xy)
@@ -1425,7 +1453,7 @@ class FenceSelectorWidget(QWidget):
             poly_xy = coords[:, :2]
         
         # Close polygon if not already closed
-        if not np.allclose(poly_xy[0], poly_xy[-1]):
+        if not np.array_equal(poly_xy[0], poly_xy[-1]):
             poly_xy = np.vstack([poly_xy, poly_xy[0]])
         
         n_poly = len(poly_xy)
@@ -1448,6 +1476,8 @@ class FenceSelectorWidget(QWidget):
 
     def cleanup_actors(self):
         """Remove all VTK actors and stop the watch timer."""
+        from gui.native_fence_selection import clear_native_fence_highlights
+        clear_native_fence_highlights(self)
         self._remove_hover()
         self._remove_sel_actors()
         if self._check_timer is not None:
@@ -1507,12 +1537,19 @@ class FenceSelectorWidget(QWidget):
                 stype = str(drawing.get('type', '')).strip().lower()
                 if self.allowed_shape_types and stype not in self.allowed_shape_types:
                     continue
-                if digitize.is_cell_creation_drawing(drawing):
+                if drawing.get('source') in ('cell_creation', 'block_creation'):
                     # Cell circles belong to Create > Cell — never fences.
                     continue
                 if len(self._shape_coords(drawing)) < 3:
                     continue
                 valid.append(drawing)
+
+        # ── Collect native Vulkan drawings ─────────────────────
+        try:
+            from gui.native_byclass_fences import native_fence_records
+            valid.extend(native_fence_records(self.app, self.allowed_shape_types))
+        except Exception as exc:
+            print(f'[Native By Class] cannot collect Draw fences: {exc}')
 
         # ── Collect curve tool curves ✅ NEW ─────────────────────
         curve_fences = []
@@ -1536,8 +1573,9 @@ class FenceSelectorWidget(QWidget):
                 | Qt.WindowCloseButtonHint
             )
         else:
-            picker_flags = Qt.SubWindow
+            picker_flags = Qt.Dialog
         dlg = QDialog(self.window(), picker_flags)
+        dlg.app = self.app
         dlg.setAttribute(Qt.WA_QuitOnClose, False)
         dlg.setAttribute(Qt.WA_DeleteOnClose, True)
         dlg.setWindowTitle("Select Fence(s)")
@@ -1579,9 +1617,18 @@ class FenceSelectorWidget(QWidget):
 
         hover_actor  = [None]
         picker_sel   = {}
+        native_picker_sel = {}
+        from gui.native_fence_selection import (
+            sync_native_fence_highlights, clear_native_fence_highlights,
+        )
+        from gui.native_draw import get_native_draw
+        use_native_picker = get_native_draw(self.app, create=True) is not None
+
 
         def _make_actor(coords, color, width):
             """Create a polyline actor for highlighting."""
+            if use_native_picker:
+                return None  # Vulkan native overlay paints cyan selection itself.
             # ✅ For curve tool, use Actor2D like the curve tool does
             try:
                 import vtk
@@ -1666,6 +1713,8 @@ class FenceSelectorWidget(QWidget):
             except Exception: pass
 
         def on_hover(shape):
+            if use_native_picker:
+                return
             if hover_actor[0]: _rem(hover_actor[0]); hover_actor[0] = None
             if shape is None:
                 try: self.app.vtk_widget.render()
@@ -1679,11 +1728,16 @@ class FenceSelectorWidget(QWidget):
 
         def on_toggle(shape, checked):
             # Use unique ID based on source type
-            if shape.get('source') == 'curve_tool':
-                sid = id(shape.get('curve_data', shape))
-            else:
-                sid = id(shape)
-            
+            from gui.native_byclass_fences import fence_identity
+            sid = fence_identity(shape)
+            if use_native_picker:
+                if checked:
+                    native_picker_sel[sid] = shape
+                else:
+                    native_picker_sel.pop(sid, None)
+                sync_native_fence_highlights(dlg, native_picker_sel.values())
+                return
+
             if not checked:
                 if sid in picker_sel: _rem(picker_sel.pop(sid))
                 try: self.app.vtk_widget.render()
@@ -1697,16 +1751,14 @@ class FenceSelectorWidget(QWidget):
                 if ac: picker_sel[sid] = ac; _add(ac)
 
         # Build current selection IDs
-        current_ids = set()
-        for f in self.selected_fences:
-            if f.get('source') == 'curve_tool':
-                current_ids.add(id(f.get('curve_data', f)))
-            else:
-                current_ids.add(id(f))
+        from gui.native_byclass_fences import fence_identity
+        current_ids = {fence_identity(f) for f in self.selected_fences}
 
-        initial_source_ids = {id(f) for f in valid}
+        from gui.native_byclass_fences import fence_identity
+        initial_source_ids = {fence_identity(f) for f in valid}
         refresh_timer = QTimer(dlg)
 
+        from gui.native_byclass_fences import fence_identity
         def _current_valid_fences():
             live_valid = []
             if digitize:
@@ -1715,10 +1767,14 @@ class FenceSelectorWidget(QWidget):
                     stype = str(drawing.get('type', '')).strip().lower()
                     if self.allowed_shape_types and stype not in self.allowed_shape_types:
                         continue
-                    if digitize.is_cell_creation_drawing(drawing):
-                        # Cell circles belong to Create > Cell — never fences.
+                    if drawing.get('source') in ('cell_creation', 'block_creation'):
                         continue
                     live_valid.append(drawing)
+            try:
+                from gui.native_byclass_fences import native_fence_records
+                live_valid.extend(native_fence_records(self.app, self.allowed_shape_types))
+            except Exception as exc:
+                print(f'[Native By Class] fence refresh failed: {exc}')
             if self.include_curve_fences and curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
                 live_valid.extend(curve_tool.get_curves_as_fences())
             return live_valid
@@ -1727,7 +1783,7 @@ class FenceSelectorWidget(QWidget):
             if not dlg.isVisible():
                 return
             live_valid = _current_valid_fences()
-            live_ids = {id(f) for f in live_valid}
+            live_ids = {fence_identity(f) for f in live_valid}
             if live_ids == initial_source_ids:
                 return
             try:
@@ -1756,7 +1812,8 @@ class FenceSelectorWidget(QWidget):
                 source_tag = "Curve Tool"
             else:
                 title_text = f"{icon} #{idx + 1}: {stype.capitalize()}"
-                source_tag = "Digitizer"
+                source_tag = ("Vulkan Draw" if shape.get('source') == 'native_draw'
+                              else "Digitizer")
             
             try:
                 arr  = np.array(coords)
@@ -1810,10 +1867,7 @@ class FenceSelectorWidget(QWidget):
                 " font-size:10px; border-radius:4px; padding:3px 8px;")
             
             # Check if currently selected
-            if is_curve:
-                is_current = id(shape.get('curve_data', shape)) in current_ids
-            else:
-                is_current = id(shape) in current_ids
+            is_current = fence_identity(shape) in current_ids
             badge.setVisible(is_current)
 
             cb = QCheckBox()
@@ -1881,25 +1935,19 @@ class FenceSelectorWidget(QWidget):
                 self.permanent_fence_mode = perm_chk.isChecked()
             else:
                 self.permanent_fence_mode = False
-            if not self.permanent_fence_mode:
-                self._remove_sel_actors()
-                self.selected_fences = []
+            # Checkboxes describe the whole current selection. Permanent mode
+            # retains it across conversions, not fences the user unchecked.
+            self._remove_sel_actors()
+            self.selected_fences = []
             
             # Build existing IDs set
-            existing_ids = set()
-            for f in self.selected_fences:
-                if f.get('source') == 'curve_tool':
-                    existing_ids.add(id(f.get('curve_data', f)))
-                else:
-                    existing_ids.add(id(f))
+            from gui.native_byclass_fences import fence_identity
+            existing_ids = {fence_identity(f) for f in self.selected_fences}
             
 
             for shp in chosen:
                 # Determine unique ID
-                if shp.get('source') == 'curve_tool':
-                    fence_id = id(shp.get('curve_data', shp))
-                else:
-                    fence_id = id(shp)
+                fence_id = fence_identity(shp)
 
                 if fence_id not in existing_ids:
                     # Close open shapes for polygon masking — work on a COPY
@@ -1909,7 +1957,7 @@ class FenceSelectorWidget(QWidget):
                         coords = shp.get('coords', [])
                         if len(coords) > 1:
                             arr = np.array(coords)
-                            if not np.allclose(arr[0], arr[-1]):
+                            if not np.array_equal(arr[0], arr[-1]):
                                 shp = dict(shp)   # shallow copy — original untouched
                                 shp['coords'] = list(arr) + [list(arr[0])]
 
@@ -1924,6 +1972,8 @@ class FenceSelectorWidget(QWidget):
                 self._fence_id_to_uuid[sid_] = stable_key  # bridge: id→uuid
             picker_sel.clear()
             self._update_status()
+            if use_native_picker:
+                clear_native_fence_highlights(dlg)
             try: self.app.vtk_widget.render()
             except: pass
             dlg.close()
@@ -1935,6 +1985,8 @@ class FenceSelectorWidget(QWidget):
             "background:#555; color:white; border-radius:3px; padding:5px 16px;")
 
         def do_close():
+            if use_native_picker:
+                clear_native_fence_highlights(dlg)
             on_hover(None)
             for ac_ in list(picker_sel.values()): _rem(ac_)
             picker_sel.clear()
@@ -1944,6 +1996,8 @@ class FenceSelectorWidget(QWidget):
         close_btn.clicked.connect(do_close)
 
         def _dlg_close_event(event):
+            if use_native_picker:
+                clear_native_fence_highlights(dlg)
             on_hover(None)
             for ac_ in list(picker_sel.values()): _rem(ac_)
             picker_sel.clear()
@@ -1981,6 +2035,8 @@ class FenceSelectorWidget(QWidget):
 
     def _update_status(self):
         """Update status label with fence counts."""
+        from gui.native_fence_selection import sync_native_fence_highlights
+        sync_native_fence_highlights(self, self.selected_fences)
         if not self.selected_fences:
             self.status_lbl.setText(self.empty_status_text)
             self.status_lbl.setStyleSheet("color:#888; font-size:10px; padding:2px 0;")
@@ -4798,6 +4854,11 @@ class _BaseClassifyDialog(QDialog):
     # RUN ALGORITHM
     # ──────────────────────────────────────────────────────────────
     def _run_algorithm(self, func, kwargs, name):
+        # Vulkan main view stores exact records in .lnt, not app.data. Route
+        # only that case to the native adapter; VTK behavior stays unchanged.
+        from gui.native_byclass_parity import route_algorithm_dialog
+        if route_algorithm_dialog(self, func, kwargs, name):
+            return
         if self.app.data is None:
             QMessageBox.warning(self.app, "No Data", "Load a point cloud first.")
             if not getattr(self, "_keep_visible_during_run", False):
@@ -4868,11 +4929,11 @@ class _BaseClassifyDialog(QDialog):
                 return
             kwargs["fence_mask"] = user_fence & line_mask
 
-        # Restrict fence to visible classes — hidden classes cannot be reclassified.
+        # Restrict fence to visible classes, including an all-hidden palette.
         _palette = getattr(self.app, "class_palette", None)
         if isinstance(_palette, dict) and _palette:
             _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get("show", True)]
-            if _vis and "classification" in kwargs:
+            if "classification" in kwargs:
                 _vis_mask = np.isin(kwargs["classification"], _vis)
                 _cur = kwargs.get("fence_mask")
                 kwargs["fence_mask"] = (_vis_mask & _cur) if _cur is not None else _vis_mask
@@ -5763,13 +5824,14 @@ class _BaseClassifyDialog(QDialog):
         if fence_sel is None or not fence_shapes:
             return
 
-        existing_ids = {id(f) for f in fence_sel.selected_fences}
+        from gui.native_byclass_fences import fence_identity
+        existing_ids = {fence_identity(f) for f in fence_sel.selected_fences}
         added = 0
         for shape in fence_shapes:
-            coords = shape.get('coords', [])
-            if not coords:
+            coords = shape.get('coords')
+            if coords is None or len(coords) == 0:
                 continue
-            fence_id = id(shape)
+            fence_id = fence_identity(shape)
             if fence_id in existing_ids:
                 continue
             s = dict(shape)
@@ -5778,14 +5840,14 @@ class _BaseClassifyDialog(QDialog):
                 c = s.get('coords', [])
                 if not isinstance(c, np.ndarray):
                     c = np.array(c)
-                if len(c) > 0 and not np.allclose(c[0], c[-1]):
+                if len(c) > 0 and not np.array_equal(c[0], c[-1]):
                     s['coords'] = list(np.vstack([c, c[0]]))
             fence_sel.selected_fences.append(s)
             existing_ids.add(fence_id)
             added += 1
 
-        fence_sel.select_btn.setVisible(False)
-        fence_sel.clear_btn.setVisible(False)
+        fence_sel.select_btn.setVisible(True)
+        fence_sel.clear_btn.setVisible(True)
         fence_sel._update_status()
 
         self.show()
@@ -5813,7 +5875,7 @@ class _BaseClassifyDialog(QDialog):
 # ═══════════════════════════════════════════════════════════════════════
 # FENCE GROUP FACTORY
 # ═══════════════════════════════════════════════════════════════════════
-def _fence_group(dialog, *, picker_as_tool_window=False) -> tuple:
+def _fence_group(dialog, *, picker_as_tool_window=True) -> tuple:
     g = QGroupBox("Fence / Spatial Filter")
     lay = QVBoxLayout(g); lay.setContentsMargins(8, 6, 8, 6)
     sel = FenceSelectorWidget(
@@ -6108,7 +6170,7 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
         super().__init__(app, "Classify Ground", parent)
         self._build_ui()
         self.setMinimumSize(470, 560)
-        self.resize(520, 640)
+        self.resize(600, 720)
 
     def _build_ui(self):
         L = self._content_layout
@@ -7080,6 +7142,11 @@ def _collect_alignment_sources(app):
 
     digitizer = getattr(app, "digitizer", None)
     drawing_stores = [("Drawing", list(getattr(digitizer, "drawings", []) or []))]
+    try:
+        from gui.native_byclass_fences import native_drawings
+        drawing_stores.append(('Native Draw', native_drawings(app)))
+    except Exception as exc:
+        print(f'[Native By Class] cannot enumerate native lines: {exc}')
     for attr in (
         "_pending_drawings_restore", "_restored_drawings", "loaded_drawings",
         "drawing_data", "las_drawings", "embedded_drawings", "saved_drawings",
@@ -7098,8 +7165,18 @@ def _collect_alignment_sources(app):
             if not isinstance(d, dict):
                 continue
             dtype = str(d.get("type") or d.get("entity_type") or d.get("geometry_type") or "").lower()
-            if dtype in {"line", "line_segment", "smartline", "smart_line", "polyline", "centerline", "freehand", "polyline3d", "lwpolyline"}:
-                add(f"{store_name} {i}: {dtype or 'line'}", d, "drawing")
+            is_native = store_name in ('Native Draw', 'Saved Native Draw')
+            accepted = {"line", "line_segment", "smartline", "smart_line", "polyline", "centerline", "freehand", "polyline3d", "lwpolyline"}
+            if is_native:
+                accepted.update(('curve', 'ortho'))
+            if dtype in accepted and d.get('source') not in ('block_creation', 'cell_creation'):
+                item = d
+                if is_native:
+                    # Curve control points are not the displayed interpolated
+                    # alignment. Use the same geometry expansion as Vulkan Draw.
+                    from gui.native_draw import NativeDraw
+                    item = dict(d, coords=NativeDraw._native_coords(d))
+                add(f"{store_name} {i}: {dtype or 'line'}", item, "drawing")
 
     return sources
 
@@ -7132,6 +7209,8 @@ def _make_alignment_highlight_actor(dialog, coords):
 
 
 def _clear_alignment_highlight(dialog):
+    if _native_byclass_line_highlights(dialog):
+        return
     actor = getattr(dialog, "_alignment_highlight_actor", None)
     if actor is None:
         return
@@ -7149,6 +7228,8 @@ def _clear_alignment_highlight(dialog):
 
 
 def _show_alignment_highlight(dialog, coords):
+    if _native_byclass_line_highlights(dialog):
+        return True
     _clear_alignment_highlight(dialog)
     if coords is None or len(coords) < 2:
         return False
@@ -7366,7 +7447,48 @@ def classify_poles_by_centerline(xyz, classification, from_classes, to_class,
 
 
 
+def _native_byclass_pick_view(app):
+    """The displayed Vulkan main canvas, never a hidden VTK QWidget."""
+    from gui.native_draw import get_native_draw
+    draw = get_native_draw(app, create=True)
+    return draw.view if draw is not None else None
+
+
+def _native_byclass_line_highlights(dialog, clear=False):
+    """Cyan line feedback on the native Qt overlay, not hidden VTK actors."""
+    view = _native_byclass_pick_view(dialog.app)
+    if view is None:
+        return False
+    from gui.native_draw import get_native_draw
+    draw = get_native_draw(dialog.app, create=not clear)
+    if draw is None:
+        return True
+    identity = id(dialog)
+    draw.aux_shapes = [shape for shape in draw.aux_shapes
+                       if not (len(shape) == 3 and isinstance(shape[2], dict)
+                               and shape[2].get('_byclass_line_picker') == identity)]
+    if not clear:
+        sources = list(getattr(dialog, '_selected_lines', {}).values())
+        hovered = getattr(dialog, '_hover_source', None)
+        if hovered is not None and hovered['key'] not in getattr(dialog, '_selected_lines', {}):
+            sources.append(hovered)
+        for source in sources:
+            coords = source['coords']
+            draw.aux_shapes.append(('drawing', coords,
+                 {'type': 'polyline', 'color': '#00ffff', 'width': 4,
+                  'show_vertices': False, '_byclass_line_picker': identity,
+                  'world_z': float(coords[0, 2]) if len(coords) else None}))
+    draw._paint()
+    return True
+
+
 class _CanvasLinePicker:
+    def _byclass_picker_widget(self):
+        view = _native_byclass_pick_view(self.app)
+        if view is not None:
+            return getattr(getattr(view, 'owner', None), 'vulkan_widget', None)
+        return getattr(self.app, 'vtk_widget', None)
+
     def _init_line_picker(self, row, label="Select CL"):
         self._pick_active = False
         self._pick_sources = []
@@ -7452,13 +7574,16 @@ class _CanvasLinePicker:
             self._remove_selected_line(key)
             return
         self._selected_lines[key] = source
-        actor = _make_alignment_highlight_actor(self, source["coords"])
+        actor = (None if _native_byclass_pick_view(self.app) is not None
+                 else _make_alignment_highlight_actor(self, source["coords"]))
         if actor is not None:
             self._selected_line_actors[key] = actor
         self._refresh_selected_lines()
         self._render_selected_lines()
 
     def _render_selected_lines(self):
+        if _native_byclass_line_highlights(self):
+            return
         try:
             self.app.vtk_widget.render()
         except Exception:
@@ -7466,6 +7591,13 @@ class _CanvasLinePicker:
 
     def _deactivate_other_tools_for_line_pick(self):
         app = self.app
+        # Native Draw has its own Vulkan event filter and must yield the
+        # pointer before the By Class centerline picker becomes active.
+        if _native_byclass_pick_view(app) is not None:
+            from gui.native_draw import get_native_draw
+            native_draw = get_native_draw(app, create=False)
+            if native_draw is not None and native_draw.active():
+                native_draw.cancel()
 
         def call(target, method, *args, **kwargs):
             fn = getattr(target, method, None)
@@ -7514,7 +7646,7 @@ class _CanvasLinePicker:
                 call(dialog, "close")
 
     def _toggle_line_picker(self, active):
-        widget = getattr(self.app, "vtk_widget", None)
+        widget = self._byclass_picker_widget()
         if widget is None:
             self.select_line_button.blockSignals(True)
             self.select_line_button.setChecked(False)
@@ -7580,6 +7712,33 @@ class _CanvasLinePicker:
         return False
 
     def _line_at_event(self, event, tolerance=25.0):
+        native_view = _native_byclass_pick_view(self.app)
+        if native_view is not None:
+            from gui.native_main_classify import MainCanvas
+            canvas = MainCanvas(native_view)
+            pos = event.position() if hasattr(event, "position") else event.pos()
+            mouse = np.array([float(pos.x()), float(pos.y())])
+            best, nearest = float(tolerance), None
+            projections = {}
+            for source in self._pick_sources:
+                coords = source['coords']
+                last = None
+                for point in coords:
+                    z = float(point[2])
+                    if z not in projections:
+                        projections[z] = canvas.world_projection_snapshot(z)
+                    snapshot = projections[z]
+                    current = (np.asarray(snapshot[1](float(point[0]), float(point[1])), dtype=float)
+                               if snapshot is not None else None)
+                    if current is not None and last is not None and np.isfinite(current).all():
+                        delta = current - last
+                        length2 = float(delta @ delta)
+                        fraction = float(np.clip(((mouse-last) @ delta)/length2, 0., 1.)) if length2 else 0.
+                        distance = float(np.linalg.norm(mouse-(last+fraction*delta)))
+                        if distance < best:
+                            best, nearest = distance, source
+                    last = current if current is not None and np.isfinite(current).all() else None
+            return nearest
         digitizer = getattr(self.app, "digitizer", None)
         renderer = getattr(digitizer, "renderer", None)
         if renderer is None:
@@ -7620,7 +7779,7 @@ class _CanvasLinePicker:
         if self._other_canvas_tool_active():
             self._toggle_line_picker(False)
             return False
-        widget = getattr(self.app, "vtk_widget", None)
+        widget = self._byclass_picker_widget()
         if kind == QEvent.KeyPress and event.key() == Qt.Key_Escape:
             self._toggle_line_picker(False)
             return True
@@ -7654,6 +7813,7 @@ class _CanvasLinePicker:
         return [source["coords"].copy() for source in self._selected_lines.values()]
 
     def _close_line_picker(self):
+        _native_byclass_line_highlights(self, clear=True)
         if getattr(self, "_pick_active", False):
             self._toggle_line_picker(False)
         _clear_alignment_highlight(self)

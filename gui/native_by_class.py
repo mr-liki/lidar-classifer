@@ -96,8 +96,7 @@ def visible_class_mask(app, cls):
     if isinstance(palette, dict) and palette:
         visible = [int(c) for c, info in palette.items()
                    if isinstance(info, dict) and info.get("show", True)]
-        if visible:
-            return np.isin(cls, np.asarray(visible))
+        return np.isin(cls, np.asarray(visible))
     return np.ones(len(cls), dtype=bool)
 
 

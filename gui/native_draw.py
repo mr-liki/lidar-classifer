@@ -148,6 +148,9 @@ class NativeDraw:
         # result delivery need an adapter. Never register VTK observers here.
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
+        # Dialog-owned selected fence outlines, independent of the VTK actors.
+        # Geometry is world XY; class colors and native point buffers are untouched.
+        self._classification_fence_highlights = {}
         self._object_actions = []
         self._object_redo = []
         self._shutting_down = False
@@ -302,6 +305,28 @@ class NativeDraw:
         if self._legacy_tool_dialog is not dialog:
             return
         self._legacy_dialog_highlights = list(features)
+        self._paint()
+
+    def set_classification_fence_highlights(self, owner, fences):
+        """Replace cyan fence outlines for one active By Class/selection dialog.
+
+        Multiple dialogs may hold selections; closing one must not discard
+        another dialog's current fence outline. Never recolor LiDAR points.
+        """
+        from gui.native_byclass_fences import _valid_ring
+        rings = []
+        for shape in fences:
+            if not isinstance(shape, dict):
+                continue
+            coords = shape.get('coords')
+            ring = _valid_ring(coords) if coords is not None else None
+            if ring is not None:
+                rings.append(ring)
+        key = id(owner)
+        if rings:
+            self._classification_fence_highlights[key] = rings
+        else:
+            self._classification_fence_highlights.pop(key, None)
         self._paint()
 
     def _scene_token(self):
@@ -1797,6 +1822,16 @@ class NativeDraw:
                                    {'type':'point' if len(feat['coords'])==1 else 'polyline',
                                     'selected':True,'width':3}))
             shapes.extend(self._selection_bridge.preview_shapes())
+        # The VTK renderer is hidden behind the Vulkan main viewport. Paint
+        # selected fence boundaries on this actual native canvas in cyan.
+        # These are highlight-only strokes, not new Draw editor objects.
+        for rings in getattr(self, '_classification_fence_highlights', {}).values():
+            for ring in rings:
+                shapes.append(('drawing', ring, {
+                    'type': 'polyline', 'color': '#00ffff', 'selected': True,
+                    'highlight_scope': 'draw', 'width': 4,
+                    'show_vertices': False,
+                }))
         shapes.extend(self.aux_shapes)
         self.overlay.set_shapes(shapes)
 
@@ -1807,6 +1842,7 @@ class NativeDraw:
         dialog = self._legacy_tool_dialog
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
+        self._classification_fence_highlights.clear()
         if dialog is not None:
             try:
                 dialog.close()
