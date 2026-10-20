@@ -91,3 +91,6 @@ patch_backups/
 vulkan_*_output/
 *.shards/
 *.naksha*
+
+# Local verification build for native structural point borders
+/native/naksha_vulkan/build_structured/

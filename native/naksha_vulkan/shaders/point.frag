@@ -32,7 +32,10 @@
 layout(location = 0) in vec4 vColor;
 layout(location = 1) in float v_point_px;   // gl_PointSize, for edge coverage
 layout(location = 2) in float v_core_px;
+layout(location = 3) in float v_ring_depth;
 layout(location = 0) out vec4 outColor;
+// Recessed rings never advance depth; allow conservative early depth rejection.
+layout(depth_greater) out float gl_FragDepth;
 
 layout(push_constant) uniform PointParams {
     vec4 size;
@@ -41,7 +44,7 @@ layout(push_constant) uniform PointParams {
     vec4 view;
     vec4 parity;     // x = colour-space byte-parity flag (unused here; layout must
                      // match point.vert, which applies it to vColor)
-    vec4 border; // x=fraction, y=mode, z=background-shell pass
+    vec4 border; // x=fraction, y=mode, z=A, w=B (Structured NDC coeffs; see point.vert)
 } pc;
 
 void main() {
@@ -70,10 +73,13 @@ void main() {
         float edge = clamp((1.0 - d) * max(v_point_px, 1.0), 0.0, 1.0);
         alpha = clamp(1.0 - (1.0 - edge) * crispness, 0.0, 1.0);
     }
-    bool shell = pc.border.z > 0.5;
-    bool ring = pc.border.x > 0.0 && radial_sq * v_point_px * v_point_px > 0.25 * v_core_px * v_core_px;
-    // Shells stay behind cores, so adjacent points form a clean object outline.
-    // Individual rings stay at their own depth (the Per-Point presentation).
-    gl_FragDepth = clamp(gl_FragCoord.z + (shell ? 0.000002 : 0.0), 0.0, 1.0);
-    outColor = vec4((shell || ring) ? vec3(0.0) : vColor.rgb, vColor.a * alpha);
+    bool ring = pc.border.x > 0.001 && radial_sq * v_point_px * v_point_px >= 0.25 * v_core_px * v_core_px;
+    // Only the black annulus is recessed. Each mode uses a world-space
+    // separation converted by the live projection (including perspective),
+    // so LNT's broad clipping range cannot swallow every structural edge.
+    // All modes use a small world-space recess. Fixed NDC nudges can mean
+    // several metres in LNT, burying Per-Point rings under neighbouring cores.
+    float ringDepth = v_ring_depth;
+    gl_FragDepth = ring ? max(gl_FragCoord.z, clamp(ringDepth, 0.0, 1.0)) : gl_FragCoord.z;
+    outColor = vec4(ring ? vec3(0.0) : vColor.rgb, vColor.a * alpha);
 }

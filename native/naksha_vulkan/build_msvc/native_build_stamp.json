@@ -1,10 +1,10 @@
 {
-  "created": "2026-10-19 16:32:06",
+  "created": "2026-10-20 13:17:39",
   "dll": "native/naksha_vulkan/build_msvc/naksha_vulkan.dll",
-  "dll_exports": 140,
-  "dll_sha256": "18399e945791f61c7084b8c68f10f61e873cde39171b54dd1c5191ca1ec9eade",
+  "dll_exports": 141,
+  "dll_sha256": "d36a1a5a20e1dc9304e99ba37aab056463bc432b569d6f0527d5c07efa9e5769",
   "missing_exports": [],
-  "source_digest": "ee80d272122b9e2b60c7843d2473b6a9fc2bf71317f679cc07ff5f1323d02a0f",
-  "source_files": 72,
-  "source_newest": "src/PointCloudRenderer.cpp"
+  "source_digest": "cb747c28ee53310abb7c809ee69cbaccfa39eb9289ae215af185757505f59065",
+  "source_files": 73,
+  "source_newest": "include/naksha/StructuralBoundary.hpp"
 }

@@ -28,6 +28,7 @@
 layout(location = 0) in vec3 inPos;         // render space (world - origin)
 layout(location = 1) in vec4 inColor;       // per-point RGB = data (RGB mode)
 layout(location = 2) in float inClassU;     // classification id, UNORM8 (id = round(*255))
+layout(location = 4) in float inBoundary;   // structural grid flag, R8_UNORM
 layout(location = 3) in float inIntensity;  // raw intensity as uploaded
 
 layout(set = 0, binding = 0) uniform FrameUbo {
@@ -47,12 +48,13 @@ layout(push_constant) uniform PointParams {
     vec4 intensity;  // x=iLo, y=iHi, z=contrast, w=gamma
     vec4 view;       // x=px per metre at 1 m, y=edge softness 0..1, z=brightness, w=unused
     vec4 parity;     // x = colour-space byte-parity flag (see the output note below)
-    vec4 border; // x=fraction, y=mode, z=background-shell pass
+    vec4 border; // x=fraction, y=mode, z=reserved, w=structural separation (m)
 } pc;
 
 layout(location = 0) out vec4 vColor;
 layout(location = 1) out float v_point_px;   // gl_PointSize, for edge coverage
 layout(location = 2) out float v_core_px;
+layout(location = 3) out float v_ring_depth;
 
 // Mirror of NkvDisplayMode in include/naksha/naksha_vulkan_c_api.h - the value
 // travels through pc.shading.x unchanged, so a display-mode switch on the
@@ -139,6 +141,16 @@ vec3 depthColor(vec3 renderPos) {
 
 void main() {
     gl_Position = ubo.mvp * vec4(inPos, 1.0);
+    v_ring_depth = gl_Position.z / gl_Position.w;
+    // Structured recess (pc.border.zw = per-frame NDC coefficients from the
+    // CPU, see PointCloudRenderer::Record): ring = (z + A) / (w + B), the exact
+    // value the previous per-vertex second projection computed, but with the
+    // mat4 multiply, length() and sqrt() folded into one CPU evaluation per
+    // frame. The CPU supplies a small world-space recess for each border mode.
+    if (pc.border.x > 0.001) {
+        float denom = gl_Position.w + pc.border.w;
+        v_ring_depth = denom > 0.0 ? clamp((gl_Position.z + pc.border.z) / denom, 0.0, 1.0) : 1.0;
+    }
     // Cross-section clip volume: a point on the negative side of any active plane
     // is moved outside the clip volume, so the rasteriser drops it. Done per point
     // in the vertex stage; no CPU buffer is modified.
@@ -209,11 +221,10 @@ void main() {
     v_core_px = clamp(pixels, 1.0, min(deviceMax, 64.0));
     float fraction = mode == MODE_SHADED_CLASS_INSTANT ? 0.0 : clamp(pc.border.x, 0.0, 1.0);
     float growth = min(8.0, 4.0 * fraction + 8.0 * fraction * fraction * fraction);
-    // Structured outlines the union of the sprites. Hybrid also gives each
-    // return a thinner ring, while retaining the full outer silhouette.
-    if (pc.border.z < 0.5 && pc.border.y > 0.5) {
-        growth *= pc.border.y > 1.5 ? 0.5 : 0.0;
-    }
+    // VTK Structured grows only structural boundaries. Per-Point and Hybrid
+    // grow every return. In all modes the coloured core keeps its original size.
+    if (pc.border.y > 0.5 && pc.border.y < 1.5 && inBoundary < 0.5)
+        growth = 0.0;
     gl_PointSize = clamp(v_core_px + growth, 1.0, min(deviceMax, 64.0));
     v_point_px = gl_PointSize;
 
