@@ -321,7 +321,7 @@ class _InputFilter(QObject):
                     return True
         # Armed Pan shortcut (Left - Click / Tap - Tap): every tool above
         # keeps its own clicks, so this only sees otherwise free left input.
-        if self._pan.handle(getattr(self.view, "app", None), ev):
+        if self._pan.handle(getattr(self.view, "app", None), ev, obj):
             if t == E.MouseButtonPress:
                 obj.setFocus()
             self._last = None
