@@ -310,9 +310,41 @@ class LntSectionStore:
         QTimer.singleShot(SHOW_WRITE_DELAY_MS, self.flush)
         return stats
 
+    def preview_live(self, indices, old_classes):
+        """Preview speculative class edits without scheduling an LNT write.
+
+        Used by the native Vulkan brush while the left mouse button is held.
+        The canonical in-memory class array already contains the speculative
+        values, so this only patches resident GPU data and presents a frame.
+        ``flush()`` is transaction-gated below, which guarantees an interrupted
+        stroke can be rolled back without ever reaching the .lnt file.
+        """
+        idx = np.asarray(indices, dtype=np.int64)
+        nv = getattr(self.view, "native", None)
+        if idx.size == 0 or nv is None:
+            return None
+        old = np.asarray(old_classes, dtype=np.uint8)
+        if old.size != idx.size:
+            raise ValueError("preview_live: old-class length mismatch")
+        stats = nv.preview_classes(
+            self.node[idx], self.local[idx], self.data["xyz"][idx],
+            old, np.asarray(self.data["classification"])[idx],
+        )
+        if stats is not None:
+            self._preview_pending = True
+            nv.frame(0.0)
+        return stats
+
     # ---- writing edits back --------------------------------------------------------
     def flush(self):
         """Write every classification that changed since the last flush into the .lnt."""
+        # A native brush stroke is speculative until physical left-button
+        # release.  The CPU class array and Vulkan previews change live, but
+        # neither this periodic timer nor show()'s single-shot writer may make
+        # those bytes durable while the gesture is incomplete.  Cancellation
+        # restores app.data first, then releases this gate.
+        if bool(getattr(self.app, "_native_brush_transaction_active", False)):
+            return 0
         if self.app.data is not self.data:
             return 0                                     # something replaced app.data: not ours
         try:
