@@ -1087,22 +1087,27 @@ class SectionClassifier:
         if key in (Qt.Key_Return, Qt.Key_Enter) and self.tool() == "polygon" and len(self.points) >= 3:
             self._finish_polygon()
             return True
-        if key == Qt.Key_Escape and (self.points or self._brush_tx_active):
+        if key == Qt.Key_Escape and self.active():
+            # Escape exits the classification tool itself, not just the current
+            # rectangle/polygon/line gesture.  Defer the full teardown until the
+            # key handler returns because it can destroy this canvas' classifier.
             if self._brush_tx_active:
                 self.cancel_pending_brush_transaction(reason="escape")
-                # Escape terminates Brush, rather than merely hiding a partially
-                # painted stroke and leaving the classifier armed.
-                try:
-                    QTimer.singleShot(
-                        0,
-                        lambda: self.app.deactivate_classification_tool(
-                            cancel_pending_brush=True
-                        ),
-                    )
-                except Exception:
-                    pass
             else:
                 self.cancel()
+            deactivate = getattr(self.app, "deactivate_classification_tool", None)
+            if callable(deactivate):
+                QTimer.singleShot(
+                    0,
+                    lambda: deactivate(
+                        preserve_cross_section=True,
+                        cancel_pending_brush=True,
+                    ),
+                )
+            else:
+                # Minimal fallback for lightweight/test hosts which do not expose
+                # the application's normal teardown helper.
+                self.app.active_classify_tool = None
             return True
         return False
 
