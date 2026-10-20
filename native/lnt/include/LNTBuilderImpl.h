@@ -353,6 +353,11 @@ LNT_BUILD_FN LNTBuildStats LNTBuilder::build(const RawPoint* pts, size_t n,
     t0 = clock::now();
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     if (!f) return fail("cannot open output file");
+    std::ofstream lines(std::string(out_path) + ".lines", std::ios::binary | std::ios::trunc);
+    if (!lines) return fail("cannot open flight-line sidecar");
+    lines.write("LNTLINE1", 8);
+    uint64_t line_count = 0;
+    lines.write(reinterpret_cast<const char*>(&line_count), 8);
 
     // Header first, with index_offset still 0: it is patched after the trailer
     // exists, so a half-written file can never advertise a valid trailer.
@@ -408,6 +413,8 @@ LNT_BUILD_FN LNTBuildStats LNTBuilder::build(const RawPoint* pts, size_t n,
         buf.reserve(static_cast<size_t>(written));
         for (uint64_t i = r.begin; i < r.end; i += stride) {
             const RawPoint& p = pts[ids[static_cast<size_t>(i)]];
+            lines.write(reinterpret_cast<const char*>(&p.source_id), 2);
+            ++line_count;
             LNTPoint q;
             const double w[3] = {p.x, p.y, p.z};
             uint16_t* rel[3] = {&q.x_rel, &q.y_rel, &q.z_rel};
@@ -468,6 +475,10 @@ LNT_BUILD_FN LNTBuildStats LNTBuilder::build(const RawPoint* pts, size_t n,
 
     // Patch index_offset now that the trailer is on disk.
     hdr.index_offset = st.index_offset;
+    lines.seekp(8);
+    lines.write(reinterpret_cast<const char*>(&line_count), 8);
+    lines.flush();
+    if (!lines) return fail("flight-line sidecar write failed");
     f.seekp(0, std::ios::beg);
     f.write(reinterpret_cast<const char*>(&hdr),
             static_cast<std::streamsize>(sizeof(hdr)));

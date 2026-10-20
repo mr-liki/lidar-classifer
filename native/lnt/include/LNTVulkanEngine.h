@@ -276,6 +276,7 @@ public:
                          uint64_t count);
     bool set_point_cloud_visible(bool visible);
     bool set_display_mode(int mode);
+    bool set_point_depth_range(float lo, float hi, float gamma);
     bool set_point_size_params(float footprint_m, float min_px, float max_px,
                                float class_intensity_mix);
 
@@ -356,6 +357,7 @@ private:
                                         const uint8_t*, const float*, uint64_t) = nullptr;
         int          (*set_point_cloud_visible)(uint64_t, int) = nullptr;
         int          (*set_display_mode)(uint64_t, int) = nullptr;
+        int          (*set_point_depth_range)(uint64_t, float, float, float) = nullptr;
         int          (*set_point_size_params)(uint64_t, float, float, float, float) = nullptr;
         int          (*reserve_point_capacity)(uint64_t, uint64_t) = nullptr;
         int          (*upload_point_tile)(uint64_t, uint64_t, uint64_t,
@@ -580,6 +582,7 @@ inline bool VulkanEngine::resolve_all(std::string& err) {
     LNT_RESOLVE(set_point_cloud, "nkv_set_point_cloud");
     LNT_RESOLVE(set_point_cloud_visible, "nkv_set_point_cloud_visible");
     LNT_RESOLVE(set_display_mode, "nkv_set_display_mode");
+    LNT_RESOLVE(set_point_depth_range, "nkv_set_point_depth_range");
     LNT_RESOLVE(set_point_size_params, "nkv_set_point_size_params");
     LNT_RESOLVE(reserve_point_capacity, "nkv_reserve_point_capacity");
     LNT_RESOLVE(upload_point_tile, "nkv_upload_point_tile");
@@ -1012,6 +1015,10 @@ inline bool VulkanEngine::set_point_cloud_visible(bool visible) {
 inline bool VulkanEngine::set_display_mode(int mode) {
     if (handle_ == 0 || api_.set_display_mode == nullptr) return false;
     return api_.set_display_mode(handle_, mode) != 0;
+}
+inline bool VulkanEngine::set_point_depth_range(float lo, float hi, float gamma) {
+    return handle_ && api_.set_point_depth_range &&
+           api_.set_point_depth_range(handle_, lo, hi, gamma) != 0;
 }
 inline bool VulkanEngine::set_point_size_params(float footprint_m, float min_px,
                                                float max_px,

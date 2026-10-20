@@ -351,6 +351,9 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         # A source save must not invalidate the edited native cache on next open.
         stamp = max(time.time_ns(), os.stat(destination).st_mtime_ns + 1_000_000)
         os.utime(target_lnt, ns=(stamp, stamp))
+        if Path(destination).suffix.lower() in ('.las', '.laz') and os.path.isfile(target_lnt):
+            from gui.lnt_open import stamp_source_cache
+            stamp_source_cache(destination, target_lnt)
         if same_source and not subset and attributes is None:
             cache['saved_digest'] = digest
             cache['saved_stat'] = os.stat(destination).st_mtime_ns

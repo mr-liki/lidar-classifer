@@ -2384,6 +2384,10 @@ class DisplayModeDialog(QDialog):
             return
         app = self._get_app_window()
         source_ids = None
+        main_native = getattr(app, '_lnt_main_view', None)
+        if int(getattr(self,'current_slot',0)) == 0 and main_native is not None:
+            flight = getattr(main_native,'flight_lines',None)
+            if flight is not None: source_ids=flight.unique()
         native_canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(int(getattr(self, 'current_slot', 0)))
         if native_canvas is not None:
             source_ids = native_canvas._source_ids
@@ -2451,6 +2455,12 @@ class DisplayModeDialog(QDialog):
             pass
 
     def _open_lines_dialog(self):
+        app = self._get_app_window()
+        view = getattr(app,'_lnt_main_view',None)
+        if int(getattr(self,'current_slot',0)) == 0 and view is not None and getattr(view,'flight_lines',None) is None:
+            from gui.native_flight_lines import prepare
+            prepare(view,self._open_lines_dialog)
+            return
         """Open a persistent selector; changes commit only when OK is clicked."""
         app = self._get_app_window()
         canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(self.current_slot)

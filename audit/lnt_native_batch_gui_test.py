@@ -6,6 +6,7 @@ proves the individual LNT collection never falls back to VTK.
 Run: venv/Scripts/python.exe audit/lnt_native_batch_gui_test.py
 """
 import os
+import hashlib
 import sys
 import tempfile
 import time
@@ -21,7 +22,7 @@ import numpy as np
 from gui.laspy_compat import install_opaque_extra_bytes_fix
 from gui.lnt_collection import read_collection
 from pyproj import CRS
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QPointF, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 install_opaque_extra_bytes_fix()
@@ -136,6 +137,79 @@ with tempfile.TemporaryDirectory(prefix="laz_batch_gui_") as folder:
     check("the native viewport erases and presents a frame", bool(view.native.frame(1 / 60.)))
     check("native presentation modes still apply", view.apply_shading("intensity")
           and view.apply_shading("class"))
+    win.set_display_mode('depth')
+    pump(.4)
+    image = view.native.capture()[:, :, :3]
+    pixels = image[np.any(image > 0, axis=2)].astype(np.int16)
+    check('Depth ribbon uses grayscale for a multi-file native view',
+          len(pixels) > 1000 and np.max(np.ptp(pixels, axis=1)) <= 2
+          and len(np.unique(pixels[:, 0])) > 30)
+    win.set_display_mode('class')
+
+    win.set_display_mode('line')
+    deadline=time.monotonic()+30.
+    while getattr(view,'flight_lines',None) is None and time.monotonic()<deadline: pump(.05)
+    pump(.5)
+    check('Line display loads actual flight IDs for the main multi-file view',
+          getattr(view,'flight_lines',None) is not None and set(view.flight_lines.unique())=={11,12})
+    from gui.native_section_display import line_colors
+    palette=line_colors(np.array([11,12],np.uint32),getattr(win,'flight_line_colors',{})).astype(int)
+    image=view.native.capture()[:,:,:3]
+    pixels=image[np.any(image>0,axis=2)].astype(int)
+    check('main Line display renders actual flight-line colours',
+          len(pixels)>1000 and np.all(np.min(np.max(np.abs(pixels[:,None]-palette),axis=2),axis=1)<=2))
+    win.open_fields_panel()
+    pump(.1)
+    fields=win._view_fields_table_dialog
+    check('Fields opens the entire multi-file cloud with flight-line information',
+          fields.reader.count==55000 and 'Flight Line' in [c[0] for c in fields.model.columns]
+          and int(fields.reader.point(0)['point_source_id']) in (11,12))
+    fields.close()
+    win.set_display_mode('class')
+
+    # BRUSH's native main-view stroke must be live but never durable until
+    # release, even when the section store's periodic writer fires mid-stroke.
+    from gui.native_main_classify import ensure_classifier
+    from gui.native_section_classify import notify_native_classification_activation
+    brush = ensure_classifier(view)
+    win.active_classify_tool = 'brush'
+    win.to_class, win.from_classes = 6, [2]
+    win.brush_preview_px = 30.
+    notify_native_classification_activation(win, 'brush')
+    pos = QPointF(*brush.canvas.screen_from_section(500050., 4000050.))
+    originals = [first.with_suffix('.lnt'), second.with_suffix('.lnt')]
+    fingerprints = lambda: [hashlib.sha256(p.read_bytes()).digest() for p in originals]
+    before = fingerprints()
+    brush.move(pos)
+    check('BRUSH selection and hover have no preview', not brush.overlay.shapes)
+    history = len(win.undo_stack)
+    brush.press(pos, Qt.LeftButton)
+    store = win._lnt_section_store
+    check('native main Brush paints immediately before release',
+          brush._brush_tx_active and brush._brush_tx_changed > 0
+          and len(win.undo_stack) == history)
+    check('active Brush has only a cursor guide and no painted trail',
+          bool(brush.overlay.shapes) and all(s[0] == 'brush_cursor_px' for s in brush.overlay.shapes))
+    check('incomplete multi-file Brush stroke cannot reach disk',
+          store.flush() == 0 and fingerprints() == before)
+    brush.key(Qt.Key_Escape)
+    pump(.1)
+    check('Escape rolls back native main Brush without history or disk writes',
+          not win._native_brush_transaction_active and fingerprints() == before
+          and len(win.undo_stack) == history and not brush.overlay.shapes)
+    win.active_classify_tool = 'brush'
+    notify_native_classification_activation(win, 'brush')
+    brush.press(pos, Qt.LeftButton)
+    brush.release(pos, Qt.LeftButton)
+    store.flush()
+    check('released Brush commits one operation and remains ready',
+          len(win.undo_stack) == history+1 and fingerprints() != before
+          and win.active_classify_tool == 'brush' and not brush.overlay.shapes)
+    win.undo_classification()
+    store.flush()
+    check('native main Brush undo restores the individual cache files', fingerprints() == before)
+    win.active_classify_tool = None
+    notify_native_classification_activation(win, None)
 
     # Reopening the same pair must hit the batch cache and stay native.
     previous = view

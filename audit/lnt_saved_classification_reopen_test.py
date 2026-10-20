@@ -80,7 +80,11 @@ try:
             rectangle()
             slot = slot_for(app, code)
             assert np.count_nonzero(store.data['classification'] == slot) > 0
+            from gui.lnt_open import lnt_is_current, stamp_source_cache
+            stamp_source_cache(source, lnt)
+            assert lnt_is_current(str(source))
             assert save_native(app)
+            assert lnt_is_current(str(source)), 'saving the source must not invalidate its LNT cache'
             saved = read_classes(str(lnt))[0].copy()
             assert np.count_nonzero(saved == slot) > 0
             assert np.count_nonzero(laspy.read(source).classification == slot) == np.count_nonzero(saved == slot)

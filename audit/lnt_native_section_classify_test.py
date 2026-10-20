@@ -41,6 +41,8 @@ store = SimpleNamespace(view=app._lnt_main_view, ensure_for_section=Mock(return_
                               'intensity': np.zeros(len(xyz), dtype=np.float32)})
 app._lnt_section_store = store
 store.show = Mock()
+store.flush = Mock(return_value=0)
+store.preview_live = Mock()
 app.data = store.data
 sections = NativeSections(app)
 app._native_sections = sections
@@ -152,6 +154,7 @@ try:
     x1, y1 = canvas.screen_from_section(5.5, 5.5)
     x2, y2 = canvas.screen_from_section(6.5, 8.5)
     canvas.classifier.press(QPointF(x1, y1), Qt.LeftButton)
+    canvas.classifier._press_time -= .2  # Deliberate drag beyond BRUSH's tap grace.
     canvas.classifier.move(QPointF(x2, y2))
     canvas.classifier.release(QPointF(x2, y2), Qt.LeftButton)
     assert changed() == {at(6, z) for z in (6, 7, 8)}, changed()
@@ -207,12 +210,31 @@ try:
     app.active_classify_tool = 'brush'
     app.brush_preview_px = .4 / canvas.world_per_pixel()       # 0.4 m
     x1, y1 = canvas.screen_from_section(2, 2)
+    canvas.classifier.move(QPointF(x1, y1))
+    assert not canvas.classifier.overlay.shapes, 'idle Brush must have no hover preview'
     canvas.classifier.press(QPointF(x1, y1), Qt.LeftButton)
+    assert all(s[0] == 'brush_cursor_px' for s in canvas.classifier.overlay.shapes)
     for h in np.linspace(2, 6, 40):
+        # Simulate moves across BRUSH's 30 Hz query batches rather than
+        # compressing the entire stroke into one synchronous test instant.
+        canvas.classifier._brush_last_query_time -= .04
         canvas.classifier.move(QPointF(*canvas.screen_from_section(h, 2)))
+        assert all(s[0] == 'brush_cursor_px' for s in canvas.classifier.overlay.shapes), 'no painted trail'
+    assert changed() == {at(h, 2) for h in range(2, 7)}, 'brush must paint live before release'
+    assert not app.undo_stack, 'incomplete stroke must not enter history'
     canvas.classifier.release(QPointF(*canvas.screen_from_section(6, 2)), Qt.LeftButton)
     assert changed() == {at(h, 2) for h in range(2, 7)}, changed()
     assert len(app.undo_stack) == 1, 'brush stroke must be one undo step'
+    assert app.active_classify_tool == 'brush' and not canvas.classifier.overlay.shapes
+    reset()
+    baseline = classes.copy()
+    canvas.classifier.press(QPointF(x1, y1), Qt.LeftButton)
+    assert changed(), 'next stroke must work without reactivation'
+    canvas.classifier.key(Qt.Key_Escape)
+    np.testing.assert_array_equal(classes, baseline)
+    assert not app.undo_stack and not app._native_brush_transaction_active
+    assert app.active_classify_tool is None and not canvas.classifier.overlay.shapes
+    print('PASS BRUSH parity: live paint, cursor only during stroke, release commit, persistent tool, Escape rollback', flush=True)
     reset()
     app.active_classify_tool = 'point'
     click(canvas, 7.02, 3.01)

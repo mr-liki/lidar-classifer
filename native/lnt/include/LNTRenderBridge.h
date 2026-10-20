@@ -178,6 +178,16 @@ public:
     }
 
 private:
+    const Reader* line_reader_ = nullptr;
+    std::vector<uint8_t> line_rgb_, line_visible_;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> line_masks_;
+public:
+    void set_lines(const Reader* reader, const uint8_t* rgb, const uint8_t* visible) {
+        line_reader_=reader; line_masks_.clear();
+        if (reader) { line_rgb_.assign(rgb,rgb+65536*3); line_visible_.assign(visible,visible+65536); }
+        for (auto& t : tiles_) t.uploaded=false;
+    }
+private:
     bool upload_impl(VulkanEngine& engine, Reader& reader, std::string& err,
                      bool with_rgb);
 
@@ -323,11 +333,19 @@ inline bool LntScene::upload_tile(VulkanEngine& engine,
     std::vector<float> inten(pts.size());
     std::vector<uint8_t> cls(pts.size());
     std::vector<uint8_t> rgb(pts.size() * 3);
+    std::vector<uint16_t> lines;
+    if (line_reader_) {
+        const auto* n=line_reader_->find_node(tile.node_id);
+        if (!n || !line_reader_->read_line_ids(*n,lines)) { err="Flight-line sidecar is missing or invalid"; return false; }
+        auto& mask=line_masks_[tile.node_id]; mask.resize(lines.size());
+        for (size_t i=0;i<lines.size();++i) mask[i]=line_visible_[lines[i]];
+    }
     for (std::size_t i = 0; i < pts.size(); ++i) {
         cls[i] = pts[i].classification;
         rgb[i * 3 + 0] = pts[i].r;
         rgb[i * 3 + 1] = pts[i].g;
         rgb[i * 3 + 2] = pts[i].b;
+        if (line_reader_) for (int k=0;k<3;++k) rgb[i*3+k]=line_rgb_[size_t(lines[i])*3+k];
         xyz[i * 3 + 0] = pts[i].x;
         xyz[i * 3 + 1] = pts[i].y;
         xyz[i * 3 + 2] = pts[i].z;
@@ -477,6 +495,26 @@ inline bool LntScene::push_tiles(VulkanEngine& engine,
     // nothing". Clearing the ranges is how the engine is told that, and it is
     // the same call every path makes, so there is one meaning and not three.
     if (firsts.empty()) return engine.clear_point_draw_ranges();
+    if (line_reader_) {
+        std::vector<uint32_t> f,c;
+        for (size_t j=0;j<firsts.size();++j) {
+            const uint64_t lo=firsts[j], hi=lo+counts[j];
+            for (const auto& tile : tiles_) {
+                if (!tile.uploaded || tile.first>=hi || uint64_t(tile.first)+tile.count<=lo) continue;
+                auto it=line_masks_.find(tile.node_id); if(it==line_masks_.end()) continue;
+                const auto& mask=it->second;
+                uint32_t begin=uint32_t(std::max<uint64_t>(lo,tile.first)-tile.first);
+                const uint32_t end=uint32_t(std::min<uint64_t>(hi,uint64_t(tile.first)+tile.count)-tile.first);
+                while(begin<end) {
+                    while(begin<end && !mask[begin]) ++begin;
+                    uint32_t finish=begin; while(finish<end && mask[finish]) ++finish;
+                    if(finish>begin) { f.push_back(tile.first+begin); c.push_back(finish-begin); }
+                    begin=finish;
+                }
+            }
+        }
+        return f.empty()?engine.clear_point_draw_ranges():engine.set_point_draw_ranges(f,c);
+    }
     return engine.set_point_draw_ranges(firsts, counts);
 }
 

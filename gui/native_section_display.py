@@ -23,11 +23,9 @@ def rainbow(t, ramp=None):
 def line_colors(ids, colors=None):
     ids = np.asarray(ids, dtype=np.uint32)
     colors = colors or {}
-    rgb = np.empty((len(ids), 3), dtype=np.uint8)
-    for value in np.unique(ids):
-        lid = int(value)
-        rgb[ids == value] = colors.get(lid, colors.get(str(lid),
-            ((lid * 67 + 53) % 256, (lid * 131 + 97) % 256, (lid * 193 + 181) % 256)))
+    rgb = np.column_stack(((ids*67+53)%256,(ids*131+97)%256,(ids*193+181)%256)).astype(np.uint8)
+    for value, color in colors.items():
+        rgb[ids == int(value)] = color
     return rgb
 
 
