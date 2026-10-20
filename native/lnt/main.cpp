@@ -646,7 +646,7 @@ static FileView section_read_file(const std::string& path) {
           hdr_ok ? std::string("magic=[") + v.hdr.magic + "]"
                  : std::string("header short read"));
     check("magic_matches() accepts the header", magic_matches(v.hdr.magic));
-    check("format version is 2", v.hdr.version == 2,
+    check("format version is current", v.hdr.version == kFormatVersion,
           "version=" + std::to_string(v.hdr.version));
     check("reserved field is zero", v.hdr.reserved == 0);
     check("index_offset is inside the file and past the header",
@@ -2721,11 +2721,12 @@ static bool generate_test_las_file(const std::string& path, size_t n,
         e.y = double(ry) * h.scale_y + h.offset_y;
         e.z = double(rz) * h.scale_z + h.offset_z;
         e.intensity = uint8_t(in16 >> 8);
-        // The class goes where the format keeps it: low 5 bits of byte 15 for
-        // formats 0-5 (top bits are flags), a full byte at 16 for formats 6-10.
+        // Keep the complete stored byte for all formats.  Legacy datasets use
+        // the packed byte for extended classes such as 51 (0x33); dropping the
+        // high bits would incorrectly turn that class into 19.
         const uint8_t cls_raw = rng.byte();
         if (format >= 6) { p[16] = cls_raw; e.classification = cls_raw; }
-        else { p[15] = uint8_t(cls_raw & 0x1F); e.classification = uint8_t(cls_raw & 0x1F); }
+        else { p[15] = cls_raw; e.classification = cls_raw; }
         if (kRgb[format] >= 0) { e.r = uint8_t(c16[0] >> 8); e.g = uint8_t(c16[1] >> 8); e.b = uint8_t(c16[2] >> 8); }
         else e.r = e.g = e.b = e.intensity;
         const double v[3] = {e.x, e.y, e.z};

@@ -1,10 +1,10 @@
 {
-  "created": "2026-10-19 15:21:13",
+  "created": "2026-10-20 13:17:39",
   "dll": "native/naksha_vulkan/build_msvc/naksha_vulkan.dll",
-  "dll_exports": 139,
-  "dll_sha256": "d120acb84757957d249dccc1148edeecb3de0855c6a316606bb9f8b87df0568d",
+  "dll_exports": 141,
+  "dll_sha256": "d36a1a5a20e1dc9304e99ba37aab056463bc432b569d6f0527d5c07efa9e5769",
   "missing_exports": [],
-  "source_digest": "97d9fa6621e420c3cc2d9142390d7517caaa18132c2ae733432bab8a88a45d5a",
-  "source_files": 72,
-  "source_newest": "src/naksha_vulkan_c_api.cpp"
+  "source_digest": "cb747c28ee53310abb7c809ee69cbaccfa39eb9289ae215af185757505f59065",
+  "source_files": 73,
+  "source_newest": "include/naksha/StructuralBoundary.hpp"
 }

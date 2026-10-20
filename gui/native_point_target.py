@@ -121,8 +121,9 @@ class NativePointTarget(QObject):
         origin = np.asarray(backend.get_render_origin_xyz(), dtype=np.float64)
         ratio = canvas.devicePixelRatioF()
         width, height = canvas.width()*ratio, canvas.height()*ratio
+        from gui.class_slots import stored_palette
         visible = np.ones(256, dtype=bool)
-        for code, rule in (getattr(self.app, 'class_palette', {}) or {}).items():
+        for code, rule in stored_palette(self.app, getattr(self.app, 'class_palette', {}) or {}).items():
             visible[int(code)] = bool(rule.get('show', True))
         classes = data.get('classification')
         count = len(xyz) if rows is None else len(rows)
@@ -200,7 +201,8 @@ class NativePointTarget(QObject):
         if data.get('xyz') is None or row < 0 or row >= len(data['xyz']):
             return False
         xyz = np.asarray(data['xyz'])[row]
-        code = int(data['classification'][row])
+        from gui.class_slots import code_for
+        code = code_for(self.app, int(data['classification'][row]))   # user class number
         from gui.native_vector_overlay import _view_for
         view = _view_for(self.app)
         if view is None:

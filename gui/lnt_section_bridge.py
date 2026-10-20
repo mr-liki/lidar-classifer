@@ -137,6 +137,9 @@ class LntSectionStore:
         self.node = np.empty(0, dtype=np.uint32)
         self.local = np.empty(0, dtype=np.uint32)
         self._synced = np.empty(0, dtype=np.uint8)       # classes as last written to the file
+        # A timer flush is not a user Save. Keep a separate checkpoint so
+        # Don't Save cannot undo classifications already explicitly saved.
+        self._saved_classes = np.empty(0, dtype=np.uint8)
         self.rgb8 = np.empty((0, 3), dtype=np.uint8)     # file colours as uploaded to section views
         self.generation = 0                              # bumps whenever flush finds class edits
         # keys kept sorted (with their store positions) so a query is matched
@@ -253,6 +256,7 @@ class LntSectionStore:
         self.node = self._append("node", self.node, new_node)
         self.local = self._append("local", self.local, new_local)
         self._synced = self._append("synced", self._synced, cls_new)
+        self._saved_classes = self._append("saved_classes", self._saved_classes, cls_new)
         rows[fresh] = np.arange(base, base + m, dtype=np.int64)
         for s0, s1 in zip(bounds[:-1], bounds[1:]):
             nd, loc = int(node[s0]), local[s0:s1]
@@ -339,14 +343,23 @@ class LntSectionStore:
             print(f"[LNT-SECTION] flush failed: {exc}")
             return 0
 
-    def discard_unflushed_edits(self, stop_timer=True):
-        """Revert on-screen classes to disk state and drop the pending queue.
+    def mark_saved(self):
+        """Advance the discard checkpoint after a successful Save of this document.
 
-        Clear / Clear Data call this when the user picks "Don't Save": writes
-        that already reached the .lnt are written back to their pre-edit
-        classes (replayed from the undo history, newest first), while edits
-        that never flushed are simply forgotten in memory. Returns the number
-        of store rows reverted in memory.
+        Undo/redo history is intentionally retained: undoing a saved action is
+        a new unsaved change, which Don't Save must restore to this checkpoint.
+        """
+        current = np.asarray(self.data['classification'], dtype=np.uint8)
+        if current.shape != self._saved_classes.shape:
+            raise RuntimeError('Native save checkpoint does not match the section store.')
+        self._saved_classes[:] = current
+        self._discarded = False
+
+    def discard_unflushed_edits(self, stop_timer=True):
+        """Discard only changes since the last successful explicit Save.
+
+        Timer flushes may already have written unsaved edits to the LNT file;
+        restore those bytes from the save checkpoint, not from undo history.
         """
         reverted = 0
         try:
@@ -362,71 +375,27 @@ class LntSectionStore:
             cur = np.asarray(data.get("classification", None))
             if cur.size == 0:
                 return 0
-            try:
-                history = list(getattr(self.app, "undo_stack", None) or [])
-            except Exception:
-                history = []
-            pending_writes = {}
-            # Newest-first replay: each older entry overwrites newer ones in
-            # memory, so after the loop cur[] holds the TRUE original classes.
-            for entry in reversed(history):
-                try:
-                    if not isinstance(entry, dict):
-                        continue
-                    idx = np.asarray(entry.get("indices", None), dtype=np.int64).ravel()
-                    old = np.asarray(entry.get("old_classes", None), dtype=np.uint8).ravel()
-                    if idx.size == 0 or old.shape[0] != idx.shape[0]:
-                        continue
-                    valid = (idx >= 0) & (idx < cur.shape[0])
-                    if not np.any(valid):
-                        continue
-                    idx = idx[valid]
-                    old = old[valid]
-                    cur[idx] = old
-                    reverted += int(idx.shape[0])
-                except Exception:
-                    continue
-            # Write back the final reverted classes for every row that is
-            # still dirty on disk (covers flushed AND never-flushed edits in
-            # one pass; overlapping entries converge to the true original).
-            try:
-                synced = np.asarray(self._synced)
-                if synced.shape[0] == cur.shape[0]:
-                    rows = np.flatnonzero(cur != synced)
-                else:
-                    rows = np.arange(cur.shape[0], dtype=np.int64)
-            except Exception:
-                rows = np.arange(cur.shape[0], dtype=np.int64)
+            saved = self._saved_classes
+            if saved.shape != cur.shape:
+                raise RuntimeError('Cannot discard: native save checkpoint is incomplete.')
+            reverted = int(np.count_nonzero(cur != saved))
+            if self._synced.shape != saved.shape:
+                raise RuntimeError('Cannot discard: native disk state is incomplete.')
+            rows = np.flatnonzero(saved != self._synced)
             if rows.size:
-                try:
-                    nodes = np.asarray(self.node)[rows].astype(np.uint64, copy=False)
-                    locals_ = np.asarray(self.local)[rows].astype(np.uint64, copy=False)
-                    for _n, _l, _c in zip(nodes.tolist(), locals_.tolist(), cur[rows].tolist()):
-                        pending_writes[(int(_n), int(_l))] = int(_c)
-                except Exception:
-                    pass
-            if pending_writes:
-                try:
-                    pairs = list(pending_writes.items())
-                    n2 = np.asarray([k[0] for k, _v in pairs], dtype=np.uint32)
-                    l2 = np.asarray([k[1] for k, _v in pairs], dtype=np.uint32)
-                    c2 = np.asarray([_v for _k, _v in pairs], dtype=np.uint8)
-                    nv = getattr(self.view, "native", None)
-                    if nv is not None and n2.size:
-                        if nv.set_classes(n2, l2, c2):
-                            print(f"[LNT-SECTION] reverted {n2.size:,} class edits on Don't Save")
-                        else:
-                            print(f"[LNT-SECTION] revert failed: {getattr(nv, 'last_error', '')}")
-                except Exception as exc:
-                    print(f"[LNT-SECTION] revert write-back failed: {exc}")
-            try:
-                self._synced = np.asarray(cur, dtype=np.uint8).copy()
-            except Exception:
-                pass
+                nv = getattr(self.view, 'native', None)
+                if nv is None or not nv.set_classes(self.node[rows], self.local[rows], saved[rows]):
+                    raise OSError(getattr(nv, 'last_error', '') or 'Could not restore saved native classes.')
+                print(f"[LNT-SECTION] reverted {rows.size:,} class edits on Don't Save")
+            # Only acknowledge the rollback after its native write succeeded.
+            cur[:] = saved
+            self._synced[:] = saved
             self._preview_pending = False
             self._discarded = True
         except Exception as exc:                          # noqa: BLE001 - never break clear
+            self.last_error = str(exc)
             print(f"[LNT-SECTION] discard_unflushed_edits failed: {exc}")
+            return 0
         return int(reverted)
 
     def release(self, flush_pending=True):

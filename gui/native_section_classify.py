@@ -21,6 +21,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
+from gui.native_measure_geometry import measurement_labels, measurement_text
 
 DRAWABLE_TOOLS = ("rectangle", "circle", "polygon", "freehand", "brush", "point",
                   "above_line", "below_line", "parallel_line")
@@ -225,7 +226,7 @@ def _drawing_vertex_markers_visible(kind, data):
     other callers that do not go through NativeDraw._paint().
     """
     dtype = str(data.get('type', 'polyline')).lower()
-    if dtype in ('text', 'freehand', 'point') or data.get('source') in (
+    if dtype in ('text', 'freehand', 'point', 'circle') or data.get('source') in (
             'block_creation', 'cell_creation'):
         return False
     if 'show_vertices' in data:
@@ -341,7 +342,12 @@ class CanvasOverlay(QWidget):
                 style = options.get('style', {})
                 rgb = style.get('color', (0., 1., .47))
                 color = QColor(*(max(0, min(255, round(float(v) * 255))) for v in rgb))
-                painter.setPen(QPen(color, max(1, int(style.get('width', 2)))))
+                # Selection is a transient overlay state: never mutate a
+                # user's configured stroke/label color or the measured values.
+                stroke_color = (QColor('#00ffff') if (options.get('highlight_scope') == 'measure'
+                                and options.get('area') is None
+                                and (options.get('selected') or options.get('hovered'))) else color)
+                painter.setPen(QPen(stroke_color, max(1, int(style.get('width', 2)))))
                 font = painter.font()
                 font.setPointSize(max(7, int(style.get('label_font_size', 16))))
                 painter.setFont(font)
@@ -371,35 +377,40 @@ class CanvasOverlay(QWidget):
                     # The measured segment(s) - and, while placing, the rubber band
                     # to the cursor - in the Measure Settings width and line style.
                     pen = painter.pen()
-                    painter.setPen(QPen(color, max(1, int(style.get('width', 2))), {
+                    painter.setPen(QPen(stroke_color, max(1, int(style.get('width', 2))), {
                         'dashed': Qt.DashLine, 'dotted': Qt.DotLine,
                         'dash-dot': Qt.DashDotLine, 'dash-dot-dot': Qt.DashDotDotLine,
                     }.get(str(style.get('line_style', 'solid')), Qt.SolidLine)))
                     painter.setBrush(Qt.NoBrush)
                     painter.drawPolyline(QPolygonF(qpts))
                     painter.setPen(pen)
-                    painter.setBrush(color)
+                    painter.setBrush(stroke_color)
                     for point in qpts:
                         painter.drawEllipse(point, 3., 3.)
-                    distances = np.linalg.norm(np.diff(np.asarray(pts), axis=0), axis=1)
+                    # QPainter.drawText uses the PEN color, not the brush.
+                    # Restore the configured measurement color for all labels.
+                    painter.setPen(QPen(color, max(1, int(style.get('width', 2)))))
+                    painter.setBrush(color)
+                    # Line: a single sum at the final endpoint.
+                    # Path: cumulative distances at P2, P3, ... final endpoint.
+                    # Never label individual segment lengths as path totals.
+                    is_path = bool(options.get('path'))
                     unit = style.get('unit', 'm')
-                    convert = (lambda d: (d / 1000., 'km')) if unit == 'km' else (lambda d: (d, 'm'))
-                    # Path segments show their own length; the final label shows
-                    # the accumulated length. A line needs only its total label.
-                    if options.get('path'):
-                        for i, distance in enumerate(distances):
-                            value, suffix = convert(float(distance))
-                            mid = (qpts[i] + qpts[i + 1]) * .5
-                            painter.drawText(mid + QPointF(6., -6.), f'{value:.3f} {suffix}')
-                    total, suffix = convert(float(distances.sum()))
-                    painter.drawText(qpts[-1] + QPointF(8., -8.), f'Total {total:.3f} {suffix}'
-                                     if options.get('path') else f'{total:.3f} {suffix}')
+                    for index, total in measurement_labels(pts, path=is_path):
+                        label = measurement_text(total, unit)
+                        if is_path and index == len(qpts) - 1:
+                            label = f'Total {label}'
+                        painter.drawText(qpts[index] + QPointF(8., -8.), label)
             elif kind in ('drawing', 'drawing_preview') and qpts:
                 data = extra or {}
                 dtype = str(data.get('type', 'polyline')).lower()
                 preview = kind == 'drawing_preview'
                 configured_color = QColor(str(data.get('color', '')))
-                color = (QColor(255, 80, 255) if data.get('selected') else
+                color = (QColor('#00ffff') if (data.get('highlight_scope') == 'draw'
+                         and data.get('source') not in ('snt', 'attachment', 'snt_readonly',
+                                                        'block_creation', 'cell_creation')
+                         and (data.get('selected') or data.get('hovered'))) else
+                         QColor(255, 80, 255) if data.get('selected') else
                          configured_color if configured_color.isValid() else
                          QColor(255, 255, 0) if preview else QColor(0, 220, 255))
                 line_style = {'solid': Qt.SolidLine, 'dashed': Qt.DashLine,
@@ -481,11 +492,17 @@ class CanvasOverlay(QWidget):
                 # points rather than their interpolated samples. Avoid even
                 # building the handle list when hidden (large CAD polylines).
                 if _drawing_vertex_markers_visible(kind, data):
-                    vertex_points = (
-                        [QPointF(*to_qt(*p)) for p in data['control_points']]
-                        if dtype == 'curve' and data.get('control_points')
-                        else qpts
-                    )
+                    if dtype == 'rectangle' and len(qpts) >= 2:
+                        a,b=qpts[0],qpts[1]
+                        # The four visible rectangle corners are editable;
+                        # the drawing record stores only two diagonal points.
+                        vertex_points=[a,QPointF(b.x(),a.y()),b,QPointF(a.x(),b.y())]
+                    elif dtype == 'curve' and data.get('control_points'):
+                        vertex_points=[QPointF(*to_qt(*p)) for p in data['control_points']]
+                    else:
+                        vertex_points=qpts
+                        if len(qpts)>2 and qpts[0]==qpts[-1]:
+                            vertex_points=qpts[:-1]
                     for point in vertex_points:
                         painter.drawEllipse(point, 2.5, 2.5)
             elif kind == "cut_preview" and qpts:
@@ -551,6 +568,19 @@ class CanvasOverlay(QWidget):
                     for q in qpts:
                         painter.drawLine(q, QPointF(q.x(), edge))
         painter.end()
+
+
+def _class_lut(slots):
+    """256-entry mask of stored class slots (see gui/class_slots.py)."""
+    lut = np.zeros(256, dtype=np.bool_)
+    for code in slots:
+        try:
+            code = int(code)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= code <= 255:
+            lut[code] = True
+    return lut
 
 
 class SectionClassifier:
@@ -752,8 +782,9 @@ class SectionClassifier:
         palette = self.canvas.palette or {}
         if not palette:
             return None
-        return np.array([int(c) for c, rule in palette.items() if rule.get("show", True)],
-                        dtype=np.int64)
+        from gui.class_slots import stored_palette
+        return np.array([slot for slot, rule in stored_palette(self.app, palette).items()
+                         if rule.get("show", True)], dtype=np.int64)
 
     def candidates(self, tool, shape):
         """Store indices this gesture would classify (before the From filter)."""
@@ -785,9 +816,7 @@ class SectionClassifier:
         visible = self._visible_classes()
         if visible is not None and indices.size:
             classes = self.app.data["classification"]
-            lut = np.zeros(256, dtype=np.bool_)
-            lut[np.asarray(visible, dtype=np.uint8)] = True
-            indices = indices[lut[classes[indices]]]
+            indices = indices[_class_lut(visible)[classes[indices]]]
         return indices
 
     def _commit(self, tool, shape):
@@ -796,15 +825,26 @@ class SectionClassifier:
         if to_class is None:
             app.statusBar().showMessage("Target class not set.", 2500)
             return 0
+        # User class numbers can be anything (e.g. 999); points store a one-byte
+        # slot (gui/class_slots.py). Never raise here: an exception escaping a
+        # Qt mouse override crashes the app.
+        from gui.class_slots import NoFreeSlot, slot_for, slots_for
+        to_code = to_class
+        try:
+            to_class = slot_for(app, to_code, allocate=True)
+        except (NoFreeSlot, OSError) as exc:
+            app.statusBar().showMessage(str(exc), 6000)
+            return 0
+        if to_class is None:
+            app.statusBar().showMessage(f"Class {to_code} is not a valid class number.", 4000)
+            return 0
         indices = self.candidates(tool, shape)
         if not indices.size:
             return 0
         classes = app.data["classification"]
         from_classes = getattr(app, "from_classes", None)
         if from_classes and indices.size:
-            lut = np.zeros(256, dtype=np.bool_)
-            lut[np.asarray(from_classes, dtype=np.uint8)] = True
-            indices = indices[lut[classes[indices]]]
+            indices = indices[_class_lut(slots_for(app, from_classes))[classes[indices]]]
         if indices.size:
             indices = indices[classes[indices] != np.asarray(to_class, dtype=classes.dtype)]
         if indices.size == 0:
@@ -831,5 +871,5 @@ class SectionClassifier:
         app._last_classify_ts = time.time()
         app.classification_revision = int(getattr(app, "classification_revision", 0) or 0) + 1
         self.canvas.owner.refresh_edits(force=True, changed=(indices, old))
-        app.statusBar().showMessage(f"{indices.size:,} points -> class {to_class}", 3000)
+        app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)

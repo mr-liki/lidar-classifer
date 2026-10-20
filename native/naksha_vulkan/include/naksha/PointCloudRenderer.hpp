@@ -1,11 +1,13 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <utility>
 #include <vector>
 
 #include "naksha/Buffer.hpp"
 #include "naksha/RenderOrigin.hpp"
+#include "naksha/StructuralBoundary.hpp"
 #include "naksha/core/vulkan/VulkanPipelineManager.h"
 
 namespace naksha {
@@ -96,6 +98,8 @@ public:
     // Legacy fixed-pixel knob kept for the existing C ABI: pins the clamp band
     // to a single size, reproducing the old constant gl_PointSize behaviour.
     void SetPointSize(float pixels);
+    void SetBorder(float percent, int mode);
+    void GetBorderStats(uint64_t out[3]) const;
     // DEPTH mode normalisation (view-space distance -> grayscale ramp). Travels in
     // the free parity.y/z/w push-constant slots; see shaders/point.vert.
     void SetDepthRange(float lo, float hi, float gamma);
@@ -130,13 +134,20 @@ public:
     // Clearing the ranges restores the exact single-draw behaviour.
     void SetDrawRanges(const uint32_t* firsts, const uint32_t* counts,
                        uint32_t rangeCount) {
-        drawRanges_.clear();
-        if (!firsts || !counts || rangeCount == 0) return;
-        drawRanges_.reserve(rangeCount);
-        for (uint32_t i = 0; i < rangeCount; ++i)
-            drawRanges_.emplace_back(firsts[i], counts[i]);
+        std::vector<std::pair<uint32_t,uint32_t>> next;
+        if (firsts && counts) {
+            next.reserve(rangeCount);
+            for (uint32_t i=0;i<rangeCount;++i) if (counts[i]) next.emplace_back(firsts[i],counts[i]);
+        }
+        if (next == drawRanges_) return;
+        drawRanges_ = std::move(next);
+        if (arenaMode_) structuralBoundary_.invalidate();
     }
-    void ClearDrawRanges() { drawRanges_.clear(); }
+    void ClearDrawRanges() {
+        if (drawRanges_.empty()) return;
+        drawRanges_.clear();
+        if (arenaMode_) structuralBoundary_.invalidate();
+    }
 
     // ---- Stable-offset ARENA residency ------------------------------------
     // The whole-cloud upload (UploadPositionsWorldF64) re-packs EVERY point at
@@ -208,6 +219,15 @@ private:
     GPUBuffer colors_;
     GPUBuffer classification_;
     GPUBuffer intensity_;
+    GPUBuffer boundaryFlags_; // R8_UNORM, one byte per resident point
+    StructuralBoundary structuralBoundary_;
+    struct BoundaryResult {
+        std::vector<uint8_t> flags;
+        std::vector<StructuralBoundary::Range> ranges;
+    };
+    std::future<BoundaryResult> boundaryJob_;
+    uint64_t boundaryBuilds_ = 0, boundaryPublishes_ = 0;
+    void updateBoundaryFlags();
     // Packed oct16x2 normal stream (4 bytes/point), bound as vertex location 4.
     // Separate from positions_: no duplication, and the two streams must use an
     // IDENTICAL point order.
@@ -280,6 +300,15 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> drawRanges_;
     float maxPointSizeDevice_ = 0.0f;  // limits.pointSizeRange[1]
     uint64_t positionUploads_ = 0;
+    float borderPercent_ = 0.0f;
+    int borderMode_ = 1;
+    // Per-frame ring recess coefficients (push-constant border.zw):
+    // ring NDC = (clipZ + A) / (clipW + B). Folded from the live MVP once per
+    // Record() so the vertex shader needs no second mat4 multiply, length() or
+    // sqrt() per point. Bit-exact replica of the old per-vertex projection of
+    // (inPos + viewAxis * metres) — see Record().
+    float structBorderA_ = 0.0f;
+    float structBorderB_ = 0.0f;
     uint64_t colorUploads_ = 0;
     uint64_t classificationUploads_ = 0;
     uint64_t intensityUploads_ = 0;

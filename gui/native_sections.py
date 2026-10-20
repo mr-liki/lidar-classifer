@@ -293,9 +293,9 @@ class SectionCanvas(QWidget):
         # Strictly per-view: this pushes to THIS view's renderer only, so
         # growing a class's points here never touches a synced sibling view.
         weights = np.ones(256, dtype=np.float32)
-        for code, rule in (palette or {}).items():
-            code = int(code)
-            if 0 <= code < 256:
+        from gui.class_slots import stored_palette
+        for code, rule in stored_palette(self.owner.app, palette).items():
+            if 0 <= code < 256:          # stored slot (user numbers > 255 mapped)
                 colors[code] = rule.get('color', (128, 128, 128))
                 visible[code] = bool(rule.get('show', True))
                 try:
@@ -312,6 +312,8 @@ class SectionCanvas(QWidget):
         # Sections are projected point views. Native instant lighting shades
         # these records without constructing a terrain TIN across vertical faces.
         self.backend.set_display_mode(modes.get(mode, 1))
+        from gui.native_border import apply_border
+        apply_border(self.owner.app, self.slot)
         if mode == 'shaded_class':
             self.backend.set_instant_shading_parameters(*self.shading_parameters)
         if len(self.local):
@@ -433,7 +435,7 @@ class SectionCanvas(QWidget):
                 or (measurement is not None and measurement.active)):
             self.pan_gesture.finish()
             return False
-        return self.pan_gesture.handle(self.owner.app, event)
+        return self.pan_gesture.handle(self.owner.app, event, self)
 
     def mousePressEvent(self, event):
         self.setFocus()
@@ -449,6 +451,21 @@ class SectionCanvas(QWidget):
                 and self.owner.locate(self, event.position())):
             return
         if event.button() == Qt.RightButton:
+            # An armed cut owns right-click as Cancel. Otherwise an idle native
+            # cross/cut canvas resumes the last classifier, matching VTK views.
+            if self.cut_armed:
+                self.owner.cancel_cut()
+                event.accept()
+                return
+            helper = getattr(
+                self.owner.app, "reactivate_last_classification_from_right_click", None
+            )
+            target = "cut" if self.slot == CUT_SLOT else "cross"
+            if callable(helper) and helper(
+                target, focus_widget=self, native=True
+            ):
+                event.accept()
+                return
             self.owner.cancel_cut()
         elif event.button() == Qt.LeftButton and self.cut_armed:
             x = self.horizontal_at(event.position().x())

@@ -3949,20 +3949,20 @@ class SectionController:
             getattr(self.app, "classify_interactors", None)
         )
         if active_tool is None or not section_has_classifier:
-            last_tool = getattr(self.app, "last_classify_tool", None)
-            print(f"   Last classify tool: {last_tool}")
-            if last_tool and hasattr(self.app, "set_classify_tool"):
-                try:
-                    self.app.from_classes = getattr(self.app, "last_classify_from_classes", None)
-                    self.app.to_class = getattr(self.app, "last_classify_to_class", None)
-                    self.app._right_click_reactivating = True
-                    try:
-                        self.app.set_classify_tool(last_tool)
-                        print(f"   ✅ Reactivated: {last_tool}")
-                    finally:
-                        self.app._right_click_reactivating = False
-                except Exception as e:
-                    print(f"   ⚠️ Right-click reactivate failed: {e}")
+            helper = getattr(self.app, "reactivate_last_classification_from_right_click", None)
+            vtk_widget = None
+            try:
+                for candidate in getattr(self.app, "section_vtks", {}).values():
+                    if getattr(candidate, "interactor", None) is obj:
+                        vtk_widget = candidate
+                        break
+            except Exception:
+                vtk_widget = None
+            if callable(helper) and helper(
+                "cross", focus_widget=vtk_widget, native=False
+            ):
+                self.app._abort_vtk_right_click(obj)
+                print(f"   ✅ Reactivated: {getattr(self.app, 'active_classify_tool', None)}")
         else:
             print(f"   ℹ️ Tool already active in cross-section: {active_tool}")
 

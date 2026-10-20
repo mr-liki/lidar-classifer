@@ -76,22 +76,16 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
         self._last_pos = (0, 0)
     
     def _block_event(self, obj, event):
-        """Block right-click rotation; reactivate last classification tool if none is active."""
-        if getattr(self.app, "active_classify_tool", None) is None:
-            last_tool = getattr(self.app, "last_classify_tool", None)
-            if last_tool and hasattr(self.app, "set_classify_tool"):
-                try:
-                    from_classes = getattr(self.app, "last_classify_from_classes", None)
-                    to_class = getattr(self.app, "last_classify_to_class", None)
-                    self.app.from_classes = from_classes
-                    self.app.to_class = to_class
-                    self.app._right_click_reactivating = True
-                    try:
-                        self.app.set_classify_tool(last_tool)
-                    finally:
-                        self.app._right_click_reactivating = False
-                except Exception as e:
-                    print(f"⚠️ Cut-section right-click reactivate failed: {e}")
+        """Safely hand an idle cut-view right-click back to classification."""
+        # Preserve every existing right-click owner (notably pending cut cancel).
+        # Consume the event only when the classification handoff actually wins.
+        if event != "RightButtonPressEvent":
+            return
+        helper = getattr(self.app, "reactivate_last_classification_from_right_click", None)
+        if callable(helper) and helper(
+            "cut", focus_widget=self.vtk_widget, native=False
+        ):
+            self.app._abort_vtk_right_click(obj)
 
     def _on_left_press(self, obj, event):
         try:
@@ -730,31 +724,11 @@ class CutSectionController:
         """Reactivate the last classification tool from an idle cut view."""
         if self._is_destroying or getattr(self.app, "_shutdown_in_progress", False):
             return
-        if getattr(self.app, "active_classify_tool", None) is not None:
+        helper = getattr(self.app, "reactivate_last_classification_from_right_click", None)
+        if not callable(helper):
             return
-
-        last_tool = getattr(self.app, "last_classify_tool", None)
-        if not last_tool or not hasattr(self.app, "set_classify_tool"):
-            return
-
-        try:
-            if hasattr(obj, "AbortFlagOn"):
-                obj.AbortFlagOn()
-            elif hasattr(obj, "SetAbortFlag"):
-                obj.SetAbortFlag(1)
-
-            print(f"Right-click detected in cut section - reactivating {last_tool}")
-            self.app.from_classes = getattr(
-                self.app, "last_classify_from_classes", None
-            )
-            self.app.to_class = getattr(self.app, "last_classify_to_class", None)
-            self.app._right_click_reactivating = True
-            try:
-                self.app.set_classify_tool(last_tool)
-            finally:
-                self.app._right_click_reactivating = False
-        except Exception as e:
-            print(f"Cut-section right-click reactivate failed: {e}")
+        if helper("cut", focus_widget=self.cut_vtk, native=False):
+            self.app._abort_vtk_right_click(obj)
 
     def _remove_cut_right_click_observer(self):
         """Detach the cut-view right-click observer before widget teardown."""

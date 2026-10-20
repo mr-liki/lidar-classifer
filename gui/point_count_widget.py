@@ -420,6 +420,9 @@ class PointCountWidget(QWidget):
         if getattr(store, "view", None) is not view:
             store = None                 # a previous .lnt's store
         point_counts = counter.counts(store) if counter is not None else None
+        if point_counts is not None:
+            from gui.class_slots import user_counts
+            point_counts = user_counts(self.app, point_counts)   # stored slot -> class number
         if point_counts is None:
             self._add_note("Counting points per class…" if counter is not None
                            else "Per-class counts are unavailable for this file.")

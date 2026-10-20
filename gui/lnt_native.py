@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_zoom.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
@@ -181,6 +181,9 @@ def lib():
     d.lnt_view_frame.argtypes = [c_void_p, c_float, POINTER(LntViewStats)]
     d.lnt_view_frame.restype = c_int
     d.lnt_view_info.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_uint64), POINTER(c_double)]
+    if hasattr(d, 'lnt_view_zoom_at'):
+        d.lnt_view_zoom_at.argtypes = [c_void_p, c_double, c_double, c_double]
+        d.lnt_view_zoom_at.restype = c_int
     _lib = d
     return d
 
@@ -251,7 +254,9 @@ class NativeView:
         Keeps the world point under the cursor fixed while the scale changes
         by the engine's own per-notch factor (ZOOM_STEP_FRACTION).
 
-        The engine's lnt_view_zoom only dollies about the view centre and
+        Current engines anchor using the actual clamped zoom scale, including
+        at maximum zoom. The code below also supports older engines:
+        lnt_view_zoom only dollies about the view centre and
         eases distance toward a goal, so the anchor is emulated EXACTLY with
         the engine's own affine 2D-plan mapping: screen = centre +
         (world - target) * metres_per_px. Centre-dollying scales that factor
@@ -266,6 +271,9 @@ class NativeView:
         """
         if not steps or not self._ok():
             return False
+        anchored = getattr(lib(), 'lnt_view_zoom_at', None)
+        if anchored is not None:
+            return bool(anchored(c_void_p(self.h), float(steps), float(px), float(py)))
         anchor = self.screen_to_world(px, py)
         probe = self.screen_to_world(px + 1.0, py)
         if not anchor or not probe:

@@ -43,6 +43,85 @@ def main_widget(app):
     return getattr(getattr(view, 'owner', None), 'vulkan_widget', None)
 
 
+def _sync_class_picker_for_native_shortcut(app, tool_name, from_cls, to_cls):
+    """Keep the floating ClassPicker in lock-step with native shortcuts.
+
+    Native LNT/Vulkan shortcuts are dispatched before the legacy ``execute_tool``
+    path. That fast path used to update ``app.from_classes`` / ``app.to_class``
+    but never created or refreshed ClassPicker, so the popup stayed hidden (or
+    showed the previous shortcut's classes) until the user clicked a classify
+    tool in the ribbon. Make the native shortcut path publish the exact same
+    live UI state as manual classification activation.
+
+    The picker is deliberately non-modal. ``ensure_visible()`` may briefly
+    activate its top-level window, so the caller restores focus to the target
+    Vulkan canvas immediately afterwards.
+    """
+    normalized_from = None if from_cls == [] else from_cls
+    app.from_classes = normalized_from
+    app.to_class = to_cls
+    app.active_classify_tool = tool_name
+
+    # Keep right-click reactivation/history helpers aligned with the shortcut
+    # that was just armed instead of retaining the previous manual tool state.
+    app.last_classify_tool = tool_name
+    clone_filter = getattr(app, "_clone_classification_filter", None)
+    app.last_classify_from_classes = (
+        clone_filter(normalized_from) if callable(clone_filter)
+        else list(normalized_from) if isinstance(normalized_from, (list, tuple))
+        else normalized_from
+    )
+    app.last_classify_to_class = to_cls
+
+    try:
+        digitizer = getattr(app, 'digitizer', None)
+        if digitizer is not None:
+            digitizer.enabled = False
+    except Exception:
+        pass
+
+    picker = None
+    get_live_picker = getattr(app, '_get_live_class_picker', None)
+    if callable(get_live_picker):
+        try:
+            picker = get_live_picker()
+        except Exception:
+            picker = None
+    else:
+        picker = getattr(app, 'class_picker', None)
+
+    try:
+        if picker is None:
+            from gui.class_picker import ClassPicker
+            picker = ClassPicker(app, parent=app)
+            app.class_picker = picker
+            picker.configure_for_background_mode()
+            print('CLASS_PICKER_SHORTCUT action=create')
+        else:
+            print('CLASS_PICKER_SHORTCUT action=refresh')
+
+        # sync_with_app() updates title + From/To selections without rebuilding
+        # the catalog unless the live PTC schema actually changed.
+        picker.sync_with_app()
+        picker.ensure_visible()
+        print(
+            f'CLASS_PICKER_SHORTCUT tool={tool_name} '
+            f'from={normalized_from} to={to_cls} visible=YES'
+        )
+        return True
+    except (RuntimeError, ReferenceError, AttributeError):
+        # A deleted C++ QWidget can leave a Python wrapper behind. Clear it so
+        # the next shortcut creates a fresh picker instead of remaining stale.
+        try:
+            app.class_picker = None
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f'ClassPicker native shortcut sync failed: {exc}')
+
+    return False
+
+
 def native_classification_history(app, redo=False):
     view = getattr(app, '_lnt_main_view', None)
     store = getattr(app, '_lnt_section_store', None)
@@ -116,7 +195,7 @@ def snt_viewport_measure(app, name, key_label=''):
 
 
 _MEASURE_HINTS = {
-    'MeasureLine': 'Click 2 points to measure.',
+    'MeasureLine': 'Click connected points; right-click finishes the total length.',
     'MeasurePath': 'Click points; right-click finishes the path.',
     'MeasureGridArea': 'Click inside a grid cell to measure its area.',
     'MeasureBlockArea': 'Click inside a block to measure its area.',
@@ -350,8 +429,25 @@ def _native_ai_history(app, view, source, destination, redo):
     return True
 
 
+# Shortcut tools that take over the canvas click; one-shot actions (Save,
+# DisplayMode, SyncViews ...) leave the footer Identify tools alone.
+_FOOTER_PICK_EXCLUSIVE = {
+    'AboveLine', 'BelowLine', 'ParallelLine', 'Rectangle', 'Circle', 'Polygon',
+    'Freehand', 'Brush', 'Point', 'TempFence',
+    'CrossSectionRect', 'CutSectionRect', 'CutFromCross', 'CutFromCut',
+    'MeasureLine', 'MeasurePath', 'MeasureGridArea', 'MeasureBlockArea',
+    'CrossSectionMeasure', 'Pan',
+}
+
+
 def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, key_label='',
                             pan_mode=None):
+    # Every shortcut (VTK execute_tool included) passes here first: a click
+    # tool turns off the footer Identify / Identify Layer tools.
+    if MEASURE_NAMES.get(tool, tool) in _FOOTER_PICK_EXCLUSIVE:
+        deactivate_footer = getattr(app, '_deactivate_footer_pick_tools', None)
+        if callable(deactivate_footer):
+            deactivate_footer(reason=f'{tool} shortcut')
     view = getattr(app, '_lnt_main_view', None)
     if view is None or getattr(view, 'native', None) is None:
         name = MEASURE_NAMES.get(TOOL_NAMES.get(tool, tool), tool)
@@ -489,16 +585,33 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
             if main_classifier is None:
                 status('Classification requires the native 2D plan view.')
                 return True
-        app.from_classes = None if from_cls == [] else from_cls
-        app.to_class = to_cls
-        app.active_classify_tool = name
+
         app.active_classify_target = ('cut' if canvas.slot == CUT_SLOT else 'cross') if canvas else 'main'
+
+        # Native shortcut dispatch bypasses gui.execute_tool, therefore it must
+        # explicitly publish the shortcut's From/To/tool state to ClassPicker.
+        # Do this before restoring canvas focus so the popup can show/update
+        # immediately without stealing the next classification key/click.
+        _sync_class_picker_for_native_shortcut(app, name, from_cls, to_cls)
+
         if canvas is not None:
             sections.active_slot = canvas.slot
             canvas.setFocus()
         else:
             focus_main()
-        status(f'{tool} ready in {"Main View" if canvas is None else "View " + str(canvas.slot)}')
+
+        normalized_from = None if from_cls == [] else from_cls
+        if normalized_from is None:
+            from_label = 'Any'
+        elif isinstance(normalized_from, (list, tuple)):
+            from_label = ', '.join(str(value) for value in normalized_from)
+        else:
+            from_label = str(normalized_from)
+        to_label = 'Any' if to_cls is None else str(to_cls)
+        status(
+            f'{tool} ready in {"Main View" if canvas is None else "View " + str(canvas.slot)} '
+            f'[{from_label} -> {to_label}]'
+        )
     elif name == 'Pan':
         # Mode comes from the Shortcut Manager's Pan cell; consumed by
         # gui/native_pan.py in the main view and every cross/cut canvas.

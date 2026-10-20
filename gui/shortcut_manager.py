@@ -3846,6 +3846,7 @@ class ShortcutManager(QWidget):
 
             # ✅ ONLY update the shortcuts lookup table — nothing else
             app_window.shortcuts = shortcuts
+            ShortcutManager._sync_active_class_picker_from_shortcuts(app_window)
             shortcut_filter = getattr(app_window, "short_cut_filter", None)
             if shortcut_filter is not None and hasattr(
                 shortcut_filter, "rebuild_ctrl_alt_shortcuts"
@@ -3866,6 +3867,50 @@ class ShortcutManager(QWidget):
             traceback.print_exc()
             if hasattr(app_window, 'statusBar'):
                 app_window.statusBar().showMessage(f"❌ Failed: {e}", 3000)
+
+    @staticmethod
+    def _sync_active_class_picker_from_shortcuts(app_window):
+        """Apply edits to the shortcut currently represented by ClassPicker."""
+        combo = getattr(app_window, "_last_classification_shortcut_combo", None)
+        shortcut = (getattr(app_window, "shortcuts", {}) or {}).get(combo)
+        active_tool = getattr(app_window, "active_classify_tool", None)
+        if not combo or not isinstance(shortcut, dict) or not active_tool:
+            return False
+        try:
+            from gui.execute_tool import TOOL_MAP
+            mapped_tool = TOOL_MAP.get(shortcut.get("tool"), shortcut.get("tool"))
+            if mapped_tool != active_tool:
+                return False
+        except Exception:
+            return False
+
+        shortcut_from = shortcut.get("from")
+        clone_filter = getattr(app_window, "_clone_classification_filter", None)
+        app_window.from_classes = (
+            clone_filter(shortcut_from) if callable(clone_filter) else shortcut_from
+        )
+        app_window.to_class = shortcut.get("to")
+        app_window.last_classify_from_classes = (
+            clone_filter(shortcut_from) if callable(clone_filter)
+            else list(shortcut_from) if isinstance(shortcut_from, (list, tuple))
+            else shortcut_from
+        )
+        app_window.last_classify_to_class = shortcut.get("to")
+
+        picker = getattr(app_window, "class_picker", None)
+        if not ShortcutManager._qobject_alive(picker):
+            return False
+        try:
+            picker.sync_with_app()
+            picker.ensure_visible()
+            print(
+                f"ClassPicker refreshed from {combo}: "
+                f"{shortcut.get('from')} -> {shortcut.get('to')}"
+            )
+            return True
+        except (RuntimeError, ReferenceError, AttributeError):
+            app_window.class_picker = None
+            return False
 
     def on_delete(self):
         sel_rows = self._get_selected_rows()

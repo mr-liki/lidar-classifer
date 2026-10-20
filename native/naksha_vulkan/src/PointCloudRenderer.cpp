@@ -1,31 +1,37 @@
 #include "naksha/PointCloudRenderer.hpp"
 #include "naksha/Renderer.hpp"
 #include <cmath>
+#include <algorithm>
 #include <cstring>
+#include <stdexcept>
+#include <chrono>
 
 namespace naksha {
 
 PointCloudRenderer::~PointCloudRenderer() { Shutdown(); }
 
-// Four vertex streams, all four bound on every draw:
+// Five vertex streams, all five bound on every ordinary point draw:
 //   0 positions       float3 xyz, render space
 //   1 colors          RGBA8 (true-colour data; also the mode-0 shade)
 //   2 classification  R8_UNORM (shader recovers the id with round(v*255))
 //   3 intensity       R32_SFLOAT
+//   4 boundary flag   R8_UNORM (same structural detector as VTK)
 // Classification and intensity travel as data so point.vert does the colouring
 // (palette / ramp lookup) instead of Python re-baking an RGBA buffer every time
 // the user flips a display mode.
-static VkVertexInputBindingDescription pointBindings[4] = {
+static VkVertexInputBindingDescription pointBindings[5] = {
     {0, sizeof(float) * 3, VK_VERTEX_INPUT_RATE_VERTEX},
     {1, sizeof(uint8_t) * 4, VK_VERTEX_INPUT_RATE_VERTEX},
     {2, sizeof(uint8_t), VK_VERTEX_INPUT_RATE_VERTEX},
     {3, sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX},
+    {4, sizeof(uint8_t), VK_VERTEX_INPUT_RATE_VERTEX},
 };
-static VkVertexInputAttributeDescription pointAttributes[4] = {
+static VkVertexInputAttributeDescription pointAttributes[5] = {
     {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
     {1, 1, VK_FORMAT_R8G8B8A8_UNORM, 0},
     {2, 2, VK_FORMAT_R8_UNORM, 0},
     {3, 3, VK_FORMAT_R32_SFLOAT, 0},
+    {4, 4, VK_FORMAT_R8_UNORM, 0},
 };
 
 // ---- Instant Shaded SPLAT pass vertex layout (mode 4 only) ----------------
@@ -83,7 +89,7 @@ bool PointCloudRenderer::Initialize(Renderer& renderer) {
     // to cover both stages.
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0;
-    pcr.size = sizeof(float) * 20;
+    pcr.size = sizeof(float) * 24; // 96 B: point border parameters
     pipelineLayout_ = renderer.Pipelines().CreatePipelineLayout(
         {renderer.GetFrameSetLayout()}, {pcr});
     if (pipelineLayout_ == VK_NULL_HANDLE) return false;
@@ -91,14 +97,14 @@ bool PointCloudRenderer::Initialize(Renderer& renderer) {
     std::vector<ShaderModule> shaders{vs_, fs_};
     pipelineCfg_ = PipelineConfig{};
     pipelineCfg_.SetDefaults();
-    // Override the legacy point layout with the 4-stream layout above.
+    // Ordinary points include structural flags; splats retain their own normal layout.
     pipelineCfg_.vertexBindings = {pointBindings[0], pointBindings[1],
-                                   pointBindings[2], pointBindings[3]};
+                                   pointBindings[2], pointBindings[3], pointBindings[4]};
     pipelineCfg_.vertexAttributes = {pointAttributes[0], pointAttributes[1],
-                                     pointAttributes[2], pointAttributes[3]};
-    pipelineCfg_.vertexInput.vertexBindingDescriptionCount = 4;
+                                     pointAttributes[2], pointAttributes[3], pointAttributes[4]};
+    pipelineCfg_.vertexInput.vertexBindingDescriptionCount = 5;
     pipelineCfg_.vertexInput.pVertexBindingDescriptions = pointBindings;
-    pipelineCfg_.vertexInput.vertexAttributeDescriptionCount = 4;
+    pipelineCfg_.vertexInput.vertexAttributeDescriptionCount = 5;
     pipelineCfg_.vertexInput.pVertexAttributeDescriptions = pointAttributes;
     pipelineCfg_.inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     pipelineCfg_.rasterizer.cullMode = VK_CULL_MODE_NONE;
@@ -212,6 +218,8 @@ void PointCloudRenderer::Shutdown() {
         renderer_->Shaders().DestroyShaderModule(splatVs_.module);
         renderer_->Shaders().DestroyShaderModule(splatFs_.module);
     }
+    VulkanAllocator::Get().DestroyBuffer(boundaryFlags_);
+    structuralBoundary_.clear();
     VulkanAllocator::Get().DestroyBuffer(positions_);
     VulkanAllocator::Get().DestroyBuffer(colors_);
     VulkanAllocator::Get().DestroyBuffer(classification_);
@@ -221,7 +229,7 @@ void PointCloudRenderer::Shutdown() {
     VulkanAllocator::Get().DestroyBuffer(fallbackIntensity_);
     VulkanAllocator::Get().DestroyBuffer(fallbackNormals_);
     positions_ = {}; colors_ = {}; classification_ = {}; intensity_ = {};
-    normals_ = {};
+    normals_ = {}; boundaryFlags_ = {};
     fallbackClass_ = {}; fallbackIntensity_ = {}; fallbackNormals_ = {};
     pipeline_ = VK_NULL_HANDLE; pipelineLayout_ = VK_NULL_HANDLE;
     splatPipeline_ = VK_NULL_HANDLE;
@@ -276,6 +284,8 @@ UploadStats PointCloudRenderer::UploadPositionsWorldF64(
     stats = renderer_->GetUploadContext().Execute({reg}, t1 - t0, t3 - t2);
     positionUploads_++;
     pointCount_ = count;
+    structuralBoundary_.clear();
+    structuralBoundary_.positions(0, render.data(), count);
     // PHASE 1: the attribute streams are indexed by POINT POSITION, so a new
     // position buffer invalidates them even when its length is unchanged - a
     // different tile set reorders the concatenation. Until the matching stream
@@ -313,6 +323,7 @@ int PointCloudRenderer::ReserveArena(std::size_t capacityPoints) {
         arenaMode_ = false; arenaCapacity_ = 0;
         return 0;
     }
+    structuralBoundary_.clear();
     arenaMode_ = true;
     arenaCapacity_ = capacityPoints;
     arenaTilesUploaded_ = 0;
@@ -344,6 +355,7 @@ UploadStats PointCloudRenderer::UploadArenaTile(
     const VkDeviceSize intBytes = intensity ? static_cast<VkDeviceSize>(count) * sizeof(float) : 0;
     const VkDeviceSize nrmBytes = normalsOct16
         ? static_cast<VkDeviceSize>(count) * kOct16BytesPerNormal : 0;
+    const VkDeviceSize boundaryBytes = (hasXyz && boundaryFlags_.IsValid() && boundaryFlags_.size >= first+count) ? count : 0;
     const VkDeviceSize rgbBytes = rgb8 ? static_cast<VkDeviceSize>(count) * 4 : 0;   // RGBA8
 
     std::vector<float> render;
@@ -377,7 +389,7 @@ UploadStats PointCloudRenderer::UploadArenaTile(
 
     // ONE staged submit for every stream: the staging buffer is filled
     // consecutively and Execute() walks the regions in the same order.
-    const VkDeviceSize total = posBytes + clsBytes + intBytes + nrmBytes + rgbBytes;
+    const VkDeviceSize total = posBytes + clsBytes + intBytes + nrmBytes + rgbBytes + boundaryBytes;
     uint8_t* dst = renderer_->GetUploadContext().Stage(total);
     if (!dst) return stats;
     double t2 = NowMs();
@@ -424,11 +436,19 @@ UploadStats PointCloudRenderer::UploadArenaTile(
         r.srcOffset = cursor; r.size = rgbBytes; regions.push_back(r);
         cursor += rgbBytes;
     }
+    if (boundaryBytes) {
+        std::memset(dst+cursor, 0, boundaryBytes);
+        regions.push_back({boundaryFlags_.buffer, first, cursor, boundaryBytes});
+    }
     double t3 = NowMs();
     stats = renderer_->GetUploadContext().Execute(regions, t1 - t0, t3 - t2);
     if (stats.bytes == 0) return stats;
 
-    if (hasXyz) positionUploads_++;
+    if (hasXyz) {
+        positionUploads_++;
+        structuralBoundary_.positions(first, render.data(), count);
+    }
+    if (classification) structuralBoundary_.classification(first, classification, count);
     if (classification) { classificationUploads_++; classInArena_ = true; }
     if (intensity)      { intensityUploads_++;      intensityInArena_ = true; }
     if (rgb8)           { colorUploads_++; }
@@ -468,6 +488,12 @@ UploadStats PointCloudRenderer::UploadPositionsRenderF32(const float* xyz, std::
     stats = renderer_->GetUploadContext().Execute({reg}, 0.0, t3 - t2);
     positionUploads_++;
     pointCount_ = count;
+    arenaMode_ = false; arenaCapacity_ = 0; arenaTilesUploaded_ = 0;
+    classInArena_ = false; intensityInArena_ = false;
+    classificationCount_ = 0; intensityCount_ = 0;
+    structuralBoundary_.clear();
+    structuralBoundary_.positions(0, xyz, count);
+    ensureFallbackNormals(count);
     return stats;
 }
 
@@ -510,6 +536,7 @@ UploadStats PointCloudRenderer::UploadClassificationU8(const uint8_t* cls, std::
     stats = renderer_->GetUploadContext().Execute({reg}, 0.0, t3 - t2);
     classificationUploads_++;
     classificationCount_ = count;
+    structuralBoundary_.classification(0, cls, count);
     return stats;
 }
 
@@ -603,6 +630,11 @@ void PointCloudRenderer::SetPointSizeParams(float footprintMeters, float minPx,
     pointSize_ = pointSizeMaxPx_;   // legacy accessor mirror
 }
 
+void PointCloudRenderer::SetBorder(float percent, int mode) {
+    borderPercent_ = std::clamp(percent, 0.0f, 100.0f);
+    borderMode_ = std::clamp(mode, 0, 2);
+}
+
 void PointCloudRenderer::SetPointSize(float pixels) {
     // Legacy fixed-size knob: pin the clamp band to one value so the shader's
     // depth term has no effect, matching the old constant gl_PointSize.
@@ -622,8 +654,74 @@ void PointCloudRenderer::SetSpriteParams(float softness, float brightness) {
     brightness_ = brightness;
 }
 
+void PointCloudRenderer::GetBorderStats(uint64_t out[3]) const {
+    out[0] = boundaryBuilds_;
+    out[1] = boundaryPublishes_;
+    out[2] = (structuralBoundary_.dirty() || boundaryJob_.valid()) ? 1 : 0;
+}
+
+void PointCloudRenderer::updateBoundaryFlags() {
+    if (!arenaMode_) {
+        // Sections/bulk uploads have fixed geometry during navigation. Build
+        // once after a data edit; camera and width changes reuse the flags.
+        if (!structuralBoundary_.dirty()) return;
+        const auto flags = structuralBoundary_.compute(pointCount_);
+        ensureBuffer(boundaryFlags_, flags.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        if (!boundaryFlags_.IsValid()) throw std::runtime_error("Structural border buffer allocation failed");
+        auto* dst = renderer_->GetUploadContext().Stage(flags.size());
+        if (!dst) throw std::runtime_error("Structural border staging failed");
+        std::memcpy(dst, flags.data(), flags.size());
+        CopyRegion region{boundaryFlags_.buffer, 0, 0, flags.size()};
+        renderer_->GetUploadContext().Execute({region}, 0.0, 0.0, true);
+        structuralBoundary_.markClean();
+        ++boundaryBuilds_; ++boundaryPublishes_;
+        return;
+    }
+    // A streamed tile must NEVER trigger an all-resident-point grid build on
+    // the UI/render thread. Snapshots share immutable tiles; only edited tiles
+    // are copied. Keep the last completed borders while another grid is built.
+    if (!boundaryFlags_.IsValid() || boundaryFlags_.size < arenaCapacity_) {
+        if (!uploadZeros(renderer_, boundaryFlags_, arenaCapacity_))
+            throw std::runtime_error("Structural border buffer allocation failed");
+    }
+    if (boundaryJob_.valid() && boundaryJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        auto result = boundaryJob_.get();
+        std::vector<CopyRegion> regions;
+        VkDeviceSize bytes = 0;
+        for (const auto& r : result.ranges) {
+            // A slot may have been recycled or reclassified while the worker
+            // ran. Never publish an old tile's flags onto its replacement.
+            if (!structuralBoundary_.matches(r) || r.first+r.count > result.flags.size()) continue;
+            regions.push_back({boundaryFlags_.buffer, r.first, bytes, r.count});
+            bytes += r.count;
+        }
+        if (bytes) {
+            auto* dst = renderer_->GetUploadContext().Stage(bytes);
+            if (!dst) throw std::runtime_error("Structural border staging failed");
+            for (const auto& r : regions)
+                std::memcpy(dst+r.srcOffset, result.flags.data()+r.dstOffset, r.size);
+            renderer_->GetUploadContext().Execute(regions, 0.0, 0.0, true);
+            ++boundaryPublishes_;
+        }
+    }
+    if (!boundaryJob_.valid() && structuralBoundary_.dirty()) {
+        auto snapshot = structuralBoundary_;
+        snapshot.restrictToRanges(drawRanges_);
+        const auto count = pointCount_;
+        boundaryJob_ = std::async(std::launch::async, [snapshot=std::move(snapshot),count]() mutable {
+            auto ranges = snapshot.ranges();
+            return BoundaryResult{snapshot.compute(count,true),std::move(ranges)};
+        });
+        structuralBoundary_.markClean();
+        ++boundaryBuilds_;
+    }
+}
+
 void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     if (!initialized_ || pointCount_ == 0 || !visible_) return;
+    if (arenaMode_ && drawRanges_.empty()) return;
+    if (borderPercent_ > 0.0f && borderMode_ == 1 && displayMode_ != 4)
+        updateBoundaryFlags();
     VkExtent2D ext = renderer_->GetExtent();
     VkViewport vp{0.0f, 0.0f, static_cast<float>(ext.width),
                      static_cast<float>(ext.height), 0.0f, 1.0f};
@@ -664,11 +762,13 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
         intensityCovers ? streamFor(intensity_, fallbackIntensity_, positions_, intensityBytes)
                         : (fallbackIntensity_.IsValid() ? fallbackIntensity_.buffer
                                                         : positions_.buffer),
+        boundaryFlags_.IsValid() && boundaryFlags_.size >= classBytes
+            ? boundaryFlags_.buffer : positions_.buffer,
     };
-    VkDeviceSize offsets[] = {0, 0, 0, 0};
+    VkDeviceSize offsets[] = {0, 0, 0, 0, 0};
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-    vkCmdBindVertexBuffers(cmd, 0, 4, buffers, offsets);
+    vkCmdBindVertexBuffers(cmd, 0, 5, buffers, offsets);
     VkDescriptorSet frameSet = renderer_->GetFrameDescriptorSet();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     pipelineLayout_, 0, 1,
@@ -686,6 +786,32 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     float rowY = std::sqrt(mvp[1] * mvp[1] + mvp[5] * mvp[5] +
                            mvp[9] * mvp[9] + mvp[13] * mvp[13]);
     float pxPerMetreAt1m = rowY * 0.5f * static_cast<float>(ext.height);
+
+    // Ring recess coefficients (push-constant border.zw), folded once per
+    // frame from the LIVE MVP. The old vertex code projected a second point
+    //     back = mvp * (inPos + axis * (metres / len)),  axis = (mvp[2],mvp[6],mvp[10])
+    // for EVERY point, costing a mat4*vec4 + length()/sqrt() per vertex plus a
+    // divergent inner branch while panning/zooming. Expanding the multiply:
+    //     backZ = clipZ + metres/len * (mvp[2]*ax+mvp[6]*ay+mvp[10]*az)
+    //     backW = clipW + metres/len * (mvp[3]*ax+mvp[7]*ay+mvp[11]*az)
+    // with (ax,ay,az)=axis gives constant A,B with ring=(z+A)/(w+B) — the exact
+    // same value, now two adds + one divide per vertex. All modes use the
+    // fixed world-space offsets: Structured .50m, Per-Point .05m, Hybrid .01m.
+    // No depth offset depends on the border width percentage.
+    structBorderA_ = 0.0f;
+    structBorderB_ = 0.0f;
+    if (borderPercent_ > 0.0f && displayMode_ != 4) {
+        const float ax = mvp[2], ay = mvp[6], az = mvp[10];
+        const float lenSq = ax * ax + ay * ay + az * az;
+        if (lenSq > 1e-40f) {
+            // Width is the only percentage-dependent quantity. Increasing it
+            // must not recess a low building edge behind the adjacent ground.
+            const float metres = borderMode_ == 1 ? 0.5f : (borderMode_ == 0 ? 0.05f : 0.01f);
+            const float k = metres / std::sqrt(lenSq);
+            structBorderA_ = k * (mvp[2] * ax + mvp[6] * ay + mvp[10] * az);
+            structBorderB_ = k * (mvp[3] * ax + mvp[7] * ay + mvp[11] * az);
+        }
+    }
 
     // Device ceiling: report_.maxPointSize is limits.pointSizeRange[1]
     // (e.g. 2047.9 on this GPU). A gl_PointSize above it is clamped by the
@@ -724,7 +850,7 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     // shader must pre-compensate the swapchain's sRGB encode to leave that byte
     // untouched in the framebuffer - the same rule surface.frag follows. Without
     // it every point renders 1.5-2.5x too bright against the VTK viewport.
-    float pc[20] = {
+    float pc[24] = {
         footprintMeters_, pointSizeMinPx_, maxPx, classIntensityMix_,
         static_cast<float>(displayMode_), elevationLo_, elevationHi_, elevationGamma_,
         intensityLo_, intensityHi_, intensityContrast_, intensityGamma_,
@@ -735,6 +861,8 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
         // PointParams at 5 vec4 / 80 bytes, so the push-constant range, the SPIR-V
         // and the C ABI are all unchanged.
         static_cast<float>(colorParityMode_), depthLo_, depthHi_, depthGamma_,
+        displayMode_ == 4 ? 0.0f : borderPercent_ / 100.0f,
+        static_cast<float>(borderMode_), structBorderA_, structBorderB_,
     };
     renderer_->WriteTimestamp(cmd, frameSlot, Renderer::kTsPointBefore);
     vkCmdPushConstants(cmd, pipelineLayout_,
@@ -745,6 +873,7 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     // into the same persistent point buffer, which was uploaded in cell
     // order. With no ranges set this is byte-for-byte the previous single
     // full-buffer draw, so LOD off is exactly the old behaviour.
+    auto drawPoints = [&]() {
     if (drawRanges_.empty()) {
         // Arena residency: an empty draw list means "nothing selected". A
         // full-buffer draw would rasterise unwritten gaps between tiles.
@@ -759,6 +888,10 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
             drawCalls_++;
         }
     }
+    };
+    // One grown sprite per point, just like VTK. Only ring fragments receive
+    // the depth bias; coloured cores retain their exact screen position/depth.
+    drawPoints();
     renderer_->WriteTimestamp(cmd, frameSlot, Renderer::kTsPointAfter);
 }
 
@@ -870,7 +1003,7 @@ uint64_t PointCloudRenderer::GetColorUploadCount() const { return colorUploads_;
 uint64_t PointCloudRenderer::GetClassificationUploadCount() const { return classificationUploads_; }
 uint64_t PointCloudRenderer::GetIntensityUploadCount() const { return intensityUploads_; }
 VkDeviceSize PointCloudRenderer::GetGpuBytes() const {
-    return positions_.size + colors_.size + classification_.size + intensity_.size +
+    return positions_.size + colors_.size + classification_.size + intensity_.size + boundaryFlags_.size +
            fallbackClass_.size + fallbackIntensity_.size;
 }
 

@@ -569,6 +569,22 @@ NKV_API uint64_t nkv_get_class_weight_update_count(NkvHandle handle) {
     return inst->renderer.GetClassWeightUpdateCount();
 }
 
+NKV_API int nkv_get_point_border_stats(NkvHandle handle, uint64_t* out3) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || !out3) return 0;
+    inst->pointCloud.GetBorderStats(out3);
+    return 1;
+}
+
+NKV_API int nkv_set_point_border(NkvHandle handle, float percent, int mode) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || !std::isfinite(percent) || mode < 0 || mode > 2) return 0;
+    inst->pointCloud.SetBorder(percent, mode);
+    return 1;
+}
+
 NKV_API int nkv_set_point_size(NkvHandle handle, float pixels) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
