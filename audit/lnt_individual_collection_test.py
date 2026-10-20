@@ -13,7 +13,7 @@ from gui.lnt_collection import read_collection,payload_bytes
 from gui.lnt_class_counts import scan_class_histogram
 from audit.lnt_surface_lod_view_test import View
 ROOT=Path(__file__).resolve().parents[1]
-nat.LNT_DLL=os.environ.get('NAKSHA_TEST_LNT_DLL',str(ROOT/'native/lnt/main_display_modes.dll'))
+nat.LNT_DLL=os.environ.get('NAKSHA_TEST_LNT_DLL',nat.LNT_DLL)
 nat.VULKAN_DLL=str(ROOT/'native/naksha_vulkan/build_msvc/naksha_vulkan.dll')
 
 with tempfile.TemporaryDirectory(prefix='individual_lnt_',dir=ROOT/'audit') as scratch:

@@ -866,7 +866,7 @@ class GlobalShortcutFilter(QObject):
 
             # ====================================================================
             # Native point-cloud shortcuts bypass the legacy inline VTK handlers.
-            from gui.native_shortcuts import execute_native_shortcut, focused_canvas
+            from gui.native_shortcuts import execute_native_shortcut, focused_canvas, TOOL_NAMES
             native_view = getattr(self.app_window, '_lnt_main_view', None)
             if native_view is not None and getattr(native_view, 'native', None) is not None:
                 native_canvas = focused_canvas(self.app_window)
@@ -887,6 +887,14 @@ class GlobalShortcutFilter(QObject):
                 if configured_shortcut:
                     if event.isAutoRepeat():
                         return True
+
+                    # Remember which class-bearing shortcut owns the live
+                    # ClassPicker. ShortcutManager.apply_shortcuts_from_settings()
+                    # uses this identity to refresh From/To immediately when the
+                    # user edits and reapplies the currently active shortcut.
+                    if configured_shortcut.get('tool') in TOOL_NAMES:
+                        self.app_window._last_classification_shortcut_combo = combo
+
                     if execute_native_shortcut(self.app_window, configured_shortcut.get('tool'),
                             configured_shortcut.get('from'), configured_shortcut.get('to'),
                             configured_shortcut.get('preset'), key_label,
@@ -1967,11 +1975,7 @@ class GlobalShortcutFilter(QObject):
                     target_display_mode = str(
                         preset.get("display_mode", "class") or "class"
                     ).lower()
-                    target_quality_mode = str(
-                        preset.get("quality_mode", "normal") or "normal"
-                    ).lower()
-                    if target_quality_mode not in ("fast", "normal", "slow"):
-                        target_quality_mode = "normal"
+                    target_quality_mode = "normal"
 
                     # Shaded Classification / Surface both read their quality
                     # (Fast/Normal/Slow) from a global app attribute -- the
@@ -3125,7 +3129,7 @@ class GlobalShortcutFilter(QObject):
                     )
 
                     print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
-                        f"| {visible_count} classes | Speed={shading_quality_label(quality_mode)}")
+                        f"| {visible_count} classes")
                     print(f"{'='*60}\n")
 
                     if hasattr(self.app_window, 'statusBar'):
@@ -3259,6 +3263,10 @@ class GlobalShortcutFilter(QObject):
             from_cls = shortcut.get("from")
             to_cls   = shortcut.get("to")
             preset   = shortcut.get("preset")
+
+            # Identify the active class-bearing shortcut so editing its
+            # From/To pair can refresh the live ClassPicker immediately.
+            self.app_window._last_classification_shortcut_combo = combo
 
             print(f"✅ SHORTCUT MATCH: {combo} → {tool}, "
                 f"from={from_cls}, to={to_cls}")

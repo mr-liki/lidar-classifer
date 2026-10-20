@@ -45,6 +45,7 @@ audit/_nkverify_out/
 native/lnt/main
 native/lnt/*.exe
 native/lnt/*.dll
+!native/lnt/main_display_modes_zoom.dll
 native/lnt/*.lnt*
 native/lnt/*.o
 native/lnt/*.obj
@@ -97,5 +98,6 @@ vulkan_*_output/
 
 # Per-source native point-cache provenance and selection indexes
 *.lnt.source.json
+*.lnt.class-semantics
 *.lntset
 naksha_native_batches/

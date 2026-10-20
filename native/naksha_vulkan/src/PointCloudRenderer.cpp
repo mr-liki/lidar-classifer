@@ -1,6 +1,7 @@
 #include "naksha/PointCloudRenderer.hpp"
 #include "naksha/Renderer.hpp"
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 
 namespace naksha {
@@ -83,7 +84,7 @@ bool PointCloudRenderer::Initialize(Renderer& renderer) {
     // to cover both stages.
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0;
-    pcr.size = sizeof(float) * 20;
+    pcr.size = sizeof(float) * 24; // 96 B: point border parameters
     pipelineLayout_ = renderer.Pipelines().CreatePipelineLayout(
         {renderer.GetFrameSetLayout()}, {pcr});
     if (pipelineLayout_ == VK_NULL_HANDLE) return false;
@@ -603,6 +604,11 @@ void PointCloudRenderer::SetPointSizeParams(float footprintMeters, float minPx,
     pointSize_ = pointSizeMaxPx_;   // legacy accessor mirror
 }
 
+void PointCloudRenderer::SetBorder(float percent, int mode) {
+    borderPercent_ = std::clamp(percent, 0.0f, 100.0f);
+    borderMode_ = std::clamp(mode, 0, 2);
+}
+
 void PointCloudRenderer::SetPointSize(float pixels) {
     // Legacy fixed-size knob: pin the clamp band to one value so the shader's
     // depth term has no effect, matching the old constant gl_PointSize.
@@ -724,7 +730,7 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     // shader must pre-compensate the swapchain's sRGB encode to leave that byte
     // untouched in the framebuffer - the same rule surface.frag follows. Without
     // it every point renders 1.5-2.5x too bright against the VTK viewport.
-    float pc[20] = {
+    float pc[24] = {
         footprintMeters_, pointSizeMinPx_, maxPx, classIntensityMix_,
         static_cast<float>(displayMode_), elevationLo_, elevationHi_, elevationGamma_,
         intensityLo_, intensityHi_, intensityContrast_, intensityGamma_,
@@ -735,6 +741,8 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
         // PointParams at 5 vec4 / 80 bytes, so the push-constant range, the SPIR-V
         // and the C ABI are all unchanged.
         static_cast<float>(colorParityMode_), depthLo_, depthHi_, depthGamma_,
+        displayMode_ == 4 ? 0.0f : borderPercent_ / 100.0f,
+        static_cast<float>(borderMode_), 0.0f, 0.0f,
     };
     renderer_->WriteTimestamp(cmd, frameSlot, Renderer::kTsPointBefore);
     vkCmdPushConstants(cmd, pipelineLayout_,
@@ -745,6 +753,7 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     // into the same persistent point buffer, which was uploaded in cell
     // order. With no ranges set this is byte-for-byte the previous single
     // full-buffer draw, so LOD off is exactly the old behaviour.
+    auto drawPoints = [&]() {
     if (drawRanges_.empty()) {
         // Arena residency: an empty draw list means "nothing selected". A
         // full-buffer draw would rasterise unwritten gaps between tiles.
@@ -759,6 +768,15 @@ void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
             drawCalls_++;
         }
     }
+    };
+    if (pc[20] > 0.0f && borderMode_ != 0) {
+        pc[22] = 1.0f; // enlarged background shells; cores are drawn afterwards
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+        drawPoints();
+        pc[22] = 0.0f;
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+    }
+    drawPoints();
     renderer_->WriteTimestamp(cmd, frameSlot, Renderer::kTsPointAfter);
 }
 

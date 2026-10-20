@@ -365,6 +365,9 @@
 import os
 
 import laspy
+from gui.laspy_compat import install_opaque_extra_bytes_fix
+
+install_opaque_extra_bytes_fix()
 import numpy as np
 import open3d as o3d
 from PySide6.QtWidgets import QDialog

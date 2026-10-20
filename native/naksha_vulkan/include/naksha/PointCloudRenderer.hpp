@@ -96,6 +96,7 @@ public:
     // Legacy fixed-pixel knob kept for the existing C ABI: pins the clamp band
     // to a single size, reproducing the old constant gl_PointSize behaviour.
     void SetPointSize(float pixels);
+    void SetBorder(float percent, int mode);
     // DEPTH mode normalisation (view-space distance -> grayscale ramp). Travels in
     // the free parity.y/z/w push-constant slots; see shaders/point.vert.
     void SetDepthRange(float lo, float hi, float gamma);
@@ -280,6 +281,8 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> drawRanges_;
     float maxPointSizeDevice_ = 0.0f;  // limits.pointSizeRange[1]
     uint64_t positionUploads_ = 0;
+    float borderPercent_ = 0.0f;
+    int borderMode_ = 1;
     uint64_t colorUploads_ = 0;
     uint64_t classificationUploads_ = 0;
     uint64_t intensityUploads_ = 0;

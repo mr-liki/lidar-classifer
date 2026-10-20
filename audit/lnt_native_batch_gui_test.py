@@ -18,10 +18,13 @@ os.environ.setdefault("NAKSHA_RENDER_BACKEND", "auto")
 
 import laspy
 import numpy as np
+from gui.laspy_compat import install_opaque_extra_bytes_fix
 from gui.lnt_collection import read_collection
 from pyproj import CRS
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication, QFileDialog
+
+install_opaque_extra_bytes_fix()
 
 results = []
 
@@ -40,6 +43,9 @@ def pump(seconds):
 
 def write_laz(path, count, line_id, rgb, epsg=32643):
     header = laspy.LasHeader(point_format=3 if rgb else 1, version="1.2")
+    # Reproduce customer files whose type-0 Extra Bytes options are 9 bytes,
+    # which older laspy getters misread as scale/no-data flags.
+    header.add_extra_dim(laspy.ExtraBytesParams(name='opaque', type='9u1'))
     header.scales = [.001] * 3
     header.offsets = [500000., 4000000., 0.]
     if epsg is not None:
@@ -55,6 +61,7 @@ def write_laz(path, count, line_id, rgb, epsg=32643):
             record.classification = np.full(n, 2 + line_id - 11, np.uint8)
             record.intensity = rng.integers(1, 60000, n, dtype=np.uint16)
             record.point_source_id = np.full(n, line_id, np.uint16)
+            record['opaque'] = np.full((n, 9), line_id, np.uint8)
             if rgb:
                 record.red = np.full(n, 30000, np.uint16)
                 record.green = np.full(n, 20000, np.uint16)

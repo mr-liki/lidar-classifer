@@ -5,26 +5,55 @@ laspy+lazrs, then converted by the native C++ builder). Every later open finds t
 .lnt newer than the source and loads it directly.
 """
 import ctypes
+import hashlib
 import json
 import os
 import shutil
 import tempfile
 import time
 
+import numpy as np
+
 from PySide6.QtCore import QEvent, QObject, QThread, Qt, QTimer, Slot, Signal
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
 
 from gui import lnt_native as nat
+from gui.laspy_compat import install_opaque_extra_bytes_fix
 from gui.native_pan import NativePanGesture
+
+install_opaque_extra_bytes_fix()
 
 LNT_SUFFIXES = (".las", ".laz", ".lnt", ".lntset")
 
 
+def _local_lnt_path(source):
+    """Stable per-source cache path for sources that must not be modified."""
+    try:
+        stat = os.stat(source)
+        identity = (
+            f"{os.path.normcase(os.path.abspath(source))}|"
+            f"{stat.st_size}|{stat.st_mtime_ns}"
+        )
+    except OSError:
+        identity = os.path.normcase(os.path.abspath(source))
+    key = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+    root = os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "NakshaAI", "lnt_cache", key[:2], key,
+    )
+    return os.path.join(root, os.path.splitext(os.path.basename(source))[0] + ".lnt")
+
+
 def lnt_path_for(source):
-    return source if source.lower().endswith(".lnt") else os.path.splitext(source)[0] + ".lnt"
+    if source.lower().endswith(".lnt"):
+        return source
+    # Keep caches and staging beside the source, including network sources.
+    # _scratch_dir reports an unwritable folder instead of moving work to C:.
+    return os.path.splitext(source)[0] + ".lnt"
 
 
-LNT_FORMAT_VERSION = 2      # 2: points carry a classification byte (11 B/pt)
+LNT_FORMAT_VERSION = 2      # points carry a classification byte (11 B/pt)
+LNT_CLASS_SEMANTICS = "legacy-packed-class-v1"
 
 
 def lnt_file_version(path):
@@ -63,25 +92,47 @@ def _source_cache_current(source, lnt):
         return False
 
 
+def _class_semantics_path(lnt):
+    return lnt + '.class-semantics'
+
+
+def _has_current_class_semantics(lnt):
+    try:
+        with open(_class_semantics_path(lnt), 'r', encoding='ascii') as marker:
+            return marker.read().strip() == LNT_CLASS_SEMANTICS
+    except OSError:
+        return False
+
+
 def _publish_source_cache(source, staged, destination, signature):
     if _source_signature(source) != signature:
         raise RuntimeError(f'{source} changed while its cache was building')
     if lnt_file_version(staged) != LNT_FORMAT_VERSION:
         raise RuntimeError(f'The converter did not produce a valid cache for {source}')
-    # Staging and destination are on the source drive, so replacement is atomic.
+    # Staging and destination share a drive, so replacement is atomic.
     metadata = os.fspath(staged) + '.source.json'
     with open(metadata, 'w', encoding='utf-8') as f:
         json.dump(signature, f, sort_keys=True)
+    marker = os.fspath(staged) + '.class-semantics'
+    with open(marker, 'w', encoding='ascii') as f:
+        f.write(LNT_CLASS_SEMANTICS + '\n')
     os.replace(staged, destination)
     os.replace(metadata, os.fspath(destination) + '.source.json')
+    os.replace(marker, _class_semantics_path(destination))
 
 
 def lnt_is_current(source):
-    """Source fingerprints survive classification edits to the cache's mtime."""
+    """A usable cache of the current format, built from this exact source.
+
+    The source fingerprint survives classification edits (which change the
+    cache's mtime), and caches written with the legacy packed class byte are
+    rebuilt so extended ASPRS classes are not silently collapsed.
+    """
     source = os.fspath(source)
     if source.lower().endswith('.lnt'):
         return os.path.isfile(source) and lnt_file_version(source) == LNT_FORMAT_VERSION
-    return _source_cache_current(source, lnt_path_for(source))
+    lnt = lnt_path_for(source)
+    return _has_current_class_semantics(lnt) and _source_cache_current(source, lnt)
 
 
 class Cancelled(Exception):
@@ -94,23 +145,58 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
     backend = (laspy.LazBackend.LazrsParallel
                if laspy.LazBackend.LazrsParallel in backends else None)
     with laspy.open(laz, laz_backend=backend) as src:
+        # Legacy point formats only carry a 5-bit ASPRS class, but this converter
+        # reads the whole packed byte as an extended class, so the temporary
+        # stream is promoted to a 1.4 format with a true 8-bit classification
+        # field. Format 7 keeps RGB (36 B/pt), 6 is the bare 30 B/pt record;
+        # the LNT built from either costs about another 22 B/pt.
+        legacy = int(src.header.point_format.id) < 6
+        # Format 7 is 6 plus RGB; keep colour when the source records have it.
+        # (PointFormat.has_color is absent in some laspy releases.)
+        dims = {dim.name for dim in src.header.point_format.dimensions}
+        target_format = 7 if {'red', 'green', 'blue'} <= dims else 6
+        if legacy:
+            # Same construction laspy.convert() uses, so the promoted chunks
+            # (target format plus the source's extra dimensions) match this
+            # writer exactly.
+            promoted = laspy.PointFormat(target_format)
+            promoted.dimensions.extend(src.header.point_format.extra_dimensions)
+            header = laspy.LasHeader(point_format=promoted, version="1.4")
+        else:
+            header = laspy.LasHeader(point_format=src.header.point_format,
+                                     version=src.header.version)
+        header.scales, header.offsets = src.header.scales, src.header.offsets
         required = (src.header.offset_to_point_data
-                    + src.header.point_count * (src.header.point_format.size + 22)
+                    + src.header.point_count * (header.point_format.size + 22)
                     + 8 * 1024**2)
         free = shutil.disk_usage(os.path.dirname(las)).free
         if required > free:
             raise RuntimeError(
                 f"Not enough free space beside {laz}: need about {required / 1024**3:.2f} GiB "
                 f"for decompression and its LNT; only {free / 1024**3:.2f} GiB is free")
-        header = laspy.LasHeader(point_format=src.header.point_format,
-                                 version=src.header.version)
-        header.scales, header.offsets = src.header.scales, src.header.offsets
         total, done = max(1, src.header.point_count), 0
         started = time.perf_counter()
         with laspy.open(las, mode="w", header=header) as dst:
             for pts in src.chunk_iterator(chunk):
                 if cancelled():
                     raise Cancelled()
+                if legacy:
+                    # The native DLL historically interpreted LAS 1.2 byte 15 as
+                    # only a 5-bit ASPRS class.  Our production files use that
+                    # complete packed byte for extended classes (51 = 19 | 0x20).
+                    # Promote the temporary stream to point format 6 and put the
+                    # reconstructed byte into its true 8-bit classification field.
+                    chunk_las = laspy.LasData(src.header, points=pts)
+                    chunk_las = laspy.convert(
+                        chunk_las, point_format_id=target_format, file_version="1.4"
+                    )
+                    base = np.asarray(pts.classification, dtype=np.uint8)
+                    packed = (base & np.uint8(0x1F)).copy()
+                    packed |= np.asarray(pts.synthetic, dtype=np.uint8) << np.uint8(5)
+                    packed |= np.asarray(pts.key_point, dtype=np.uint8) << np.uint8(6)
+                    packed |= np.asarray(pts.withheld, dtype=np.uint8) << np.uint8(7)
+                    chunk_las.classification = packed
+                    pts = chunk_las.points
                 dst.write_points(pts)
                 done += len(pts)
                 rate = done / max(time.perf_counter() - started, 0.001) / 1_000_000
@@ -118,10 +204,11 @@ def _laz_to_las(laz, las, progress, cancelled, chunk=2_000_000):
                          f"Decompressing LAZ  {done:,}/{total:,} points ({rate:.1f} M/s)")
 
 
-def _scratch_dir(source):
-    """Require scratch space beside the source; never fall back to system TEMP."""
-    folder = os.path.dirname(os.path.realpath(os.fspath(source)))
+def _scratch_dir(source, lnt=None):
+    """Require staging space beside the cache; never fall back to system TEMP."""
+    folder = os.path.dirname(os.path.realpath(os.fspath(lnt or source)))
     try:
+        os.makedirs(folder, exist_ok=True)
         fd, probe = tempfile.mkstemp(prefix="naksha_probe_", dir=folder)
         os.close(fd)
         os.remove(probe)
@@ -141,7 +228,7 @@ def build_lnt(source, progress, cancelled):
         return lnt_path_for(source)
     lnt = lnt_path_for(source)
     signature = _source_signature(source)
-    folder = _scratch_dir(source)
+    folder = _scratch_dir(source, lnt)
     if source.lower().endswith('.las'):
         import laspy
         with laspy.open(source) as reader:
@@ -215,6 +302,7 @@ class _InputFilter(QObject):
         super().__init__(view)
         self.view = view
         self._last = None
+        self._context_press = None
         self._pan = NativePanGesture(self._pan_main)
 
     def _pan_main(self, dx, dy):
@@ -222,12 +310,38 @@ class _InputFilter(QObject):
         if nv is not None:
             nv.pan(dx, dy)
 
+    def _show_snt_context_menu(self, x, y):
+        if not self.view.mode_2d or self.view.native is None:
+            return
+        app = getattr(self.view, "app", None)
+        manager = getattr(app, "grid_label_manager", None)
+        handler = getattr(manager, "on_native_right_click", None)
+        if not callable(handler):
+            return
+        from gui.native_main_classify import MainCanvas
+        canvas = MainCanvas(self.view)
+        world_xy = canvas.section_at(x, y)
+        handler(world_xy, float(canvas.world_per_pixel()))
+
     def eventFilter(self, obj, ev):   # noqa: N802 (Qt API)
         t = ev.type()
         nv = self.view.native
         if nv is None:
             return False
         E = QEvent
+        # Track only free right-clicks; tool-owned presses below never arm a menu.
+        context_click = False
+        if t == E.MouseButtonPress:
+            self._context_press = None
+        elif t == E.MouseMove and self._context_press is not None:
+            if (ev.position() - self._context_press).manhattanLength() > 4:
+                self._context_press = None
+        elif t == E.MouseButtonRelease and ev.button() == Qt.RightButton:
+            press = self._context_press
+            self._context_press = None
+            context_click = (press is not None
+                             and (ev.position() - press).manhattanLength() <= 4)
+
         creation = getattr(self.view, 'creation', None)
         if creation is not None and creation.active:
             middle_drag = t == E.MouseMove and bool(ev.buttons() & Qt.MiddleButton)
@@ -327,12 +441,14 @@ class _InputFilter(QObject):
                     return True
         # Armed Pan shortcut (Left - Click / Tap - Tap): every tool above
         # keeps its own clicks, so this only sees otherwise free left input.
-        if self._pan.handle(getattr(self.view, "app", None), ev):
+        if self._pan.handle(getattr(self.view, "app", None), ev, obj):
             if t == E.MouseButtonPress:
                 obj.setFocus()
             self._last = None
             return True
         if t == E.MouseButtonPress:
+            if ev.button() == Qt.RightButton and self.view.mode_2d:
+                self._context_press = ev.position()
             picker = getattr(self.view, "picker", None)
             if picker is not None and ev.button() == Qt.LeftButton:
                 # Handled above (armed Cross Section owns left-press); kept as
@@ -353,6 +469,9 @@ class _InputFilter(QObject):
             return True
         if t == E.MouseButtonRelease:
             self._last = None
+            if context_click:
+                x, y = float(ev.position().x()), float(ev.position().y())
+                QTimer.singleShot(0, lambda: self._show_snt_context_menu(x, y))
             return True
         if t == E.MouseMove:
             picker = getattr(self.view, "picker", None)
@@ -672,9 +791,9 @@ class LntMainView(QObject):
             # weight never re-uploads a point.
             weights = np.ones(256, dtype=np.float32)
             weight = float(getattr(self.app, "class_weight", 1.0) or 1.0)
-            for code, entry in self.app.class_palette.items():
-                code = int(code)
-                if 0 <= code < 256:
+            from gui.class_slots import stored_palette
+            for code, entry in stored_palette(self.app, self.app.class_palette).items():
+                if 0 <= code < 256:      # stored slot (user numbers > 255 mapped)
                     packed[code, :3] = np.clip(
                         np.asarray(entry.get("color", (128, 128, 128)),
                                    dtype=np.float64) * weight, 0, 255).astype(np.uint8)
@@ -697,6 +816,8 @@ class LntMainView(QObject):
                           "predates lnt_view_set_class_weights)")
                 self._palette_baseline = self.app.class_palette
                 self.ptc_applied = True
+                from gui.native_border import apply_border
+                apply_border(self.app, 0)
                 self._refresh_point_statistics()
             print("[LNT] applied the palette from the Display dialog (Apply)")
             return ok
@@ -1151,6 +1272,26 @@ def _refresh_total_points(app):
 
 
 def _show(app, lnt_path, name):
+    # Saving a native document may change the source identity and therefore
+    # reopen it from a newly built local .lnt.  Preserve presentation state
+    # across that renderer handoff: start() intentionally installs a neutral
+    # palette for a genuinely new first open, but an already-applied PTC must
+    # not disappear merely because Save replaced/reopened the document.
+    previous = getattr(app, "_lnt_main_view", None)
+    restore_applied_palette = bool(
+        previous is not None and getattr(previous, "ptc_applied", False)
+    )
+    restore_shading_name = (
+        str(getattr(previous, "shading_name", "class") or "class")
+        if previous is not None else "class"
+    )
+    restore_palette = None
+    if restore_applied_palette:
+        try:
+            from gui.display_mode import clone_palette
+            restore_palette = clone_palette(getattr(app, "class_palette", {}) or {})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[LNT] could not snapshot the applied PTC before reopen: {exc}")
     close_lnt_view(app, reopening=True)
     view = LntMainView(app, lnt_path, name)
     try:
@@ -1162,6 +1303,36 @@ def _show(app, lnt_path, name):
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
     app._lnt_main_view = view
+    if restore_applied_palette and restore_palette:
+        # Restore all three owners of Main View presentation state atomically.
+        # If the dialog keeps its neutral/reinitialised checkbox snapshot, its
+        # next Apply would otherwise hide the cloud even after the GPU LUT was
+        # restored correctly.
+        from gui.display_mode import clone_palette
+        app.class_palette = clone_palette(restore_palette)
+        if not isinstance(getattr(app, "view_palettes", None), dict):
+            app.view_palettes = {}
+        app.view_palettes[0] = clone_palette(restore_palette)
+        dialog = (
+            getattr(app, "display_mode_dialog", None)
+            or getattr(app, "display_dialog", None)
+        )
+        if dialog is not None:
+            if not isinstance(getattr(dialog, "view_palettes", None), dict):
+                dialog.view_palettes = {}
+            dialog.view_palettes[0] = clone_palette(restore_palette)
+            if hasattr(dialog, "sync_slot_visibility_from_palette"):
+                dialog.sync_slot_visibility_from_palette(0, restore_palette)
+        if view._push_applied_palette():
+            view.apply_shading(restore_shading_name)
+            print(
+                "[LNT] restored the applied PTC palette after document reopen "
+                f"(mode={restore_shading_name})"
+            )
+        else:
+            print("[LNT] could not restore the applied PTC palette after document reopen")
+    from gui.native_border import apply_border
+    apply_border(app, 0)
     _keep_vector_overlay(app)
     app.data = None   # full-cloud records are owned by the native file, not a VTK array
     app.loaded_file = getattr(app, "_lnt_source_path", lnt_path)

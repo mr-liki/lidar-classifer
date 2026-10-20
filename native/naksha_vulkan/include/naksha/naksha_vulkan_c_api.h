@@ -112,6 +112,9 @@ NKV_API int nkv_set_point_cloud(NkvHandle handle,
 NKV_API int nkv_set_display_mode(NkvHandle handle, int mode /* NkvDisplayMode */);
 /* Legacy fixed pixel size (pins the adaptive band to one value). */
 NKV_API int nkv_set_point_size(NkvHandle handle, float pixels);
+/* Border percent 0..100; mode 0 per-point, 1 structured union, 2 hybrid.
+ * Uniform-only; no point buffers are modified. Shaded Class disables borders. */
+NKV_API int nkv_set_point_border(NkvHandle handle, float percent, int mode);
 
 /* Adaptive sizing + GPU-side shading parameters. point.vert derives each
  * point's screen footprint from footprint_m / view depth and clamps it to

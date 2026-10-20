@@ -1105,6 +1105,51 @@ class NakshaApp(QMainWindow):
     # Phase 4: Global signal bus
     classification_finished = Signal(object)  # emits changed_mask (numpy array or None)
 
+    # Classification tools that own the canvas click (VTK and native alike).
+    _CLICK_CLASSIFY_TOOLS = frozenset((
+        "above_line", "below_line", "parallel_line", "rectangle", "circle",
+        "polygon", "freehand", "brush", "point",
+    ))
+
+    @property
+    def active_classify_tool(self):
+        """The armed classification tool name, or None."""
+        return getattr(self, "_active_classify_tool_value", None)
+
+    @active_classify_tool.setter
+    def active_classify_tool(self, tool):
+        # Every classification entry point (ribbon, shortcut, ClassPicker,
+        # right-click reactivation) sets this, so arming a classify tool here
+        # turns the latched click tools (Pan, footer Identify ...) off.
+        previous = getattr(self, "_active_classify_tool_value", None)
+        self._active_classify_tool_value = tool
+        if tool in self._CLICK_CLASSIFY_TOOLS and tool != previous:
+            deactivate = getattr(self, "_deactivate_transient_click_tools", None)
+            if callable(deactivate):
+                try:
+                    deactivate(reason=f"{tool} classification activated")
+                except Exception as exc:
+                    print(f"⚠️ Classification stand-down of latched tools failed: {exc}")
+
+    @property
+    def _left_pan_shortcut_active(self):
+        """True while the Pan shortcut tool (Left - Click / Tap - Tap) is armed."""
+        return getattr(self, "_left_pan_shortcut_active_value", False)
+
+    @_left_pan_shortcut_active.setter
+    def _left_pan_shortcut_active(self, active):
+        # Every arm / disarm path (shortcut, Esc, another tool) lands here, so
+        # the native Vulkan canvases switch to / from the pan hand at once.
+        active = bool(active)
+        changed = active != getattr(self, "_left_pan_shortcut_active_value", False)
+        self._left_pan_shortcut_active_value = active
+        if changed:
+            try:
+                from gui.native_pan import refresh_pan_cursors
+                refresh_pan_cursors(self)
+            except Exception as exc:
+                print(f"Pan cursor refresh failed: {exc}")
+
     def __init__(self):
 
        
@@ -1237,6 +1282,10 @@ class NakshaApp(QMainWindow):
         self.section_controller = SectionController(self)
         self.active_mode = None          
         self.last_classify_tool = None
+        self.last_classify_from_classes = None
+        self.last_classify_to_class = None
+        self._right_click_reactivating = False
+        self._right_click_reactivation_in_progress = False
         self.section_dock = None
         self.sec_vtk = None
         self.current_view = "top"
@@ -2542,6 +2591,12 @@ class NakshaApp(QMainWindow):
             self._active_tools = set()
 
         if active:
+            # Any other tool taking the canvas cursor (cross/cut section,
+            # draw, curve, coordinate pick ...) also takes the click, so the
+            # footer Identify / Identify Layer tools step aside.
+            # (Axis guides are a display aid, not a click tool.)
+            if tool_name not in ("point_target_sync", "snt_layer_pick", "axis_guides"):
+                self._deactivate_transient_click_tools(reason=f"{tool_name or 'tool'} activated")
             if tool_name:
                 self._active_tools.add(tool_name)
             self._cursor_state = True
@@ -3420,9 +3475,9 @@ class NakshaApp(QMainWindow):
         self._update_point_sync_footer_state_visual(bool(enabled))
 
         if enabled:
-            if hasattr(self, "snt_layer_pick_tool") and self.snt_layer_pick_tool is not None:
-                if getattr(self.snt_layer_pick_tool, "active", False):
-                    self.snt_layer_pick_tool.deactivate()
+            # Only one click tool at a time: Identify Layer, ribbon tools,
+            # sections, classification, measurement and drawing stand down.
+            self._release_other_click_tools("point_sync_tool")
             self.point_sync_tool.activate()
             self.statusBar().showMessage("🎯 Point target sync enabled", 2000)
         else:
@@ -3450,6 +3505,7 @@ class NakshaApp(QMainWindow):
             return
 
         if enabled:
+            self._release_other_click_tools("snt_layer_pick_tool")
             self.snt_layer_pick_tool.activate()
             self.statusBar().showMessage("🎯 Identify Layer activated (click SNT, DXF, or GIS features in main view). Click again or press Esc to deactivate.", 2500)
         else:
@@ -4761,6 +4817,202 @@ class NakshaApp(QMainWindow):
             print("🚫 Point-pick tools auto-disabled (Cross/Cut Section activated)")
         return disabled
 
+    # Footer click tools: Identify (point target sync) and Identify Layer.
+    _FOOTER_PICK_TOOLS = ("point_sync_tool", "snt_layer_pick_tool")
+
+    def _deactivate_transient_click_tools(self, keep=None, reason="another tool activated",
+                                          source=None):
+        """Turn off the latched click tools another tool is taking over from.
+
+        Those are the footer Identify / Identify Layer tools, the Pan shortcut
+        tool and the Identify-ribbon tools (Identify / Zoom / Select). ``keep``
+        is the tool being activated ("point_sync_tool", "snt_layer_pick_tool"
+        or "pan"); ``source`` "IdentificationRibbon" leaves that ribbon's own
+        tools to its handlers. Called from every activation chokepoint (ribbon
+        buttons, shortcuts, canvas-cursor owners, right-click reactivation).
+        Returns True when anything was turned off.
+        """
+        if getattr(self, "_releasing_click_tools", False):
+            return False
+        disabled = False
+        if keep != "pan" and self._disarm_pan_tool(reason):
+            disabled = True
+        if source != "IdentificationRibbon" and self._identify_tab_tool_active():
+            self._deactivate_identify_tab_tools()
+            disabled = True
+        for tool_name in self._FOOTER_PICK_TOOLS:
+            if tool_name == keep:
+                continue
+            tool = getattr(self, tool_name, None)
+            if tool is None or not getattr(tool, "active", False):
+                continue
+            try:
+                tool.deactivate()
+                disabled = True
+                print(f"🚫 Footer {tool_name} deactivated ({reason})")
+            except Exception as exc:
+                print(f"⚠️ Could not deactivate footer {tool_name}: {exc}")
+        return disabled
+
+    def _identify_tab_tool_active(self):
+        """True while an Identify-ribbon tool (Identify / Zoom / Select) is armed."""
+        ribbon = getattr(getattr(self, "ribbon_manager", None), "ribbons", {}).get("identify")
+        return bool(ribbon is not None and (
+            getattr(ribbon, "identify_active", False)
+            or getattr(ribbon, "zoom_rectangle_active", False)
+            or getattr(ribbon, "select_rectangle_active", False)
+        ))
+
+    def _disarm_pan_tool(self, reason="another tool activated"):
+        """Turn the Pan shortcut tool (Left - Click / Tap - Tap) off.
+
+        Restores the persistent panning-button preference the shortcut
+        overrode and ends any pan in progress in the native main and
+        cross/cut canvases. Returns True when Pan was armed.
+        """
+        if not self._left_pan_shortcut_active:
+            return False
+        try:
+            from gui.execute_tool import _deactivate_pan_navigation_safely
+            _deactivate_pan_navigation_safely(self)   # flag off + panning button restored
+        except Exception as exc:
+            self._left_pan_shortcut_active = False
+            print(f"⚠️ Pan stand-down incomplete: {exc}")
+        gestures = []
+        view = getattr(self, "_lnt_main_view", None)
+        gestures.append(getattr(getattr(view, "_filter", None), "_pan", None))
+        try:
+            from gui.native_sections import manager
+            sections = manager(self, create=False)
+            if sections is not None:
+                gestures.extend(getattr(c, "pan_gesture", None) for c in sections.views.values())
+        except Exception:
+            pass
+        for gesture in gestures:
+            if gesture is not None:
+                try:
+                    gesture.finish()
+                except Exception:
+                    pass
+        print(f"[PAN] tool disarmed ({reason})")
+        try:
+            self.statusBar().showMessage(f"Pan deactivated ({reason})", 2500)
+        except Exception:
+            pass
+        return True
+
+    def _release_other_click_tools(self, owner):
+        """Stand down every other click tool before ``owner`` takes the canvas.
+
+        ``owner`` is the tool being activated: a footer pick tool
+        ("point_sync_tool" / "snt_layer_pick_tool") or "pan". Completed
+        cross/cut docks and finished measurements/drawings stay; only the
+        tools that own left-click (VTK and native .lnt) are released and
+        their ribbon buttons unchecked.
+        """
+        self._deactivate_transient_click_tools(keep=owner, reason=f"{owner} activated")
+        self._releasing_click_tools = True
+        try:
+            # Identify ribbon (Identify / Zoom / Select).
+            self._deactivate_identify_tab_tools()
+            self._deactivate_selection_tools(f"{owner} activated")
+
+            # Cross / Cut placement (completed docks stay open).
+            if getattr(self, "cross_section_active", False):
+                cancel_cross = getattr(self, "_cancel_cross_section_tool_only", None)
+                if callable(cancel_cross):
+                    cancel_cross()
+            self._deactivate_pending_cut_section_tool(f"{owner} activated")
+
+            # Classification.
+            if getattr(self, "active_classify_tool", None) is not None or getattr(
+                self, "classify_interactor", None
+            ) or getattr(self, "classify_interactors", None) or getattr(
+                self, "cut_classify_interactor", None
+            ):
+                try:
+                    self.deactivate_classification_tool(preserve_cross_section=True)
+                except Exception as exc:
+                    print(f"⚠️ {owner}: classification stand-down failed: {exc}")
+                self.active_classify_tool = None
+
+            # Measurement, temp fence, draw/AccuDraw, curve, coordinate pick.
+            from gui.execute_tool import (
+                _deactivate_measurement_tool_safely,
+                _deactivate_temp_fence_safely,
+            )
+            _deactivate_measurement_tool_safely(self, f"{owner} activated")
+            _deactivate_temp_fence_safely(self, f"{owner} activated")
+            self._deactivate_digitize_tool()
+            curve_tool = getattr(self, "curve_tool", None)
+            if curve_tool is not None:
+                try:
+                    if getattr(curve_tool, "active", False):
+                        if callable(getattr(curve_tool, "suspend", None)):
+                            curve_tool.suspend()
+                        elif callable(getattr(curve_tool, "_cancel_curve", None)):
+                            curve_tool._cancel_curve()
+                    if getattr(curve_tool, "_select_mode", False):
+                        curve_tool.deactivate_select_mode()
+                except Exception as exc:
+                    print(f"⚠️ {owner}: curve stand-down failed: {exc}")
+            coordinate_pick = getattr(self, "coordinate_pick_tool", None)
+            if coordinate_pick is not None and getattr(coordinate_pick, "active", False):
+                try:
+                    coordinate_pick.deactivate()
+                except Exception:
+                    pass
+
+            # XS (cross-section measuring) - its toggled handler stands the
+            # VTK or native tool down.
+            measure_ribbon = getattr(getattr(self, "ribbon_manager", None), "ribbons", {}).get("measure")
+            xs_btn = getattr(measure_ribbon, "cross_section_measure_btn", None)
+            if xs_btn is not None and xs_btn.isChecked():
+                xs_btn.setChecked(False)
+
+            self._release_native_click_tools()
+
+            ribbon_manager = getattr(self, "ribbon_manager", None)
+            if ribbon_manager is not None:
+                ribbon_manager.clear_all_tool_buttons()
+                try:
+                    from gui.native_shortcuts import refresh_measure_ribbon
+                    refresh_measure_ribbon(self)
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"⚠️ {owner}: tool stand-down failed: {exc}")
+        finally:
+            self._releasing_click_tools = False
+
+    def _release_native_click_tools(self):
+        """Cancel native (.lnt / SNT viewport) gesture owners, like a native shortcut does."""
+        try:
+            from gui.native_shortcuts import cancel_native_measurements
+            cancel_native_measurements(self)
+        except Exception:
+            pass
+        view = getattr(self, "_lnt_main_view", None)
+        if view is None or getattr(view, "native", None) is None:
+            return
+        try:
+            from gui.native_sections import manager
+            sections = manager(self)
+            sections.cancel_cut()
+            sections.cancel_cross()
+            owners = [view] + list(sections.views.values())
+        except Exception as exc:
+            print(f"⚠️ Native section stand-down failed: {exc}")
+            owners = [view]
+        for owner in owners:
+            for attr in ("classifier", "measurement", "drawing"):
+                tool = getattr(owner, attr, None)
+                if tool is not None and callable(getattr(tool, "cancel", None)):
+                    try:
+                        tool.cancel()
+                    except Exception:
+                        pass
+
     def enable_cross_section_mode(self):   #Added by bala
         from gui.native_sections import manager
         native_sections = manager(self)
@@ -5315,18 +5567,11 @@ class NakshaApp(QMainWindow):
                         active_tool = getattr(app, "active_classify_tool", None)
                         section_has_classifier = bool(getattr(app, "classify_interactors", None))
                         if active_tool is None or not section_has_classifier:
-                            last_tool = getattr(app, "last_classify_tool", None)
-                            if last_tool and hasattr(app, "set_classify_tool"):
-                                try:
-                                    app.from_classes = getattr(app, "last_classify_from_classes", None)
-                                    app.to_class = getattr(app, "last_classify_to_class", None)
-                                    app._right_click_reactivating = True
-                                    try:
-                                        app.set_classify_tool(last_tool)
-                                    finally:
-                                        app._right_click_reactivating = False
-                                except Exception as e:
-                                    print(f"   ⚠️ Right-click reactivate failed: {e}")
+                            helper = getattr(app, "reactivate_last_classification_from_right_click", None)
+                            if callable(helper) and helper(
+                                "cross", focus_widget=vtk_widget, native=False
+                            ):
+                                app._abort_vtk_right_click(obj)
                     return _handler
                 # Remove old observer if any
                 old_tag = self._section_right_click_observers.get(view_index)
@@ -10170,7 +10415,193 @@ class NakshaApp(QMainWindow):
             traceback.print_exc()
             print(f"{'='*60}\n")
         # ------------------ Classification Tools ------------------
-        
+
+    @staticmethod
+    def _clone_classification_filter(value):
+        """Return an isolated snapshot of a From-class filter."""
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, set):
+            return list(value)
+        return value
+
+    @staticmethod
+    def _abort_vtk_right_click(obj):
+        """Consume a VTK right-click after it has been used for tool handoff."""
+        try:
+            if hasattr(obj, "AbortFlagOn"):
+                obj.AbortFlagOn()
+            elif hasattr(obj, "SetAbortFlag"):
+                obj.SetAbortFlag(1)
+        except Exception:
+            pass
+
+    def reactivate_last_classification_from_right_click(
+        self,
+        target="cross",
+        focus_widget=None,
+        *,
+        native=False,
+        fallback_tool=None,
+    ):
+        """Reactivate the remembered classifier from a section-view right click.
+
+        This is the single arbitration point used by VTK and native Vulkan
+        cross/cut views. It does not steal a right-click from a tool that owns
+        that gesture (measurement or an in-progress cut). If the section view
+        is otherwise idle, it atomically stands down transient section/cut/pan
+        state, restores the remembered From/To snapshot, arms the remembered
+        classifier, refreshes ClassPicker, and returns focus to the view that
+        initiated the handoff.
+        """
+        drawable = {
+            "above_line", "below_line", "parallel_line",
+            "rectangle", "circle", "freehand", "polygon", "brush", "point",
+        }
+        target = "cut" if str(target).lower() == "cut" else "cross"
+
+        if getattr(self, "_shutdown_in_progress", False):
+            return False
+        if getattr(self, "_right_click_reactivation_in_progress", False):
+            return False
+
+        # An already-active classifier owns right-click only when it is actually
+        # attached/effective in this target view. A tool can remain active on
+        # the cut/main view while cross-section interactors were restored; in
+        # that detached case right-click is allowed to rebind it to cross view.
+        active_tool = getattr(self, "active_classify_tool", None)
+        if active_tool in drawable:
+            if native:
+                return False
+            if target == "cross" and bool(getattr(self, "classify_interactors", None)):
+                return False
+            if target == "cut" and getattr(self, "cut_classify_interactor", None) is not None:
+                return False
+
+        # Measurements own right-click until their own handler releases them.
+        xs_measure = getattr(self, "cross_section_measurement_tool", None)
+        if xs_measure is not None and getattr(xs_measure, "active", False):
+            return False
+        if native and focus_widget is not None:
+            measurement = getattr(focus_widget, "measurement", None)
+            if measurement is not None and getattr(measurement, "active", False):
+                return False
+
+        # Pending cut placement owns right-click as Cancel.
+        if native and focus_widget is not None and getattr(focus_widget, "cut_armed", False):
+            return False
+        if not native:
+            cut_ctrl = getattr(self, "cut_section_controller", None)
+            if cut_ctrl is not None and getattr(cut_ctrl, "_state", 0) in (1, 2):
+                return False
+
+        last_tool = getattr(self, "last_classify_tool", None) or fallback_tool
+        if last_tool not in drawable:
+            return False
+
+        from_state = self._clone_classification_filter(
+            getattr(self, "last_classify_from_classes", None)
+        )
+        to_state = getattr(self, "last_classify_to_class", None)
+
+        self._right_click_reactivation_in_progress = True
+        self._right_click_reactivating = True
+        try:
+            # Release transient pan ownership first (restores the panning
+            # button preference the Pan shortcut overrode).
+            self._disarm_pan_tool("classification reactivated")
+            try:
+                pan_gesture = getattr(focus_widget, "pan_gesture", None)
+                if pan_gesture is not None and hasattr(pan_gesture, "finish"):
+                    pan_gesture.finish()
+            except Exception:
+                pass
+
+            # Cross-section locate/draw is replaceable by this right-click
+            # handoff; keep the already-created section views intact.
+            if getattr(self, "cross_section_active", False):
+                cancel_cross = getattr(self, "_cancel_cross_section_tool_only", None)
+                if callable(cancel_cross):
+                    cancel_cross()
+
+            # Footer Identify / Identify Layer would compete for the click.
+            self._deactivate_transient_click_tools(reason="classification reactivated")
+
+            # Temp Fence can otherwise leave competing click observers alive.
+            try:
+                temp_fence = getattr(self, "temp_fence_tool", None)
+                if temp_fence is not None and hasattr(temp_fence, "deactivate"):
+                    temp_fence.deactivate()
+            except Exception:
+                pass
+
+            self.from_classes = self._clone_classification_filter(from_state)
+            self.to_class = to_state
+
+            if native:
+                # Native section canvases read classification state directly;
+                # do not route through the VTK/main-view attachment path.
+                sections = getattr(self, "_native_sections", None)
+                if sections is not None:
+                    try:
+                        sections.cancel_cut()
+                    except Exception:
+                        pass
+                    try:
+                        sections.cancel_cross()
+                    except Exception:
+                        pass
+
+                from gui.native_shortcuts import _sync_class_picker_for_native_shortcut
+                picker_synced = _sync_class_picker_for_native_shortcut(
+                    self, last_tool, self.from_classes, self.to_class
+                )
+                # Classification state is published before ClassPicker UI work.
+                # If Windows/Qt rejects a popup operation, still consume this
+                # right-click as long as the native classifier was armed; do not
+                # let the same click fall through into another tool.
+                if (not picker_synced
+                        and getattr(self, "active_classify_tool", None) != last_tool):
+                    return False
+                self.active_classify_target = target
+            else:
+                self.set_classify_tool(last_tool)
+                if getattr(self, "active_classify_tool", None) != last_tool:
+                    return False
+                self.active_classify_target = target
+
+            # Raising/restoring ClassPicker must not steal the next classify click.
+            if focus_widget is not None:
+                try:
+                    focus_widget.setFocus()
+                except Exception:
+                    try:
+                        focus_widget.interactor.setFocus()
+                    except Exception:
+                        pass
+
+            try:
+                self.statusBar().showMessage(
+                    f"Classification resumed: {last_tool.replace('_', ' ')}", 2000
+                )
+            except Exception:
+                pass
+
+            print(
+                "RIGHT_CLICK_CLASSIFY_REACTIVATE "
+                f"target={target} native={int(bool(native))} "
+                f"tool={last_tool} from={self.from_classes} to={self.to_class}"
+            )
+            return True
+        except Exception as exc:
+            print(f"Right-click classification reactivation failed: {exc}")
+            return False
+        finally:
+            self._right_click_reactivating = False
+            self._right_click_reactivation_in_progress = False
+
     def set_classify_tool(self, tool_name):
             """
             Activate a classification tool.
@@ -10391,7 +10822,9 @@ class NakshaApp(QMainWindow):
             }
             if tool_name in _DRAWABLE_TOOLS:
                 self.last_classify_tool = tool_name
-                self.last_classify_from_classes = getattr(self, "from_classes", None)
+                self.last_classify_from_classes = self._clone_classification_filter(
+                    getattr(self, "from_classes", None)
+                )
                 self.last_classify_to_class = getattr(self, "to_class", None)
 
             self.from_classes = getattr(self, "from_classes", None)
@@ -13687,10 +14120,10 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"⚠️ Failed to load elevation ramp: {e}")
                     self.elevation_color_ramp = None
-            self.shading_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
+            self.shading_quality = "normal"
             if self.shading_quality not in ("fast", "normal", "slow"):
                 self.shading_quality = "normal"
-            self.surface_quality = str(settings.value("global_surface_quality", "normal") or "normal").lower()
+            self.surface_quality = "normal"
             if self.surface_quality not in ("fast", "normal", "slow"):
                 self.surface_quality = "normal"
 
@@ -16235,7 +16668,7 @@ class NakshaApp(QMainWindow):
             if not hasattr(self, '_section_right_click_observers'):
                 self._section_right_click_observers = {}
 
-            def _make_right_click_handler(app):
+            def _make_right_click_handler(app, target_widget):
                 def _handler(obj, event):
                     cs_measure = getattr(app, "cross_section_measurement_tool", None)
                     if cs_measure is not None and getattr(cs_measure, "active", False):
@@ -16244,18 +16677,11 @@ class NakshaApp(QMainWindow):
                     active_tool = getattr(app, "active_classify_tool", None)
                     section_has_classifier = bool(getattr(app, "classify_interactors", None))
                     if active_tool is None or not section_has_classifier:
-                        last_tool = getattr(app, "last_classify_tool", None)
-                        if last_tool and hasattr(app, "set_classify_tool"):
-                            try:
-                                app.from_classes = getattr(app, "last_classify_from_classes", None)
-                                app.to_class = getattr(app, "last_classify_to_class", None)
-                                app._right_click_reactivating = True
-                                try:
-                                    app.set_classify_tool(last_tool)
-                                finally:
-                                    app._right_click_reactivating = False
-                            except Exception as e:
-                                print(f"   ⚠️ Right-click reactivate failed: {e}")
+                        helper = getattr(app, "reactivate_last_classification_from_right_click", None)
+                        if callable(helper) and helper(
+                            "cross", focus_widget=target_widget, native=False
+                        ):
+                            app._abort_vtk_right_click(obj)
                 return _handler
 
             if hasattr(self, 'section_vtks') and self.section_vtks:
@@ -16272,7 +16698,7 @@ class NakshaApp(QMainWindow):
                                     pass
                             self._apply_plain_section_2d_style(interactor, vtk_widget)
                             tag = interactor.AddObserver(
-                                "RightButtonPressEvent", _make_right_click_handler(self), 1.0
+                                "RightButtonPressEvent", _make_right_click_handler(self, vtk_widget), 1.0
                             )
                             self._section_right_click_observers[view_idx] = tag
                             print(f"   ✅ View {view_idx + 1}: Interactor restored (fallback)")
@@ -16324,18 +16750,11 @@ class NakshaApp(QMainWindow):
                 active_tool = getattr(app, "active_classify_tool", None)
                 section_has_classifier = bool(getattr(app, "classify_interactors", None))
                 if active_tool is None or not section_has_classifier:
-                    last_tool = getattr(app, "last_classify_tool", None)
-                    if last_tool and hasattr(app, "set_classify_tool"):
-                        try:
-                            app.from_classes = getattr(app, "last_classify_from_classes", None)
-                            app.to_class = getattr(app, "last_classify_to_class", None)
-                            app._right_click_reactivating = True
-                            try:
-                                app.set_classify_tool(last_tool)
-                            finally:
-                                app._right_click_reactivating = False
-                        except Exception as e:
-                            print(f"   ⚠️ Right-click reactivate failed: {e}")
+                    helper = getattr(app, "reactivate_last_classification_from_right_click", None)
+                    if callable(helper) and helper(
+                        "cross", focus_widget=vtk_widget, native=False
+                    ):
+                        app._abort_vtk_right_click(obj)
             return _handler
 
         # Ensure plain 2D style is set
@@ -19492,6 +19911,9 @@ class NakshaApp(QMainWindow):
             print(f"⚠️ Failed to refresh 2D lock: {e}")
         
     def _save_quick_no_dialog(self):
+        from .native_save import native_active, save_native
+        if native_active(self):
+            return save_native(self)
         from .save_pointcloud import save_pointcloud, has_fenced_parent_writeback
 
         if has_fenced_parent_writeback(self):

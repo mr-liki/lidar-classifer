@@ -244,7 +244,8 @@ class NativeSelectRect:
         try:
             palette = getattr(self.app, "class_palette", None)
             if isinstance(palette, dict) and palette:
-                vis = [int(c) for c, i in palette.items()
+                from gui.class_slots import stored_palette  # noqa: PLC0415
+                vis = [int(c) for c, i in stored_palette(self.app, palette).items()
                        if isinstance(i, dict) and i.get("show", True)]
                 if vis:
                     cls = np.asarray(store.data["classification"])[rows]

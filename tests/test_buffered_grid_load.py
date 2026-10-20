@@ -4,6 +4,9 @@ import laspy
 import numpy as np
 import pytest
 
+from gui.data_loader import _extract_classification_array
+from gui.lnt_open import _laz_to_las
+
 from gui.grid_label_system import (
     GridLabelManager,
     _buffer_polygon_xy,
@@ -25,6 +28,53 @@ def _write_las(path, classes):
     las.z = np.zeros(count, dtype=float)
     las.classification = np.asarray(classes, dtype=np.uint8)
     las.write(path)
+
+
+def test_legacy_las_extended_class_51_is_not_collapsed_to_19():
+    las = SimpleNamespace(
+        header=SimpleNamespace(version="1.2", point_format=SimpleNamespace(id=3)),
+        point_format=SimpleNamespace(
+            dimension_names={"classification", "synthetic", "key_point", "withheld"}
+        ),
+        classification=np.asarray([19, 19, 7], dtype=np.uint8),
+        synthetic=np.asarray([1, 0, 0], dtype=np.uint8),
+        key_point=np.zeros(3, dtype=np.uint8),
+        withheld=np.zeros(3, dtype=np.uint8),
+        vlrs=[],
+    )
+
+    assert _extract_classification_array(las).tolist() == [51, 19, 7]
+
+
+def test_lnt_laz_bridge_promotes_legacy_packed_class_51(tmp_path):
+    source = tmp_path / "legacy.laz"
+    promoted = tmp_path / "promoted.las"
+    header = laspy.LasHeader(point_format=3, version="1.2")
+    las = laspy.LasData(header)
+    las.x = [1.0, 2.0, 3.0]
+    las.y = [1.0, 2.0, 3.0]
+    las.z = [1.0, 2.0, 3.0]
+    las.classification = np.asarray([19, 19, 7], dtype=np.uint8)
+    las.synthetic = np.asarray([1, 0, 0], dtype=bool)
+    las.red = np.asarray([65535, 0, 0], dtype=np.uint16)
+    las.green = np.zeros(3, dtype=np.uint16)
+    las.blue = np.zeros(3, dtype=np.uint16)
+    try:
+        las.write(source)
+    except laspy.LaspyException as exc:
+        pytest.skip(f"LAZ backend unavailable: {exc}")
+
+    _laz_to_las(
+        str(source), str(promoted), lambda *_args: None, lambda: False, chunk=2
+    )
+    loaded = laspy.read(promoted)
+
+    # Format 7 is format 6 plus RGB: the promotion must keep the legacy
+    # colour channels, not only the packed class byte.
+    assert loaded.header.point_format.id == 7
+    assert np.asarray(loaded.classification).tolist() == [51, 19, 7]
+    assert np.asarray(loaded.red).tolist() == [65535, 0, 0]
+    assert np.asarray(loaded.green).tolist() == [0, 0, 0]
 
 
 def test_buffer_polygon_contains_primary_and_requested_neighbor_strip():

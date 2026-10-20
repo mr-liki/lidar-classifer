@@ -4,6 +4,7 @@ import math
 from PySide6.QtCore import QEvent, QObject, Qt
 from gui.native_section_classify import CanvasOverlay
 from gui.measure_settings_dialog import load_measure_settings
+from gui.native_measure_geometry import measurement_distance, measurement_text
 
 
 class NativeMeasure:
@@ -42,13 +43,11 @@ class NativeMeasure:
 
     @staticmethod
     def distance(points):
-        return sum(math.hypot(b[0]-a[0], b[1]-a[1]) for a, b in zip(points, points[1:]))
+        return measurement_distance(points)
 
     @staticmethod
     def _text(distance, unit):
-        if unit == 'km':
-            return f'{distance / 1000.0:.3f} km'
-        return f'{distance:.3f} m'
+        return measurement_text(distance, unit)
 
     def _status(self, message, timeout=4000):
         bar = getattr(self.app, 'statusBar', lambda: None)()
@@ -109,13 +108,16 @@ class NativeMeasure:
         return self._pick_area(world, 'grid')
 
     def _finish(self):
-        if len(self.points) < 2:
+        if len(self.points) < 2 or self.distance(self.points) <= 1e-12:
             self.points, self.hover = [], None
             self._paint()
             return False
         points = list(self.points)
         self.completed.append(points)
         self.completed_modes.append(bool(self.path))
+        # Finishing a draft invalidates its per-vertex redo history. Otherwise
+        # redo could append an old point to an unrelated new measurement.
+        self.undone.clear()
         style = self._style()
         self._status(f'{"Path" if self.path else "Line"}: '
                      f'{self._text(self.distance(points), style.get("unit", "m"))}')
@@ -124,10 +126,23 @@ class NativeMeasure:
         return True
 
     def _paint(self):
+        # Highlight *the existing measurement stroke* in its own overlay,
+        # rather than drawing a second polygon into the Draw overlay (which
+        # could appear underneath the measurement layer on some Qt windows).
+        # No calls to selection_manager.get_features() here: that would prune
+        # and repaint recursively while Qt is rendering this overlay.
+        owner = getattr(self.canvas, 'owner', None)
+        draw = getattr(owner, 'drawing', None)
+        bridge = getattr(draw, '_selection_bridge', None)
+        selected = (bridge.selection_manager._selected if bridge is not None else {})
+        hovered = getattr(bridge, '_hover_feature', None) if bridge is not None else None
+        hovered_key = hovered.get('key') if hovered and hovered.get('source') == 'measure' else None
         shapes = [('measurement', points,
                    {'style': self._style(self.completed_modes[i] if i < len(self.completed_modes) else False),
                     'path': self.completed_modes[i] if i < len(self.completed_modes) else False,
-                    'complete': True})
+                    'complete': True, 'highlight_scope': 'measure',
+                    'selected': ('measure', id(self), id(points)) in selected,
+                    'hovered': ('measure', id(self), id(points)) == hovered_key})
                   for i, points in enumerate(self.completed)]
         for cell in self.grids:
             # Closed cell outline + centroid area label (see CanvasOverlay:
@@ -138,7 +153,12 @@ class NativeMeasure:
                             'grid_label': cell['label'],
                             'complete': True}))
         if self.points:
-            shapes.append(('measurement', self.points + ([self.hover] if self.hover else []),
+            preview = list(self.points)
+            if (self.hover is not None and len(self.hover) >= 2
+                    and (self.hover[0] != self.points[-1][0]
+                         or self.hover[1] != self.points[-1][1])):
+                preview.append(self.hover)
+            shapes.append(('measurement', preview,
                            {'style': self._style(), 'path': self.path, 'complete': False}))
         self.overlay.set_shapes(shapes)
 
@@ -179,7 +199,9 @@ class NativeMeasure:
             self._paint()
             return True
         if button == Qt.RightButton:
-            if self.path:
+            if self.path or getattr(self, 'style_key', None) != 'cross_section':
+                # Line and Path both have SmartLine-style multi-click input.
+                # Cross-section measurement remains the existing two-click tool.
                 self._finish()
             else:
                 self.points, self.hover = [], None
@@ -187,15 +209,23 @@ class NativeMeasure:
             return True
         if button != Qt.LeftButton:
             return False
-        self.points.append(self.canvas.section_at(pos.x(), pos.y()))
+        point = self.canvas.section_at(pos.x(), pos.y())
+        if point is None or len(point) < 2:
+            return True
+        if self.points and point[0] == self.points[-1][0] and point[1] == self.points[-1][1]:
+            return True  # A double-click must not create a zero-length leg.
+        self.points.append(point)
         self.undone.clear()
-        if not self.path and len(self.points) == 2:
-            self._finish()
+        if (getattr(self, 'style_key', None) == 'cross_section'
+                and not self.path and len(self.points) == 2):
+            self._finish()  # Preserve cross-section's original two-click workflow.
         else:
             self._paint()
-            if self.path and len(self.points) > 1:
+            if len(self.points) > 1:
                 style = self._style()
-                self._status(f'Path: {self._text(self.distance(self.points), style.get("unit", "m"))}; '
+                name = 'Path' if self.path else 'Line'
+                self._status(f'{name} total: '
+                             f'{self._text(self.distance(self.points), style.get("unit", "m"))}; '
                              'click next point or right-click to finish')
         return True
 
@@ -207,10 +237,13 @@ class NativeMeasure:
         return True
 
     def double_click(self, pos, button):
-        if not self.active or not self.path or button != Qt.LeftButton:
+        if (not self.active or self.area_mode or button != Qt.LeftButton
+                or getattr(self, 'style_key', None) == 'cross_section'):
             return False
         point = self.canvas.section_at(pos.x(), pos.y())
-        if not self.points or point != self.points[-1]:
+        if (point is not None and len(point) >= 2
+                and (not self.points or point[0] != self.points[-1][0]
+                     or point[1] != self.points[-1][1])):
             self.points.append(point)
         self._finish()
         return True

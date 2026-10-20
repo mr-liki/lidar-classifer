@@ -1436,18 +1436,21 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
 
     # ✅ CRITICAL: Update ClassPicker BUT keep focus on main view
     class_picker = _get_live_class_picker(app_window)
-    if class_picker is not None:
+    try:
+        if class_picker is None:
+            from gui.class_picker import ClassPicker
+            app_window.class_picker = ClassPicker(app_window, parent=app_window)
+            class_picker = app_window.class_picker
+            class_picker.configure_for_background_mode()
+        class_picker.sync_with_app()
+        class_picker.ensure_visible()
+    except (RuntimeError, ReferenceError, AttributeError):
         try:
-            class_picker.sync_with_app()
-            if not _class_picker_is_visible(class_picker):
-                class_picker.show()
-        except (RuntimeError, ReferenceError, AttributeError):
-            try:
-                app_window.class_picker = None
-            except Exception:
-                pass
+            app_window.class_picker = None
         except Exception:
             pass
+    except Exception as exc:
+        print(f"ClassPicker shortcut activation failed: {exc}")
 
     # ✅ CRITICAL: Return focus to appropriate view
     if classification_target == "cross":

@@ -136,4 +136,5 @@ class NativeIdentify:
         best = int(np.argmin(d2))
         if float(d2[best]) > (half * 3.0) ** 2:
             return None
-        return int(rows[best]), pts[best], int(cls[best])
+        from gui.class_slots import code_for
+        return int(rows[best]), pts[best], code_for(self.app, int(cls[best]))   # user class number

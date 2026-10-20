@@ -183,6 +183,7 @@ class SectionCanvas(QWidget):
         self.cut_source = None
         self.mode = 'class'
         self.palette = {}
+        self._render_palette = {}      # the same palette keyed by stored slot
         self.shading_parameters = (45., 45., .25)
         self._display_revision = 0
         self._mesh_future = None
@@ -403,7 +404,7 @@ class SectionCanvas(QWidget):
         # _finish_mesh on the GUI thread, guarded by a display revision.
         revision = self._display_revision
         future = _mesh_workers.submit(build_mesh_data, xyz, np.ascontiguousarray(display[mask]),
-                                      classes[mask].copy(), self.palette, self.mode, options)
+                                      classes[mask].copy(), self._render_palette, self.mode, options)
         self._mesh_future = future
         self._pending_mesh_revision = revision
         self._pending_mesh_key = signature
@@ -436,7 +437,7 @@ class SectionCanvas(QWidget):
             self._surface_loaded = self._surface_resident = True
             self._dirty = True
             return True
-        colors = recolor_mesh(data, classes_masked, self.palette)
+        colors = recolor_mesh(data, classes_masked, self._render_palette)
         if colors is None:
             return False
         update = getattr(self.backend, 'update_surface_colors', None)
@@ -462,6 +463,10 @@ class SectionCanvas(QWidget):
             raise ValueError(f'Unknown section display mode: {mode}')
         self.palette = {int(k): dict(v) for k, v in (palette or {}).items()}
         self.mode = mode
+        # Native tables are keyed by the stored one-byte class slot, so user
+        # numbers above 255 keep their colour, weight and visibility.
+        from gui.class_slots import stored_palette
+        self._render_palette = stored = stored_palette(self.owner.app, self.palette)
         self._display_revision += 1
         if self._mesh_future is not None:
             self._mesh_future.cancel()
@@ -485,9 +490,9 @@ class SectionCanvas(QWidget):
         if source_ids is None and (mode == 'line' or any(not shown for shown in lines.values())):
             self._load_source_lines(store)
             return
-        mask = visibility(classes, self.palette, getattr(app, '_import_class_blocked', ()), source_ids, lines)
+        mask = visibility(classes, stored, getattr(app, '_import_class_blocked', ()), source_ids, lines)
         if mode == 'surface':
-            for code, entry in self.palette.items():
+            for code, entry in stored.items():
                 support = entry.get('surface', entry.get('surface_support', True))
                 if support is not None and not support:
                     mask &= classes != code
@@ -502,11 +507,16 @@ class SectionCanvas(QWidget):
         firsts, counts = draw_ranges(mask)
         self.backend.set_point_draw_ranges(firsts, counts)
         if not np.any(mask):
+            # An empty range list tells the engine to draw the whole buffer,
+            # so hiding every class must hide the cloud (and its border
+            # shells) explicitly - otherwise the view shows everything.
+            self.backend.set_point_cloud_visible(False)
+            self._dirty = True
             return
         display = self.local if self.axis == 0 else self.local[:, [1, 0, 2]]
         colors = np.full((256, 3), 128, dtype=np.uint8)
         weights = np.ones(256, dtype=np.float32)
-        for code, rule in self.palette.items():
+        for code, rule in stored.items():   # stored slot (user > 255 mapped)
             if 0 <= code < 256:
                 colors[code] = rule.get('color', (128, 128, 128))
                 try:
@@ -516,6 +526,8 @@ class SectionCanvas(QWidget):
         self.backend.set_point_luts(class_rgb=colors,
             elevation_rgb=rainbow(np.linspace(0, 1, 256), getattr(app, 'elevation_color_ramp', None)),
             intensity_rgb=np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1))
+        # Visibility already narrowed the draw ranges above, so every class
+        # left in them is shown; slots keep the LUT/resolution consistent.
         self.backend.set_class_visibility(np.ones(256, dtype=np.uint8))
         self.backend.set_class_weights(weights)
         # Line mode uses source IDs, never classification IDs. Restore original
@@ -547,6 +559,8 @@ class SectionCanvas(QWidget):
             float(getattr(app, 'intensity_contrast', 1.)), float(getattr(app, 'intensity_gamma', 1.35)))
         self.backend.set_display_mode(0 if mode == 'depth' else POINT_MODES[mode])
         self.backend.set_point_cloud_visible(True)
+        from gui.native_border import apply_border
+        apply_border(self.owner.app, self.slot)
         self._dirty = True
 
     @Slot(int, object, str)
@@ -744,7 +758,7 @@ class SectionCanvas(QWidget):
                 or (measurement is not None and getattr(measurement, 'active', False))):
             self.pan_gesture.finish()
             return False
-        return self.pan_gesture.handle(self.owner.app, event)
+        return self.pan_gesture.handle(self.owner.app, event, self)
 
     def mousePressEvent(self, event):
         self.setFocus()
@@ -760,6 +774,21 @@ class SectionCanvas(QWidget):
                 and self.owner.locate(self, event.position())):
             return
         if event.button() == Qt.RightButton:
+            # An armed cut owns right-click as Cancel. Otherwise an idle native
+            # cross/cut canvas resumes the last classifier, matching VTK views.
+            if self.cut_armed:
+                self.owner.cancel_cut()
+                event.accept()
+                return
+            helper = getattr(
+                self.owner.app, "reactivate_last_classification_from_right_click", None
+            )
+            target = "cut" if self.slot == CUT_SLOT else "cross"
+            if callable(helper) and helper(
+                target, focus_widget=self, native=True
+            ):
+                event.accept()
+                return
             self.owner.cancel_cut()
         elif event.button() == Qt.LeftButton and self.cut_armed:
             x = self.horizontal_at(event.position().x())
