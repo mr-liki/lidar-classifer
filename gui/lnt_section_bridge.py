@@ -82,8 +82,14 @@ def _sorted_positions(haystack, needles, needles_sorted):
     if _njit is not None and needles_sorted and len(needles) > 4096:
         return _merge_searchsorted(haystack, needles)
     return np.searchsorted(haystack, needles)
-FLUSH_INTERVAL_MS = 400
-SHOW_WRITE_DELAY_MS = 30     # after show(): write once the recoloured frame is presented
+# Interactive classification must never block on a full-store diff or one disk
+# write per click.  GPU recolour is immediate; durable LNT writes are coalesced.
+# A periodic max-latency flush keeps long classification sessions durable without
+# stealing every tap from the GUI thread.
+FLUSH_INTERVAL_MS = 1000
+SHOW_WRITE_DELAY_MS = 180    # debounce after the latest committed classification
+DIRTY_COMPACT_BATCHES = 24
+DIRTY_COMPACT_ROWS = 1_000_000
 
 
 def active_view(app):
@@ -159,9 +165,21 @@ class LntSectionStore:
         }
         self.last_error = ""
         self.writes = 0
+        # Sparse write journal.  The old implementation scanned the whole
+        # classification store every 400 ms *and* after every gesture.  A loaded
+        # native section can contain several million rows, so rapid tap-tap work
+        # repeatedly paid O(store-size) plus synchronous LNT I/O.  Every normal
+        # native edit already knows its changed rows; retain those rows and only
+        # compare/write them.
+        self._dirty_batches = []
+        self._dirty_rows_queued = 0
+        self._write_timer = QTimer(app)
+        self._write_timer.setSingleShot(True)
+        self._write_timer.setInterval(SHOW_WRITE_DELAY_MS)
+        self._write_timer.timeout.connect(self._flush_dirty_only)
         self._timer = QTimer(app)
         self._timer.setInterval(FLUSH_INTERVAL_MS)
-        self._timer.timeout.connect(self.flush)
+        self._timer.timeout.connect(self._flush_dirty_only)
         app.data = self.data
         self._timer.start()
 
@@ -292,6 +310,54 @@ class LntSectionStore:
         hi = (high[0], high[1], 1.0e12)
         return self.ensure_region(lo, hi)
 
+    # ---- sparse dirty journal -------------------------------------------------------
+    def _queue_dirty(self, indices, restart_debounce=True):
+        """Remember committed store rows without scanning the whole store.
+
+        Rows may be queued repeatedly (classification followed by undo, overlapping
+        brush strokes, etc.).  ``flush(False)`` resolves them against ``_synced`` at
+        write time, so only the final class value reaches disk.
+        """
+        rows = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if rows.size == 0:
+            return
+        self._dirty_batches.append(rows.copy())
+        self._dirty_rows_queued += int(rows.size)
+        if (len(self._dirty_batches) >= DIRTY_COMPACT_BATCHES
+                or self._dirty_rows_queued >= DIRTY_COMPACT_ROWS):
+            self._compact_dirty()
+        if restart_debounce:
+            self._write_timer.start()
+
+    def _compact_dirty(self):
+        if not self._dirty_batches:
+            self._dirty_rows_queued = 0
+            return
+        if len(self._dirty_batches) == 1:
+            rows = self._dirty_batches[0]
+        else:
+            rows = np.concatenate(self._dirty_batches)
+            if rows.size > 1:
+                rows = np.unique(rows)
+        self._dirty_batches = [np.ascontiguousarray(rows, dtype=np.int64)]
+        self._dirty_rows_queued = int(rows.size)
+
+    def _take_dirty(self):
+        if not self._dirty_batches:
+            return np.empty(0, dtype=np.int64)
+        if len(self._dirty_batches) == 1:
+            rows = self._dirty_batches[0]
+        else:
+            rows = np.concatenate(self._dirty_batches)
+            if rows.size > 1:
+                rows = np.unique(rows)
+        self._dirty_batches = []
+        self._dirty_rows_queued = 0
+        return np.asarray(rows, dtype=np.int64)
+
+    def _flush_dirty_only(self):
+        return self.flush(force_scan=False)
+
     # ---- showing edits at once ------------------------------------------------------
     def show(self, indices, old_classes):
         """Display class edits of these store rows in the main view now (surface tiles are
@@ -302,12 +368,21 @@ class LntSectionStore:
         nv = getattr(self.view, "native", None)
         if idx.size == 0 or nv is None:
             return None
+        # Journal before rendering: even if a preview frame fails, the canonical
+        # class edit is still committed and must be persisted later.  Restarting
+        # the one-shot timer coalesces a burst of fast tap-tap classifications.
+        self._queue_dirty(idx, restart_debounce=True)
         stats = nv.preview_classes(self.node[idx], self.local[idx], self.data["xyz"][idx],
                                    old_classes, np.asarray(self.data["classification"])[idx])
         if stats is not None:
             self._preview_pending = True
-            nv.frame(0.0)                                # present the recoloured view now
-        QTimer.singleShot(SHOW_WRITE_DELAY_MS, self.flush)
+            # LntMainView already pumps native frames every 8 ms.  Forcing another
+            # full frame here blocks the GUI thread and can redraw several million
+            # points once per classification on top of that timer.  Only fall back
+            # to an explicit present when the normal frame pump is not running.
+            timer = getattr(self.view, "_timer", None)
+            if timer is None or not timer.isActive():
+                nv.frame(0.0)
         return stats
 
     def preview_live(self, indices, old_classes):
@@ -332,17 +407,24 @@ class LntSectionStore:
         )
         if stats is not None:
             self._preview_pending = True
-            nv.frame(0.0)
+            # The 8 ms LNT frame pump will present this patched class stream.
+            # Avoid a second synchronous multi-million-point frame on every live
+            # Brush batch; cursor painting remains independent and immediate.
+            timer = getattr(self.view, "_timer", None)
+            if timer is None or not timer.isActive():
+                nv.frame(0.0)
         return stats
 
     # ---- writing edits back --------------------------------------------------------
-    def flush(self):
-        """Write every classification that changed since the last flush into the .lnt."""
-        # A native brush stroke is speculative until physical left-button
-        # release.  The CPU class array and Vulkan previews change live, but
-        # neither this periodic timer nor show()'s single-shot writer may make
-        # those bytes durable while the gesture is incomplete.  Cancellation
-        # restores app.data first, then releases this gate.
+    def flush(self, force_scan=True):
+        """Persist committed classifications.
+
+        Interactive preview paths call ``flush(False)`` and therefore touch only
+        rows recorded by :meth:`show`.  Explicit save/close/AI callers keep the
+        default ``force_scan=True`` as a safety net for legacy code that may have
+        mutated ``app.data`` directly.  This preserves correctness while removing
+        the multi-million-row diff from the classification critical path.
+        """
         if bool(getattr(self.app, "_native_brush_transaction_active", False)):
             return 0
         if self.app.data is not self.data:
@@ -352,26 +434,50 @@ class LntSectionStore:
             if cur.shape[0] != self._synced.shape[0]:
                 return 0
             cur = cur.astype(np.uint8, copy=False)
-            changed = np.flatnonzero(cur != self._synced)
+
+            queued = self._take_dirty()
+            if force_scan:
+                changed = np.flatnonzero(cur != self._synced)
+            elif queued.size:
+                valid = (queued >= 0) & (queued < cur.shape[0])
+                queued = queued[valid]
+                if queued.size > 1 and np.any(queued[1:] == queued[:-1]):
+                    queued = np.unique(queued)
+                changed = queued[cur[queued] != self._synced[queued]]
+            else:
+                changed = np.empty(0, dtype=np.int64)
+
             if changed.size == 0:
                 if getattr(self, '_preview_pending', False):
-                    # Undo can restore the on-disk classes before the delayed write.
-                    # Complete that preview transaction too, without rewriting points.
+                    # A quick undo can restore the on-disk value before the
+                    # debounce expires. Finalise the preview transaction without
+                    # rewriting any records.
                     if self.view.native.set_classes(self.node[:0], self.local[:0], cur[:0]):
                         self._preview_pending = False
                 return 0
-            self.generation += 1
-            ok = self.view.native.set_classes(self.node[changed], self.local[changed], cur[changed])
+
+            old_disk = self._synced[changed].copy()
+            ok = self.view.native.set_classes(
+                self.node[changed], self.local[changed], cur[changed],
+                old_classification=old_disk,
+            )
             if not ok:
                 self.last_error = self.view.native.last_error
+                # Retry only the affected rows; never fall back to a whole-store
+                # scan on the next GUI tick.
+                self._queue_dirty(changed, restart_debounce=False)
                 print(f"[LNT-SECTION] could not write {changed.size:,} class edits: {self.last_error}")
                 return 0
             self._synced[changed] = cur[changed]
             self._preview_pending = False
+            self.generation += 1
             self.writes += int(changed.size)
             print(f"[LNT-SECTION] wrote {changed.size:,} class edits into the .lnt file")
             return int(changed.size)
         except Exception as exc:                          # noqa: BLE001 - never break the UI timer
+            # Do not lose the journal if an unexpected Python-side failure occurs.
+            if 'queued' in locals() and getattr(queued, 'size', 0):
+                self._queue_dirty(queued, restart_debounce=False)
             print(f"[LNT-SECTION] flush failed: {exc}")
             return 0
 
@@ -398,8 +504,11 @@ class LntSectionStore:
             if stop_timer:
                 try:
                     self._timer.stop()
+                    self._write_timer.stop()
                 except Exception:
                     pass
+            self._dirty_batches = []
+            self._dirty_rows_queued = 0
             self._preview_pending = False
             data = self.data
             if not isinstance(data, dict):
@@ -416,7 +525,9 @@ class LntSectionStore:
             rows = np.flatnonzero(saved != self._synced)
             if rows.size:
                 nv = getattr(self.view, 'native', None)
-                if nv is None or not nv.set_classes(self.node[rows], self.local[rows], saved[rows]):
+                if nv is None or not nv.set_classes(
+                        self.node[rows], self.local[rows], saved[rows],
+                        old_classification=self._synced[rows].copy()):
                     raise OSError(getattr(nv, 'last_error', '') or 'Could not restore saved native classes.')
                 print(f"[LNT-SECTION] reverted {rows.size:,} class edits on Don't Save")
             # Only acknowledge the rollback after its native write succeeded.
@@ -433,10 +544,11 @@ class LntSectionStore:
     def release(self, flush_pending=True):
         try:
             self._timer.stop()
+            self._write_timer.stop()
         except Exception:                                 # noqa: BLE001
             pass
         if flush_pending and not getattr(self, "_discarded", False):
-            self.flush()
+            self.flush(force_scan=True)
         if self.app.data is self.data:
             self.app.data = self._saved_data
 

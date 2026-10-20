@@ -369,7 +369,7 @@ def sync_store_rows(app, view, node, local, new):
     store.generation += 1
     sections = getattr(app, "_native_sections", None)
     if sections is not None:
-        sections.refresh_edits(force=True)
+        sections.refresh_edits(force=True, changed=(rows, values), show_main=False)
 
 
 # ---- fences and highlights (AI > Fence tab on an .lnt) -----------------------------

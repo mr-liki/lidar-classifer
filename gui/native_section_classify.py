@@ -170,7 +170,14 @@ def select(tool, pts2d, shape, app, radius=None):
                 (z >= min(z1, z2)) & (z <= max(z1, z2)))
     if tool in ("circle", "point"):
         centre, r = shape[0], (float(np.hypot(*(shape[1] - shape[0]))) if radius is None else radius)
-        return (h - centre[0]) ** 2 + (z - centre[1]) ** 2 <= r * r
+        mask = np.zeros(len(h), dtype=bool)
+        box = ((h >= centre[0] - r) & (h <= centre[0] + r)
+               & (z >= centre[1] - r) & (z <= centre[1] + r))
+        cand = np.flatnonzero(box)
+        if cand.size:
+            dx, dz = h[cand] - centre[0], z[cand] - centre[1]
+            mask[cand] = dx * dx + dz * dz <= r * r
+        return mask
     if tool == "brush":
         return brush_sweep(h, z, shape, radius, brush_is_square(app))
     if tool in ("polygon", "freehand"):
@@ -184,10 +191,14 @@ def select(tool, pts2d, shape, app, radius=None):
         return mask
     if tool in ("above_line", "below_line"):
         (x1, z1), (x2, z2) = shape[:2]
-        slope = (z2 - z1) / (x2 - x1 + 1e-9)
-        line_z = slope * (h - x1) + z1
-        strip = (h >= min(x1, x2)) & (h <= max(x1, x2))
-        return strip & ((z >= line_z) if tool == "above_line" else (z <= line_z))
+        mask = np.zeros(len(h), dtype=bool)
+        strip = np.flatnonzero((h >= min(x1, x2)) & (h <= max(x1, x2)))
+        if strip.size:
+            slope = (z2 - z1) / (x2 - x1 + 1e-9)
+            line_z = slope * (h[strip] - x1) + z1
+            mask[strip] = ((z[strip] >= line_z) if tool == "above_line"
+                           else (z[strip] <= line_z))
+        return mask
     if tool == "parallel_line":
         p1, p2 = shape[0], shape[1]
         length = float(np.hypot(*(p2 - p1)))
@@ -198,9 +209,18 @@ def select(tool, pts2d, shape, app, radius=None):
         if n[1] < 0:
             n = -n
         above, below = parallel_tolerances(app)
-        rel = pts2d - p1
-        t, signed = rel @ d, rel @ n
-        return (t >= 0) & (t <= length) & (signed <= above) & (signed >= -below)
+        corners = np.vstack((p1 + n * above, p2 + n * above,
+                             p1 - n * below, p2 - n * below))
+        lo, hi = corners.min(axis=0), corners.max(axis=0)
+        cand = np.flatnonzero((h >= lo[0]) & (h <= hi[0])
+                              & (z >= lo[1]) & (z <= hi[1]))
+        mask = np.zeros(len(h), dtype=bool)
+        if cand.size:
+            rel = pts2d[cand] - p1
+            t, signed = rel @ d, rel @ n
+            mask[cand] = ((t >= 0) & (t <= length)
+                          & (signed <= above) & (signed >= -below))
+        return mask
     return np.zeros(len(h), dtype=bool)
 
 
@@ -284,7 +304,17 @@ class CanvasOverlay(QWidget):
             self._timer.start()
         else:
             self._timer.stop()
+            # Clear the translucent backing store *before* hide/show reuse.  Without
+            # this, Windows can briefly composite the previous Brush cursor when the
+            # tool window is shown for the next stroke.
+            if self.isVisible():
+                try:
+                    self.repaint()
+                except Exception:
+                    pass
             self.hide()
+            self._follow_state = None
+            self._paint_projection = None
         self.update()
 
     def _follow(self, immediate=False):
@@ -320,6 +350,12 @@ class CanvasOverlay(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
+        if not self.shapes and not self.marks:
+            # Explicit transparent clear for the one repaint issued before hiding.
+            # Normal populated paints stay on the fast SourceOver path.
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            return
         painter.setRenderHint(QPainter.Antialiasing, True)
         to_qt = self._paint_projection or self.canvas.screen_from_section
         label_cells = {}
@@ -623,11 +659,18 @@ def _iter_native_classifiers(app):
     """Yield every live native Vulkan classifier exactly once.
 
     The native main/cross/cut canvases deliberately share classification state on
-    ``app`` but own independent Qt overlays.  Brush preview lifecycle therefore
-    has to be broadcast to every native canvas or a cursor left in a background
-    view can remain visible after the stroke finishes elsewhere.
+    ``app`` but own independent Qt overlays.  The weak registry is intentionally
+    consulted first: a dock/view can be replaced while its Qt tool window is still
+    alive for one event-loop turn, and that stale overlay must also be cleared or a
+    previous Brush cursor can flash at the start of the next stroke.
     """
     seen = set()
+    registry = getattr(app, "_native_classifier_registry", None)
+    for classifier in list(registry or ()):
+        if classifier is not None and id(classifier) not in seen:
+            seen.add(id(classifier))
+            yield classifier
+
     view = getattr(app, "_lnt_main_view", None)
     classifier = getattr(view, "classifier", None) if view is not None else None
     if classifier is not None:
@@ -764,6 +807,34 @@ class SectionClassifier:
         self._brush_tx_from_user = None
         self._brush_tx_last_preview = 0.0
         self._brush_tx_changed = 0
+        # Reuse the de-duplication bitmap between strokes.  Allocating/zeroing a
+        # bool array the size of a multi-million-point store on every mouse-down
+        # made Main View Brush latency scale with *loaded* points instead of touched
+        # points.  Only rows changed by the current stroke are marked, and those
+        # marks are cleared when the transaction ends.
+        self._brush_seen_cache = np.empty(0, dtype=np.bool_)
+        # Mouse events are kept as a lossless polyline but native stroke queries are
+        # coalesced to a bounded cadence.  query_stroke() accepts the whole path, so
+        # batching does not create gaps or change swept-brush coverage.
+        self._brush_pending_path = []
+        self._brush_last_query_time = 0.0
+        self._brush_tx_started_at = 0.0
+        self._brush_tx_query_ms = 0.0
+        self._brush_tx_preview_ms = 0.0
+        self._brush_tx_batches = 0
+        # Cache viewport clipping for repeated tap/tap classifications while the
+        # camera and resident section rows are unchanged.
+        self._visible_rows_cache_key = None
+        self._visible_rows_cache = None
+        try:
+            import weakref
+            registry = getattr(self.app, "_native_classifier_registry", None)
+            if registry is None:
+                registry = weakref.WeakSet()
+                self.app._native_classifier_registry = registry
+            registry.add(self)
+        except Exception:
+            pass
 
     # ---- state ---------------------------------------------------------------
     def tool(self):
@@ -793,6 +864,12 @@ class SectionClassifier:
         self.cancel()
         self.overlay._timer.stop()
         self.overlay.close()
+        try:
+            registry = getattr(self.app, "_native_classifier_registry", None)
+            if registry is not None:
+                registry.discard(self)
+        except Exception:
+            pass
 
     def _brush_view_name(self):
         if not getattr(self.canvas, "line_tools", True):
@@ -804,7 +881,12 @@ class SectionClassifier:
             return "section"
 
     def hide_brush_preview(self):
-        """Remove brush-only shapes immediately; preserve unrelated overlay marks."""
+        """Remove brush-only shapes immediately; preserve unrelated overlay marks.
+
+        ``repaint()`` before hiding is deliberate for translucent top-level Qt tool
+        windows: it clears the previous cursor from the backing store, preventing a
+        one-frame flash of the last stroke position when the overlay is shown again.
+        """
         self.hover_px = None
         shapes = [shape for shape in self.overlay.shapes
                   if shape[0] not in ("stroke", "circle_px", "brush_cursor_px")]
@@ -899,21 +981,25 @@ class SectionClassifier:
         if tool in ("brush", "freehand"):
             self.points, self.dragging = [pt], True
             if tool == "brush":
-                # The tool may remain selected indefinitely, but preview ownership
-                # starts only on this physical left press. Hide every other native
-                # canvas so only the stroke's viewport can draw a cursor.
-                self.app._native_brush_preview_armed = True
-                self.app._native_brush_preview_owner = id(self)
+                # Clear *all* known overlays, including a Qt canvas replaced one event
+                # turn ago.  Do not paint yet: showing once before the transaction and
+                # again after its first live refresh was the source of the double/ghost
+                # cursor at the previous stroke location.
+                self.app._native_brush_preview_armed = False
+                self.app._native_brush_preview_owner = None
                 self._brush_cursor_logged = False
                 for classifier in _iter_native_classifiers(self.app):
-                    if classifier is not self:
-                        classifier.hide_brush_preview()
-                self._paint()
+                    classifier.hide_brush_preview()
                 if not self._begin_brush_transaction(pt):
                     self.points, self.press_px, self.dragging = [], None, False
                     disarm_native_brush_preview(self.app, reason="stroke_begin_failed")
                     self._paint()
                     return True
+                # One owner, one paint, at the current physical press position.
+                self.app._native_brush_preview_armed = True
+                self.app._native_brush_preview_owner = id(self)
+                self.hover_px = (float(pos.x()), float(pos.y()))
+                self._paint()
                 print(
                     "NATIVE_BRUSH_STROKE status=begin mode=live_transaction "
                     f"view={self._brush_view_name()} radius_px={self.brush_radius_px():.2f} "
@@ -978,13 +1064,15 @@ class SectionClassifier:
                         f"tool={tool} moved_px={self._press_max_move_px:.1f}"
                     )
         if tool == "brush" and self.dragging and self.points:
-            # Sample the stroke every quarter brush radius (at least 2 px): the sweep
-            # between samples is exact, so this only bounds the work, not the coverage.
+            # Keep the proven geometric sampling density, but do not pay one native
+            # query/fetch per sample.  _flush_pending_brush_path submits the exact
+            # polyline in batches, so coverage is unchanged while DLL/NumPy overhead is
+            # bounded by time rather than raw mouse-event rate.
             last = self.canvas.screen_from_section(*self.points[-1])
             if np.hypot(pos.x() - last[0], pos.y() - last[1]) >= max(2., .25 * self.brush_radius_px()):
-                previous = self.points[-1]
                 self.points.append(self.hover)
-                self._apply_live_brush_segment(previous, self.hover)
+                self._brush_pending_path.append(self.hover)
+                self._flush_pending_brush_path()
         elif tool == "freehand" and self.dragging:
             last = self.canvas.screen_from_section(*self.points[-1])
             if np.hypot(pos.x() - last[0], pos.y() - last[1]) >= 2:
@@ -1006,7 +1094,10 @@ class SectionClassifier:
                 previous = self.points[-1]
                 if previous != pt:
                     self.points.append(pt)
-                    self._apply_live_brush_segment(previous, pt, force_preview=True)
+                    self._brush_pending_path.append(pt)
+                # Also flush samples accumulated since the last 30 Hz batch even when
+                # release lands exactly on the last sampled point.
+                self._flush_pending_brush_path(force=True, force_preview=True)
             changed = self._finalize_brush_transaction()
             stroke_samples = len(self.points)
             self.points = []
@@ -1128,6 +1219,18 @@ class SectionClassifier:
 
     # ---- native live-brush transaction --------------------------------------
     def _clear_brush_transaction_state(self):
+        # Reset only rows marked by this stroke; never memset a store-sized array.
+        # _brush_tx_seen marks changed rows only, so _brush_tx_indices is exactly
+        # the set that needs clearing (duplicates are harmless).
+        if self._brush_tx_seen is not None and self._brush_tx_indices:
+            try:
+                for rows in self._brush_tx_indices:
+                    if getattr(rows, "size", 0):
+                        self._brush_tx_seen[rows] = False
+            except Exception:
+                # Safety fallback: if a malformed row payload ever appears, drop the
+                # cache rather than risking a future stroke skipping points.
+                self._brush_seen_cache = np.empty(0, dtype=np.bool_)
         self._brush_tx_active = False
         self._brush_tx_seen = None
         self._brush_tx_indices = []
@@ -1140,6 +1243,12 @@ class SectionClassifier:
         self._brush_tx_from_user = None
         self._brush_tx_last_preview = 0.0
         self._brush_tx_changed = 0
+        self._brush_pending_path = []
+        self._brush_last_query_time = 0.0
+        self._brush_tx_started_at = 0.0
+        self._brush_tx_query_ms = 0.0
+        self._brush_tx_preview_ms = 0.0
+        self._brush_tx_batches = 0
 
     def _release_brush_transaction_lock(self):
         app = self.app
@@ -1184,15 +1293,11 @@ class SectionClassifier:
         if bool(getattr(self.app, "_native_brush_transaction_active", False)) and owner != id(self):
             cancel_native_brush_transaction(self.app, reason="new_brush_owner")
 
-        # Make every previously *committed* classification the transaction's
-        # baseline before we suppress the store's periodic writer.
-        try:
-            from gui.lnt_section_bridge import get_store
-            store = get_store(self.app)
-            if store is not None:
-                store.flush()
-        except Exception as exc:
-            print(f"NATIVE_BRUSH_BASELINE status=flush_warning error={exc}")
+        # Do NOT flush committed dirty rows here.  The sparse dirty journal can
+        # safely span multiple brush transactions: while a stroke is speculative
+        # the writer is gated, and after release it persists the final values of all
+        # queued rows.  Flushing on every mouse-down made rapid persistent Brush
+        # strokes wait for disk I/O before they could even start.
 
         self._clear_brush_transaction_state()
         (self._brush_tx_to_slot, self._brush_tx_to_code,
@@ -1200,6 +1305,7 @@ class SectionClassifier:
         self._brush_tx_active = True
         self.app._native_brush_transaction_active = True
         self.app._native_brush_transaction_owner = id(self)
+        self._brush_tx_started_at = time.perf_counter()
 
         data = getattr(self.app, "data", None)
         if not isinstance(data, dict) or "classification" not in data:
@@ -1213,11 +1319,13 @@ class SectionClassifier:
                 pass
             return False
         classes = np.asarray(data["classification"])
-        self._brush_tx_seen = np.zeros(len(classes), dtype=np.bool_)
+        self._grow_brush_seen(len(classes))
+        self._brush_pending_path = [first_point]
+        self._brush_last_query_time = 0.0
 
         # A mouse-down is a real brush stamp.  Paint it immediately so the user
         # never sees a cursor moving over points that wait for release.
-        self._apply_live_brush_segment(first_point, first_point, force_preview=True)
+        self._flush_pending_brush_path(force=True, force_preview=True)
         if self._brush_tx_active:
             print(
                 "NATIVE_BRUSH_LIVE status=enabled transaction=speculative "
@@ -1228,15 +1336,18 @@ class SectionClassifier:
         return bool(self._brush_tx_active)
 
     def _grow_brush_seen(self, size):
-        seen = self._brush_tx_seen
-        if seen is None:
-            self._brush_tx_seen = np.zeros(int(size), dtype=np.bool_)
-            return self._brush_tx_seen
-        if len(seen) < size:
-            grown = np.zeros(int(size), dtype=np.bool_)
-            grown[:len(seen)] = seen
-            self._brush_tx_seen = grown
-        return self._brush_tx_seen
+        size = int(size)
+        cache = self._brush_seen_cache
+        if len(cache) < size:
+            # Grow geometrically so a streaming/large point cloud does not reallocate
+            # this buffer every time a few more records enter the shared store.
+            capacity = max(size, int(len(cache) * 1.5) + 4096)
+            grown = np.zeros(capacity, dtype=np.bool_)
+            if len(cache):
+                grown[:len(cache)] = cache
+            self._brush_seen_cache = cache = grown
+        self._brush_tx_seen = cache
+        return cache
 
     def _flush_live_brush_preview(self, force=False):
         """Push accumulated speculative classes to Vulkan at ~30 FPS.
@@ -1261,6 +1372,7 @@ class SectionClassifier:
         self._brush_tx_frame_old = []
         self._brush_tx_last_preview = now
 
+        preview_t0 = time.perf_counter()
         try:
             from gui.lnt_section_bridge import get_store
             store = get_store(self.app)
@@ -1272,24 +1384,35 @@ class SectionClassifier:
             # intensity, elevation, depth, shading and surface/line behaviour.
             sections = getattr(self.app, "_native_sections", None)
             if sections is not None:
-                sections.refresh_edits(force=True)
+                sections.refresh_edits(
+                    force=True, changed=(indices, old), show_main=False
+                )
         except Exception as exc:
             print(f"NATIVE_BRUSH_LIVE status=preview_warning error={exc}")
+        self._brush_tx_preview_ms += (time.perf_counter() - preview_t0) * 1000.0
         return int(indices.size)
 
-    def _apply_live_brush_segment(self, start, end, force_preview=False):
-        """Classify only newly touched records for one swept cursor segment."""
+    def _apply_live_brush_path(self, path, force_preview=False):
+        """Classify newly touched records for one exact swept polyline batch."""
         if not self._brush_tx_active:
             return 0
         try:
-            indices = self.candidates("brush", [start, end])
+            path = list(path or [])
+            if not path:
+                return 0
+            if len(path) == 1:
+                path = [path[0], path[0]]
+            query_t0 = time.perf_counter()
+            indices = self.candidates("brush", path)
+            self._brush_tx_query_ms += (time.perf_counter() - query_t0) * 1000.0
+            self._brush_tx_batches += 1
             if not indices.size:
                 self._flush_live_brush_preview(force=force_preview)
                 return 0
 
             classes = np.asarray(self.app.data["classification"])
             seen = self._grow_brush_seen(len(classes))
-            # Native source identities are unique, but the swept segments overlap.
+            # Native source identities are unique, but adjacent swept batches overlap.
             # A point's pre-stroke class is captured exactly once.
             indices = np.asarray(indices, dtype=np.int64)
             indices = indices[~seen[indices]]
@@ -1310,10 +1433,13 @@ class SectionClassifier:
             old = classes[indices].copy()
             seen[indices] = True
             classes[indices] = np.asarray(self._brush_tx_to_slot, dtype=classes.dtype)
-            self._brush_tx_indices.append(indices.copy())
+            # ``indices`` and ``old`` are immutable for the rest of the transaction.
+            # Reuse the same arrays for history and the next GPU-preview batch instead
+            # of copying both twice on every mouse segment.
+            self._brush_tx_indices.append(indices)
             self._brush_tx_old_classes.append(old)
-            self._brush_tx_frame_indices.append(indices.copy())
-            self._brush_tx_frame_old.append(old.copy())
+            self._brush_tx_frame_indices.append(indices)
+            self._brush_tx_frame_old.append(old)
             self._brush_tx_changed += int(indices.size)
             self._flush_live_brush_preview(force=force_preview)
             return int(indices.size)
@@ -1321,6 +1447,40 @@ class SectionClassifier:
             print(f"NATIVE_BRUSH_LIVE status=error error={exc}")
             self.cancel_pending_brush_transaction(reason="live_error")
             return 0
+
+    def _flush_pending_brush_path(self, force=False, force_preview=False):
+        """Coalesce mouse samples into one native stroke query without losing path shape.
+
+        Every sampled cursor vertex is retained.  We merely submit several vertices in
+        one ``query_stroke`` call instead of issuing one DLL query/fetch for every tiny
+        mouse segment.  Coverage is therefore identical to the sampled polyline.
+        """
+        if not self._brush_tx_active or not self._brush_pending_path:
+            return 0
+        now = time.perf_counter()
+        # Query at the same 30 Hz cadence as visible class-stream updates.  The Qt
+        # cursor still follows every mouse event; only expensive native query/fetch
+        # work is coalesced.  A long pending path is flushed early to bound latency.
+        if (not force and len(self._brush_pending_path) < 32
+                and (now - self._brush_last_query_time) < (1.0 / 30.0)):
+            return 0
+        # A single pending point after the first query is only the continuity
+        # anchor for the *next* batch; re-querying it on every release doubles the
+        # final stamp with no new coverage.
+        if len(self._brush_pending_path) == 1 and self._brush_last_query_time > 0.0:
+            if force_preview:
+                self._flush_live_brush_preview(force=True)
+            return 0
+        path = self._brush_pending_path
+        changed = self._apply_live_brush_path(path, force_preview=force_preview)
+        if self._brush_tx_active and path:
+            self._brush_pending_path = [path[-1]]
+            self._brush_last_query_time = now
+        return changed
+
+    def _apply_live_brush_segment(self, start, end, force_preview=False):
+        """Compatibility wrapper for callers that still provide one segment."""
+        return self._apply_live_brush_path([start, end], force_preview=force_preview)
 
     def _brush_transaction_arrays(self):
         if not self._brush_tx_indices:
@@ -1383,6 +1543,17 @@ class SectionClassifier:
             app.statusBar().showMessage(
                 f"{indices.size:,} points -> class {to_code}", 3000
             )
+            total_ms = ((time.perf_counter() - self._brush_tx_started_at) * 1000.0
+                        if self._brush_tx_started_at else 0.0)
+            if total_ms >= 20.0 or self._brush_view_name() == "main":
+                print(
+                    "NATIVE_BRUSH_PERF "
+                    f"view={self._brush_view_name()} changed={indices.size} "
+                    f"batches={self._brush_tx_batches} "
+                    f"query_ms={self._brush_tx_query_ms:.1f} "
+                    f"preview_ms={self._brush_tx_preview_ms:.1f} "
+                    f"total_ms={total_ms:.1f}"
+                )
             return int(indices.size)
         finally:
             self._release_brush_transaction_lock()
@@ -1409,7 +1580,9 @@ class SectionClassifier:
                         store.preview_live(indices, current)
                     sections = getattr(app, "_native_sections", None)
                     if sections is not None:
-                        sections.refresh_edits(force=True)
+                        sections.refresh_edits(
+                            force=True, changed=(indices, current), show_main=False
+                        )
                 except Exception as exc:
                     print(f"NATIVE_BRUSH_CANCEL status=preview_warning error={exc}")
         finally:
@@ -1512,16 +1685,48 @@ class SectionClassifier:
                 return np.empty(0, dtype=np.int64)
         if not len(canvas.indices):
             return np.empty(0, dtype=np.int64)
-        points = getattr(canvas, "selection_points", None)
-        pts2d = points() if points is not None else canvas.local[:, [canvas.axis, 2]]
+
+        # Main-view native query_stroke already returns exactly the swept records.
+        # Do not copy XY, compute visible extents, or run another brush geometry test.
+        # This keeps Main Brush proportional to touched records rather than the size
+        # of the resident classification store.
         if getattr(canvas, "exact_selection", None) == tool:
-            mask = np.ones(len(pts2d), dtype=bool)   # the native query applied the shape
+            indices = np.asarray(canvas.indices, dtype=np.int64)
         else:
-            mask = select(tool, pts2d, shape, self.app, radius)
-        # Only what the view shows: inside the viewport, visible class.
-        lo_h, hi_h, lo_z, hi_z = canvas.visible_extent()
-        mask &= (pts2d[:, 0] >= lo_h) & (pts2d[:, 0] <= hi_h) & (pts2d[:, 1] >= lo_z) & (pts2d[:, 1] <= hi_z)
-        indices = canvas.indices[mask]
+            points = getattr(canvas, "selection_points", None)
+            pts2d = points() if points is not None else canvas.local[:, [canvas.axis, 2]]
+
+            # Cache the viewport clip while camera + resident rows are unchanged.
+            # Repeated tap/tap classifications usually do not move the camera; without
+            # this cache each click rescanned millions of retained section rows just to
+            # rediscover the same visible subset.
+            lo_h, hi_h, lo_z, hi_z = canvas.visible_extent()
+            idx_ptr = int(canvas.indices.__array_interface__["data"][0]) if len(canvas.indices) else 0
+            pts_ptr = int(pts2d.__array_interface__["data"][0]) if len(pts2d) else 0
+            cache_key = (idx_ptr, pts_ptr, len(canvas.indices), len(pts2d),
+                         float(lo_h), float(hi_h), float(lo_z), float(hi_z))
+            cached = self._visible_rows_cache if cache_key == self._visible_rows_cache_key else None
+            if cached is None:
+                in_view = ((pts2d[:, 0] >= lo_h) & (pts2d[:, 0] <= hi_h)
+                           & (pts2d[:, 1] >= lo_z) & (pts2d[:, 1] <= hi_z))
+                visible_rows = np.flatnonzero(in_view)
+                self._visible_rows_cache_key = cache_key
+                self._visible_rows_cache = (visible_rows, in_view)
+            else:
+                visible_rows, in_view = cached
+            if not visible_rows.size:
+                return np.empty(0, dtype=np.int64)
+
+            if visible_rows.size < int(len(pts2d) * 0.70):
+                local_mask = select(tool, pts2d[visible_rows], shape, self.app, radius)
+                selected_rows = visible_rows[local_mask]
+            else:
+                # Avoid materialising an Nx2 subset when almost the whole section is
+                # visible; in that case the original vectorised path is cheaper.
+                mask = select(tool, pts2d, shape, self.app, radius)
+                mask &= in_view
+                selected_rows = np.flatnonzero(mask)
+            indices = canvas.indices[selected_rows]
         visible = self._visible_classes()
         if visible is not None and indices.size:
             classes = self.app.data["classification"]
@@ -1529,6 +1734,7 @@ class SectionClassifier:
         return indices
 
     def _commit(self, tool, shape):
+        perf_start = time.perf_counter()
         app = self.app
         to_class = getattr(app, "to_class", None)
         if to_class is None:
@@ -1548,6 +1754,7 @@ class SectionClassifier:
             app.statusBar().showMessage(f"Class {to_code} is not a valid class number.", 4000)
             return 0
         indices = self.candidates(tool, shape)
+        select_done = time.perf_counter()
         if not indices.size:
             return 0
         classes = app.data["classification"]
@@ -1579,6 +1786,17 @@ class SectionClassifier:
         app._last_from_classes = list(from_classes or [])
         app._last_classify_ts = time.time()
         app.classification_revision = int(getattr(app, "classification_revision", 0) or 0) + 1
+        refresh_start = time.perf_counter()
         self.canvas.owner.refresh_edits(force=True, changed=(indices, old))
+        perf_end = time.perf_counter()
+        total_ms = (perf_end - perf_start) * 1000.0
+        if total_ms >= 20.0:
+            print(
+                "NATIVE_CLASSIFY_PERF "
+                f"tool={tool} changed={indices.size} "
+                f"select_ms={(select_done - perf_start) * 1000.0:.1f} "
+                f"refresh_ms={(perf_end - refresh_start) * 1000.0:.1f} "
+                f"total_ms={total_ms:.1f}"
+            )
         app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)

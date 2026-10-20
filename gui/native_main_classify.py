@@ -86,12 +86,16 @@ class MainCanvas:
         self.exact_selection = None
         store = get_store(self.view.app)
         if tool == 'brush' and store is not None and self.view.native.has_stroke_query():
-            # Only the swept records: a stroke's bounding box can hold many times more,
-            # and testing them in Python dominated the release.
+            # Native query_stroke already performs the exact swept-brush geometry.
+            # Keep only its store-row identities here: building/copying an Nx2 XY
+            # array for those same rows on every live brush batch is redundant and
+            # becomes visible on very large clouds.
             from gui.native_section_classify import brush_is_square
             if not store.ensure_stroke(shape, radius, brush_is_square(self.view.app)):
                 raise RuntimeError(store.last_error)
-            self._take_rows(store)
+            self.indices = np.asarray(store.last_region_indices, dtype=np.int64)
+            self._selection_points = np.empty((0, 2), dtype=np.float64)
+            self._store = store
             self._region = None            # not a box: a later box tool queries again
             self.exact_selection = 'brush'
             return
@@ -140,12 +144,17 @@ class MainCanvas:
         store = get_store(self.view.app)
         if store is not None:
             if changed is not None:
-                store.show(*changed)         # recolour now, write right after
+                store.show(*changed)         # recolour now; sparse write is debounced
             else:
-                store.flush()
+                # A render refresh is not an explicit Save.  Never turn it into a
+                # full multi-million-row class diff on the GUI thread.
+                store.flush(force_scan=False)
         sections = getattr(self.view.app, '_native_sections', None)
         if sections is not None:
-            sections.refresh_edits(force=True)
+            # Preserve the exact changed-row payload so every open cross/cut view
+            # can use its sparse update path.  The old call dropped it and forced
+            # a full classification-array gather/compare in every section.
+            sections.refresh_edits(force=True, changed=changed, show_main=False)
 
 
 def ensure_classifier(view):

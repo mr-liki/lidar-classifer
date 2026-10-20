@@ -120,17 +120,27 @@ class LntClassCounts(QObject):
         self._closed = True
 
     # ---- write tracking (called by NativeView.set_classes) ----------------------
-    def before_write(self, node, local, classification):
-        """Old class bytes of the records about to be written (last write per record
-        wins, as in the native writer), or None when the delta cannot be computed."""
+    def before_write(self, node, local, classification, old_classification=None):
+        """Old/new class bytes for the records about to be written.
+
+        ``old_classification`` is an optional trusted pre-write snapshot.  The
+        native section store already owns exactly that snapshot in ``_synced``;
+        using it avoids a random file read and ``np.unique`` on every interactive
+        classification.  Other writers keep the original identity->file lookup.
+        """
         with self._lock:
             if self._scanning or self._hist is None:
                 self._rescan = self._scanning
                 return None
         try:
+            new = np.asarray(classification, dtype=np.uint8)
+            if old_classification is not None:
+                old = np.asarray(old_classification, dtype=np.uint8)
+                if old.shape != new.shape:
+                    raise ValueError('known old-class array length mismatch')
+                return old, new
             node = np.asarray(node, dtype=np.int64)
             local = np.asarray(local, dtype=np.int64)
-            new = np.asarray(classification, dtype=np.uint8)
             key = node * (1 << 32) + local
             _, last = np.unique(key[::-1], return_index=True)
             pick = len(key) - 1 - last

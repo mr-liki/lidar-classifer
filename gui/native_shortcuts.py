@@ -149,10 +149,12 @@ def native_classification_history(app, redo=False):
     store.data['classification'][entry['indices']] = entry['new_classes' if redo else 'old_classes']
     destination.append(entry)
     app.classification_revision = int(getattr(app, 'classification_revision', 0)) + 1
-    store.show(entry['indices'], shown)            # recolour now; the write follows
+    store.show(entry['indices'], shown)            # recolour now; sparse write follows
     sections = getattr(app, '_native_sections', None)
     if sections is not None:
-        sections.refresh_edits(force=True)
+        # Undo/redo knows the exact rows too.  Do not throw that information
+        # away and force every section to rescan its entire classification stream.
+        sections.refresh_edits(force=True, changed=(entry['indices'], shown), show_main=False)
     return True
 
 
