@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
 from gui.native_measure_geometry import measurement_labels, measurement_text
 
@@ -28,6 +28,11 @@ DRAWABLE_TOOLS = ("rectangle", "circle", "polygon", "freehand", "brush", "point"
 _TWO_CLICK = ("rectangle", "circle", "above_line", "below_line", "parallel_line")
 LINE_TOOLS = ("above_line", "below_line", "parallel_line")
 _CLICK_SLOP_PX = 4.0
+# Two-point tools use tap-tap by default.  A press becomes a drag only after
+# the cursor crosses the threshold *after* the short settle window.  These
+# values deliberately mirror the proven VTK ClassificationInteractor path.
+_TAP_GRACE_SEC = 0.12
+_TAP_DRAG_THRESHOLD_PX = 6.0
 
 
 def _points_in_polygon(px, py, poly):
@@ -334,7 +339,13 @@ class CanvasOverlay(QWidget):
                 snapshot = world_planes[world_z]
                 if snapshot is not None:
                     to_qt = snapshot[1]
-            qpts = [QPointF(*to_qt(p[0], p[1])) for p in pts]
+            if kind == "brush_cursor_px":
+                # Already in this overlay's Qt logical-pixel coordinates.  Keeping
+                # the brush here avoids the section/world round trip that made the
+                # Vulkan cursor lag or wobble behind the OS pointer.
+                qpts = [QPointF(float(p[0]), float(p[1])) for p in pts]
+            else:
+                qpts = [QPointF(*to_qt(p[0], p[1])) for p in pts]
             painter.setPen(QPen(QColor(255, 255, 0), 1.5, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             if kind == 'measurement' and len(qpts) >= 2:
@@ -540,6 +551,31 @@ class CanvasOverlay(QWidget):
                     painter.setPen(pen)
                     painter.setBrush(Qt.NoBrush)
                     painter.drawPolyline(QPolygonF(qpts))     # one path: uniform alpha
+            elif kind == "brush_cursor_px" and qpts:
+                square, r, (color, width) = extra
+                width = max(1., float(width))
+                pen = QPen(color, width, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                centre = qpts[0]
+                if square:
+                    painter.drawRect(QRectF(centre.x() - r, centre.y() - r, 2 * r, 2 * r))
+                else:
+                    painter.drawEllipse(centre, r, r)
+
+                # Same visual language as the established brush cursor: a stable
+                # crosshair and tiny centre ring make the actual stamp centre clear.
+                guide = QPen(color, max(1., width * .75), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                guide.setCosmetic(True)
+                painter.setPen(guide)
+                ch = max(3., float(r) * .30)
+                painter.drawLine(QPointF(centre.x() - ch, centre.y()),
+                                 QPointF(centre.x() + ch, centre.y()))
+                painter.drawLine(QPointF(centre.x(), centre.y() - ch),
+                                 QPointF(centre.x(), centre.y() + ch))
+                dot = max(1.5, float(r) * .06)
+                painter.drawEllipse(centre, dot, dot)
             elif kind in ("rect", "polyline", "polygon", "circle_px", "guided_line"):
                 # Classify previews use the tool's Classify Tools colour/width (VTK parity).
                 color, width = extra[-1] if kind in ("circle_px", "guided_line") else extra
@@ -583,6 +619,110 @@ def _class_lut(slots):
     return lut
 
 
+def _iter_native_classifiers(app):
+    """Yield every live native Vulkan classifier exactly once.
+
+    The native main/cross/cut canvases deliberately share classification state on
+    ``app`` but own independent Qt overlays.  Brush preview lifecycle therefore
+    has to be broadcast to every native canvas or a cursor left in a background
+    view can remain visible after the stroke finishes elsewhere.
+    """
+    seen = set()
+    view = getattr(app, "_lnt_main_view", None)
+    classifier = getattr(view, "classifier", None) if view is not None else None
+    if classifier is not None:
+        seen.add(id(classifier))
+        yield classifier
+
+    sections = getattr(app, "_native_sections", None)
+    for canvas in getattr(sections, "views", {}).values() if sections is not None else ():
+        classifier = getattr(canvas, "classifier", None)
+        if classifier is not None and id(classifier) not in seen:
+            seen.add(id(classifier))
+            yield classifier
+
+
+def disarm_native_brush_preview(app, reason="inactive"):
+    """Hide every native brush preview without deactivating the Brush tool.
+
+    Brush selection and Brush *stroke preview* are intentionally separate states.
+    Selecting Brush (shortcut/ribbon/right-click reactivation) leaves the tool
+    persistent but visually idle.  The QPainter cursor exists only while the user
+    is physically holding the left button for a live transactional stroke.
+    Releasing or cancelling the stroke clears only this preview ownership; the
+    selected Brush remains ready for the next left press.
+    """
+    was_armed = bool(getattr(app, "_native_brush_preview_armed", False))
+    app._native_brush_preview_armed = False
+    app._native_brush_preview_owner = None
+    for classifier in _iter_native_classifiers(app):
+        hide = getattr(classifier, "hide_brush_preview", None)
+        if callable(hide):
+            hide()
+    if was_armed:
+        print(f"NATIVE_BRUSH_PREVIEW state=hidden reason={reason}")
+
+
+def cancel_native_brush_transaction(app, reason="tool_terminated"):
+    """Roll back any in-progress native brush stroke, without history or disk writes.
+
+    Native Vulkan brush painting is transactional: while the left button is held
+    the canonical in-memory class array and the Vulkan/section previews are updated
+    live, but LNT flushing is suspended.  Only a *real* left-button release turns
+    that speculative paint into one undoable classification operation.  Any tool
+    switch, Escape, view shutdown, or other interruption calls this helper first so
+    partially painted points return to their exact pre-stroke classes.
+    """
+    cancelled = 0
+    for classifier in _iter_native_classifiers(app):
+        cancel = getattr(classifier, "cancel_pending_brush_transaction", None)
+        if callable(cancel):
+            try:
+                cancelled += int(cancel(reason=reason) or 0)
+            except Exception as exc:
+                print(f"NATIVE_BRUSH_CANCEL status=error reason={reason} error={exc}")
+    return cancelled
+
+
+def notify_native_classification_activation(app, tool_name):
+    """Publish an explicit native tool activation to all Vulkan canvases.
+
+    Native shortcuts and the ribbon bypass the legacy VTK attach step.  This
+    activation serial is the native equivalent: it lets a Brush->stroke->Brush
+    sequence re-arm the cursor even when ``active_classify_tool`` has the same
+    string value before and after the second activation.
+    """
+    native_view = getattr(app, "_lnt_main_view", None)
+    sections = getattr(app, "_native_sections", None)
+    if getattr(native_view, "native", None) is None and sections is None:
+        return False
+
+    # Switching/re-arming while a stroke is down is a cancellation boundary,
+    # never an implicit commit.  Roll the speculative paint back *before* the
+    # new tool state becomes visible to the canvases.
+    cancel_native_brush_transaction(app, reason="tool_activation")
+
+    serial = int(getattr(app, "_native_classify_activation_serial", 0) or 0) + 1
+    app._native_classify_activation_serial = serial
+    is_brush = tool_name == "brush"
+    # Tool selection must never create a hover cursor. Brush is persistent, but
+    # the preview belongs to an individual left-button stroke only.
+    app._native_brush_preview_armed = False
+    app._native_brush_preview_owner = None
+
+    for classifier in _iter_native_classifiers(app):
+        activated = getattr(classifier, "external_tool_activated", None)
+        if callable(activated):
+            activated(tool_name, serial)
+
+    if is_brush:
+        print(
+            "NATIVE_BRUSH_PREVIEW state=idle trigger=tool_selected "
+            f"backend=qpainter trail=0 activation={serial}"
+        )
+    return True
+
+
 class SectionClassifier:
     """Mouse gesture state machine for one canvas; reads the app's active tool,
     From/To classes and brush settings on every event (no attach step)."""
@@ -594,8 +734,36 @@ class SectionClassifier:
         self.points = []           # gesture vertices in section coordinates
         self.press_px = None
         self.dragging = False
+        # Hybrid tap-tap / drag arbitration for rectangle, circle and line tools.
+        # ``dragging`` only means the left button is currently down; the gesture
+        # does not become a true drag until ``_two_point_drag_latched`` flips.
+        self._press_time = 0.0
+        self._press_max_move_px = 0.0
+        self._two_point_drag_latched = False
         self.hover = None
+        # Cursor preview is kept in Qt logical pixels so the circle is locked
+        # exactly to the mouse.  Classification still uses float64 section/world
+        # coordinates; only the visual cursor bypasses world->screen round trips.
+        self.hover_px = None
         self._tool = None
+        self._activation_serial = int(getattr(self.app, "_native_classify_activation_serial", 0) or 0)
+        self._brush_cursor_logged = False
+        # One active native brush stroke is a transaction.  Points are changed
+        # in app.data live for immediate visual feedback, but the store's LNT
+        # writer is blocked until release.  These arrays preserve the *first*
+        # class value touched for exact rollback/undo.
+        self._brush_tx_active = False
+        self._brush_tx_seen = None
+        self._brush_tx_indices = []
+        self._brush_tx_old_classes = []
+        self._brush_tx_frame_indices = []
+        self._brush_tx_frame_old = []
+        self._brush_tx_to_slot = None
+        self._brush_tx_to_code = None
+        self._brush_tx_from_slots = None
+        self._brush_tx_from_user = None
+        self._brush_tx_last_preview = 0.0
+        self._brush_tx_changed = 0
 
     # ---- state ---------------------------------------------------------------
     def tool(self):
@@ -611,13 +779,59 @@ class SectionClassifier:
         return bool(self.points)
 
     def cancel(self):
+        if self._brush_tx_active:
+            self.cancel_pending_brush_transaction(reason="gesture_cancel")
         self.points, self.press_px, self.dragging = [], None, False
+        self._press_time = 0.0
+        self._press_max_move_px = 0.0
+        self._two_point_drag_latched = False
         self._paint()
 
     def shutdown(self):
+        if self._brush_tx_active:
+            self.cancel_pending_brush_transaction(reason="view_shutdown")
         self.cancel()
         self.overlay._timer.stop()
         self.overlay.close()
+
+    def _brush_view_name(self):
+        if not getattr(self.canvas, "line_tools", True):
+            return "main"
+        try:
+            from gui.native_sections import CUT_SLOT
+            return "cut" if getattr(self.canvas, "slot", None) == CUT_SLOT else "section"
+        except Exception:
+            return "section"
+
+    def hide_brush_preview(self):
+        """Remove brush-only shapes immediately; preserve unrelated overlay marks."""
+        self.hover_px = None
+        shapes = [shape for shape in self.overlay.shapes
+                  if shape[0] not in ("stroke", "circle_px", "brush_cursor_px")]
+        if len(shapes) != len(self.overlay.shapes):
+            self.overlay.set_shapes(shapes)
+
+    def external_tool_activated(self, tool_name, serial=None):
+        """Reset transient gesture state on an explicit shortcut/ribbon activation."""
+        if self._brush_tx_active:
+            self.cancel_pending_brush_transaction(reason="tool_switch")
+        self.points = []
+        self.press_px = None
+        self.dragging = False
+        self._press_time = 0.0
+        self._press_max_move_px = 0.0
+        self._two_point_drag_latched = False
+        self.hover = None
+        self.hover_px = None
+        self._tool = tool_name if tool_name in DRAWABLE_TOOLS else None
+        self._activation_serial = int(serial or 0)
+        self._brush_cursor_logged = False
+        # Never carry a preview from the old tool into the newly armed tool.
+        if self.overlay.shapes:
+            self.overlay.set_shapes([])
+        # Brush selection is intentionally preview-free. The first visible
+        # cursor is created by the next physical left-button press, never by a
+        # shortcut, ribbon click, ClassPicker update, or right-click reactivation.
 
     def _sync_tool(self):
         tool = self.tool()
@@ -642,15 +856,44 @@ class SectionClassifier:
             if self.points:
                 self.cancel()
                 return True
+            if tool == "brush":
+                # Persistent Brush owns its idle right-click so it cannot fall
+                # through into Locate/Cut/context handlers. Right-click is not
+                # a preview trigger; only a left press starts a Brush stroke.
+                return True
             return False
         if button != Qt.LeftButton:
             return False
         pt = self.canvas.section_at(pos.x(), pos.y())
         self.press_px = (pos.x(), pos.y())
+        self._press_time = time.monotonic()
+        self._press_max_move_px = 0.0
+        self._two_point_drag_latched = False
+        self.hover = pt
+        self.hover_px = (float(pos.x()), float(pos.y()))
         if tool in ("brush", "freehand"):
-            # The brush only paints while the button is down; the whole stroke is
-            # classified once, on release (one undo step, one refresh).
             self.points, self.dragging = [pt], True
+            if tool == "brush":
+                # The tool may remain selected indefinitely, but preview ownership
+                # starts only on this physical left press. Hide every other native
+                # canvas so only the stroke's viewport can draw a cursor.
+                self.app._native_brush_preview_armed = True
+                self.app._native_brush_preview_owner = id(self)
+                self._brush_cursor_logged = False
+                for classifier in _iter_native_classifiers(self.app):
+                    if classifier is not self:
+                        classifier.hide_brush_preview()
+                self._paint()
+                if not self._begin_brush_transaction(pt):
+                    self.points, self.press_px, self.dragging = [], None, False
+                    disarm_native_brush_preview(self.app, reason="stroke_begin_failed")
+                    self._paint()
+                    return True
+                print(
+                    "NATIVE_BRUSH_STROKE status=begin mode=live_transaction "
+                    f"view={self._brush_view_name()} radius_px={self.brush_radius_px():.2f} "
+                    "tool=persistent"
+                )
         elif tool == "point":
             self._commit(tool, [pt, pt])
         elif tool == "polygon":
@@ -662,26 +905,61 @@ class SectionClassifier:
             self.points.append(pt)
         elif tool in _TWO_CLICK:
             if not self.points:
+                # First physical press starts a *candidate* gesture only.  Tap is
+                # the priority: unless a deliberate drag is latched while this
+                # button is held, release leaves P1 armed and the rubber-band
+                # preview follows the cursor until the confirming second tap.
                 self.points, self.dragging = [pt], True
             else:
-                self._commit(tool, [self.points[0], pt])
+                # Fast tap-tap finalizes on the second PRESS.  Doing this on press
+                # (rather than waiting for release) prevents OS/Qt double-click
+                # coalescing from dropping the confirming tap.
+                changed = self._commit(tool, [self.points[0], pt])
                 self.points = []
+                self.dragging = False
+                self._press_max_move_px = 0.0
+                self._two_point_drag_latched = False
+                print(
+                    "NATIVE_CLASSIFY_GESTURE mode=tap_finalize "
+                    f"tool={tool} changed={int(changed or 0)}"
+                )
         self._paint()
         return True
 
     def move(self, pos):
         tool = self._sync_tool()
+        self.hover_px = (float(pos.x()), float(pos.y()))
         self.hover = self.canvas.section_at(pos.x(), pos.y())
         if tool is None:
             if self.overlay.shapes:
                 self.overlay.set_shapes([])
             return False
+        if tool in _TWO_CLICK and self.dragging and self.press_px is not None:
+            # Track peak motion at native mouse-event cadence.  Movement inside the
+            # settle window is ignored, so hand jitter from a fast click cannot
+            # silently convert tap-tap into drag mode.  Once the threshold is
+            # crossed after the grace period the gesture is permanently latched as
+            # a drag, even if the cursor later returns near P1.
+            if (time.monotonic() - self._press_time) >= _TAP_GRACE_SEC:
+                distance = float(np.hypot(pos.x() - self.press_px[0],
+                                          pos.y() - self.press_px[1]))
+                if distance > self._press_max_move_px:
+                    self._press_max_move_px = distance
+                if (not self._two_point_drag_latched
+                        and self._press_max_move_px >= _TAP_DRAG_THRESHOLD_PX):
+                    self._two_point_drag_latched = True
+                    print(
+                        "NATIVE_CLASSIFY_GESTURE mode=drag_latched "
+                        f"tool={tool} moved_px={self._press_max_move_px:.1f}"
+                    )
         if tool == "brush" and self.dragging and self.points:
             # Sample the stroke every quarter brush radius (at least 2 px): the sweep
             # between samples is exact, so this only bounds the work, not the coverage.
             last = self.canvas.screen_from_section(*self.points[-1])
             if np.hypot(pos.x() - last[0], pos.y() - last[1]) >= max(2., .25 * self.brush_radius_px()):
+                previous = self.points[-1]
                 self.points.append(self.hover)
+                self._apply_live_brush_segment(previous, self.hover)
         elif tool == "freehand" and self.dragging:
             last = self.canvas.screen_from_section(*self.points[-1])
             if np.hypot(pos.x() - last[0], pos.y() - last[1]) >= 2:
@@ -694,28 +972,89 @@ class SectionClassifier:
         if tool is None or button != Qt.LeftButton:
             return False
         pt = self.canvas.section_at(pos.x(), pos.y())
-        moved = (self.press_px is not None and
-                 np.hypot(pos.x() - self.press_px[0], pos.y() - self.press_px[1]) > _CLICK_SLOP_PX)
         if tool == "brush" and self.dragging:
             self.dragging = False
-            stroke, self.points = self.points + [pt], []
-            self._commit(tool, stroke)
+            # Include the physical release position even when the last move was
+            # below the sampling threshold, then atomically turn the speculative
+            # live paint into one history entry + one delayed LNT write.
+            if self.points:
+                previous = self.points[-1]
+                if previous != pt:
+                    self.points.append(pt)
+                    self._apply_live_brush_segment(previous, pt, force_preview=True)
+            changed = self._finalize_brush_transaction()
+            stroke_samples = len(self.points)
+            self.points = []
+            # A completed stroke hides its cursor/trail but keeps Brush selected.
+            # The very next left press starts another independent transaction; no
+            # shortcut/ribbon reactivation is required.
+            disarm_native_brush_preview(self.app, reason="stroke_complete")
+            print(
+                "NATIVE_BRUSH_STROKE status=commit "
+                f"view={self._brush_view_name()} changed={int(changed or 0)} "
+                f"samples={stroke_samples} preview=hidden tool=persistent"
+            )
         elif tool == "freehand" and self.dragging:
             self.dragging = False
             shape, self.points = self.points + [pt], []
             self._commit(tool, shape)
         elif tool in _TWO_CLICK and self.dragging:
             self.dragging = False
-            if moved and self.points:          # press-drag-release form
-                self._commit(tool, [self.points[0], pt])
+            held_sec = max(0.0, time.monotonic() - self._press_time)
+            release_move = (float(np.hypot(pos.x() - self.press_px[0],
+                                           pos.y() - self.press_px[1]))
+                            if self.press_px is not None else 0.0)
+            # Exact parity with the proven VTK hybrid input model: a fast click's
+            # settle/jitter window is always treated as a tap.  Afterwards only a
+            # real threshold crossing opts into drag-to-drag behavior.
+            moved_px = 0.0 if held_sec < _TAP_GRACE_SEC else max(
+                release_move, self._press_max_move_px
+            )
+            is_drag = bool(
+                self._two_point_drag_latched
+                or moved_px >= _TAP_DRAG_THRESHOLD_PX
+            )
+            if is_drag and self.points:
+                changed = self._commit(tool, [self.points[0], pt])
                 self.points = []
+                print(
+                    "NATIVE_CLASSIFY_GESTURE mode=drag_finalize "
+                    f"tool={tool} moved_px={moved_px:.1f} "
+                    f"changed={int(changed or 0)}"
+                )
+            elif self.points:
+                # TAP #1: keep P1, clear button-down state, and leave the live
+                # rubber-band preview active.  TAP #2 will finalize in press().
+                print(
+                    "NATIVE_CLASSIFY_GESTURE mode=tap_anchor "
+                    f"tool={tool} held_ms={held_sec * 1000.0:.0f} "
+                    f"moved_px={moved_px:.1f}"
+                )
+            self._press_max_move_px = 0.0
+            self._two_point_drag_latched = False
         self.press_px = None
+        self._press_time = 0.0
         self._paint()
         return True
 
     def double_click(self, pos):
-        if self.tool() == "polygon" and len(self.points) >= 3:
+        tool = self._sync_tool()
+        if tool == "polygon" and len(self.points) >= 3:
             self._finish_polygon()
+            return True
+        if tool in _TWO_CLICK:
+            # Qt can replace the second MouseButtonPress of a very fast pair with
+            # MouseButtonDblClick.  If TAP #1 is armed, route that event through
+            # the exact same second-tap finalizer.  If the normal press already
+            # finalized it, simply swallow the double-click so it cannot start a
+            # new accidental gesture or reach window/camera handlers.
+            if self.points and not self.dragging:
+                print(f"NATIVE_CLASSIFY_GESTURE mode=double_click_bridge tool={tool}")
+                self.press(pos, Qt.LeftButton)
+            return True
+        # Point is already a single-tap tool.  Swallow a Qt double-click so one
+        # physical double-click cannot leak into another tool/window handler.
+        if tool == "point":
             return True
         return False
 
@@ -723,8 +1062,22 @@ class SectionClassifier:
         if key in (Qt.Key_Return, Qt.Key_Enter) and self.tool() == "polygon" and len(self.points) >= 3:
             self._finish_polygon()
             return True
-        if key == Qt.Key_Escape and self.points:
-            self.cancel()
+        if key == Qt.Key_Escape and (self.points or self._brush_tx_active):
+            if self._brush_tx_active:
+                self.cancel_pending_brush_transaction(reason="escape")
+                # Escape terminates Brush, rather than merely hiding a partially
+                # painted stroke and leaving the classifier armed.
+                try:
+                    QTimer.singleShot(
+                        0,
+                        lambda: self.app.deactivate_classification_tool(
+                            cancel_pending_brush=True
+                        ),
+                    )
+                except Exception:
+                    pass
+            else:
+                self.cancel()
             return True
         return False
 
@@ -743,6 +1096,310 @@ class SectionClassifier:
         except (TypeError, ValueError):
             return 20.
 
+    # ---- native live-brush transaction --------------------------------------
+    def _clear_brush_transaction_state(self):
+        self._brush_tx_active = False
+        self._brush_tx_seen = None
+        self._brush_tx_indices = []
+        self._brush_tx_old_classes = []
+        self._brush_tx_frame_indices = []
+        self._brush_tx_frame_old = []
+        self._brush_tx_to_slot = None
+        self._brush_tx_to_code = None
+        self._brush_tx_from_slots = None
+        self._brush_tx_from_user = None
+        self._brush_tx_last_preview = 0.0
+        self._brush_tx_changed = 0
+
+    def _release_brush_transaction_lock(self):
+        app = self.app
+        if getattr(app, "_native_brush_transaction_owner", None) == id(self):
+            app._native_brush_transaction_active = False
+            app._native_brush_transaction_owner = None
+
+    def _resolve_brush_transaction_classes(self):
+        """Resolve public class numbers once at stroke start and keep them stable."""
+        app = self.app
+        to_code = getattr(app, "to_class", None)
+        if to_code is None:
+            app.statusBar().showMessage("Target class not set.", 2500)
+            return None
+        from gui.class_slots import NoFreeSlot, slot_for, slots_for
+        try:
+            to_slot = slot_for(app, to_code, allocate=True)
+        except (NoFreeSlot, OSError) as exc:
+            app.statusBar().showMessage(str(exc), 6000)
+            return None
+        if to_slot is None:
+            app.statusBar().showMessage(
+                f"Class {to_code} is not a valid class number.", 4000
+            )
+            return None
+        from_user = getattr(app, "from_classes", None)
+        from_slots = None
+        if from_user:
+            from_slots = np.asarray(slots_for(app, from_user), dtype=np.int64)
+        return int(to_slot), to_code, from_slots, list(from_user or [])
+
+    def _begin_brush_transaction(self, first_point):
+        """Begin speculative live painting; no disk write/history exists yet."""
+        resolved = self._resolve_brush_transaction_classes()
+        if resolved is None:
+            return False
+
+        # Only one native Vulkan brush transaction may own the shared class
+        # array at a time.  This also protects against a stale drag in a hidden
+        # cross/cut window when the user starts in another viewport.
+        owner = getattr(self.app, "_native_brush_transaction_owner", None)
+        if bool(getattr(self.app, "_native_brush_transaction_active", False)) and owner != id(self):
+            cancel_native_brush_transaction(self.app, reason="new_brush_owner")
+
+        # Make every previously *committed* classification the transaction's
+        # baseline before we suppress the store's periodic writer.
+        try:
+            from gui.lnt_section_bridge import get_store
+            store = get_store(self.app)
+            if store is not None:
+                store.flush()
+        except Exception as exc:
+            print(f"NATIVE_BRUSH_BASELINE status=flush_warning error={exc}")
+
+        self._clear_brush_transaction_state()
+        (self._brush_tx_to_slot, self._brush_tx_to_code,
+         self._brush_tx_from_slots, self._brush_tx_from_user) = resolved
+        self._brush_tx_active = True
+        self.app._native_brush_transaction_active = True
+        self.app._native_brush_transaction_owner = id(self)
+
+        data = getattr(self.app, "data", None)
+        if not isinstance(data, dict) or "classification" not in data:
+            self._release_brush_transaction_lock()
+            self._clear_brush_transaction_state()
+            try:
+                self.app.statusBar().showMessage(
+                    "Native classification store is not available.", 3500
+                )
+            except Exception:
+                pass
+            return False
+        classes = np.asarray(data["classification"])
+        self._brush_tx_seen = np.zeros(len(classes), dtype=np.bool_)
+
+        # A mouse-down is a real brush stamp.  Paint it immediately so the user
+        # never sees a cursor moving over points that wait for release.
+        self._apply_live_brush_segment(first_point, first_point, force_preview=True)
+        if self._brush_tx_active:
+            print(
+                "NATIVE_BRUSH_LIVE status=enabled transaction=speculative "
+                "commit=left_release cancel=rollback "
+                f"view={self._brush_view_name()} "
+                f"display_mode={getattr(self.app, 'display_mode', 'class')}"
+            )
+        return bool(self._brush_tx_active)
+
+    def _grow_brush_seen(self, size):
+        seen = self._brush_tx_seen
+        if seen is None:
+            self._brush_tx_seen = np.zeros(int(size), dtype=np.bool_)
+            return self._brush_tx_seen
+        if len(seen) < size:
+            grown = np.zeros(int(size), dtype=np.bool_)
+            grown[:len(seen)] = seen
+            self._brush_tx_seen = grown
+        return self._brush_tx_seen
+
+    def _flush_live_brush_preview(self, force=False):
+        """Push accumulated speculative classes to Vulkan at ~30 FPS.
+
+        The QPainter cursor is updated on every mouse move.  Class-stream/GPU
+        updates are batched to keep motion smooth.  This method never schedules
+        an LNT write; the store timer is also blocked by the transaction flag.
+        """
+        if not self._brush_tx_active or not self._brush_tx_frame_indices:
+            return 0
+        now = time.perf_counter()
+        if not force and (now - self._brush_tx_last_preview) < (1.0 / 30.0):
+            return 0
+
+        if len(self._brush_tx_frame_indices) == 1:
+            indices = self._brush_tx_frame_indices[0]
+            old = self._brush_tx_frame_old[0]
+        else:
+            indices = np.concatenate(self._brush_tx_frame_indices)
+            old = np.concatenate(self._brush_tx_frame_old)
+        self._brush_tx_frame_indices = []
+        self._brush_tx_frame_old = []
+        self._brush_tx_last_preview = now
+
+        try:
+            from gui.lnt_section_bridge import get_store
+            store = get_store(self.app)
+            if store is not None:
+                store.preview_live(indices, old)
+
+            # Cross/cut renderers hold their own resident class stream.  Update
+            # only attributes (never XYZ/camera/display mode), preserving RGB,
+            # intensity, elevation, depth, shading and surface/line behaviour.
+            sections = getattr(self.app, "_native_sections", None)
+            if sections is not None:
+                sections.refresh_edits(force=True)
+        except Exception as exc:
+            print(f"NATIVE_BRUSH_LIVE status=preview_warning error={exc}")
+        return int(indices.size)
+
+    def _apply_live_brush_segment(self, start, end, force_preview=False):
+        """Classify only newly touched records for one swept cursor segment."""
+        if not self._brush_tx_active:
+            return 0
+        try:
+            indices = self.candidates("brush", [start, end])
+            if not indices.size:
+                self._flush_live_brush_preview(force=force_preview)
+                return 0
+
+            classes = np.asarray(self.app.data["classification"])
+            seen = self._grow_brush_seen(len(classes))
+            # Native source identities are unique, but the swept segments overlap.
+            # A point's pre-stroke class is captured exactly once.
+            indices = np.asarray(indices, dtype=np.int64)
+            indices = indices[~seen[indices]]
+            if not indices.size:
+                self._flush_live_brush_preview(force=force_preview)
+                return 0
+
+            if self._brush_tx_from_slots is not None and self._brush_tx_from_slots.size:
+                indices = indices[_class_lut(self._brush_tx_from_slots)[classes[indices]]]
+            if indices.size:
+                indices = indices[classes[indices] != np.asarray(
+                    self._brush_tx_to_slot, dtype=classes.dtype
+                )]
+            if not indices.size:
+                self._flush_live_brush_preview(force=force_preview)
+                return 0
+
+            old = classes[indices].copy()
+            seen[indices] = True
+            classes[indices] = np.asarray(self._brush_tx_to_slot, dtype=classes.dtype)
+            self._brush_tx_indices.append(indices.copy())
+            self._brush_tx_old_classes.append(old)
+            self._brush_tx_frame_indices.append(indices.copy())
+            self._brush_tx_frame_old.append(old.copy())
+            self._brush_tx_changed += int(indices.size)
+            self._flush_live_brush_preview(force=force_preview)
+            return int(indices.size)
+        except Exception as exc:
+            print(f"NATIVE_BRUSH_LIVE status=error error={exc}")
+            self.cancel_pending_brush_transaction(reason="live_error")
+            return 0
+
+    def _brush_transaction_arrays(self):
+        if not self._brush_tx_indices:
+            return (np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.uint8))
+        if len(self._brush_tx_indices) == 1:
+            return self._brush_tx_indices[0], self._brush_tx_old_classes[0]
+        return (np.concatenate(self._brush_tx_indices),
+                np.concatenate(self._brush_tx_old_classes))
+
+    def _finalize_brush_transaction(self):
+        """Commit live paint on physical release as one undo/write operation."""
+        if not self._brush_tx_active:
+            return 0
+        self._flush_live_brush_preview(force=True)
+        indices, old = self._brush_transaction_arrays()
+        app = self.app
+        to_slot = self._brush_tx_to_slot
+        to_code = self._brush_tx_to_code
+        from_user = list(self._brush_tx_from_user or [])
+
+        try:
+            if indices.size == 0:
+                return 0
+            classes = np.asarray(app.data["classification"])
+            new = np.full(indices.size, to_slot, dtype=classes.dtype)
+
+            stack = getattr(app, "undo_stack", None)
+            if stack is None:
+                stack = app.undo_stack = []
+            stack.append({
+                "indices": indices.copy(),
+                "old_classes": old.copy(),
+                "new_classes": new,
+            })
+            redo = getattr(app, "redo_stack", None)
+            if redo is not None:
+                redo.clear()
+            from gui.memory_manager import trim_undo_stack
+            trim_undo_stack(app)
+
+            app._last_changed_indices = indices.copy()
+            app._last_from_classes = from_user
+            app._last_classify_ts = time.time()
+            app.classification_revision = int(
+                getattr(app, "classification_revision", 0) or 0
+            ) + 1
+
+            # The speculative interval ends *before* refresh_edits(), so the
+            # established store.show()->delayed flush path can persist this one
+            # successful stroke.  It never ran while the button was down.
+            self._release_brush_transaction_lock()
+            try:
+                self.canvas.owner.refresh_edits(force=True, changed=(indices, old))
+            except Exception as exc:
+                # The class transaction is already committed in app.data and
+                # history.  Never let a renderer-refresh exception escape a Qt
+                # mouse callback; the store timer can still persist the edit.
+                print(f"NATIVE_BRUSH_COMMIT status=refresh_warning error={exc}")
+            app.statusBar().showMessage(
+                f"{indices.size:,} points -> class {to_code}", 3000
+            )
+            return int(indices.size)
+        finally:
+            self._release_brush_transaction_lock()
+            self._clear_brush_transaction_state()
+
+    def cancel_pending_brush_transaction(self, reason="cancel"):
+        """Restore an unfinished live stroke exactly; add no undo and write nothing."""
+        if not self._brush_tx_active:
+            return 0
+        app = self.app
+        indices, old = self._brush_transaction_arrays()
+        restored = int(indices.size)
+        try:
+            if indices.size:
+                classes = np.asarray(app.data["classification"])
+                current = classes[indices].copy()
+                classes[indices] = old
+                try:
+                    from gui.lnt_section_bridge import get_store
+                    store = get_store(app)
+                    if store is not None:
+                        # Reverse the speculative Vulkan colours/classes without
+                        # scheduling a write. app.data is already back to baseline.
+                        store.preview_live(indices, current)
+                    sections = getattr(app, "_native_sections", None)
+                    if sections is not None:
+                        sections.refresh_edits(force=True)
+                except Exception as exc:
+                    print(f"NATIVE_BRUSH_CANCEL status=preview_warning error={exc}")
+        finally:
+            self._release_brush_transaction_lock()
+            self._clear_brush_transaction_state()
+            self.points = []
+            self.press_px = None
+            self.dragging = False
+            disarm_native_brush_preview(app, reason=reason)
+            try:
+                self.overlay.set_shapes([])
+            except Exception:
+                pass
+
+        print(
+            "NATIVE_BRUSH_CANCEL status=rolled_back "
+            f"view={self._brush_view_name()} restored={restored} reason={reason}"
+        )
+        return restored
+
     def _paint(self):
         tool, hover, pts = self.tool(), self.hover, self.points
         shapes = []
@@ -751,10 +1408,32 @@ class SectionClassifier:
             return
         style = line_style(tool)
         if tool == "brush":
+            # QPainter cursor only (trail=0), no Vulkan/VTK render per mouse move.
+            # Tool selection is not a preview state: the cursor exists only while
+            # this classifier owns an active left-button stroke.
+            preview_owned = (
+                bool(getattr(self.app, "_native_brush_preview_armed", False))
+                and getattr(self.app, "_native_brush_preview_owner", None) == id(self)
+                and self.dragging
+            )
+            if not preview_owned:
+                if self.overlay.shapes:
+                    self.hide_brush_preview()
+                return
+            if self.hover_px is None:
+                if self.overlay.shapes:
+                    self.overlay.set_shapes([])
+                return
             square = str(getattr(self.app, "brush_shape", "circle")).lower() == "rectangle"
-            if pts:
-                shapes.append(("stroke", list(pts) + [hover], (square, self.brush_radius_px(), style)))
-            shapes.append(("circle_px", [hover], (square, self.brush_radius_px(), style)))
+            shapes.append(("brush_cursor_px", [self.hover_px],
+                           (square, self.brush_radius_px(), style)))
+            if not self._brush_cursor_logged:
+                self._brush_cursor_logged = True
+                print(
+                    "PHASE2B4_BRUSH_CURSOR status=enabled backend=qpainter "
+                    f"view={self._brush_view_name()} mode=cursor_locked "
+                    "trail=0 vtk_render_per_move=0"
+                )
         elif tool == "point":
             shapes.append(("circle_px", [hover], (False, 4., style)))
         elif pts:
