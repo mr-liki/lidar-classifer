@@ -1,4 +1,4 @@
-# Install script for directory: H:/naksha-lidar 2/native/naksha_vulkan
+# Install script for directory: H:/new beignning/native/naksha_vulkan
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -47,6 +47,6 @@ endif()
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-  file(WRITE "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/${CMAKE_INSTALL_MANIFEST}"
+  file(WRITE "H:/new beignning/native/naksha_vulkan/build_msvc/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()

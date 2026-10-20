@@ -39,7 +39,7 @@ include CMakeFiles\rules.ninja
 #############################################
 # Logical path to working directory; prefix for absolute paths.
 
-cmake_ninja_workdir = H$:\naksha-lidar$ 2\native\naksha_vulkan\build_msvc\
+cmake_ninja_workdir = H$:\new$ beignning\native\naksha_vulkan\build_msvc\
 # =============================================================================
 # Object build statements for STATIC_LIBRARY target volk
 
@@ -102,6 +102,18 @@ build naksha_shader_surface.frag: phony CMakeFiles\naksha_shader_surface.frag sh
 
 
 #############################################
+# Utility command for naksha_shader_surface_crisp_indexed.vert
+
+build naksha_shader_surface_crisp_indexed.vert: phony CMakeFiles\naksha_shader_surface_crisp_indexed.vert shaders\surface_crisp_indexed.vert.spv
+
+
+#############################################
+# Utility command for naksha_shader_surface_crisp_indexed.frag
+
+build naksha_shader_surface_crisp_indexed.frag: phony CMakeFiles\naksha_shader_surface_crisp_indexed.frag shaders\surface_crisp_indexed.frag.spv
+
+
+#############################################
 # Utility command for naksha_shader_surface_indexed.vert
 
 build naksha_shader_surface_indexed.vert: phony CMakeFiles\naksha_shader_surface_indexed.vert shaders\surface_indexed.vert.spv
@@ -111,6 +123,18 @@ build naksha_shader_surface_indexed.vert: phony CMakeFiles\naksha_shader_surface
 # Utility command for naksha_shader_surface_indexed.frag
 
 build naksha_shader_surface_indexed.frag: phony CMakeFiles\naksha_shader_surface_indexed.frag shaders\surface_indexed.frag.spv
+
+
+#############################################
+# Utility command for naksha_shader_surface_indexed_vc.vert
+
+build naksha_shader_surface_indexed_vc.vert: phony CMakeFiles\naksha_shader_surface_indexed_vc.vert shaders\surface_indexed_vc.vert.spv
+
+
+#############################################
+# Utility command for naksha_shader_surface_indexed_vc.frag
+
+build naksha_shader_surface_indexed_vc.frag: phony CMakeFiles\naksha_shader_surface_indexed_vc.frag shaders\surface_indexed_vc.frag.spv
 
 
 #############################################
@@ -136,6 +160,18 @@ build naksha_shader_splat.vert: phony CMakeFiles\naksha_shader_splat.vert shader
 
 build naksha_shader_splat.frag: phony CMakeFiles\naksha_shader_splat.frag shaders\splat.frag.spv
 
+
+#############################################
+# Utility command for naksha_shader_vector.vert
+
+build naksha_shader_vector.vert: phony CMakeFiles\naksha_shader_vector.vert shaders\vector.vert.spv
+
+
+#############################################
+# Utility command for naksha_shader_vector.frag
+
+build naksha_shader_vector.frag: phony CMakeFiles\naksha_shader_vector.frag shaders\vector.frag.spv
+
 # =============================================================================
 # Object build statements for STATIC_LIBRARY target naksha_vulkan_core
 
@@ -143,183 +179,192 @@ build naksha_shader_splat.frag: phony CMakeFiles\naksha_shader_splat.frag shader
 #############################################
 # Order-only phony target for naksha_vulkan_core
 
-build cmake_object_order_depends_target_naksha_vulkan_core: phony || cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert
+build cmake_object_order_depends_target_naksha_vulkan_core: phony || cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_crisp_indexed.frag naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed_vc.frag naksha_shader_surface_indexed_vc.vert naksha_shader_vector.frag naksha_shader_vector.vert
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VmaImplementation.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VmaImplementation.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VmaImplementation.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VmaImplementation.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanAllocator.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanAllocator.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanAllocator.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanAllocator.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanCommandPool.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanCommandPool.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanCommandPool.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanCommandPool.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanContext.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanContext.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanContext.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanContext.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDescriptorManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanDescriptorManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDescriptorManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanDescriptorManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDevice.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanDevice.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDevice.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanDevice.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanFrameManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanFrameManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanFrameManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanFrameManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanInstance.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanInstance.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanInstance.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanInstance.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPhysicalDevice.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanPhysicalDevice.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPhysicalDevice.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanPhysicalDevice.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPipelineManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanPipelineManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPipelineManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanPipelineManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanRenderPass.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanRenderPass.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanRenderPass.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanRenderPass.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanShaderManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanShaderManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanShaderManager.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanShaderManager.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanSwapchain.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\vulkan\VulkanSwapchain.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanSwapchain.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\vulkan\VulkanSwapchain.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\CoreCamera.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\renderer\CoreCamera.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\CoreCamera.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\renderer\CoreCamera.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\renderer
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\Camera.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\core\renderer\Camera.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\Camera.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\core\renderer\Camera.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src\core\renderer
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\Buffer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\Buffer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\Buffer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\Buffer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\Renderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\Renderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\Renderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\Renderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\PointCloudRenderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\PointCloudRenderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\PointCloudRenderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\PointCloudRenderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\SurfaceRenderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\SurfaceRenderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\SurfaceRenderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\SurfaceRenderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
   TARGET_PDB = naksha_vulkan_core.pdb
 
-build CMakeFiles\naksha_vulkan_core.dir\src\SurfaceTiling.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\SurfaceTiling.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+build CMakeFiles\naksha_vulkan_core.dir\src\VectorOverlayRenderer.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\VectorOverlayRenderer.cpp || cmake_object_order_depends_target_naksha_vulkan_core
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
+  OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
+  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
+  TARGET_PDB = naksha_vulkan_core.pdb
+
+build CMakeFiles\naksha_vulkan_core.dir\src\SurfaceTiling.cpp.obj: CXX_COMPILER__naksha_vulkan_core_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\SurfaceTiling.cpp || cmake_object_order_depends_target_naksha_vulkan_core
+  DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_core.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_core.dir\naksha_vulkan_core.pdb
@@ -333,7 +378,7 @@ build CMakeFiles\naksha_vulkan_core.dir\src\SurfaceTiling.cpp.obj: CXX_COMPILER_
 #############################################
 # Link the static library naksha_vulkan_core.lib
 
-build naksha_vulkan_core.lib: CXX_STATIC_LIBRARY_LINKER__naksha_vulkan_core_Release CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VmaImplementation.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanAllocator.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanCommandPool.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanContext.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDescriptorManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDevice.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanFrameManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanInstance.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPhysicalDevice.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPipelineManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanRenderPass.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanShaderManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanSwapchain.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\CoreCamera.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\Camera.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\Buffer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\Renderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\PointCloudRenderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\SurfaceRenderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\SurfaceTiling.cpp.obj || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert volk.lib
+build naksha_vulkan_core.lib: CXX_STATIC_LIBRARY_LINKER__naksha_vulkan_core_Release CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VmaImplementation.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanAllocator.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanCommandPool.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanContext.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDescriptorManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanDevice.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanFrameManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanInstance.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPhysicalDevice.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanPipelineManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanRenderPass.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanShaderManager.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\vulkan\VulkanSwapchain.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\CoreCamera.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\core\renderer\Camera.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\Buffer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\Renderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\PointCloudRenderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\SurfaceRenderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\VectorOverlayRenderer.cpp.obj CMakeFiles\naksha_vulkan_core.dir\src\SurfaceTiling.cpp.obj || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_crisp_indexed.frag naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed_vc.frag naksha_shader_surface_indexed_vc.vert naksha_shader_vector.frag naksha_shader_vector.vert volk.lib
   LANGUAGE_COMPILE_FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
   LINK_FLAGS = /machine:x64
   OBJECT_DIR = CMakeFiles\naksha_vulkan_core.dir
@@ -344,56 +389,18 @@ build naksha_vulkan_core.lib: CXX_STATIC_LIBRARY_LINKER__naksha_vulkan_core_Rele
   TARGET_PDB = naksha_vulkan_core.pdb
 
 # =============================================================================
-# Object build statements for EXECUTABLE target naksha_vulkan_benchmark
-
-
-#############################################
-# Order-only phony target for naksha_vulkan_benchmark
-
-build cmake_object_order_depends_target_naksha_vulkan_benchmark: phony || cmake_object_order_depends_target_naksha_vulkan_core cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert
-
-build CMakeFiles\naksha_vulkan_benchmark.dir\tests\benchmark_main.cpp.obj: CXX_COMPILER__naksha_vulkan_benchmark_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\tests\benchmark_main.cpp || cmake_object_order_depends_target_naksha_vulkan_benchmark
-  DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
-  OBJECT_DIR = CMakeFiles\naksha_vulkan_benchmark.dir
-  OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_benchmark.dir\tests
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_benchmark.dir\
-  TARGET_PDB = naksha_vulkan_benchmark.pdb
-
-
-# =============================================================================
-# Link build statements for EXECUTABLE target naksha_vulkan_benchmark
-
-
-#############################################
-# Link the executable naksha_vulkan_benchmark.exe
-
-build naksha_vulkan_benchmark.exe: CXX_EXECUTABLE_LINKER__naksha_vulkan_benchmark_Release CMakeFiles\naksha_vulkan_benchmark.dir\tests\benchmark_main.cpp.obj | naksha_vulkan_core.lib volk.lib || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_vulkan_core.lib volk.lib
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
-  LINK_FLAGS = /machine:x64 /INCREMENTAL:NO /subsystem:windows
-  LINK_LIBRARIES = naksha_vulkan_core.lib  user32.lib  gdi32.lib  volk.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
-  OBJECT_DIR = CMakeFiles\naksha_vulkan_benchmark.dir
-  POST_BUILD = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.frag.spv""
-  PRE_LINK = cd .
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_benchmark.dir\
-  TARGET_FILE = naksha_vulkan_benchmark.exe
-  TARGET_IMPLIB = naksha_vulkan_benchmark.lib
-  TARGET_PDB = naksha_vulkan_benchmark.pdb
-
-# =============================================================================
 # Object build statements for SHARED_LIBRARY target naksha_vulkan
 
 
 #############################################
 # Order-only phony target for naksha_vulkan
 
-build cmake_object_order_depends_target_naksha_vulkan: phony || cmake_object_order_depends_target_naksha_vulkan_core cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert
+build cmake_object_order_depends_target_naksha_vulkan: phony || cmake_object_order_depends_target_naksha_vulkan_core cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_crisp_indexed.frag naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed_vc.frag naksha_shader_surface_indexed_vc.vert naksha_shader_vector.frag naksha_shader_vector.vert
 
-build CMakeFiles\naksha_vulkan.dir\src\naksha_vulkan_c_api.cpp.obj: CXX_COMPILER__naksha_vulkan_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\naksha_vulkan_c_api.cpp || cmake_object_order_depends_target_naksha_vulkan
+build CMakeFiles\naksha_vulkan.dir\src\naksha_vulkan_c_api.cpp.obj: CXX_COMPILER__naksha_vulkan_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\src\naksha_vulkan_c_api.cpp || cmake_object_order_depends_target_naksha_vulkan
   DEFINES = -DNAKSHA_VULKAN_C_API_BUILD -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN -Dnaksha_vulkan_EXPORTS
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_vulkan.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan.dir\src
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan.dir\
@@ -407,12 +414,12 @@ build CMakeFiles\naksha_vulkan.dir\src\naksha_vulkan_c_api.cpp.obj: CXX_COMPILER
 #############################################
 # Link the shared library naksha_vulkan.dll
 
-build naksha_vulkan.dll naksha_vulkan.lib: CXX_SHARED_LIBRARY_LINKER__naksha_vulkan_Release CMakeFiles\naksha_vulkan.dir\src\naksha_vulkan_c_api.cpp.obj | naksha_vulkan_core.lib volk.lib || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_vulkan_core.lib volk.lib
+build naksha_vulkan.dll naksha_vulkan.lib: CXX_SHARED_LIBRARY_LINKER__naksha_vulkan_Release CMakeFiles\naksha_vulkan.dir\src\naksha_vulkan_c_api.cpp.obj | naksha_vulkan_core.lib volk.lib || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_crisp_indexed.frag naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed_vc.frag naksha_shader_surface_indexed_vc.vert naksha_shader_vector.frag naksha_shader_vector.vert naksha_vulkan_core.lib volk.lib
   LANGUAGE_COMPILE_FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
-  LINK_FLAGS = /machine:x64 /INCREMENTAL:NO  -static-libgcc -static-libstdc++ -static -lwinpthread
+  LINK_FLAGS = /machine:x64 /INCREMENTAL:NO
   LINK_LIBRARIES = naksha_vulkan_core.lib  user32.lib  gdi32.lib  volk.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
   OBJECT_DIR = CMakeFiles\naksha_vulkan.dir
-  POST_BUILD = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface_indexed.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface_indexed.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/instant.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/instant.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/splat.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/splat.frag.spv""
+  POST_BUILD = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/point.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/point.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/point.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/point.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_crisp_indexed.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_crisp_indexed.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_crisp_indexed.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_crisp_indexed.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_indexed.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_indexed.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed_vc.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_indexed_vc.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed_vc.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/surface_indexed_vc.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/instant.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/instant.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/splat.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/splat.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/vector.vert.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/vector.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/vector.frag.spv" "H:/new beignning/native/naksha_vulkan/build_msvc/vector.frag.spv""
   PRE_LINK = cd .
   RESTAT = 1
   TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan.dir\
@@ -429,7 +436,7 @@ build naksha_vulkan.dll naksha_vulkan.lib: CXX_SHARED_LIBRARY_LINKER__naksha_vul
 
 build cmake_object_order_depends_target_naksha_startup_probe: phony || .
 
-build CMakeFiles\naksha_startup_probe.dir\diagnostics\startup_probe.cpp.obj: CXX_COMPILER__naksha_startup_probe_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\diagnostics\startup_probe.cpp || cmake_object_order_depends_target_naksha_startup_probe
+build CMakeFiles\naksha_startup_probe.dir\diagnostics\startup_probe.cpp.obj: CXX_COMPILER__naksha_startup_probe_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\diagnostics\startup_probe.cpp || cmake_object_order_depends_target_naksha_startup_probe
   DEFINES = -DNOMINMAX -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
   OBJECT_DIR = CMakeFiles\naksha_startup_probe.dir
@@ -466,10 +473,10 @@ build naksha_startup_probe.exe: CXX_EXECUTABLE_LINKER__naksha_startup_probe_Rele
 
 build cmake_object_order_depends_target_naksha_startup_core_probe: phony || cmake_object_order_depends_target_naksha_vulkan_core cmake_object_order_depends_target_volk
 
-build CMakeFiles\naksha_startup_core_probe.dir\diagnostics\startup_core_probe.cpp.obj: CXX_COMPILER__naksha_startup_core_probe_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\diagnostics\startup_core_probe.cpp || cmake_object_order_depends_target_naksha_startup_core_probe
+build CMakeFiles\naksha_startup_core_probe.dir\diagnostics\startup_core_probe.cpp.obj: CXX_COMPILER__naksha_startup_core_probe_unscanned_Release H$:\new$ beignning\native\naksha_vulkan\diagnostics\startup_core_probe.cpp || cmake_object_order_depends_target_naksha_startup_core_probe
   DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
+  INCLUDES = -I"H:\new beignning\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
   OBJECT_DIR = CMakeFiles\naksha_startup_core_probe.dir
   OBJECT_FILE_DIR = CMakeFiles\naksha_startup_core_probe.dir\diagnostics
   TARGET_COMPILE_PDB = CMakeFiles\naksha_startup_core_probe.dir\
@@ -495,106 +502,12 @@ build naksha_startup_core_probe.exe: CXX_EXECUTABLE_LINKER__naksha_startup_core_
   TARGET_IMPLIB = naksha_startup_core_probe.lib
   TARGET_PDB = naksha_startup_core_probe.pdb
 
-# =============================================================================
-# Object build statements for EXECUTABLE target naksha_vulkan_tiling_test
-
-
-#############################################
-# Order-only phony target for naksha_vulkan_tiling_test
-
-build cmake_object_order_depends_target_naksha_vulkan_tiling_test: phony || .
-
-build CMakeFiles\naksha_vulkan_tiling_test.dir\tests\tiling_test_main.cpp.obj: CXX_COMPILER__naksha_vulkan_tiling_test_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\tests\tiling_test_main.cpp || cmake_object_order_depends_target_naksha_vulkan_tiling_test
-  DEFINES = -DNOMINMAX -DWIN32_LEAN_AND_MEAN
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include"
-  OBJECT_DIR = CMakeFiles\naksha_vulkan_tiling_test.dir
-  OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_tiling_test.dir\tests
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_tiling_test.dir\
-  TARGET_PDB = naksha_vulkan_tiling_test.pdb
-
-build CMakeFiles\naksha_vulkan_tiling_test.dir\src\SurfaceTiling.cpp.obj: CXX_COMPILER__naksha_vulkan_tiling_test_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\SurfaceTiling.cpp || cmake_object_order_depends_target_naksha_vulkan_tiling_test
-  DEFINES = -DNOMINMAX -DWIN32_LEAN_AND_MEAN
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include"
-  OBJECT_DIR = CMakeFiles\naksha_vulkan_tiling_test.dir
-  OBJECT_FILE_DIR = CMakeFiles\naksha_vulkan_tiling_test.dir\src
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_tiling_test.dir\
-  TARGET_PDB = naksha_vulkan_tiling_test.pdb
-
-
-# =============================================================================
-# Link build statements for EXECUTABLE target naksha_vulkan_tiling_test
-
-
-#############################################
-# Link the executable naksha_vulkan_tiling_test.exe
-
-build naksha_vulkan_tiling_test.exe: CXX_EXECUTABLE_LINKER__naksha_vulkan_tiling_test_Release CMakeFiles\naksha_vulkan_tiling_test.dir\tests\tiling_test_main.cpp.obj CMakeFiles\naksha_vulkan_tiling_test.dir\src\SurfaceTiling.cpp.obj
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
-  LINK_FLAGS = /machine:x64 /INCREMENTAL:NO /subsystem:console
-  LINK_LIBRARIES = kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
-  OBJECT_DIR = CMakeFiles\naksha_vulkan_tiling_test.dir
-  POST_BUILD = cd .
-  PRE_LINK = cd .
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_vulkan_tiling_test.dir\
-  TARGET_FILE = naksha_vulkan_tiling_test.exe
-  TARGET_IMPLIB = naksha_vulkan_tiling_test.lib
-  TARGET_PDB = naksha_vulkan_tiling_test.pdb
-
-# =============================================================================
-# Object build statements for EXECUTABLE target naksha_surface_acceptance
-
-
-#############################################
-# Order-only phony target for naksha_surface_acceptance
-
-build cmake_object_order_depends_target_naksha_surface_acceptance: phony || cmake_object_order_depends_target_naksha_vulkan_core cmake_object_order_depends_target_volk naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert
-
-build CMakeFiles\naksha_surface_acceptance.dir\tests\surface_acceptance_main.cpp.obj: CXX_COMPILER__naksha_surface_acceptance_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\tests\surface_acceptance_main.cpp || cmake_object_order_depends_target_naksha_surface_acceptance
-  DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
-  OBJECT_DIR = CMakeFiles\naksha_surface_acceptance.dir
-  OBJECT_FILE_DIR = CMakeFiles\naksha_surface_acceptance.dir\tests
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_surface_acceptance.dir\
-  TARGET_PDB = naksha_surface_acceptance.pdb
-
-build CMakeFiles\naksha_surface_acceptance.dir\src\naksha_vulkan_c_api.cpp.obj: CXX_COMPILER__naksha_surface_acceptance_unscanned_Release H$:\naksha-lidar$ 2\native\naksha_vulkan\src\naksha_vulkan_c_api.cpp || cmake_object_order_depends_target_naksha_surface_acceptance
-  DEFINES = -DNOMINMAX -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_WIN32_KHR -DVMA_DYNAMIC_VULKAN_FUNCTIONS=1 -DVMA_STATIC_VULKAN_FUNCTIONS=0 -DWIN32_LEAN_AND_MEAN
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD
-  INCLUDES = -I"H:\naksha-lidar 2\native\naksha_vulkan\include" -IH:\tools\Include\Volk -IH:\tools\Include\vma -external:IH:\tools\Include -external:W0
-  OBJECT_DIR = CMakeFiles\naksha_surface_acceptance.dir
-  OBJECT_FILE_DIR = CMakeFiles\naksha_surface_acceptance.dir\src
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_surface_acceptance.dir\
-  TARGET_PDB = naksha_surface_acceptance.pdb
-
-
-# =============================================================================
-# Link build statements for EXECUTABLE target naksha_surface_acceptance
-
-
-#############################################
-# Link the executable naksha_surface_acceptance.exe
-
-build naksha_surface_acceptance.exe: CXX_EXECUTABLE_LINKER__naksha_surface_acceptance_Release CMakeFiles\naksha_surface_acceptance.dir\tests\surface_acceptance_main.cpp.obj CMakeFiles\naksha_surface_acceptance.dir\src\naksha_vulkan_c_api.cpp.obj | naksha_vulkan_core.lib volk.lib || naksha_shader_instant.frag naksha_shader_instant.vert naksha_shader_point.frag naksha_shader_point.vert naksha_shader_splat.frag naksha_shader_splat.vert naksha_shader_surface.frag naksha_shader_surface.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed.vert naksha_vulkan_core.lib volk.lib
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
-  LINK_FLAGS = /machine:x64 /INCREMENTAL:NO /subsystem:console
-  LINK_LIBRARIES = naksha_vulkan_core.lib  user32.lib  gdi32.lib  volk.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
-  OBJECT_DIR = CMakeFiles\naksha_surface_acceptance.dir
-  POST_BUILD = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/surface.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/point.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/instant.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/instant.frag.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/splat.vert.spv" && H:\tools\CMake_64\bin\cmake.exe -E copy_if_different "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv" "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/splat.frag.spv""
-  PRE_LINK = cd .
-  TARGET_COMPILE_PDB = CMakeFiles\naksha_surface_acceptance.dir\
-  TARGET_FILE = naksha_surface_acceptance.exe
-  TARGET_IMPLIB = naksha_surface_acceptance.lib
-  TARGET_PDB = naksha_surface_acceptance.pdb
-
 
 #############################################
 # Utility command for edit_cache
 
 build CMakeFiles\edit_cache.util: CUSTOM_COMMAND
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake-gui.exe -S"H:\naksha-lidar 2\native\naksha_vulkan" -B"H:\naksha-lidar 2\native\naksha_vulkan\build_msvc""
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake-gui.exe -S"H:\new beignning\native\naksha_vulkan" -B"H:\new beignning\native\naksha_vulkan\build_msvc""
   DESC = Running CMake cache editor...
   pool = console
   restat = 1
@@ -606,7 +519,7 @@ build edit_cache: phony CMakeFiles\edit_cache.util
 # Utility command for rebuild_cache
 
 build CMakeFiles\rebuild_cache.util: CUSTOM_COMMAND
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe --regenerate-during-build -S"H:\naksha-lidar 2\native\naksha_vulkan" -B"H:\naksha-lidar 2\native\naksha_vulkan\build_msvc""
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\CMake_64\bin\cmake.exe --regenerate-during-build -S"H:\new beignning\native\naksha_vulkan" -B"H:\new beignning\native\naksha_vulkan\build_msvc""
   DESC = Running CMake to regenerate build system...
   pool = console
   restat = 1
@@ -623,8 +536,8 @@ build CMakeFiles\naksha_shader_point.vert | ${cmake_ninja_workdir}CMakeFiles\nak
 #############################################
 # Custom command for shaders\point.vert.spv
 
-build shaders\point.vert.spv | ${cmake_ninja_workdir}shaders\point.vert.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\point.vert
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/point.vert" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.vert.spv""
+build shaders\point.vert.spv | ${cmake_ninja_workdir}shaders\point.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\point.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/point.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/point.vert.spv""
   DESC = Compiling point.vert
   restat = 1
 
@@ -638,8 +551,8 @@ build CMakeFiles\naksha_shader_point.frag | ${cmake_ninja_workdir}CMakeFiles\nak
 #############################################
 # Custom command for shaders\point.frag.spv
 
-build shaders\point.frag.spv | ${cmake_ninja_workdir}shaders\point.frag.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\point.frag
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/point.frag" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.frag.spv""
+build shaders\point.frag.spv | ${cmake_ninja_workdir}shaders\point.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\point.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/point.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/point.frag.spv""
   DESC = Compiling point.frag
   restat = 1
 
@@ -653,8 +566,8 @@ build CMakeFiles\naksha_shader_surface.vert | ${cmake_ninja_workdir}CMakeFiles\n
 #############################################
 # Custom command for shaders\surface.vert.spv
 
-build shaders\surface.vert.spv | ${cmake_ninja_workdir}shaders\surface.vert.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\surface.vert
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/surface.vert" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv""
+build shaders\surface.vert.spv | ${cmake_ninja_workdir}shaders\surface.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv""
   DESC = Compiling surface.vert
   restat = 1
 
@@ -668,9 +581,39 @@ build CMakeFiles\naksha_shader_surface.frag | ${cmake_ninja_workdir}CMakeFiles\n
 #############################################
 # Custom command for shaders\surface.frag.spv
 
-build shaders\surface.frag.spv | ${cmake_ninja_workdir}shaders\surface.frag.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\surface.frag
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/surface.frag" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv""
+build shaders\surface.frag.spv | ${cmake_ninja_workdir}shaders\surface.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv""
   DESC = Compiling surface.frag
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_surface_crisp_indexed.vert
+
+build CMakeFiles\naksha_shader_surface_crisp_indexed.vert | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_surface_crisp_indexed.vert: phony shaders\surface_crisp_indexed.vert.spv
+
+
+#############################################
+# Custom command for shaders\surface_crisp_indexed.vert.spv
+
+build shaders\surface_crisp_indexed.vert.spv | ${cmake_ninja_workdir}shaders\surface_crisp_indexed.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface_crisp_indexed.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface_crisp_indexed.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_crisp_indexed.vert.spv""
+  DESC = Compiling surface_crisp_indexed.vert
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_surface_crisp_indexed.frag
+
+build CMakeFiles\naksha_shader_surface_crisp_indexed.frag | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_surface_crisp_indexed.frag: phony shaders\surface_crisp_indexed.frag.spv
+
+
+#############################################
+# Custom command for shaders\surface_crisp_indexed.frag.spv
+
+build shaders\surface_crisp_indexed.frag.spv | ${cmake_ninja_workdir}shaders\surface_crisp_indexed.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 -DCRISP_INDEXED "H:/new beignning/native/naksha_vulkan/shaders/surface.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_crisp_indexed.frag.spv""
+  DESC = Compiling surface.frag (CRISP_INDEXED)
   restat = 1
 
 
@@ -683,8 +626,8 @@ build CMakeFiles\naksha_shader_surface_indexed.vert | ${cmake_ninja_workdir}CMak
 #############################################
 # Custom command for shaders\surface_indexed.vert.spv
 
-build shaders\surface_indexed.vert.spv | ${cmake_ninja_workdir}shaders\surface_indexed.vert.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\surface_indexed.vert
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/surface_indexed.vert" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.vert.spv""
+build shaders\surface_indexed.vert.spv | ${cmake_ninja_workdir}shaders\surface_indexed.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface_indexed.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface_indexed.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed.vert.spv""
   DESC = Compiling surface_indexed.vert
   restat = 1
 
@@ -698,9 +641,39 @@ build CMakeFiles\naksha_shader_surface_indexed.frag | ${cmake_ninja_workdir}CMak
 #############################################
 # Custom command for shaders\surface_indexed.frag.spv
 
-build shaders\surface_indexed.frag.spv | ${cmake_ninja_workdir}shaders\surface_indexed.frag.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\surface_indexed.frag
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/surface_indexed.frag" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.frag.spv""
+build shaders\surface_indexed.frag.spv | ${cmake_ninja_workdir}shaders\surface_indexed.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface_indexed.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface_indexed.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed.frag.spv""
   DESC = Compiling surface_indexed.frag
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_surface_indexed_vc.vert
+
+build CMakeFiles\naksha_shader_surface_indexed_vc.vert | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_surface_indexed_vc.vert: phony shaders\surface_indexed_vc.vert.spv
+
+
+#############################################
+# Custom command for shaders\surface_indexed_vc.vert.spv
+
+build shaders\surface_indexed_vc.vert.spv | ${cmake_ninja_workdir}shaders\surface_indexed_vc.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface_indexed_vc.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface_indexed_vc.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed_vc.vert.spv""
+  DESC = Compiling surface_indexed_vc.vert
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_surface_indexed_vc.frag
+
+build CMakeFiles\naksha_shader_surface_indexed_vc.frag | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_surface_indexed_vc.frag: phony shaders\surface_indexed_vc.frag.spv
+
+
+#############################################
+# Custom command for shaders\surface_indexed_vc.frag.spv
+
+build shaders\surface_indexed_vc.frag.spv | ${cmake_ninja_workdir}shaders\surface_indexed_vc.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\surface_indexed_vc.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/surface_indexed_vc.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/surface_indexed_vc.frag.spv""
+  DESC = Compiling surface_indexed_vc.frag
   restat = 1
 
 
@@ -713,8 +686,8 @@ build CMakeFiles\naksha_shader_instant.vert | ${cmake_ninja_workdir}CMakeFiles\n
 #############################################
 # Custom command for shaders\instant.vert.spv
 
-build shaders\instant.vert.spv | ${cmake_ninja_workdir}shaders\instant.vert.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\instant.vert
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/instant.vert" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv""
+build shaders\instant.vert.spv | ${cmake_ninja_workdir}shaders\instant.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\instant.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/instant.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv""
   DESC = Compiling instant.vert
   restat = 1
 
@@ -728,8 +701,8 @@ build CMakeFiles\naksha_shader_instant.frag | ${cmake_ninja_workdir}CMakeFiles\n
 #############################################
 # Custom command for shaders\instant.frag.spv
 
-build shaders\instant.frag.spv | ${cmake_ninja_workdir}shaders\instant.frag.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\instant.frag
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/instant.frag" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv""
+build shaders\instant.frag.spv | ${cmake_ninja_workdir}shaders\instant.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\instant.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/instant.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv""
   DESC = Compiling instant.frag
   restat = 1
 
@@ -743,8 +716,8 @@ build CMakeFiles\naksha_shader_splat.vert | ${cmake_ninja_workdir}CMakeFiles\nak
 #############################################
 # Custom command for shaders\splat.vert.spv
 
-build shaders\splat.vert.spv | ${cmake_ninja_workdir}shaders\splat.vert.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\splat.vert
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/splat.vert" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv""
+build shaders\splat.vert.spv | ${cmake_ninja_workdir}shaders\splat.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\splat.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/splat.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv""
   DESC = Compiling splat.vert
   restat = 1
 
@@ -758,9 +731,39 @@ build CMakeFiles\naksha_shader_splat.frag | ${cmake_ninja_workdir}CMakeFiles\nak
 #############################################
 # Custom command for shaders\splat.frag.spv
 
-build shaders\splat.frag.spv | ${cmake_ninja_workdir}shaders\splat.frag.spv: CUSTOM_COMMAND H$:\naksha-lidar$ 2\native\naksha_vulkan\shaders\splat.frag
-  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\naksha-lidar 2\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/naksha-lidar 2/native/naksha_vulkan/shaders/splat.frag" -o "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv""
+build shaders\splat.frag.spv | ${cmake_ninja_workdir}shaders\splat.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\splat.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/splat.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv""
   DESC = Compiling splat.frag
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_vector.vert
+
+build CMakeFiles\naksha_shader_vector.vert | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_vector.vert: phony shaders\vector.vert.spv
+
+
+#############################################
+# Custom command for shaders\vector.vert.spv
+
+build shaders\vector.vert.spv | ${cmake_ninja_workdir}shaders\vector.vert.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\vector.vert
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/vector.vert" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/vector.vert.spv""
+  DESC = Compiling vector.vert
+  restat = 1
+
+
+#############################################
+# Phony custom command for CMakeFiles\naksha_shader_vector.frag
+
+build CMakeFiles\naksha_shader_vector.frag | ${cmake_ninja_workdir}CMakeFiles\naksha_shader_vector.frag: phony shaders\vector.frag.spv
+
+
+#############################################
+# Custom command for shaders\vector.frag.spv
+
+build shaders\vector.frag.spv | ${cmake_ninja_workdir}shaders\vector.frag.spv: CUSTOM_COMMAND H$:\new$ beignning\native\naksha_vulkan\shaders\vector.frag
+  COMMAND = C:\Windows\system32\cmd.exe /C "cd /D "H:\new beignning\native\naksha_vulkan\build_msvc" && H:\tools\Bin\glslc.exe --target-env=vulkan1.3 "H:/new beignning/native/naksha_vulkan/shaders/vector.frag" -o "H:/new beignning/native/naksha_vulkan/build_msvc/shaders/vector.frag.spv""
+  DESC = Compiling vector.frag
   restat = 1
 
 # =============================================================================
@@ -770,15 +773,9 @@ build naksha_startup_core_probe: phony naksha_startup_core_probe.exe
 
 build naksha_startup_probe: phony naksha_startup_probe.exe
 
-build naksha_surface_acceptance: phony naksha_surface_acceptance.exe
-
 build naksha_vulkan: phony naksha_vulkan.dll
 
-build naksha_vulkan_benchmark: phony naksha_vulkan_benchmark.exe
-
 build naksha_vulkan_core: phony naksha_vulkan_core.lib
-
-build naksha_vulkan_tiling_test: phony naksha_vulkan_tiling_test.exe
 
 build volk: phony volk.lib
 
@@ -788,9 +785,9 @@ build volk: phony volk.lib
 # =============================================================================
 
 #############################################
-# Folder: H:/naksha-lidar 2/native/naksha_vulkan/build_msvc
+# Folder: H:/new beignning/native/naksha_vulkan/build_msvc
 
-build all: phony volk.lib naksha_shader_point.vert naksha_shader_point.frag naksha_shader_surface.vert naksha_shader_surface.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_instant.vert naksha_shader_instant.frag naksha_shader_splat.vert naksha_shader_splat.frag naksha_vulkan_core.lib naksha_vulkan_benchmark.exe naksha_vulkan.dll naksha_startup_probe.exe naksha_startup_core_probe.exe naksha_vulkan_tiling_test.exe naksha_surface_acceptance.exe
+build all: phony volk.lib naksha_shader_point.vert naksha_shader_point.frag naksha_shader_surface.vert naksha_shader_surface.frag naksha_shader_surface_crisp_indexed.vert naksha_shader_surface_crisp_indexed.frag naksha_shader_surface_indexed.vert naksha_shader_surface_indexed.frag naksha_shader_surface_indexed_vc.vert naksha_shader_surface_indexed_vc.frag naksha_shader_instant.vert naksha_shader_instant.frag naksha_shader_splat.vert naksha_shader_splat.frag naksha_shader_vector.vert naksha_shader_vector.frag naksha_vulkan_core.lib naksha_vulkan.dll naksha_startup_probe.exe naksha_startup_core_probe.exe
 
 # =============================================================================
 # Built-in targets
@@ -799,14 +796,14 @@ build all: phony volk.lib naksha_shader_point.vert naksha_shader_point.frag naks
 #############################################
 # Re-run CMake if any of its inputs changed.
 
-build build.ninja: RERUN_CMAKE | CMakeCache.txt CMakeFiles\3.30.5\CMakeCCompiler.cmake CMakeFiles\3.30.5\CMakeCXXCompiler.cmake CMakeFiles\3.30.5\CMakeRCCompiler.cmake CMakeFiles\3.30.5\CMakeSystem.cmake H$:\naksha-lidar$ 2\native\naksha_vulkan\CMakeLists.txt H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCommonLanguageInclude.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeGenericSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeInitializeConfigs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeLanguageInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInitialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CMakeCommonCompilerMacros.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageHandleStandardArgs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageMessage.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindVulkan.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Initialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\WindowsPaths.cmake
+build build.ninja: RERUN_CMAKE | CMakeCache.txt CMakeFiles\3.30.5\CMakeCCompiler.cmake CMakeFiles\3.30.5\CMakeCXXCompiler.cmake CMakeFiles\3.30.5\CMakeRCCompiler.cmake CMakeFiles\3.30.5\CMakeSystem.cmake H$:\new$ beignning\native\naksha_vulkan\CMakeLists.txt H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCCompilerABI.c H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXCompilerABI.cpp H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCommonLanguageInclude.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCompilerIdDetection.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCXXCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerABI.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerId.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerSupport.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineRCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeFindBinUtils.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeGenericSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeInitializeConfigs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeLanguageInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeNinjaFindMake.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseImplicitIncludeInfo.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseImplicitLinkInfo.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseLibraryArchitecture.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystem.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInitialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCXXCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCompilerCommon.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestRCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ADSP-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ARMCC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ARMClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\AppleClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Borland-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Bruce-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CMakeCommonCompilerMacros.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Clang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Clang-DetermineCompilerInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Compaq-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Compaq-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Cray-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CrayClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Embarcadero-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Fujitsu-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\FujitsuClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GHS-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GNU-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GNU-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\HP-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\HP-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IAR-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMCPP-C-DetermineVersionInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMCPP-CXX-DetermineVersionInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMClang-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMClang-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Intel-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IntelLLVM-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\LCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\LCC-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX-CXXImportStd.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\NVHPC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\NVIDIA-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\OpenWatcom-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\OrangeC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\PGI-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\PathScale-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SCO-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SDCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SunPro-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SunPro-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TI-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TIClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Tasking-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TinyCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\VisualAge-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\VisualAge-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Watcom-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XL-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XL-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XLClang-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XLClang-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\zOS-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\zOS-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageHandleStandardArgs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageMessage.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindVulkan.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Internal\CMakeDetermineLinkerId.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Internal\FeatureTesting.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Determine-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Initialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\WindowsPaths.cmake
   pool = console
 
 
 #############################################
 # A missing CMake input file is not an error.
 
-build CMakeCache.txt CMakeFiles\3.30.5\CMakeCCompiler.cmake CMakeFiles\3.30.5\CMakeCXXCompiler.cmake CMakeFiles\3.30.5\CMakeRCCompiler.cmake CMakeFiles\3.30.5\CMakeSystem.cmake H$:\naksha-lidar$ 2\native\naksha_vulkan\CMakeLists.txt H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCommonLanguageInclude.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeGenericSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeInitializeConfigs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeLanguageInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInitialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CMakeCommonCompilerMacros.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageHandleStandardArgs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageMessage.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindVulkan.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Initialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\WindowsPaths.cmake: phony
+build CMakeCache.txt CMakeFiles\3.30.5\CMakeCCompiler.cmake CMakeFiles\3.30.5\CMakeCXXCompiler.cmake CMakeFiles\3.30.5\CMakeRCCompiler.cmake CMakeFiles\3.30.5\CMakeSystem.cmake H$:\new$ beignning\native\naksha_vulkan\CMakeLists.txt H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCCompilerABI.c H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXCompilerABI.cpp H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCXXInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCommonLanguageInclude.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeCompilerIdDetection.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCXXCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerABI.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerId.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineCompilerSupport.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineRCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeDetermineSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeFindBinUtils.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeGenericSystem.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeInitializeConfigs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeLanguageInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeNinjaFindMake.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseImplicitIncludeInfo.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseImplicitLinkInfo.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeParseLibraryArchitecture.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCCompiler.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeRCInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystem.cmake.in H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInformation.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeSystemSpecificInitialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCXXCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestCompilerCommon.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\CMakeTestRCCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ADSP-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ARMCC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\ARMClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\AppleClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Borland-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Bruce-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CMakeCommonCompilerMacros.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Clang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Clang-DetermineCompilerInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Compaq-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Compaq-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Cray-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\CrayClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Embarcadero-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Fujitsu-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\FujitsuClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GHS-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GNU-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\GNU-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\HP-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\HP-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IAR-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMCPP-C-DetermineVersionInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMCPP-CXX-DetermineVersionInternal.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMClang-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IBMClang-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Intel-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\IntelLLVM-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\LCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\LCC-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX-CXXImportStd.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\NVHPC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\NVIDIA-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\OpenWatcom-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\OrangeC-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\PGI-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\PathScale-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SCO-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SDCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SunPro-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\SunPro-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TI-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TIClang-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Tasking-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\TinyCC-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\VisualAge-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\VisualAge-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\Watcom-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XL-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XL-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XLClang-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\XLClang-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\zOS-C-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Compiler\zOS-CXX-DetermineCompiler.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageHandleStandardArgs.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindPackageMessage.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\FindVulkan.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Internal\CMakeDetermineLinkerId.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Internal\FeatureTesting.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Determine-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-Initialize.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-C.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC-CXX.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows-MSVC.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\Windows.cmake H$:\tools\CMake_64\share\cmake-3.30\Modules\Platform\WindowsPaths.cmake: phony
 
 
 #############################################

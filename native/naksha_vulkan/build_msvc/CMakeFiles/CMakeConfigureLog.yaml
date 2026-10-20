@@ -39,7 +39,7 @@ events:
       Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.obj"
       
       The CXX compiler identification is MSVC, found in:
-        H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/3.30.5/CompilerIdCXX/CMakeCXXCompilerId.exe
+        H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/3.30.5/CompilerIdCXX/CMakeCXXCompilerId.exe
       
   -
     kind: "message-v1"
@@ -51,7 +51,7 @@ events:
     message: |
       Detecting CXX compiler /showIncludes prefix:
         main.c
-        Note: including file: H:\\naksha-lidar 2\\native\\naksha_vulkan\\build_msvc\\CMakeFiles\\ShowIncludes\\foo.h
+        Note: including file: H:\\new beignning\\native\\naksha_vulkan\\build_msvc\\CMakeFiles\\ShowIncludes\\foo.h
         
       Found prefix "Note: including file: "
   -
@@ -63,8 +63,8 @@ events:
     checks:
       - "Detecting CXX compiler ABI info"
     directories:
-      source: "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-4g1ru5"
-      binary: "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-4g1ru5"
+      source: "H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-05bsvp"
+      binary: "H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-05bsvp"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -74,11 +74,11 @@ events:
       variable: "CMAKE_CXX_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-4g1ru5'
+        Change Dir: 'H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-05bsvp'
         
-        Run Build Command(s): H:/tools/Ninja/ninja.exe -v cmTC_aa941
-        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP   /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_aa941.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_aa941.dir\\ /FS -c H:\\tools\\CMake_64\\share\\cmake-3.30\\Modules\\CMakeCXXCompilerABI.cpp
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && H:\\tools\\CMake_64\\bin\\cmake.exe -E vs_link_exe --intdir=CMakeFiles\\cmTC_aa941.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_aa941.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_aa941.exe /implib:cmTC_aa941.lib /pdb:cmTC_aa941.pdb /version:0.0 /machine:x64  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        Run Build Command(s): C:/PROGRA~2/MICROS~2/2022/BUILDT~1/Common7/IDE/COMMON~1/MICROS~1/CMake/Ninja/ninja.exe -v cmTC_76304
+        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP   /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_76304.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_76304.dir\\ /FS -c H:\\tools\\CMake_64\\share\\cmake-3.30\\Modules\\CMakeCXXCompilerABI.cpp
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && H:\\tools\\CMake_64\\bin\\cmake.exe -E vs_link_exe --intdir=CMakeFiles\\cmTC_76304.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_76304.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_76304.exe /implib:cmTC_76304.lib /pdb:cmTC_76304.pdb /version:0.0 /machine:x64  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
         
       exitCode: 0
   -
@@ -140,7 +140,7 @@ events:
       Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.obj"
       
       The C compiler identification is MSVC, found in:
-        H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/3.30.5/CompilerIdC/CMakeCCompilerId.exe
+        H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/3.30.5/CompilerIdC/CMakeCCompilerId.exe
       
   -
     kind: "message-v1"
@@ -152,7 +152,7 @@ events:
     message: |
       Detecting C compiler /showIncludes prefix:
         main.c
-        Note: including file: H:\\naksha-lidar 2\\native\\naksha_vulkan\\build_msvc\\CMakeFiles\\ShowIncludes\\foo.h
+        Note: including file: H:\\new beignning\\native\\naksha_vulkan\\build_msvc\\CMakeFiles\\ShowIncludes\\foo.h
         
       Found prefix "Note: including file: "
   -
@@ -164,8 +164,8 @@ events:
     checks:
       - "Detecting C compiler ABI info"
     directories:
-      source: "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-5xrfae"
-      binary: "H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-5xrfae"
+      source: "H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-gs6cmi"
+      binary: "H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-gs6cmi"
     cmakeVariables:
       CMAKE_C_FLAGS: "/DWIN32 /D_WINDOWS"
       CMAKE_C_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -174,11 +174,11 @@ events:
       variable: "CMAKE_C_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-5xrfae'
+        Change Dir: 'H:/new beignning/native/naksha_vulkan/build_msvc/CMakeFiles/CMakeScratch/TryCompile-gs6cmi'
         
-        Run Build Command(s): H:/tools/Ninja/ninja.exe -v cmTC_0989a
-        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\cl.exe  /nologo   /DWIN32 /D_WINDOWS  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_0989a.dir\\CMakeCCompilerABI.c.obj /FdCMakeFiles\\cmTC_0989a.dir\\ /FS -c H:\\tools\\CMake_64\\share\\cmake-3.30\\Modules\\CMakeCCompilerABI.c
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && H:\\tools\\CMake_64\\bin\\cmake.exe -E vs_link_exe --intdir=CMakeFiles\\cmTC_0989a.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_0989a.dir\\CMakeCCompilerABI.c.obj  /out:cmTC_0989a.exe /implib:cmTC_0989a.lib /pdb:cmTC_0989a.pdb /version:0.0 /machine:x64  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        Run Build Command(s): C:/PROGRA~2/MICROS~2/2022/BUILDT~1/Common7/IDE/COMMON~1/MICROS~1/CMake/Ninja/ninja.exe -v cmTC_e20f3
+        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\cl.exe  /nologo   /DWIN32 /D_WINDOWS  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_e20f3.dir\\CMakeCCompilerABI.c.obj /FdCMakeFiles\\cmTC_e20f3.dir\\ /FS -c H:\\tools\\CMake_64\\share\\cmake-3.30\\Modules\\CMakeCCompilerABI.c
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && H:\\tools\\CMake_64\\bin\\cmake.exe -E vs_link_exe --intdir=CMakeFiles\\cmTC_e20f3.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_e20f3.dir\\CMakeCCompilerABI.c.obj  /out:cmTC_e20f3.exe /implib:cmTC_e20f3.lib /pdb:cmTC_e20f3.pdb /version:0.0 /machine:x64  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
         
       exitCode: 0
   -
