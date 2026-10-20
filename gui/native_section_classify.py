@@ -1786,3 +1786,4 @@ class SectionClassifier:
             )
         app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)
+    
