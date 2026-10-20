@@ -27,7 +27,7 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
         self.setObjectName("BackupSettingsDialog")
         self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Auto-Backup Settings")
-        self.setFixedSize(680, 440)
+        self.setFixedSize(680, 500)
 
         # Load settings object
         self.settings = QSettings("NakshaAI", "LidarApp")
@@ -65,6 +65,22 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
             "QCheckBox { font-weight: bold; font-size: 11pt; }"
         )
         layout.addWidget(self.enable_checkbox)
+
+        # ============================================
+        # Backup when the application closes
+        # ============================================
+        # The periodic timer and the exit backup are independent: the exit
+        # backup is what protects the work when the app is closed (or the
+        # power goes) and it never overwrites the loaded point cloud.
+        self.on_exit_checkbox = QCheckBox(
+            "Back up the classified point cloud when the application closes"
+        )
+        layout.addWidget(self.on_exit_checkbox)
+
+        self.keep_original_checkbox = QCheckBox(
+            "Keep the loaded file unchanged (the classifications go to the backup file)"
+        )
+        layout.addWidget(self.keep_original_checkbox)
 
         # ============================================
         # Backup Location Group
@@ -186,6 +202,7 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
         self.same_folder_radio.toggled.connect(self._toggle_path_options)
         self.custom_folder_radio.toggled.connect(self._toggle_path_options)
         self.enable_checkbox.toggled.connect(self._toggle_all_options)
+        self.on_exit_checkbox.toggled.connect(self._toggle_keep_original)
 
     # ------------------------------------------------------------------ #
     #  HELPERS
@@ -224,7 +241,12 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
             self.same_folder_radio.setChecked(True)
 
     def _toggle_all_options(self, enabled: bool):
-        """Enable/disable all options based on main checkbox."""
+        """Enable/disable all options based on main checkbox.
+
+        The periodic-backup options follow the main switch; the exit backup
+        does not - it is the safety net for the work in the open document and
+        it is useful even when the periodic timer is off.
+        """
         self.same_folder_radio.setEnabled(enabled)
         self.custom_folder_radio.setEnabled(enabled)
         self.interval_spinbox.setEnabled(enabled)
@@ -237,6 +259,10 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
         else:
             self.path_input.setEnabled(False)
             self.browse_btn.setEnabled(False)
+
+    def _toggle_keep_original(self, enabled: bool):
+        """The "keep the loaded file unchanged" option needs the exit backup."""
+        self.keep_original_checkbox.setEnabled(bool(enabled))
 
     # ------------------------------------------------------------------ #
     #  SETTINGS LOAD / SAVE
@@ -275,8 +301,14 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
         naming_format = self.settings.value("backup_naming_format", 0, type=int)
         self.naming_combo.setCurrentIndex(naming_format)
 
+        on_exit = self.settings.value("backup_on_exit", True, type=bool)
+        self.on_exit_checkbox.setChecked(on_exit)
+        keep_original = self.settings.value("backup_keep_original", True, type=bool)
+        self.keep_original_checkbox.setChecked(keep_original)
+
         # Apply enabled/disabled state to controls
         self._toggle_all_options(enabled)
+        self._toggle_keep_original(on_exit)
 
     def _save_settings(self):
         """Save settings and apply to application."""
@@ -303,11 +335,15 @@ class BackupSettingsDialog(InputPopupMixin, QDialog):
         self.settings.setValue("backup_custom_path", self.path_input.text())
         self.settings.setValue("backup_interval_minutes", self.interval_spinbox.value())
         self.settings.setValue("backup_naming_format", self.naming_combo.currentIndex())
+        self.settings.setValue("backup_on_exit", self.on_exit_checkbox.isChecked())
+        self.settings.setValue("backup_keep_original", self.keep_original_checkbox.isChecked())
         self.settings.sync()
 
         print("✅ Backup settings saved:")
         print(f"   Enabled: {self.enable_checkbox.isChecked()}")
         print(f"   Interval: {self.interval_spinbox.value()} minutes")
+        print(f"   Backup on exit: {self.on_exit_checkbox.isChecked()}")
+        print(f"   Keep the loaded file unchanged: {self.keep_original_checkbox.isChecked()}")
         if self.custom_folder_radio.isChecked():
             print(f"   Location: {self.path_input.text()}")
         else:

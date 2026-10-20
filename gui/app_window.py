@@ -945,6 +945,43 @@ class _CRSStatusClickFilter(QObject):
         return False
 
 
+class _NativeBackupWorker(QThread):
+    """Writes the classified native point cloud to a backup file.
+
+    The native engine's own exporter does the work: it reads the native
+    document and its LAS/LAZ source and writes a NEW file. Neither the loaded
+    document nor its source is touched, and no VTK readback is involved.
+
+    The GUI-thread reads (the class map, the digitizer drawings) are taken by
+    the caller before the worker starts; everything here is file work.
+    """
+    finished_ok = Signal(str)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, app, destination, mapping=None, drawings=None):
+        super().__init__()
+        self.setObjectName("NakshaNativeBackupWorker")
+        # A backup must never compete with the interactive rendering.
+        self.setPriority(QThread.LowPriority)
+        self._app = app
+        self._destination = destination
+        self._mapping = mapping
+        self._drawings = drawings
+        self.error = ""
+
+    def run(self):
+        try:
+            from gui import native_backup
+            native_backup.export_backup(self._app, self._destination, flush=False,
+                                        mapping=self._mapping, drawings=self._drawings,
+                                        progress=lambda n, text: self.progress.emit(n, text))
+            self.finished_ok.emit(self._destination)
+        except Exception as exc:  # noqa: BLE001 - reported through the signal
+            self.error = str(exc)
+            self.failed.emit(str(exc))
+
+
 class _BackupWorker(QThread):
     """
     Writes LAZ backup in a background thread.
@@ -960,6 +997,8 @@ class _BackupWorker(QThread):
                  runtime_crs_wkt=None, output_crs_wkt=None):
         super().__init__()
         self.setObjectName("NakshaBackupWorker")
+        # A backup must never compete with the interactive rendering.
+        self.setPriority(QThread.LowPriority)
         self._snapshot = snapshot
         self._path = path
         self._las_version = las_version
@@ -13930,6 +13969,17 @@ class NakshaApp(QMainWindow):
             print("Auto-backup deferred - dataset load is still in progress")
             return
 
+        # Native sessions own their own data: the VTK snapshot below cannot
+        # see a native cloud (app.data is the section store, i.e. a subset), so
+        # the backup is produced by the native exporter instead.
+        try:
+            from gui import native_backup
+            if native_backup.active(self):
+                self._auto_backup_native()
+                return
+        except Exception as exc:  # noqa: BLE001 - fall through to the VTK path
+            print(f"⚠️ Native auto-backup unavailable: {exc}")
+
         # Guard: prevent overlapping backups
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
@@ -14046,43 +14096,217 @@ class NakshaApp(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
 
     def _compute_backup_path(self) -> str:
-        """Compute the backup file path from saved settings."""
+        """Compute the backup file path from saved settings.
+
+        The Auto-Backup Settings decide the folder (next to the file that was
+        loaded, or the custom folder) and the name (123_backup.laz by
+        default). The native and the VTK path share this, so both honour the
+        same settings.
+        """
         try:
-            import time as _time
-
-            loaded = getattr(self, "loaded_file", None)
-            if not loaded:
-                return None
-
-            base_name = os.path.splitext(os.path.basename(loaded))[0]
-            ext = os.path.splitext(loaded)[1].lower()
-            if ext not in (".las", ".laz"):
-                ext = ".laz"
-
-            naming_format = self.settings.value("backup_naming_format", 0, type=int)
-
-            if naming_format == 1:
-                timestamp = _time.strftime("%Y%m%d_%H%M%S")
-                filename = f"{base_name}_{timestamp}{ext}"
-            elif naming_format == 2:
-                filename = f"{base_name}_autosave{ext}"
+            from gui import native_backup
+            source = None
+            if native_backup.active(self):
+                source = native_backup.source_for(self)
             else:
-                filename = f"{base_name}_backup{ext}"
-
-            use_custom = self.settings.value("backup_use_custom_path", False, type=bool)
-            if use_custom:
-                folder = self.settings.value("backup_custom_path", "", type=str)
-                if not folder:
-                    folder = os.path.dirname(loaded)
-            else:
-                folder = os.path.join(os.path.dirname(loaded), "backup")
-
-            os.makedirs(folder, exist_ok=True)
-            return os.path.join(folder, filename)
-
+                source = getattr(self, "loaded_file", None)
+            return native_backup.backup_path(self, source)
         except Exception as e:
             print(f"⚠️ Failed to compute backup path: {e}")
             return None
+
+    def _auto_backup_native(self):
+        """Periodic backup of a native cloud: the native exporter writes it.
+
+        The pending class edits are flushed on the GUI thread first (the worker
+        only reads the native document from disk), and the export never writes
+        the loaded document or the file it was built from.
+        """
+        from gui import native_backup, native_save
+        if self._backup_worker_running:
+            print("⏭️ Auto-backup skipped — previous still writing")
+            return
+        destination = native_backup.backup_path(self)
+        if not destination:
+            return
+        if not native_backup.has_work(self):
+            print("⏭️ Auto-backup skipped — nothing was classified in this session")
+            return
+        if native_backup.backup_is_current(self, destination):
+            print("⏭️ Auto-backup skipped — the backup already holds this work")
+            return
+        # Flush the pending classifications into the native document on the GUI
+        # thread; the worker then only reads it.
+        try:
+            native_save.flush_edits(self)
+        except Exception as exc:
+            print(f"⚠️ Auto-backup skipped — the classifications are not on disk yet: {exc}")
+            return
+        # These are GUI-thread reads: do them before the worker starts.
+        try:
+            from gui.class_slots import _state
+            mapping = dict(_state(self)["code_to_slot"])
+            from .save_pointcloud import _serialize_drawings
+            drawings = _serialize_drawings(self)
+        except Exception as exc:
+            print(f"⚠️ Auto-backup skipped — {exc}")
+            return
+        self._backup_worker_running = True
+        worker = _NativeBackupWorker(self, destination, mapping=mapping, drawings=drawings)
+        worker.finished_ok.connect(self._on_backup_finished)
+        worker.failed.connect(self._on_backup_failed)
+        worker.finished.connect(self._on_backup_worker_done)
+        self._active_backup_worker = worker
+        worker.start()
+
+    def _backup_progress_dialog(self, destination):
+        """A small progress window for the backup written while closing."""
+        try:
+            from PySide6.QtCore import Qt
+            from PySide6.QtWidgets import QProgressDialog
+            name = os.path.basename(destination)
+            dialog = QProgressDialog(f"Backing up the classified point cloud to {name}…",
+                                     None, 0, 100, self)
+            dialog.setWindowTitle("Auto-Backup")
+            dialog.setWindowModality(Qt.ApplicationModal)
+            dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setValue(0)
+            return dialog
+        except Exception:  # noqa: BLE001 - the backup runs without a dialog then
+            return None
+
+    def _on_backup_progress(self, percent, text):
+        """The backup progress, also shown in the status bar."""
+        try:
+            if text:
+                self.statusBar().showMessage(f"Auto-backup: {text}", 5000)
+        except Exception:
+            pass
+
+    def _backup_on_exit(self):
+        """Save the classified point cloud to its own file when the app closes.
+
+        A native session is backed up by the native exporter (no VTK involved);
+        a VTK session falls back to the VTK snapshot. Either way the file the
+        user loaded is never written - the classifications go to a separate
+        backup file.
+        """
+        try:
+            from gui import native_backup
+            if native_backup.active(self):
+                self._backup_native_on_exit()
+            else:
+                self._backup_vtk_on_exit()
+        except Exception as exc:  # noqa: BLE001 - a failed backup must not block the exit
+            print(f"⚠️ Exit backup failed: {exc}")
+
+    def _backup_vtk_on_exit(self):
+        """The exit backup for a VTK session: the same file the timer writes."""
+        try:
+            from gui import native_backup
+            cfg = native_backup.settings()
+            if not cfg["on_exit"]:
+                print("💾 Exit backup skipped — disabled in the Auto-Backup Settings")
+                return
+            data = getattr(self, "data", None)
+            if data is None or "xyz" not in data:
+                return
+            self._auto_backup()          # snapshot + background writer
+            worker = getattr(self, "_active_backup_worker", None)
+            if worker is not None:
+                worker.wait(600000)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ Exit backup failed: {exc}")
+
+    def _backup_native_on_exit(self):
+        """Write the classified native cloud to a separate backup file on exit.
+
+        The file the user loaded is NEVER written by this path: the classified
+        result goes to 123_backup.laz next to it (the Auto-Backup Settings
+        decide the folder and the name). With "keep the loaded document
+        unchanged" the class edits are rolled back out of the native document
+        afterwards - but only once the backup has actually been written, so the
+        work can never be lost.
+        """
+        try:
+            from gui import native_backup
+            cfg = native_backup.settings()
+            if not cfg["on_exit"]:
+                print("💾 Exit backup skipped — disabled in the Auto-Backup Settings")
+                return
+            if not native_backup.active(self):
+                return
+            if not native_backup.has_work(self):
+                print("💾 Exit backup skipped — nothing was classified in this session")
+                return
+            # A periodic backup may still be writing: let it finish first.
+            running = getattr(self, "_active_backup_worker", None)
+            if running is not None and running.isRunning():
+                running.wait(600000)
+            destination = native_backup.backup_path(self)
+            if not destination:
+                return
+            # End the AI session FIRST: it writes its result into the native
+            # document, and the backup must contain it. Ending it here also
+            # stops the teardown from writing the AI classes again after the
+            # document has been restored.
+            try:
+                from gui.lnt_ai_bridge import active_bridge
+                bridge = active_bridge(self)
+                if bridge is not None and getattr(bridge, "view", None) is getattr(self, "_lnt_main_view", None):
+                    bridge.end()
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ Exit backup: the AI session could not be closed: {exc}")
+            # Flush the pending classifications into the native document (GUI
+            # thread): the worker only reads the document from disk.
+            try:
+                from gui import native_save
+                native_save.flush_edits(self)
+            except Exception as exc:  # noqa: BLE001 - export anyway, the file holds what was written
+                print(f"⚠️ Exit backup: some classifications are not on disk yet: {exc}")
+            from gui.class_slots import _state
+            mapping = dict(_state(self)["code_to_slot"])
+            from .save_pointcloud import _serialize_drawings
+            drawings = _serialize_drawings(self)
+            if native_backup.backup_is_current(self, destination):
+                print("💾 The backup already holds this session's classifications")
+            else:
+                worker = _NativeBackupWorker(self, destination, mapping=mapping, drawings=drawings)
+                self._active_backup_worker = worker
+                # The export rewrites the whole cloud: show the progress so the
+                # closing window does not look frozen.
+                dialog = self._backup_progress_dialog(destination)
+                worker.progress.connect(self._on_backup_progress)
+                if dialog is not None:
+                    worker.progress.connect(dialog.setValue)
+                worker.start()
+                if dialog is not None:
+                    dialog.setValue(0)
+                    dialog.exec()
+                if not worker.wait(1800000):        # the backup must finish before the app goes
+                    print("⚠️ Exit backup timed out; the loaded document was left as it is")
+                    return
+                error = getattr(worker, "error", "")
+                self._active_backup_worker = None
+                if dialog is not None:
+                    dialog.deleteLater()
+                if error:
+                    print(f"⚠️ Exit backup failed: {error}")
+                    return
+                print(f"💾 Classified point cloud saved to {destination} "
+                      f"(the loaded file was not modified)")
+                try:
+                    self.statusBar().showMessage(
+                        f"Classified point cloud saved to {os.path.basename(destination)}", 8000)
+                except Exception:
+                    pass
+            if cfg["keep_original"]:
+                native_backup.restore_loaded_document(self)
+        except Exception as exc:  # noqa: BLE001 - a failed backup must not block the exit
+            print(f"⚠️ Exit backup failed: {exc}")
 
     def _on_backup_finished(self, path: str):
         """Signal handler: backup succeeded (runs on main thread)."""
@@ -14650,8 +14874,13 @@ class NakshaApp(QMainWindow):
         self._shutdown_in_progress = True
         native_view = getattr(self, "_lnt_main_view", None)
         if native_view is not None:
+            # The classified cloud is written to a SEPARATE backup file first:
+            # closing the application must never overwrite the loaded file.
+            self._backup_on_exit()
             native_view.stop(restore=False)
             self._lnt_main_view = None
+        else:
+            self._backup_on_exit()
         renderer_owner = getattr(self, "render_backend", None)
         if renderer_owner is not None:
             renderer_owner.shutdown()
