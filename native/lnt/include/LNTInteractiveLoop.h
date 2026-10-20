@@ -19,6 +19,8 @@
 #define LNT_INTERACTIVE_LOOP_H
 
 #include <cstddef>
+#include <array>
+#include <vector>
 #include <cstdint>
 #include <string>
 
@@ -56,6 +58,8 @@ public:
     // Time slice for GPU uploads per frame (ms); 0 = unlimited. Keeps a frame's
     // cost bounded when a camera move makes many tiles newly visible at once.
     void set_upload_budget_ms(double ms) { upload_budget_ms_ = ms; }
+    void set_depth_samples(const std::vector<std::array<double, 3>>& points) { depth_samples_ = points; }
+    void set_depth_enabled(bool enabled) { depth_enabled_ = enabled; }
 
     LntCameraController& controller() { return *controller_; }
     const LNTCamera& camera() const { return cam_; }
@@ -85,6 +89,9 @@ private:
     LNTCamera cam_;
     LNTStreamerStats stats_;
     std::string err_;
+    bool depth_enabled_ = false;
+    std::vector<std::array<double, 3>> depth_samples_;
+    std::vector<double> depth_values_;
 };
 
 }  // namespace lnt

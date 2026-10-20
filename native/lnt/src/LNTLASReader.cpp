@@ -157,6 +157,7 @@ std::size_t LASReader::read_into(RawPoint* dst, std::size_t max_points) {
             // This matches gui.data_loader's legacy-class reconstruction and keeps
             // the source byte unchanged throughout loading, rendering and saving.
             o.classification = (fmt_ >= 6) ? p[16] : p[15];
+            std::memcpy(&o.source_id, p + (fmt_ >= 6 ? 20 : 18), 2);
             if (rgb_offset_ >= 0) {
                 o.r = uint8_t(rd<uint16_t>(p + rgb_offset_) >> 8);
                 o.g = uint8_t(rd<uint16_t>(p + rgb_offset_ + 2) >> 8);

@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_zoom.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
@@ -301,6 +301,16 @@ class NativeView:
 
     def set_mode(self, mode):
         self._ok() and lib().lnt_view_set_mode(c_void_p(self.h), int(mode))
+
+    def set_lines(self, colors, visible):
+        import numpy as np
+        fn=getattr(lib(),'lnt_view_set_lines',None)
+        if fn is None: return False
+        fn.argtypes=[c_void_p,c_void_p,c_void_p]; fn.restype=c_int
+        colors=np.ascontiguousarray(colors,dtype=np.uint8)
+        visible=np.ascontiguousarray(visible,dtype=np.uint8)
+        if colors.shape!=(65536,3) or visible.shape!=(65536,): raise ValueError('Invalid flight-line palette')
+        return bool(fn(c_void_p(self.h),c_void_p(colors.ctypes.data),c_void_p(visible.ctypes.data)))
 
     def set_luts(self, class_rgb, elev_rgb, int_rgb):
         """Three (256,3) uint8 numpy tables: class palette, elevation ramp, intensity ramp."""

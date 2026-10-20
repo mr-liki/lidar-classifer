@@ -16817,7 +16817,12 @@ class ClassificationInteractor:
         if key == "escape":
             print("\n⚠️ ESC pressed - deactivating classification tool")
             
-            if hasattr(self.app, 'deactivate_classification'):
+            if hasattr(self.app, 'deactivate_classification_tool'):
+                self.app.deactivate_classification_tool(
+                    preserve_cross_section=True,
+                    cancel_pending_brush=True,
+                )
+            elif hasattr(self.app, 'deactivate_classification'):
                 self.app.deactivate_classification()
             else:
                 self.app.active_classify_tool = None

@@ -446,6 +446,38 @@ def test_main_canvas_escape_is_preserved_when_identification_is_inactive():
     assert not navigation_filter.eventFilter(_Canvas(), event)
 
 
+def test_native_classifier_escape_cancels_gesture_and_deactivates_tool(monkeypatch):
+    from types import SimpleNamespace
+    from gui.native_section_classify import SectionClassifier
+
+    calls = []
+    app = SimpleNamespace(active_classify_tool="rectangle")
+
+    def deactivate_classification_tool(**kwargs):
+        calls.append(kwargs)
+        app.active_classify_tool = None
+
+    app.deactivate_classification_tool = deactivate_classification_tool
+    classifier = SectionClassifier.__new__(SectionClassifier)
+    classifier.app = app
+    classifier.canvas = SimpleNamespace(line_tools=True)
+    classifier.points = [(1.0, 2.0)]
+    classifier._brush_tx_active = False
+    classifier.cancel = lambda: classifier.points.clear()
+    monkeypatch.setattr(
+        "gui.native_section_classify.QTimer.singleShot",
+        lambda _delay, callback: callback(),
+    )
+
+    assert classifier.key(Qt.Key_Escape)
+    assert classifier.points == []
+    assert app.active_classify_tool is None
+    assert calls == [{
+        "preserve_cross_section": True,
+        "cancel_pending_brush": True,
+    }]
+
+
 def test_queued_move_without_middle_finishes_and_later_release_is_swallowed():
     app = _App()
     canvas = _Canvas()

@@ -28,6 +28,7 @@ struct RawPoint {
     // ASPRS classification code (0..255). Sits in what used to be tail padding, so
     // sizeof(RawPoint) is unchanged (32 on LP64/LLP64).
     uint8_t  classification;
+    uint16_t source_id = 0;
 };
 
 // ---- Bounds3d ----------------------------------------------------------
