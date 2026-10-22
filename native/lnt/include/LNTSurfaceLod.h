@@ -55,7 +55,7 @@
 namespace lnt { namespace surface_lod {
 using surface_archive::Digest;
 
-constexpr uint32_t kAlgorithm = 2;
+constexpr uint32_t kAlgorithm = 3; // highest visible return at coincident XY
 constexpr uint32_t kFlagExact = 1;
 constexpr unsigned kMaxDepth = 27;
 
@@ -854,6 +854,7 @@ public:
     }
 
     void shutdown() {
+        verify_cancel_ = true;
         {
             std::lock_guard<std::mutex> lk(q_mu_);
             if (stop_ && workers_.empty() && !writer_.joinable()) return;
@@ -1228,11 +1229,11 @@ public:
         return changed;
     }
 
-    // True while the wanted cut is not yet fully resident (or a verification runs).
+    // True while the wanted cut is not yet fully resident. Archive verification
+    // is background maintenance and must not keep a rendered viewport busy.
     bool busy() const {
         std::lock_guard<std::mutex> lk(q_mu_);
-        return wanted_missing_ != 0 || !queue_.empty() || !inflight_.empty() || !completions_.empty() ||
-               verifying_.load();
+        return wanted_missing_ != 0 || !queue_.empty() || !inflight_.empty() || !completions_.empty();
     }
     bool verifying() const { return verifying_.load(); }
     // First tile that could not be built or loaded (its area shows a coarser tile), or "".
@@ -1346,7 +1347,11 @@ private:
             uint64_t sgen = 0;
             {
                 std::unique_lock<std::mutex> lk(q_mu_);
-                q_cv_.wait(lk, [&] { return stop_ || (!queue_.empty() && !verifying_.load()); });
+                // Verification only gates reuse of stored geometry. Fresh
+                // meshes read the current source and must remain available
+                // while a multi-gigabyte source fingerprint runs in the
+                // background; otherwise even the root stays blank for minutes.
+                q_cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
                 if (stop_) return;
                 auto best = std::min_element(queue_.begin(), queue_.end(), [](const Job& a, const Job& b) { return a.priority < b.priority; });
                 job = *best;
@@ -1389,7 +1394,10 @@ private:
                     BuildIo io{&qt_, points_.get(), &rd, sgen, io_lock_};
                     std::string why;
                     if (!build_tile(io, job.key, snap->params, *tile, &why)) throw std::runtime_error(why);
-                    if (config.persist) {
+                    // Do not race the untrusted archive verifier with a second
+                    // full source hash in the writer. These fresh tiles remain
+                    // in the normal session CPU/GPU caches during verification.
+                    if (config.persist && !verifying_.load()) {
                         surface_archive::PendingRecord rec;
                         encode_tile(*tile, snap->settings, qt_, codec, rec);
                         std::lock_guard<std::mutex> lk(w_mu_);
@@ -1617,6 +1625,17 @@ private:
         if (!cam.visible(box)) return true;
         if (corridor && !box.intersects(*corridor)) return true;
         const unsigned d = key_level(k);
+        const bool resident = gpu_.count(k) != 0;
+        if (resident) cover_keep_.insert(k);
+        // Refine from a resident cover, one level at a time. Walking straight
+        // to the leaves on a cold billion-point view floods the queue with
+        // exact meshes before a usable coarse viewport has been uploaded.
+        if (!resident && !failed_.count(k)) {
+            const double cx = 0.5 * (mn[0] + mx[0]) - cam.target[0];
+            const double cy = 0.5 * (mn[1] + mx[1]) - cam.target[1];
+            wanted_.push_back({double(d) * 1e12 + cx * cx + cy * cy, k});
+            return false;
+        }
         const bool exact = in.exact;
         bool want = false;
         if (!exact) {
@@ -1667,14 +1686,19 @@ private:
     void select(const LNTCamera& cam, const BoundingBox* corridor) {
         drawn_.clear();
         wanted_.clear();
+        cover_keep_.clear();
         std::unordered_set<uint64_t> refined_now;
         cover(make_key(0, 0, 0), cam, corridor, refined_now);
         refined_.swap(refined_now);
         // Keep the coarse continuous TIN resident under the detailed cut. It
         // is drawn at background depth and cannot cover a detailed fragment.
         const uint64_t root = make_key(0, 0, 0);
-        if (!gpu_.count(root) && !failed_.count(root))
-            wanted_.push_back({-1.0, root});
+        if (!gpu_.count(root) && !failed_.count(root)) {
+            auto request = std::find_if(wanted_.begin(), wanted_.end(),
+                [root](const auto& w) { return w.second == root; });
+            if (request == wanted_.end()) wanted_.push_back({-1.0, root});
+            else request->first = -1.0;
+        }
         std::sort(wanted_.begin(), wanted_.end());
         wanted_missing_ = wanted_.size();
     }
@@ -1754,6 +1778,11 @@ private:
         if (!over) return;
         std::unordered_set<uint64_t> keep(drawn_.begin(), drawn_.end());
         keep.insert(make_key(0, 0, 0)); // Continuous interpolation underlay.
+        // Ready siblings and resident ancestors may have been rolled out of
+        // drawn_ while another child loads. Evicting them here makes the next
+        // upload evict a different sibling: refinement never completes and
+        // pan/zoom repeatedly falls back to the root.
+        keep.insert(cover_keep_.begin(), cover_keep_.end());
         std::vector<std::pair<uint64_t, uint64_t>> lru;
         for (const auto& g : gpu_) if (!keep.count(g.first)) lru.push_back({g.second.last_frame, g.first});
         std::sort(lru.begin(), lru.end());
@@ -1852,6 +1881,7 @@ private:
     std::string failure_;
     std::vector<uint64_t> drawn_;
     std::vector<std::pair<double, uint64_t>> wanted_;
+    std::unordered_set<uint64_t> cover_keep_;
     uint64_t wanted_missing_ = 0;
     std::vector<VulkanEngine::SurfaceTileDraw> last_draw_;
     std::unordered_map<uint64_t, Info> info_;

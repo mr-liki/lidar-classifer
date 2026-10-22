@@ -14424,10 +14424,10 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"⚠️ Failed to load elevation ramp: {e}")
                     self.elevation_color_ramp = None
-            self.shading_quality = "normal"
+            self.shading_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
             if self.shading_quality not in ("fast", "normal", "slow"):
                 self.shading_quality = "normal"
-            self.surface_quality = "normal"
+            self.surface_quality = str(settings.value("global_surface_quality", "normal") or "normal").lower()
             if self.surface_quality not in ("fast", "normal", "slow"):
                 self.surface_quality = "normal"
 

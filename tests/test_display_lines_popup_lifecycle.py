@@ -51,6 +51,9 @@ class _Window:
     def isWindow(self):
         return True
 
+    def windowType(self):
+        return Qt.Window
+
     def raise_(self):
         self.raise_count += 1
 

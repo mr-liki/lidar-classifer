@@ -1510,6 +1510,42 @@ class VulkanRenderBackend(RenderBackend):
         )
         return bool(ok)
 
+    def set_shaded_class_surface_indexed(self, positions: np.ndarray, faces: np.ndarray,
+                                         vertex_class_id: np.ndarray,
+                                         class_color_lut: np.ndarray) -> bool:
+        """Compact Shaded-Class upload: 28 B/point instead of the soup's 96 B/tri.
+
+        Same crisp formula and byte parity as set_shaded_class_surface(), but the
+        fragment shader rebuilds the flat face normal from the shared index
+        buffer, so full-detail TINs fit in VRAM. Returns False when the loaded
+        DLL predates nkv_set_shaded_class_surface_indexed(), letting the caller
+        fall back to the soup upload.
+        """
+        fn = getattr(self._dll, "nkv_set_shaded_class_surface_indexed", None)
+        if not self._handle or fn is None:
+            return False
+        positions = np.ascontiguousarray(positions, dtype=np.float64)
+        faces = np.ascontiguousarray(faces, dtype=np.int32)
+        vertex_class_id = np.ascontiguousarray(vertex_class_id, dtype=np.uint8)
+        class_color_lut = np.ascontiguousarray(class_color_lut, dtype=np.uint8)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError("positions must be (V,3)")
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            raise ValueError("faces must be (T,3)")
+        if vertex_class_id.shape != (positions.shape[0],):
+            raise ValueError("vertex_class_id must be (V,) uint8 matching positions count")
+        if class_color_lut.shape != (256, 3):
+            raise ValueError("class_color_lut must be (256,3) uint8")
+        ok = fn(
+            ctypes.c_uint64(self._handle),
+            positions.ctypes.data_as(ctypes.c_void_p), ctypes.c_uint64(positions.shape[0]),
+            faces.ctypes.data_as(ctypes.c_void_p), ctypes.c_uint64(faces.shape[0]),
+            vertex_class_id.ctypes.data_as(ctypes.c_void_p),
+            class_color_lut.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_uint64(0),
+        )
+        return bool(ok)
+
     def set_crisp_shading_parameters(self, azimuth_deg: float, sharpness_raw: float,
                                       ambient: float, key_intensity: float = 0.85,
                                       fill_intensity: float = 0.18) -> bool:
@@ -3962,6 +3998,13 @@ class AppRenderBackendOwner:
         self._ortho_standoff = None
         self._vulkan_hwnd = 0              # HWND the LIVE renderer is bound to (see _rebind_renderer_to_current_hwnd)
         self._rebinding = False            # True while the surface widget is being reparented
+        # Native Shaded Class crisp TIN (surface_crisp_indexed). Owned by
+        # gui/shading_display.py; this owner only remembers whether the last
+        # upload succeeded and which inputs produced it, so mode/palette
+        # changes never re-upload geometry.
+        self._shaded_surface_key = None
+        self._shaded_surface_cache = None
+        self._shaded_surface_live = False
         self._log = logging.getLogger(__name__ + ".AppRenderBackendOwner")
 
         # ---- Real state machine (see BackendState) - single authoritative
@@ -7513,6 +7556,40 @@ class AppRenderBackendOwner:
         nkv_mode = None
         try:
             b = self.vulkan_backend
+            # Any point-based mode retires the crisp Shaded Class surface; a
+            # loaded SurfaceRenderer mesh is drawn every frame regardless of the
+            # point display mode, so leaving it resident would cover the cloud.
+            if mode != "shaded_class" and self._shaded_surface_live:
+                try:
+                    b.clear_surface()
+                except Exception:
+                    pass
+                self._shaded_surface_live = False
+                self._shaded_surface_key = None
+                self._shaded_surface_cache = None
+            # The crisp TIN owns Shaded Class once gui/shading_display.py has
+            # uploaded it: the point cloud must stay hidden and only the
+            # azimuth/sharpness/ambient uniforms change. Without this guard a
+            # palette or mode refresh would re-show the instant splats on top of
+            # the exact VTK-parity surface.
+            if mode == "shaded_class" and self._shaded_surface_live:
+                from .shading_display import sync_vulkan_shaded_surface
+                ok = sync_vulkan_shaded_surface(app, present=present)
+                if ok or self._shaded_surface_live:
+                    if ok:
+                        self.mark_active("shaded_class")
+                    else:
+                        self._log.warning(
+                            "sync_vulkan_shaded_surface failed; keeping the "
+                            "uploaded crisp Shaded Class surface")
+                    try:
+                        _record_render_mode(
+                            app, mode, NKV_MODE_CLASSIFICATION, False)
+                    except Exception:
+                        pass
+                    return bool(ok)
+                # The resolver retired the surface (single-class): fall through
+                # to the ordinary instant/point path below.
             u = shading_uniforms(app)
             cls_lut, elev_lut, int_lut = build_point_luts(app)
             ok = True

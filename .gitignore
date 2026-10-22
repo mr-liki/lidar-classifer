@@ -47,6 +47,7 @@ native/lnt/*.exe
 native/lnt/*.dll
 !native/lnt/main_display_modes_zoom.dll
 !native/lnt/main_display_modes_lighting.dll
+!native/lnt/main_display_modes_peaks.dll
 native/lnt/*.lnt*
 native/lnt/*.o
 native/lnt/*.obj

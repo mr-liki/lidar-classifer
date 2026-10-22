@@ -19,6 +19,16 @@ RUNTIME_PYTHON = Path(os.environ.get(
     str(_external_python if _external_python.is_file() else Path(sys.executable)),
 ))
 FULL_RUNNER = BUNDLED_VEHICLE_DIR / "vehicle_fullfile_tiled_runner.py"
+
+
+def _runtime_command(script_path) -> list[str]:
+    """Interpreter + script. A frozen build re-enters the app exe instead."""
+    cmd = [str(RUNTIME_PYTHON)]
+    if (getattr(sys, "frozen", False)
+            and Path(str(RUNTIME_PYTHON)) == Path(sys.executable)):
+        cmd.append("--run-python-script")
+    cmd.append(str(script_path))
+    return cmd
 WORK_ROOT = Path(os.environ.get(
     "NAKSHA_LIDAR_VEHICLE_WORK",
     str(_external_root / "work" if _external_root.exists() else Path(os.getenv("TEMP", ".")) / "NakshaVehicleAI"),
@@ -93,9 +103,7 @@ def apply_lidar_vehicle_class0_full_file(
                 f"(tile={tile_size:g}m, overlap={overlap:g}m)..."
             )
 
-        cmd = [
-            str(RUNTIME_PYTHON),
-            str(FULL_RUNNER),
+        cmd = _runtime_command(FULL_RUNNER) + [
             "--classified", str(classified_path),
             "--report", str(report_path),
             "--tile-size", str(tile_size),

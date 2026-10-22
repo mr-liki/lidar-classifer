@@ -873,16 +873,32 @@ class LntMainView(QObject):
         the same azimuth / Sharpness / Ambient. Falls back to the VTK defaults when the
         application has never exposed those controls."""
         app = self.app
-        azimuth = getattr(app, "last_shade_azimuth", None)
-        sharpness = getattr(app, "shading_sharpness_angle", None)
-        ambient = getattr(app, "shade_ambient", None)
-        light_elevation = getattr(app, "shading_light_elevation", None)
+        # Read the controls through the SAME derivations the VTK view uses. Reading the raw
+        # attributes is not equivalent: Sharpness is clipped to 0..999 and falls back to
+        # last_shade_angle, and the base light elevation honours
+        # NAKSHA_SHADING_LIGHT_ELEVATION and clamps to 5..85. Pushing the raw values made
+        # the two renderers disagree whenever those details mattered.
+        from gui.shading_display import (
+            _shading_fixed_light_elevation,
+            _shading_sharpness_angle,
+        )
+
+        def _control(reader, current):
+            try:
+                value = reader()
+            except Exception:   # noqa: BLE001
+                return current
+            return value if value is not None else current
+
         try:
-            self.shading_azimuth = float(azimuth if azimuth is not None else self.shading_azimuth)
-            self.shading_sharpness = float(
-                sharpness if sharpness is not None else self.shading_sharpness)
-            self.shading_ambient = float(ambient if ambient is not None else self.shading_ambient)
-            elevation = float(light_elevation) if light_elevation is not None else 0.0
+            self.shading_azimuth = float(_control(
+                lambda: getattr(app, "last_shade_azimuth", None), self.shading_azimuth))
+            self.shading_sharpness = float(_control(
+                lambda: _shading_sharpness_angle(app), self.shading_sharpness))
+            self.shading_ambient = float(_control(
+                lambda: getattr(app, "shade_ambient", None), self.shading_ambient))
+            elevation = float(_control(
+                lambda: _shading_fixed_light_elevation(app), 0.0))
         except Exception:   # noqa: BLE001
             return False
         if self.native is None:

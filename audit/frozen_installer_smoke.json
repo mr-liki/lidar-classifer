@@ -1,0 +1,31 @@
+{
+  "frozen": true,
+  "bundle": "H:\\new beignning\\dist\\Naksha\\_internal",
+  "imports": {
+    "numpy": "H:\\new beignning\\dist\\Naksha\\_internal\\numpy\\__init__.py",
+    "scipy": "H:\\new beignning\\dist\\Naksha\\_internal\\scipy\\__init__.py",
+    "PySide6": "H:\\new beignning\\dist\\Naksha\\_internal\\PySide6\\__init__.py",
+    "vtk": "H:\\new beignning\\dist\\Naksha\\_internal\\vtk.py",
+    "laspy": "H:\\new beignning\\dist\\Naksha\\_internal\\laspy\\__init__.py",
+    "lazrs": "H:\\new beignning\\dist\\Naksha\\_internal\\lazrs\\__init__.py",
+    "numba": "H:\\new beignning\\dist\\Naksha\\_internal\\numba\\__init__.py",
+    "triangle": "H:\\new beignning\\dist\\Naksha\\_internal\\triangle\\__init__.py",
+    "snt_core": "H:\\new beignning\\dist\\Naksha\\_internal\\snt_core\\__init__.py",
+    "CSF": "H:\\new beignning\\dist\\Naksha\\_internal\\CSF.py",
+    "torch": "H:\\new beignning\\dist\\Naksha\\_internal\\torch\\__init__.py",
+    "open3d": "H:\\new beignning\\dist\\Naksha\\_internal\\open3d\\__init__.py",
+    "pyproj": "H:\\new beignning\\dist\\Naksha\\_internal\\pyproj\\__init__.py",
+    "rasterio": "H:\\new beignning\\dist\\Naksha\\_internal\\rasterio\\__init__.py",
+    "jakteristics": "H:\\new beignning\\dist\\Naksha\\_internal\\jakteristics\\__init__.py",
+    "zstandard": "H:\\new beignning\\dist\\Naksha\\_internal\\zstandard\\__init__.py"
+  },
+  "vulkan_render": true,
+  "frame_shape": [
+    240,
+    320,
+    4
+  ],
+  "lnt_dll": "H:\\new beignning\\dist\\Naksha\\_internal\\native\\lnt\\main_display_modes_peaks.dll",
+  "gui_startup": true,
+  "gpu_name": "NVIDIA T400 4GB"
+}

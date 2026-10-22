@@ -88,8 +88,8 @@ if _SURFACE_HAS_NUMBA:
 
 
     @njit(cache=True)
-    def _surface_dense_grid_first(points, precision, min_gx, min_gy, gx_span, gy_span):
-        """Select the first source point in every occupied XY grid cell."""
+    def _surface_dense_grid_first(points, precision, min_gx, min_gy, gx_span, gy_span, heights=None):
+        """Select the highest source point in every occupied XY grid cell."""
         best_idx = np.empty(gx_span * gy_span, dtype=np.int64)
         for c in range(best_idx.shape[0]):
             best_idx[c] = -1
@@ -97,7 +97,13 @@ if _SURFACE_HAS_NUMBA:
             gx = int(np.floor(points[i, 0] / precision)) - min_gx
             gy = int(np.floor(points[i, 1] / precision)) - min_gy
             key = gx * gy_span + gy
-            if best_idx[key] < 0:
+            previous = best_idx[key]
+            if previous < 0:
+                best_idx[key] = i
+            elif heights is not None:
+                if heights[i] > heights[previous]:
+                    best_idx[key] = i
+            elif points.shape[1] > 2 and points[i, 2] > points[previous, 2]:
                 best_idx[key] = i
         count = 0
         for c in range(best_idx.shape[0]):
@@ -145,7 +151,9 @@ def _surface_grid_count(points: np.ndarray, precision: float) -> int:
     return int(np.unique(grid, axis=0).shape[0])
 
 
-def _surface_grid_select(points: np.ndarray, precision: float) -> np.ndarray:
+def _surface_grid_select(points: np.ndarray, precision: float, heights=None) -> np.ndarray:
+    if heights is None:
+        heights = points[:, 2] if points.shape[1] > 2 else np.zeros(len(points))
     min_gx, min_gy, gx_span, gy_span = _surface_grid_shape(points, precision)
     n_cells = int(gx_span) * int(gy_span)
     dense_limit = int(os.environ.get("NAKSHA_SURFACE_DENSE_GRID_MAX_CELLS", "12000000"))
@@ -153,9 +161,9 @@ def _surface_grid_select(points: np.ndarray, precision: float) -> np.ndarray:
     if _SURFACE_HAS_NUMBA and 0 < n_cells <= dense_limit and occupancy_ok:
         try:
             result = _surface_dense_grid_first(
-                points, float(precision), min_gx, min_gy, gx_span, gy_span
+                points, float(precision), min_gx, min_gy, gx_span, gy_span, heights
             )
-            # Preserve the old source-order semantics used by _grid_dedup_indices.
+            # Keep deterministic source order after selecting each cell's highest return.
             return np.sort(result.astype(np.int64, copy=False))
         except Exception:
             pass
@@ -164,17 +172,19 @@ def _surface_grid_select(points: np.ndarray, precision: float) -> np.ndarray:
     gx = grid[:, 0] - grid[:, 0].min()
     gy = grid[:, 1] - grid[:, 1].min()
     gy_span2 = int(gy.max()) + 1
+    order = np.argsort(-np.asarray(heights), kind="stable")
     if gx.max() < 2**30 and gy_span2 < 2**30:
-        _, idx = np.unique(gx * gy_span2 + gy, return_index=True)
+        _, idx = np.unique((gx * gy_span2 + gy)[order], return_index=True)
     else:
-        _, idx = np.unique(grid, axis=0, return_index=True)
-    return np.sort(idx.astype(np.int64, copy=False))
+        _, idx = np.unique(grid[order], axis=0, return_index=True)
+    return np.sort(order[idx].astype(np.int64, copy=False))
 
 
 def _select_surface_representatives(
     local_points: np.ndarray,
     target_max: int,
     user_precision: float = 0.0,
+    heights=None,
 ):
     """Count-first Surface LOD selection, analogous to shading representatives."""
     n = int(len(local_points))
@@ -204,7 +214,7 @@ def _select_surface_representatives(
         precision = max(float(user_precision or 0.0), precision * np.sqrt(max(ratio, 1e-9)))
         count = _surface_grid_count(local_points, precision)
 
-    idx = _surface_grid_select(local_points, precision)
+    idx = _surface_grid_select(local_points, precision, heights)
     if len(idx) > target_max:
         # Deterministic, low-cost final cap. The grid step has already made the
         # candidates spatially representative; this only clips small overshoot.
@@ -801,10 +811,10 @@ def _compute_surface_geometry_backend(
             "target": int(target_max),
         }
     else:
-        # _select_surface_representatives only reads columns 0/1, so an Nx2
-        # local array is behavior-identical to the previous Nx3 local array.
+        # Keep compact local XY and pass authoritative Z separately so grid
+        # representatives retain peaks without allocating another Nx3 array.
         unique_local_idx, selected_precision, rep_meta = _select_surface_representatives(
-            local_xy, target_max, user_precision
+            local_xy, target_max, user_precision, heights=xyz[:, 2]
         )
     _checkpoint("representative_select")
 
@@ -822,6 +832,16 @@ def _compute_surface_geometry_backend(
         unique_global_idx = global_idx[unique_local_idx].astype(np.int64, copy=False)
         del local_xy
     _checkpoint("representative_materialize")
+
+    # Use the highest return at duplicate plan positions, including Slow mode.
+    order = np.lexsort((-pts[:, 2], xy[:, 1], xy[:, 0]))
+    ordered_xy = xy[order]
+    first = np.r_[True, np.any(ordered_xy[1:] != ordered_xy[:-1], axis=1)]
+    if not first.all():
+        keep = np.sort(order[first])
+        pts, xy = pts[keep], xy[keep]
+        unique_global_idx = unique_global_idx[keep]
+    del order, ordered_xy, first
 
     _emit(55, f"Triangulating Surface mesh ({quality_mode})...")
     faces, triangulator = _triangulate_surface_xy(xy)
@@ -2163,6 +2183,7 @@ def surface_mesh_cache_signature(app) -> tuple:
 
         return (
             _surface_data_signature(app),
+            'highest-z-surface-v1',
             preset_sig,
             normalize_surface_quality(getattr(app, "surface_quality", "normal")),
             ramp_sig,
@@ -2363,12 +2384,8 @@ def restore_cached_surface_mesh(app, signature=None) -> bool:
 
 
 def _grid_dedup_indices(points: np.ndarray, precision: float) -> np.ndarray:
-    if len(points) == 0:
-        return np.empty(0, dtype=np.int64)
-    precision = max(float(precision), 1e-6)
-    grid = np.floor(points[:, :2] / precision).astype(np.int64, copy=False)
-    _, idx = np.unique(grid, axis=0, return_index=True)
-    return np.sort(idx.astype(np.int64, copy=False))
+    """Highest visible return per occupied plan cell."""
+    return _surface_grid_select(points, precision)
 
 
 def _filter_long_edges(faces: np.ndarray, xy: np.ndarray, max_edge: float) -> np.ndarray:

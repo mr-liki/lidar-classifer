@@ -397,6 +397,12 @@ struct View {
             params.azimuth_deg = surface_shading.azimuth_deg;
             params.elevation_deg = surface_shading.light_elevation_deg;
             params.ambient = surface_shading.ambient;
+            // The CPU bake needs the whole derivation (Sharpness gain, over-90 elevation,
+            // ambient floor), not just the three raw numbers: see SurfaceParams::crisp_shade.
+            params.surface = surface_shading;
+            // The class count decides between VTK's crisp cell shade (multi-class) and its
+            // plain hillshade (one visible class); build_surface_job narrows this below.
+            params.crisp_shade = true;
         }
         params.single_elevation_deg = surface_single_elevation;
         params.compact_crisp = (!surface_elev || surface_gpu_elev) && eng.has_compact_shaded_class_surface();
@@ -610,6 +616,9 @@ struct View {
             job.class_count = unsigned(classes.count());
             job.method = params.method = job.class_count >= 2
                 ? SurfaceMethod::Barycentric : SurfaceMethod::Facet;
+            // Multi-class Shading bakes VTK's crisp cell shade; one visible class keeps
+            // VTK's plain hillshade (its own branch, selected by single_elevation_deg).
+            params.crisp_shade = params.crisp_shade && job.class_count >= 2;
             // The compact crisp engine path colours and lights the mesh itself: skip the
             // per-face colours, the mixed-face list and the per-vertex barycentric bake.
             if (params.compact_crisp && job.class_count >= 2 &&

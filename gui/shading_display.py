@@ -8746,7 +8746,7 @@ _MAX_STORED_REPRESENTATIVE_CACHES = 4
 _ADAPTIVE_SHADING_VERSION = 1
 _ADAPTIVE_DEFAULT_TARGET = 3_000_000
 _SHADING_FAST_TARGET = 1_000_000
-_FEATURE_AWARE_VERSION = 2
+_FEATURE_AWARE_VERSION = 1
 _SHADING_LINE_FILTER_VERSION = 2
 
 # Multi-class classification refresh must keep the enormous base shaded mesh
@@ -9576,7 +9576,7 @@ def _feature_aware_filter_faces(faces, xyz_unique, representative_boundary, spac
     original mesh when thresholds would remove too much topology.
     """
     t0 = time.perf_counter()
-    enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "0").strip().lower() not in ("0", "false", "off", "no")
+    enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "1").strip().lower() not in ("0", "false", "off", "no")
     meta = {
         "enabled": False, "reason": "disabled", "input_faces": int(len(faces)),
         "output_faces": int(len(faces)), "removed": 0, "elapsed": 0.0,
@@ -9876,10 +9876,22 @@ def _compute_shading_geometry_backend(
     checkpoint("delaunay")
 
     if len(faces) > 0:
-        # Valid skinny faces belong to the Delaunay coverage. Spacing and
-        # shape thresholds punch holes in irregularly sampled surfaces.
-        min_area = 0.0
-        min_aspect = 0.0
+        # Slow means fidelity, not geometric simplification. The historical
+        # spacing/aspect thresholds reject skinny but valid triangles and can
+        # orphan LiDAR samples around poles, wires, roof edges and vertical
+        # returns. Slow only rejects numerical zero-area triangles; Fast and
+        # Normal retain the established thresholds unchanged.
+        slow_numeric_only = str(quality_mode or "normal").lower() == "slow"
+        if slow_numeric_only:
+            min_area = 1e-12
+            min_aspect = 1e-10
+            print(
+                "SHADING_DEGENERATE_POLICY mode=slow policy=numeric_only "
+                f"min_area={min_area:.1e} min_aspect={min_aspect:.1e}"
+            )
+        else:
+            min_area = (spacing * 0.1) ** 2
+            min_aspect = 0.001
         if HAS_NUMBA:
             keep = _numba_degenerate_filter(
                 faces, xy, float(min_area), float(min_aspect)
@@ -9902,11 +9914,44 @@ def _compute_shading_geometry_backend(
                 faces = faces[nd]
     checkpoint("degenerate_filter")
 
-    # Keep continuous coverage unless the user explicitly requests a limit.
-    explicit_edge = float(single_class_max_edge or 0.0)
-    if len(faces) > 0 and explicit_edge > 0.0:
-        faces = _filter_edges_by_absolute(faces, xy, explicit_edge)
-        max_edge_factor = explicit_edge / max(spacing, 1e-9)
+    if len(faces) > 0:
+        if is_sc:
+            me = single_class_max_edge if single_class_max_edge else data_extent * 0.2
+            faces = _filter_edges_by_absolute(faces, xy, me)
+        else:
+            mea = data_extent * 0.10
+            if bool(line_filter_active):
+                # A selected subset of LAS Point Source IDs can leave large XY
+                # gaps between swaths.  A global Delaunay otherwise bridges those
+                # gaps with long/steep triangles, which appears as black scan-line
+                # hatching in Shaded Classification.  Tighten ONLY this filtered
+                # mesh; the normal all-lines Shading threshold is unchanged.
+                line_edge_factor = max(
+                    2.0,
+                    float(os.environ.get(
+                        "NAKSHA_SHADING_LINE_MAX_EDGE_FACTOR", "12.0"
+                    )),
+                )
+                line_min_edge = max(
+                    0.25,
+                    float(os.environ.get(
+                        "NAKSHA_SHADING_LINE_MIN_EDGE", "1.5"
+                    )),
+                )
+                guarded_edge = max(spacing * line_edge_factor, line_min_edge)
+                mea = min(mea, guarded_edge)
+                before_line_edge = len(faces)
+                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
+                print(
+                    "SHADING_LINE_EDGE_GUARD "
+                    f"status=enabled max_edge={mea:.3f} spacing={spacing:.4f} "
+                    f"factor={line_edge_factor:.2f} "
+                    f"faces_before={before_line_edge} faces_after={len(faces)} "
+                    f"removed={before_line_edge-len(faces)}"
+                )
+            else:
+                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
+            max_edge_factor = mea / max(spacing, 1e-9)
     checkpoint("edge_filter")
 
     faces, feature_meta = _feature_aware_filter_faces(
@@ -11546,42 +11591,8 @@ def _rebuild_crisp_live_edit_overlays(app, cache, classes_raw,
     )
     return pure_count, mixed_count, pure_vertices + mixed_vertices
 
-def _configure_microstation_color_blend_lighting(app, actor=None):
-    """Flat faceted lighting with Sharpness independent of brightness.
-
-    Multi-class Shaded Classification controls now mean:
-      Azimuth   -> direction around the terrain.
-      Sharpness -> face/tip contrast, not sun elevation.
-      Ambient   -> brightness / shadow floor.
-
-    Values through 90 keep the legacy 45-degree elevation. Overdrive lowers the
-    incidence angle for visible facet contrast. Geometry/topology/class RGB,
-    Ambient control and barycentric colour blending are untouched.
-    """
-    plotter = getattr(app, 'vtk_widget', None)
-    renderer = getattr(plotter, 'renderer', None) if plotter is not None else None
-    if renderer is None:
-        return False
-
-    azimuth = float(getattr(app, 'last_shade_azimuth', 45.0))
-    sharpness_angle = _shading_sharpness_angle(app)
-    ambient = float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0))
-    sharpness, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
-
-    # Ambient now owns brightness. Keep only a very small anti-black safety floor
-    light_elevation = _shading_effective_light_elevation(
-        app, sharpness_overdrive
-    )
-    # instead of the previous 0.42 clamp that made Ambient=0.25 ineffective.
-    try:
-        ambient_floor = float(os.environ.get(
-            'NAKSHA_SHADING_BLEND_AMBIENT_FLOOR', '0.08'
-        ))
-    except Exception:
-        ambient_floor = 0.08
-    ambient_floor = float(np.clip(ambient_floor, 0.0, 0.30))
-    effective_ambient = max(ambient, ambient_floor)
-
+def _shading_key_fill_from_response(app, sharpness, overdrive):
+    """Split the constant directional energy into key/fill intensities."""
     # Keep directional energy roughly constant. Sharpness only redistributes it
     # between key and opposite fill, increasing face-to-face contrast without
     # acting like a brightness slider.
@@ -11607,15 +11618,10 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
         except Exception:
             total_directional = 1.05
         total_directional = float(np.clip(total_directional, 0.25, 1.50))
-        # 0..90 is unchanged: key_ratio runs 0.58 -> 0.95. Most overdrive
-        # contrast is deliberately distributed across 90..200, with a smaller
-        # tail through 999 instead of visually saturating immediately after 90.
-        # Total directional energy stays constant, so Ambient remains the
-        # brightness control while facet-to-facet contrast gets stronger.
         key_ratio = (
             0.58
-            + 0.37 * sharpness
-            + 0.049 * sharpness_overdrive
+            + 0.37 * float(sharpness)
+            + 0.049 * float(overdrive)
         )
         key_ratio = float(np.clip(key_ratio, 0.50, 0.999))
         key_intensity = total_directional * key_ratio
@@ -11623,6 +11629,64 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
 
     key_intensity = float(np.clip(key_intensity, 0.0, 2.0))
     fill_intensity = float(np.clip(fill_intensity, 0.0, 1.0))
+    return key_intensity, fill_intensity
+
+
+def _shading_key_fill_intensities(app, legacy, overdrive):
+    """Public CPU key/fill resolver used by the parity harness."""
+    return _shading_key_fill_from_response(app, legacy, overdrive)
+
+
+def _shading_blend_intensities(app):
+    """Resolve the crisp/overlay light-rig numbers used by BOTH viewports.
+
+    Returns (azimuth, sharpness_angle, ambient, sharpness, overdrive,
+    light_elevation, effective_ambient, key_intensity, fill_intensity).
+    _configure_microstation_color_blend_lighting() feeds these to the VTK
+    lights; the Vulkan crisp surface pushes the same values into
+    surface.frag's mode 5. Keeping one resolver is what makes a VTK/Vulkan
+    switch visually invisible.
+    """
+    azimuth = float(getattr(app, 'last_shade_azimuth', 45.0))
+    sharpness_angle = _shading_sharpness_angle(app)
+    ambient = float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0))
+    sharpness, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
+
+    # Ambient owns brightness. Keep only a very small anti-black safety floor.
+    light_elevation = _shading_effective_light_elevation(
+        app, sharpness_overdrive
+    )
+    ambient_floor = _crisp_blend_ambient_floor(app)
+    effective_ambient = max(ambient, ambient_floor)
+    key_intensity, fill_intensity = _shading_key_fill_from_response(
+        app, sharpness, sharpness_overdrive
+    )
+    return (
+        azimuth, sharpness_angle, ambient, sharpness, sharpness_overdrive,
+        light_elevation, effective_ambient, key_intensity, fill_intensity,
+    )
+
+
+def _configure_microstation_color_blend_lighting(app, actor=None):
+    """Flat faceted lighting with Sharpness independent of brightness.
+
+    Multi-class Shaded Classification controls now mean:
+      Azimuth   -> direction around the terrain.
+      Sharpness -> face/tip contrast, not sun elevation.
+      Ambient   -> brightness / shadow floor.
+
+    Values through 90 keep the legacy 45-degree elevation. Overdrive lowers the
+    incidence angle for visible facet contrast. Geometry/topology/class RGB,
+    Ambient control and barycentric colour blending are untouched.
+    """
+    plotter = getattr(app, 'vtk_widget', None)
+    renderer = getattr(plotter, 'renderer', None) if plotter is not None else None
+    if renderer is None:
+        return False
+
+    (azimuth, sharpness_angle, ambient, sharpness, sharpness_overdrive,
+     light_elevation, effective_ambient, key_intensity,
+     fill_intensity) = _shading_blend_intensities(app)
 
     key_light = getattr(app, '_shading_microstation_key_light', None)
     fill_light = getattr(app, '_shading_microstation_fill_light', None)
@@ -12787,7 +12851,7 @@ def _build_cache_key(xyz, visible_classes, single_class_max_edge=None, quality_m
     else:
         adaptive_target = int(os.environ.get("NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)))
     adaptive_ratio = round(float(os.environ.get("NAKSHA_SHADING_ADAPTIVE_FINE_RATIO", "0.55")), 4)
-    feature_enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "0").strip().lower() not in ("0", "false", "off", "no")
+    feature_enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "1").strip().lower() not in ("0", "false", "off", "no")
     feature_key = (
         _FEATURE_AWARE_VERSION, int(feature_enabled),
         round(float(os.environ.get("NAKSHA_SHADING_FEATURE_EDGE_FACTOR", "3.0")), 4),
@@ -12801,7 +12865,7 @@ def _build_cache_key(xyz, visible_classes, single_class_max_edge=None, quality_m
         edge_key = "auto" if single_class_max_edge is None else round(float(single_class_max_edge), 6)
         mode_key = ("single", edge_key, quality_key)
     else:
-        mode_key = ("multi", round(float(single_class_max_edge or 0.0), 6), quality_key)
+        mode_key = ("multi", quality_key)
     return (_compute_xyz_hash(xyz), _normalize_visible_classes(visible_classes), mode_key)
 
 _cache_store = OrderedDict()
@@ -13326,6 +13390,15 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
             and rendered_cache_key != requested_cache_key
         ),
     )
+
+    # Cached/parked presets below return without rebuilding the VTK mesh. The
+    # Vulkan crisp surface must still be (re)uploaded when the resident TIN is
+    # valid, otherwise leaving Shaded Class and coming back would show splats.
+    try:
+        if _vulkan_shaded_backend(app) is not None:
+            _sync_vulkan_shaded_surface(app, cache, classes_raw=classes_raw)
+    except Exception as _vulkan_exc:
+        print(f'VULKAN_SHADED_SURFACE presync_failed={_vulkan_exc}')
 
     # A prior sparse replay may have discovered a topology transition that
     # cannot be represented safely by the bounded local patcher. Only that
@@ -14168,7 +14241,240 @@ def _face_class_ids_sparse_shading(app, cache, face_vertex_classes, face_vertex_
     ).astype(np.int64, copy=False)
 
 
+def _vulkan_shaded_backend(app):
+    """Return the live Vulkan backend that owns the Shaded Class viewport.
+
+    None in VTK mode (the default), in the native LNT main view (which has its
+    own crisp engine path), or before Vulkan is usable. This is the single gate
+    that keeps the VTK behaviour byte-identical when NAKSHA_RENDER_BACKEND is
+    not "vulkan".
+    """
+    if getattr(app, '_lnt_main_view', None) is not None:
+        return None
+    rb = getattr(app, 'render_backend', None)
+    if rb is None or not getattr(rb, 'active', False):
+        return None
+    try:
+        displayed = bool(rb.vulkan_owns_lidar_viewport()
+                         or getattr(rb, 'is_displayed', False))
+    except Exception:
+        displayed = False
+    if not displayed:
+        return None
+    b = getattr(rb, 'vulkan_backend', None)
+    if b is None or not getattr(b, '_handle', 0):
+        return None
+    return b
+
+
+def _vulkan_shaded_class_lut(app):
+    """256x3 uint8 palette for the crisp surface (same colours VTK bakes)."""
+    # Use the overlay's production resolver: hidden and unmapped classes are
+    # black, and two classes with the same displayed RGB form a pure face.
+    # An independent grey-filled LUT changes both the blend and face kind.
+    return np.ascontiguousarray(_shading_palette_rgb(
+        app, np.arange(256, dtype=np.int64), _get_shading_visibility(app)
+    ), dtype=np.uint8)
+
+
+def _vulkan_shaded_surface_key(app, cache, classes_raw):
+    """Inputs that require a geometry/colour re-upload (parameters do not)."""
+    try:
+        vis = _get_shading_visibility(app)
+        vis_key = tuple(sorted(int(c) for c in vis)) if vis else ()
+    except Exception:
+        vis_key = ()
+    palette_key = 0
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        try:
+            colour = tuple(int(v) for v in entry.get('color', (128, 128, 128))[:3])
+            palette_key = (
+                palette_key * 1000003 + int(code) * 65537
+                + colour[0] * 65536 + colour[1] * 256 + colour[2]
+            ) & 0xFFFFFFFFFFFF
+        except Exception:
+            pass
+    xyz = getattr(cache, 'xyz_final', None)
+    faces = getattr(cache, 'faces', None)
+    return (
+        id(cache), id(xyz), id(faces),
+        int(len(xyz)) if xyz is not None else 0,
+        int(len(faces)) if faces is not None else 0,
+        int(getattr(app, 'classification_revision', 0) or 0),
+        int(getattr(app, '_shading_delta_seq', 0) or 0),
+        id(classes_raw), vis_key, palette_key,
+    )
+
+
+def _sync_vulkan_shaded_surface_params(app, present=True):
+    """Push azimuth/sharpness/ambient to an already uploaded crisp surface."""
+    rb = getattr(app, 'render_backend', None)
+    if rb is None or not getattr(rb, '_shaded_surface_live', False):
+        return False
+    b = _vulkan_shaded_backend(app)
+    if b is None:
+        return False
+    azimuth, angle, ambient, _, _, _, _, key_i, fill_i = (
+        _shading_blend_intensities(app)
+    )
+    try:
+        from .render_backend import color_parity_mode, shading_debug_stage
+        b.set_color_parity_params(
+            color_parity_mode(), shading_debug_stage(),
+            _crisp_blend_ambient_floor(app),
+            _shading_fixed_light_elevation(app),
+        )
+        ok = b.set_crisp_shading_parameters(
+            float(azimuth), float(angle), float(ambient),
+            float(key_i), float(fill_i),
+        )
+        b.set_point_cloud_visible(False)
+        if present:
+            b.request_render()
+        return bool(ok)
+    except Exception as exc:
+        print(f'VULKAN_SHADED_SURFACE status=params_failed error={exc}')
+        return False
+
+
+def _sync_vulkan_shaded_surface(app, cache, force_upload=False, classes_raw=None):
+    """Upload the exact VTK crisp TIN once, then only update lighting.
+
+    This is the Shaded Classification presentation in Vulkan: same face normals,
+    same ambient clamp, same sharpness remap and byte parity as VTK, rendered by
+    surface_crisp_indexed.frag. Skipped for single-class shading (the instant
+    splat path keeps that look) and whenever the VTK backend is active.
+    """
+    b = _vulkan_shaded_backend(app)
+    if b is None:
+        return False
+    rb = getattr(app, 'render_backend', None)
+    try:
+        blend = _microstation_color_blend_enabled(app, cache)
+    except Exception:
+        blend = False
+    if not blend:
+        # Single-class shading keeps the instant splat presentation. Retire a
+        # surface left over from the previous multi-class state so the cloud is
+        # not covered by stale triangles.
+        if rb is not None and getattr(rb, '_shaded_surface_live', False):
+            try:
+                b.clear_surface()
+                b.set_point_cloud_visible(True)
+                b.request_render()
+            except Exception:
+                pass
+            rb._shaded_surface_live = False
+            rb._shaded_surface_key = None
+            rb._shaded_surface_cache = None
+        return False
+
+    xyz = getattr(cache, 'xyz_final', None)
+    faces = getattr(cache, 'faces', None)
+    if classes_raw is None:
+        # Flight-line filtering hands _render_mesh a subset array whose rows no
+        # longer match app.data['classification']; always reuse the exact array
+        # that built this cache's unique_indices.
+        classes_raw = getattr(cache, '_vulkan_classes_raw', None)
+    if classes_raw is None:
+        classes_raw = (getattr(app, 'data', None) or {}).get('classification')
+    unique_idx = getattr(cache, 'unique_indices', None)
+    if (xyz is None or faces is None or classes_raw is None
+            or unique_idx is None or len(xyz) == 0 or len(faces) == 0):
+        return False
+
+    key = _vulkan_shaded_surface_key(app, cache, classes_raw)
+    if (not force_upload and getattr(rb, '_shaded_surface_live', False)
+            and getattr(rb, '_shaded_surface_key', None) == key):
+        return _sync_vulkan_shaded_surface_params(app)
+
+    try:
+        vertex_class = np.clip(
+            np.asarray(classes_raw, dtype=np.int64).reshape(-1)[unique_idx],
+            0, 255,
+        ).astype(np.uint8)
+        lut = _vulkan_shaded_class_lut(app)
+        positions = np.ascontiguousarray(xyz, dtype=np.float64)
+        tris = np.ascontiguousarray(faces, dtype=np.int32)
+
+        uploaded = False
+        try:
+            uploaded = b.set_shaded_class_surface_indexed(
+                positions, tris, vertex_class, lut
+            )
+        except Exception as exc:
+            print(f'VULKAN_SHADED_SURFACE indexed_failed={exc}')
+        if not uploaded:
+            c0 = vertex_class[tris[:, 0]]
+            c1 = vertex_class[tris[:, 1]]
+            c2 = vertex_class[tris[:, 2]]
+            mixed = np.nonzero((c0 != c1) | (c0 != c2))[0].astype(np.int32)
+            uploaded = b.set_shaded_class_surface(
+                positions, tris, vertex_class, lut, mixed
+            )
+        if not uploaded:
+            raise RuntimeError('both compact and soup Shaded Class uploads failed')
+
+        rb._shaded_surface_key = key
+        rb._shaded_surface_cache = cache
+        rb._shaded_surface_live = True
+        try:
+            cache._vulkan_classes_raw = classes_raw
+        except Exception:
+            pass
+        _sync_vulkan_shaded_surface_params(app, present=False)
+        from .render_backend import NKV_MODE_CLASSIFICATION
+        b.set_display_mode(int(NKV_MODE_CLASSIFICATION))
+        b.set_point_cloud_visible(False)
+        try:
+            rb.mark_active('shaded_class')
+        except Exception:
+            pass
+        b.request_render()
+        print(
+            'VULKAN_SHADED_SURFACE status=uploaded '
+            f'points={len(xyz):,} faces={len(faces):,} '
+            f'classes={int(vertex_class.max(initial=0))}'
+        )
+        return True
+    except Exception as exc:
+        print(f'VULKAN_SHADED_SURFACE status=failed error={exc}')
+        rb._shaded_surface_live = False
+        rb._shaded_surface_key = None
+        try:
+            b.set_point_cloud_visible(True)
+            b.request_render()
+        except Exception:
+            pass
+        return False
+
+
+def sync_vulkan_shaded_surface(app, present=True):
+    """Revalidate/re-upload the last crisp surface, then update its lighting.
+
+    Called by AppRenderBackendOwner.sync_point_shading() so a palette or
+    classification change can refresh the resident class-colour buffer without
+    rebuilding the TIN. Cheap when nothing but the light parameters changed.
+    """
+    rb = getattr(app, 'render_backend', None)
+    cache = getattr(rb, '_shaded_surface_cache', None) if rb is not None else None
+    if cache is None:
+        return _sync_vulkan_shaded_surface_params(app, present=present)
+    ok = _sync_vulkan_shaded_surface(app, cache)
+    if ok and present:
+        try:
+            app.render_backend.vulkan_backend.request_render()
+        except Exception:
+            pass
+    return ok
+
+
 def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
+    _render_mesh_vtk(app, cache, classes_raw, saved_camera, cached_restore)
+    _sync_vulkan_shaded_surface(app, cache, classes_raw=classes_raw)
+
+
+def _render_mesh_vtk(app, cache, classes_raw, saved_camera, cached_restore=False):
     if cache.faces is None or len(cache.faces) == 0: return
     _prepare_single_class_state_for_full_render(app, cache)
     # A full canonical render makes every local topology replacement obsolete.
@@ -18785,6 +19091,7 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
                 )
                 return True
             _enforce_crisp_base_actor_state(app)
+            _sync_vulkan_shaded_surface_params(app)
             cache.last_crisp_sharpness = sharpness_angle
         else:
             _configure_microstation_color_blend_lighting(
@@ -18896,7 +19203,7 @@ class ShadingControlPanel(QWidget):
         super().__init__(); self.app=app; self.setWindowTitle('Shading')
         layout=QVBoxLayout()
         rows=[
-            ('Max edge (m, 0 = unlimited):','max_edge',(0,1000),0,10),
+            ('Max edge (m):','max_edge',(1,1000),100,10),
             ('Azimuth:','az',(0,360),45,5),
             ('Sharpness:','el',(0,999),45,5),
             ('Ambient (brightness):','amb',(0,1),0.25,0.05),
