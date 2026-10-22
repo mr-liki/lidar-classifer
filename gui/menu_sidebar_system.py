@@ -3101,7 +3101,9 @@ class DrawRibbon(QWidget):
                     main_window._element_selection_dialog = None
                 else:
                     try:
-                        existing.restore_pick_interaction()
+                        # Each Draw -> Select click starts neutral; the user
+                        # explicitly chooses Individual/Block/Shape/Line/Text.
+                        existing.reset_pick_method()
                         self._restore_tool_dialog(existing)
                         return
                     except Exception:
@@ -5181,7 +5183,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     def add_selection_highlight(shape):
         if use_native_picker:
             native_picker_selected[_get_fence_identity(shape)] = shape
-            sync_native_fence_highlights(dialog, native_picker_selected.values())
+            from gui.native_fence_selection import preview_native_fence_highlights
+            preview_native_fence_highlights(dialog, native_picker_selected.values())
             return
         coords = shape.get("coords", [])
         if not coords:
@@ -5195,7 +5198,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     def remove_selection_highlight(shape):
         if use_native_picker:
             native_picker_selected.pop(_get_fence_identity(shape), None)
-            sync_native_fence_highlights(dialog, native_picker_selected.values())
+            from gui.native_fence_selection import preview_native_fence_highlights
+            preview_native_fence_highlights(dialog, native_picker_selected.values())
             return
         actor = selection_highlight_actors.pop(_get_fence_identity(shape), None)
         if actor is not None:
@@ -7305,8 +7309,8 @@ class ClosedByClassDialog(QDialog):
         return InsideFenceDialog._highlight_classified_fences(self)
 
     def _restore_highlights_from_data(self):
-        from gui.native_fence_selection import sync_native_fence_highlights
-        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+        from gui.native_fence_selection import restore_native_fence_highlights
+        if restore_native_fence_highlights(self):
             return
         return InsideFenceDialog._restore_highlights_from_data(self)
 
@@ -9484,14 +9488,14 @@ class ByClassHeightDialog(QDialog):
                 self.select_fence_btn.setText("Select Fence")
 
     def add_fences_from_selection(self, fence_shapes):
-        """Pre-load fence shapes from the Element Selection tool.
-
-        Enables the fence filter, hides the manual fence picker buttons, and
-        pre-populates selected_fences — matching InsideFenceDialog behaviour.
-        """
+        """Pre-load the current Element Selection group (replace on Vulkan)."""
         if not fence_shapes:
             return
 
+        from gui.native_draw import get_native_draw
+        native = get_native_draw(self.app, create=False) is not None
+        if native:
+            self.selected_fences = []  # New group supersedes previous classified fences.
         from gui.native_byclass_fences import fence_identity
         existing_ids = {fence_identity(f) for f in self.selected_fences}
         added = 0
@@ -9529,6 +9533,9 @@ class ByClassHeightDialog(QDialog):
             )
 
         self.update_fence_display()
+        if native:
+            from gui.native_fence_selection import sync_native_fence_highlights
+            sync_native_fence_highlights(self, self.selected_fences)
         self._restore_highlights_from_data()
         self.show()
         self.raise_()
@@ -9536,8 +9543,8 @@ class ByClassHeightDialog(QDialog):
         print(f"🔷 Height dialog: {added} fence(s) pre-loaded from selection")
 
     def _restore_highlights_from_data(self):
-        from gui.native_fence_selection import sync_native_fence_highlights
-        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+        from gui.native_fence_selection import restore_native_fence_highlights
+        if restore_native_fence_highlights(self):
             return
         try:
             if hasattr(self, '_selection_highlight_actors'):
@@ -9818,7 +9825,50 @@ class ByClassHeightDialog(QDialog):
             from gui.native_byclass_height_analysis import height_analysis_points
             self.height_info_label.setText("Reading point data for Height analysis...")
             QApplication.processEvents()  # paint status before the exact LNT query
-            xyz, classification, native_height = height_analysis_points(self.app)
+            # On large LNT clouds, select only the current verified Height
+            # fence. Preserve the same unscoped call for VTK/no-fence paths.
+            active_fences = (getattr(self, 'selected_fences', None) or
+                getattr(getattr(self, '_fence_sel', None), 'selected_fences', None))
+            if active_fences:
+                from gui.native_by_class import want_native
+                if want_native(self.app):
+                    from gui.native_byclass_parity import _polygon_coords
+                    height_polygons = _polygon_coords(self)
+                    from gui.native_by_class import native_main_view, cloud_bbox
+                    from gui.native_byclass_parity import MAX_EXACT_POINTS
+                    height_view = native_main_view(self.app)
+                    large_cloud = bool(height_view and
+                        cloud_bbox(height_view)[-1] > MAX_EXACT_POINTS)
+                    if large_cloud:
+                        # The disk reader validates the full directory but
+                        # reads only fenced leaves. Give users cancellable
+                        # progress during a potentially long directory scan.
+                        from PySide6.QtWidgets import QProgressDialog
+                        reading = QProgressDialog(
+                            'Reading exact points inside selected Height fences...',
+                            'Cancel', 0, 100, self)
+                        reading.setWindowTitle('Large LNT Height Analysis')
+                        reading.setMinimumDuration(0)
+                        reading.show()
+                        QApplication.processEvents()
+                        def read_progress(pct, message):
+                            reading.setValue(int(pct))
+                            reading.setLabelText(str(message)[:180])
+                            QApplication.processEvents()
+                        try:
+                            xyz, classification, native_height = height_analysis_points(
+                                self.app, fence_polygons=height_polygons,
+                                progress=read_progress,
+                                cancelled=reading.wasCanceled)
+                        finally:
+                            reading.close()
+                    else:
+                        xyz, classification, native_height = height_analysis_points(
+                            self.app, fence_polygons=height_polygons)
+                else:
+                    xyz, classification, native_height = height_analysis_points(self.app)
+            else:
+                xyz, classification, native_height = height_analysis_points(self.app)
             print(f"[By Class Height] Analyze Heights input: "
                   f"{'native LNT' if native_height else 'VTK'} "
                   f"records={len(xyz):,}")
@@ -9838,8 +9888,20 @@ class ByClassHeightDialog(QDialog):
             )
             return
 
-        # ✅ CHECK FENCE FILTER
-        use_fence = len(self.selected_fences) > 0
+        # For the native file-backed main cloud, use the same selection that
+        # conversion will use (including the embedded fence selector).  The
+        # original VTK path below is deliberately unchanged.
+        active_fences = (self.selected_fences or
+                         getattr(getattr(self, '_fence_sel', None), 'selected_fences', None) or [])
+        use_fence = len(active_fences) > 0
+        native_polygons = None
+        if native_height and use_fence:
+            try:
+                from gui.native_byclass_parity import _polygon_coords
+                native_polygons = _polygon_coords(self)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Invalid Height Fence', str(exc))
+                return
         
         print(f"\n{'='*60}")
         print(f"📊 ANALYZING HEIGHT DISTRIBUTION {'(FENCE-RESTRICTED)' if use_fence else ''}")
@@ -9858,22 +9920,46 @@ class ByClassHeightDialog(QDialog):
         
         # Get From class points
         from_class_mask = (classification == from_class)
-        from_class_count = np.sum(from_class_mask)
+        from_class_count = int(np.count_nonzero(from_class_mask))
         if from_class_count == 0:
             QMessageBox.warning(self, "No Source Points", f"No points of class {from_class} found")
             return
+        if native_height:
+            # Match the original VTK conversion rule: hidden From classes
+            # cannot be reclassified.  The old native analyzer ignored this
+            # and could misleadingly find thousands of unconvertible points.
+            palette = getattr(self.app, 'class_palette', None)
+            if isinstance(palette, dict) and palette:
+                visible = [int(code) for code, setting in palette.items()
+                           if isinstance(setting, dict) and setting.get('show', True)]
+                from_class_mask &= np.isin(classification, visible)
+            eligible_count = int(np.count_nonzero(from_class_mask))
+            if not eligible_count:
+                QMessageBox.warning(
+                    self, 'Height Source Class Hidden',
+                    f'Class {from_class} has {from_class_count:,} native points, '
+                    'but none are visible in the active Display Mode palette. '
+                    'Enable that source class and Analyze Heights again. '
+                    'No points were changed.')
+                return
+            print(f'[By Class Height] visible source class {from_class}: '
+                  f'{eligible_count:,}/{from_class_count:,} records eligible')
         
         # ✅ FENCE FILTER: restrict to points inside fence(s)
         if use_fence:
             from_class_xyz_all = xyz[from_class_mask]
             
             combined_inside = np.zeros(len(from_class_xyz_all), dtype=bool)
-            for fence in self.selected_fences:
-                fence_coords = fence['coords']
-                if isinstance(fence_coords, list):
-                    fence_coords = np.array(fence_coords)
-                inside = self._points_inside_polygon(from_class_xyz_all, fence_coords)
-                combined_inside |= inside
+            if native_height:
+                from gui.native_byclass_parity import _fence_mask
+                combined_inside = _fence_mask(from_class_xyz_all, native_polygons)
+            else:
+                for fence in self.selected_fences:
+                    fence_coords = fence['coords']
+                    if isinstance(fence_coords, list):
+                        fence_coords = np.array(fence_coords)
+                    inside = self._points_inside_polygon(from_class_xyz_all, fence_coords)
+                    combined_inside |= inside
             
             from_class_xyz = from_class_xyz_all[combined_inside]
             fence_label_text = f" (inside {len(self.selected_fences)} fence(s))"
@@ -9886,14 +9972,42 @@ class ByClassHeightDialog(QDialog):
             # Also filter ground to fence area for better local reference
             ground_xyz_all = xyz[ground_mask]
             ground_inside = np.zeros(len(ground_xyz_all), dtype=bool)
-            for fence in self.selected_fences:
-                fence_coords = fence['coords']
-                if isinstance(fence_coords, list):
-                    fence_coords = np.array(fence_coords)
-                inside = self._points_inside_polygon(ground_xyz_all, fence_coords)
-                ground_inside |= inside
-            
-            ground_xyz = ground_xyz_all[ground_inside] if np.sum(ground_inside) > 0 else ground_xyz_all
+            if native_height:
+                from gui.native_byclass_parity import _fence_mask
+                ground_inside = _fence_mask(ground_xyz_all, native_polygons)
+            else:
+                for fence in self.selected_fences:
+                    fence_coords = fence['coords']
+                    if isinstance(fence_coords, list):
+                        fence_coords = np.array(fence_coords)
+                    inside = self._points_inside_polygon(ground_xyz_all, fence_coords)
+                    ground_inside |= inside
+
+            ground_local = ground_xyz_all[ground_inside]
+            if native_height:
+                # On very large LNT files, the input is already fenced and
+                # there is no audited global reference surface. Refuse a bad
+                # local TIN instead of analyzing a partial/global fallback.
+                from gui.height_reference_surface import has_tin_xy_support
+                from gui.native_by_class import native_main_view, cloud_bbox
+                view = native_main_view(self.app)
+                huge_height = bool(view and cloud_bbox(view)[-1] > 8_000_000)
+                if huge_height and not has_tin_xy_support(ground_local):
+                    QMessageBox.warning(
+                        self, 'Insufficient Local Reference Points',
+                        'Large-cloud Height requires 3 non-collinear '
+                        'reference-class points inside the selected fence. '
+                        'Expand the fence or select a suitable reference class.')
+                    return
+                if huge_height and len(ground_local) > 500_000:
+                    QMessageBox.warning(
+                        self, 'Large Reference TIN',
+                        'The selected fence has more than 500,000 reference '
+                        'points. Narrow the fence to safely build an exact TIN.')
+                    return
+                ground_xyz = ground_local if has_tin_xy_support(ground_local) else ground_xyz_all
+            else:
+                ground_xyz = ground_local if np.any(ground_inside) else ground_xyz_all
             print(f"   Ground points in fence: {np.sum(ground_inside):,}")
         else:
             from_class_xyz = xyz[from_class_mask]
@@ -11757,8 +11871,8 @@ class InsideFenceDialog(QDialog):
         
     def _restore_highlights_from_data(self):
         """Rebuilds blue highlight actors directly from the selected_fences array"""
-        from gui.native_fence_selection import sync_native_fence_highlights
-        if sync_native_fence_highlights(self, getattr(self, 'selected_fences', ())):
+        from gui.native_fence_selection import restore_native_fence_highlights
+        if restore_native_fence_highlights(self):
             return
         try:
             # Clear old garbage
@@ -12561,23 +12675,14 @@ class InsideFenceDialog(QDialog):
         return converted_count, final_convert_indices
 
     def add_fences_from_selection(self, fence_shapes):
-        """Accept a list of drawing dicts and add them as fences.
-
-        Called by SelectionModeDialog._on_add_to_byclass() when the user
-        selects drawings and clicks 'Add to By Class'.  Each shape dict
-        must have at least a 'coords' key with a list/array of (x,y) or
-        (x,y,z) points.
-
-        Duplicate detection is based on the shape's Python id() to avoid
-        re-adding the same drawing twice.
-
-        When fences come from the selection tool, the Select Fence(s) and
-        Clear All buttons are hidden so the user cannot accidentally
-        re-enter the fence picker (which would cause undo/clear issues).
-        """
+        """Accept the current selection; never accumulate old Vulkan fences."""
         if not fence_shapes:
             return
 
+        from gui.native_draw import get_native_draw
+        native = get_native_draw(self.app, create=False) is not None
+        if native:
+            self.selected_fences = []
         from gui.native_byclass_fences import fence_identity
         existing_ids = set()
         for f in self.selected_fences:
@@ -12617,6 +12722,9 @@ class InsideFenceDialog(QDialog):
         pass
 
         self.update_fence_display()
+        if native:
+            from gui.native_fence_selection import sync_native_fence_highlights
+            sync_native_fence_highlights(self, self.selected_fences)
 
         if hasattr(self, '_restore_highlights_from_data'):
             try:

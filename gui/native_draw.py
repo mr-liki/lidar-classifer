@@ -152,6 +152,14 @@ class NativeDraw:
         # Geometry is world XY; class colors and native point buffers are untouched.
         self._classification_fence_highlights = {}
         self._classification_fence_highlight_refs = {}
+        # Selection is a VIEW state, not a classification/used-fence flag.
+        # Exactly one group owns the permanent cyan selection at a time. The
+        # popup's checkbox preview has a separate temporary overlay.
+        self._active_fence_highlight_owner = None
+        self._active_fence_shapes = []
+        self._fence_selection_revision = 0
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
         self._object_actions = []
         self._object_redo = []
         self._shutting_down = False
@@ -308,35 +316,78 @@ class NativeDraw:
         self._legacy_dialog_highlights = list(features)
         self._paint()
 
-    def set_classification_fence_highlights(self, owner, fences):
-        """Replace cyan fence outlines for one active By Class/selection dialog.
+    def set_classification_fence_highlights(self, owner, fences, *,
+                                            preview=False, replace=False):
+        """Show only the *current* selection in cyan, never historical fences.
 
-        Multiple dialogs may hold selections; closing one must not discard
-        another dialog's current fence outline. Never recolor LiDAR points.
+        `preview` belongs to a checkbox picker and does not commit selection.
+        A stale dialog clearing/closing cannot erase a newer owner's selection.
+        `replace=True` is used by actual canvas selection (including a click on
+        empty canvas), which must be authoritative even when the set is empty.
         """
-        from gui.native_byclass_fences import _valid_ring
-        rings = []
-        refs = []
-        if not hasattr(self, '_classification_fence_highlight_refs'):
-            self._classification_fence_highlight_refs = {}
+        from gui.native_byclass_fences import _valid_ring, fence_identity
+        rings, refs, shapes, seen = [], [], [], set()
         for shape in fences:
             if not isinstance(shape, dict):
                 continue
             coords = shape.get('coords')
             ring = _valid_ring(coords) if coords is not None else None
-            if ring is not None:
-                rings.append(ring)
-                ref = shape.get('native_ref')
-                if ref is None and any(shape is obj for obj in getattr(self, 'drawings', ())):
-                    ref = shape
-                refs.append(id(ref) if ref is not None else None)
+            if ring is None:
+                continue
+            identity = fence_identity(shape)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rings.append(ring)
+            shapes.append(shape)
+            ref = shape.get('native_ref')
+            if ref is None and any(shape is obj for obj in getattr(self, 'drawings', ())):
+                ref = shape
+            refs.append(id(ref) if ref is not None else None)
+
         key = id(owner)
+        # Some older selection/Undo sessions construct an uninitialized
+        # controller before its overlay is attached. Initialize lazily rather
+        # than breaking Stage 1-5 selection tests or viewport restoration.
+        if not hasattr(self, '_classification_fence_highlights'):
+            self._classification_fence_highlights = {}
+        if not hasattr(self, '_classification_fence_highlight_refs'):
+            self._classification_fence_highlight_refs = {}
+        if not hasattr(self, '_active_fence_highlight_owner'):
+            self._active_fence_highlight_owner = None
+        if not hasattr(self, '_fence_picker_preview_owner'):
+            self._fence_picker_preview_owner = None
+            self._fence_picker_preview_rings = []
+        if preview:
+            self._fence_picker_preview_owner = key
+            self._fence_picker_preview_rings = rings
+            self._paint()
+            return
+
+        active = getattr(self, '_active_fence_highlight_owner', None)
+        if not rings and key != active and not replace:
+            # Stale dialog cleanup; an older owner must not clear new picks.
+            if self._fence_picker_preview_owner == key:
+                self._fence_picker_preview_owner = None
+                self._fence_picker_preview_rings = []
+                self._paint()
+            return
+        previous = list(getattr(self, '_active_fence_shapes', ()))
+        previous_ids = [fence_identity(item) for item in previous]
+        new_ids = [fence_identity(item) for item in shapes]
+        # Retire ALL previous dialog outlines rather than rendering their union.
+        self._classification_fence_highlights.clear()
+        self._classification_fence_highlight_refs.clear()
         if rings:
             self._classification_fence_highlights[key] = rings
             self._classification_fence_highlight_refs[key] = refs
-        else:
-            self._classification_fence_highlights.pop(key, None)
-            self._classification_fence_highlight_refs.pop(key, None)
+        self._active_fence_highlight_owner = key if rings else None
+        self._active_fence_shapes = shapes
+        if previous_ids != new_ids:
+            self._fence_selection_revision = getattr(self, '_fence_selection_revision', 0) + 1
+        # A new committed selection supersedes any checkbox preview.
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
         self._paint()
 
     def _scene_token(self):
@@ -517,7 +568,17 @@ class NativeDraw:
             self._selected_native_ref = None
             self._selected_imported = dict(feature,scene_token=self._scene_token())
             self._selection_scene_token = self._scene_token()
-        self._paint()
+        # A standalone Draw > Select click is a new selection, not a request
+        # to keep old cyan fences from a previous By Class dialog. Selection
+        # never undoes a previously applied LiDAR classification.
+        from gui.native_fence_selection import selected_fence_shapes
+        selected_shapes = selected_fence_shapes(
+            [feature['drawing']] if feature is not None
+            and feature.get('source') == 'native' else [], native_draw=self,
+        )
+        self.set_classification_fence_highlights(self, selected_shapes, replace=True)
+        from gui.native_fence_selection import propagate_native_fence_selection
+        propagate_native_fence_selection(self.app, selected_shapes)
 
     @staticmethod
     def _parallel_output(source, click):
@@ -1665,6 +1726,17 @@ class NativeDraw:
             else:
                 self._classification_fence_highlights.pop(key, None)
                 highlight_refs.pop(key, None)
+        if not all_highlights:
+            self._active_fence_highlight_owner = None
+        old_fence_count = len(getattr(self, '_active_fence_shapes', ()))
+        self._active_fence_shapes = [shape for shape in
+            getattr(self, '_active_fence_shapes', ())
+            if (shape.get('native_ref') is None or
+                id(shape['native_ref']) not in removed_ids)]
+        if len(self._active_fence_shapes) != old_fence_count:
+            self._fence_selection_revision = getattr(self, '_fence_selection_revision', 0) + 1
+            from gui.native_fence_selection import propagate_native_fence_selection
+            propagate_native_fence_selection(self.app, self._active_fence_shapes)
         bridge = getattr(self, '_selection_bridge', None)
         if bridge is not None:
             bridge.selection_manager._prune()
@@ -1804,6 +1876,11 @@ class NativeDraw:
         shapes = []
         bridge = self._selection_bridge
         chosen = (bridge.selection_manager._selected if bridge is not None else {})
+        # An open picker previews a REPLACEMENT group. Obsolete selection
+        # strokes must not stay cyan behind that preview.
+        picker_preview = getattr(self, '_fence_picker_preview_owner', None) is not None
+        if picker_preview:
+            chosen = {}
         hidden_in_intersect = (bridge._intersect_source_ids if bridge is not None
                                and bridge._intersect_mode else set())
         hovered = (getattr(bridge, '_hover_feature', None) if bridge is not None
@@ -1820,7 +1897,8 @@ class NativeDraw:
             data = self._style(drawing.get('type'))
             data.update(drawing)
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
-                                else i == self.selected and drawing is self._selected_native_ref)
+                                else not picker_preview and i == self.selected
+                                and drawing is self._selected_native_ref)
             # Only editable native Draw objects get cyan. Block/cell geometry
             # and imported SNT linework retain their existing special colors.
             data['highlight_scope'] = 'draw' if editable_draw(drawing) else None
@@ -1896,16 +1974,34 @@ class NativeDraw:
                                    {'type':'point' if len(feat['coords'])==1 else 'polyline',
                                     'selected':True,'width':3}))
             shapes.extend(self._selection_bridge.preview_shapes())
-        # The VTK renderer is hidden behind the Vulkan main viewport. Paint
-        # selected fence boundaries on this actual native canvas in cyan.
-        # These are highlight-only strokes, not new Draw editor objects.
-        for rings in getattr(self, '_classification_fence_highlights', {}).values():
-            for ring in rings:
-                shapes.append(('drawing', ring, {
-                    'type': 'polyline', 'color': '#00ffff', 'selected': True,
-                    'highlight_scope': 'draw', 'width': 4,
-                    'show_vertices': False,
-                }))
+        # The VTK renderer is hidden behind the Vulkan main viewport. Only
+        # the CURRENT fence group is cyan; formerly classified shapes are not
+        # selected just because their class edits are still committed.
+        # The active Draw/Element Selection path already paints a chosen source
+        # object cyan, so skip a second overlay for exactly that same object.
+        active_key = getattr(self, '_active_fence_highlight_owner', None)
+        active_rings = (() if picker_preview else
+                        getattr(self, '_classification_fence_highlights', {}).get(active_key, ()))
+        active_refs = getattr(self, '_classification_fence_highlight_refs', {}).get(active_key, ())
+        selection_refs = {key[1] for key in chosen if key[0] == 'native'}
+        if bridge is None and getattr(self, '_selected_native_ref', None) is not None and getattr(self, 'selected', None) is not None:
+            selection_refs.add(id(self._selected_native_ref))
+        for i, ring in enumerate(active_rings):
+            if i < len(active_refs) and active_refs[i] in selection_refs:
+                continue
+            shapes.append(('drawing', ring, {
+                'type': 'polyline', 'color': '#00ffff', 'selected': True,
+                'highlight_scope': 'draw', 'width': 4,
+                'show_vertices': False,
+            }))
+        # The picker is a non-destructive preview. When it closes, the last
+        # committed selection becomes visible again, not an obsolete dialog.
+        for ring in getattr(self, '_fence_picker_preview_rings', ()):
+            shapes.append(('drawing', ring, {
+                'type': 'polyline', 'color': '#00ffff', 'selected': True,
+                'highlight_scope': 'draw', 'width': 4,
+                'show_vertices': False,
+            }))
         shapes.extend(self.aux_shapes)
         self.overlay.set_shapes(shapes)
 
@@ -1918,6 +2014,10 @@ class NativeDraw:
         self._legacy_dialog_highlights = []
         self._classification_fence_highlights.clear()
         self._classification_fence_highlight_refs.clear()
+        self._active_fence_highlight_owner = None
+        self._active_fence_shapes = []
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
         if dialog is not None:
             try:
                 dialog.close()

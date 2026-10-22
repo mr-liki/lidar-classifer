@@ -82,6 +82,11 @@ def point_on_segment(p,a,b):
 def line_selects(coords, a, b, tol=0):
     if len(coords) < 2:
         return bool(coords and point_on_segment(coords[0],a,b))
+    # A segment entirely within a closed fence intersects that drawing too,
+    # even if it never crosses the boundary stroke.
+    if len(coords) >= 4 and coords[0] == coords[-1]:
+        if point_in_polygon(a, coords) or point_in_polygon(b, coords):
+            return True
     return any(segment_crosses(a,b,c,d) for c,d in zip(coords,coords[1:]))
 
 

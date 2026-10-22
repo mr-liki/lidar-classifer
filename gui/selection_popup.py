@@ -355,11 +355,11 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setStyleSheet(_PANEL_QSS)
 
-        self._method = "individual"
-        # The highlighted pick method is also its on/off state. Keep the
-        # historical default (Individual starts active), while allowing the
-        # user to click the active method again to stand selection down.
-        self._pick_enabled = True
+        # Draw -> Select opens the method panel WITHOUT arming Individual.
+        # The user must explicitly select Individual, Block, Shape, Line or
+        # SNT Text. None of their mouse handlers may run before that choice.
+        self._method = None
+        self._pick_enabled = False
         self._enclose_mode = "overlap"
         self._poll_generation = 0  # incremented each time move mode is armed
 
@@ -677,7 +677,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             "block":      "Drag a rectangle to pick touched elements.",
             "shape":      "Click polygon vertices, right-click to close.",
             "cline":      "Click two points to draw a line; crossed elements pick.",
-            "snt_text":   "Drag a rectangle to select only SNT text labels for copying.",
+            "snt_text":   "Pick SNT label(s), click Copy, then click the canvas to place editable copies.",
         }.get(key, "")
 
     # ------------------------------------------------------------------
@@ -796,6 +796,38 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     # ------------------------------------------------------------------
     # Tool plumbing
     # ------------------------------------------------------------------
+    def _refresh_native_controller(self):
+        """Bind the panel to the CURRENT Vulkan canvas after an LNT switch.
+
+        A long-lived Element Selection window may outlive its original LNT
+        viewport. A blue method button must never keep a controller attached
+        to that obsolete mouse-event target.
+        """
+        try:
+            from gui.native_draw import get_native_draw
+            draw = get_native_draw(self.app, create=True)
+        except (ImportError, RuntimeError, AttributeError):
+            draw = None
+        current = self._native_selection
+        if (current is None and draw is None or
+                current is not None and draw is current.draw):
+            return
+        if current is not None:
+            for slot in (self._on_selection_count, self._on_drawings_changed):
+                try: current.selection_manager.selection_changed.disconnect(slot)
+                except (RuntimeError, TypeError): pass
+            try: current.deactivate()
+            except (RuntimeError, AttributeError): pass
+        self._native_selection = None
+        if draw is not None:
+            from gui.native_selection_bridge import NativeSelectionController
+            self._native_selection = NativeSelectionController(draw)
+        # The existing panel needs to follow the new source of selections.
+        self._connect_selection_signal()
+        print('[Native Element Selection] rebound panel to '
+              + ('Vulkan viewport' if draw is not None else 'VTK viewport'),
+              flush=True)
+
     def _get_tool(self):
         if self._native_selection is not None:
             return self._native_selection
@@ -807,6 +839,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
     def _activate_tool(self):
         if not self._pick_enabled:
             return
+        self._refresh_native_controller()
         if self._native_selection is not None:
             self._native_selection.activate(self._method)
             return
@@ -827,6 +860,27 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
                 tool.set_enclose_mode(self._enclose_mode)
             except Exception:
                 pass
+
+    def reset_pick_method(self):
+        """Draw -> Select is a neutral panel until the user chooses a method.
+
+        Opening a reused dialog must not resurrect last session's Individual
+        picker or leave a cyan group selected. This deliberately does not
+        modify point classifications or classified-fence bookkeeping.
+        """
+        self._pick_enabled = False
+        self._method = None
+        for button in self._method_group.buttons():
+            button.setChecked(False)
+        self._poll_generation += 1
+        if self._native_selection is not None:
+            self._native_selection.deactivate()
+        else:
+            digitizer = getattr(self.app, 'digitizer', None)
+            if digitizer is not None:
+                digitizer.deactivate_element_select_tool()
+        self.lbl_count.setText('Selection: 0')
+        self._refresh_measurement_total()
 
     def suspend_pick_interaction(self):
         """Temporarily stand down live pick observers while keeping the dialog open."""
@@ -853,6 +907,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         if not key:
             return
 
+        self._refresh_native_controller()
         tool = self._get_tool()
 
         # Preserve Intersect behavior:
@@ -1162,7 +1217,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Select All failed: {e}")
 
     def _on_deselect(self):
+        self._refresh_native_controller()
         if self._native_selection is not None:
+            self._native_selection.exit_copy_mode() if self._native_selection._copy_mode else None
             self._selection_manager().clear()
             return
         tool = self._get_tool()
@@ -1268,12 +1325,13 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         QTimer.singleShot(150, lambda: self._poll_move_mode(generation))
 
     def _on_copy(self):
+        self._refresh_native_controller()
         self._deactivate_intersect_if_needed()
         tool = self._get_tool()
         if tool is None or not tool.is_active():
             return
         if getattr(tool, "_method", None) == "snt_text":
-            tool.copy_selected_snt_text_to_clipboard()
+            tool.enter_copy_mode()
             return
         tool.enter_copy_mode()
 
