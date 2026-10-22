@@ -17,8 +17,9 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# Keep the terminal visible in installed builds for live operational diagnostics.
-DEBUG_CONSOLE = True
+# The terminal stays visible in installed builds for live operational
+# diagnostics. Set NAKSHA_BUILD_CONSOLE=0 to build a windowed exe.
+DEBUG_CONSOLE = os.environ.get("NAKSHA_BUILD_CONSOLE", "1") != "0"
 
 project_root = Path(SPECPATH).resolve()
 
@@ -88,9 +89,8 @@ added_datas = [
     (str(project_root / 'gui' / 'theme_light.qss'),  'gui'),
     (str(project_root / 'models'),                   'models'),
     (str(project_root / 'Advance_Model'),            'Advance_Model'),
-    (str(project_root / 'gui' / 'AI' / 'basic' / 'models'),    'gui/AI/basic/models'),
-    (str(project_root / 'gui' / 'AI' / 'advanced' / 'models'), 'gui/AI/advanced/models'),
-    (str(project_root / 'gui' / 'AI' / 'premium' / 'models'),  'gui/AI/premium/models'),
+    (str(project_root / 'assets'),                   'assets'),
+
     (str(project_root / 'naksha.crt'),               '.'),
     # .snt file-type registration helpers (called by post_install + app on launch)
     (str(project_root / 'post_install.py'),          '.'),
@@ -171,8 +171,7 @@ if snt_core_pkg.exists():
         snt_core_found = True
 
 if not snt_core_found:
-    print("[ERROR] snt_core is not installed in the active environment.")
-    print(f"        Install it first with: {sys.executable} -m pip install --force-reinstall \"{snt_core_wheel}\"")
+    raise RuntimeError("snt_core must be installed before building the offline installer")
 
 
 # -- CSF / Cloth-Simulation-Filter ---------------------------------------------
@@ -281,6 +280,148 @@ if numba_pkg.exists():
     print("[OK] numba binaries collected manually")
 else:
     print("[WARN] numba package directory not found")
+
+
+# ==============================================================================
+#  NATIVE RUNTIME PAYLOAD
+# ==============================================================================
+# gui/render_backend.py and gui/lnt_native.py resolve their DLLs relative to the
+# package root, which is _MEIPASS in a frozen build. The payload therefore has
+# to keep the same relative paths inside _internal that it has in the source
+# tree, otherwise the app silently falls back to VTK.
+
+nk_vk_dir = project_root / 'native' / 'naksha_vulkan' / 'build_msvc'
+
+if nk_vk_dir.is_dir():
+    spv_files = sorted(nk_vk_dir.glob('*.spv'))
+    for spv in spv_files:
+        added_datas.append((str(spv), 'native/naksha_vulkan/build_msvc'))
+    print(f"[OK] Vulkan shaders: {len(spv_files)} .spv at build_msvc root")
+
+    shaders_src = nk_vk_dir / 'shaders'
+    if shaders_src.is_dir():
+        shader_subs = sorted(shaders_src.glob('*.spv'))
+        for spv in shader_subs:
+            added_datas.append((str(spv), 'native/naksha_vulkan/build_msvc/shaders'))
+        print(f"[OK] Vulkan shaders: {len(shader_subs)} .spv in shaders/")
+
+    nk_vk_dll = nk_vk_dir / 'naksha_vulkan.dll'
+    if nk_vk_dll.is_file():
+        added_binaries.append((str(nk_vk_dll), 'native/naksha_vulkan/build_msvc'))
+        print(f"[OK] Vulkan renderer: {nk_vk_dll.name} "
+              f"({nk_vk_dll.stat().st_size / 1e6:.1f} MB)")
+    else:
+        raise RuntimeError(f"Vulkan renderer missing: {nk_vk_dll}")
+
+    # main.py's startup self-check reads the C API header (export surface) and
+    # the build stamp (source provenance) from these exact relative paths.
+    nk_header = (project_root / 'native' / 'naksha_vulkan' / 'include' /
+                 'naksha' / 'naksha_vulkan_c_api.h')
+    if nk_header.is_file():
+        added_datas.append((str(nk_header), 'native/naksha_vulkan/include/naksha'))
+
+    nk_stamp = nk_vk_dir / 'native_build_stamp.json'
+    if nk_stamp.is_file():
+        added_datas.append((str(nk_stamp), 'native/naksha_vulkan/build_msvc'))
+else:
+    raise RuntimeError(f"native Vulkan build folder missing: {nk_vk_dir}")
+
+
+# -- LNT viewer / converter ----------------------------------------------------
+lnt_dir = project_root / 'native' / 'lnt'
+lnt_dll = lnt_dir / 'main_display_modes_peaks.dll'
+
+if lnt_dll.is_file():
+    added_binaries.append((str(lnt_dll), 'native/lnt'))
+    print(f"[OK] LNT viewer: {lnt_dll.name} ({lnt_dll.stat().st_size / 1e6:.1f} MB)")
+else:
+    raise RuntimeError(f"LNT viewer DLL missing: {lnt_dll}")
+
+for name in ('libzstd.dll',):
+    extra = project_root / 'native' / name
+    if extra.is_file():
+        added_binaries.append((str(extra), 'native'))
+        print(f"[OK] native dependency: {name}")
+
+
+# -- GL loaders and the MSVC runtime the native DLLs import --------------------
+
+def _first_existing(*candidates):
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return str(candidate)
+    return None
+
+
+_system32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+_vk_sdk = os.environ.get('VULKAN_SDK')
+
+# volk links the loader at runtime (no import-table entry), so vulkan-1.dll has
+# to be found through the normal DLL search path: next to the exe and inside
+# _internal both work for a frozen app.
+vulkan_loader = _first_existing(
+    os.path.join(_vk_sdk, 'Bin', 'vulkan-1.dll') if _vk_sdk else None,
+    os.path.join(_system32, 'vulkan-1.dll'),
+)
+if vulkan_loader:
+    added_binaries.append((vulkan_loader, '.'))
+    added_binaries.append((vulkan_loader, 'native/naksha_vulkan/build_msvc'))
+    print(f"[OK] Vulkan loader: {vulkan_loader}")
+else:
+    raise RuntimeError("Vulkan loader missing; offline installer cannot be built")
+
+# naksha_vulkan.dll is built with MSVC and imports MSVCP140 / VCRUNTIME140*.dll.
+# PyInstaller only pulls the vcruntime pair Python itself needs, so pin the set
+# beside the native DLL.
+for runtime_dll in ('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'concrt140.dll'):
+    found = _first_existing(os.path.join(_system32, runtime_dll))
+    if found:
+        added_binaries.append((found, 'native/naksha_vulkan/build_msvc'))
+    else:
+        raise RuntimeError(f"MSVC runtime missing: {runtime_dll}")
+
+
+# ==============================================================================
+#  PLUGIN PAYLOAD (copied to %LOCALAPPDATA% on first launch)
+# ==============================================================================
+
+plugins_root = project_root / 'plugins'
+plugin_files = 0
+
+if plugins_root.is_dir():
+    for path in plugins_root.rglob('*'):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(project_root)
+        if '__pycache__' in relative.parts or '.install-cache' in relative.parts:
+            continue
+        added_datas.append((str(path), str(relative.parent).replace(os.sep, '/')))
+        plugin_files += 1
+    print(f"[OK] plugin payload: {plugin_files} files")
+else:
+    print("[WARN] no plugins/ folder to bundle")
+
+
+# ==============================================================================
+#  AI PACKAGE (models + engine scripts loaded by file path)
+# ==============================================================================
+# The premium / vehicle engines are NOT imported: they are executed from their
+# files (importlib.util.spec_from_file_location / --run-python-script). Source
+# files loaded that way only exist in a frozen build if they are shipped as data.
+
+ai_root = project_root / 'gui' / 'AI'
+ai_files = 0
+
+if ai_root.is_dir():
+    for path in ai_root.rglob('*'):
+        if not path.is_file() or '__pycache__' in path.parts:
+            continue
+        relative = path.parent.relative_to(project_root)
+        added_datas.append((str(path), str(relative).replace(os.sep, '/')))
+        ai_files += 1
+    print(f"[OK] AI payload: {ai_files} files (models, engines, runners)")
+else:
+    print(f"[WARN] no gui/AI package to bundle: {ai_root}")
 
 
 # ==============================================================================
@@ -488,6 +629,19 @@ for mod in ("onnxruntime", "numba", "triangle", "_CSF", "torchvision"):
     if module_exists(mod):
         hidden_imports.append(mod)
         print(f"[OK] optional hidden import added: {mod}")
+
+# Every gui.* module is collected: the merge added several modules that are
+# imported lazily (plugin manager, native view bindings, GIS layers), and a
+# lazily imported module is invisible to the static import graph.
+try:
+    from PyInstaller.utils.hooks import collect_submodules as _collect_submodules
+    _gui_submodules = _collect_submodules("gui", on_error="ignore")
+    hidden_imports.append("gui.plugin_seed")
+    hidden_imports += _gui_submodules
+    print(f"[OK] gui submodules collected: {len(_gui_submodules)}")
+except Exception as _exc:
+    print(f"[WARN] gui submodule collection failed: {_exc}")
+    hidden_imports.append("gui.plugin_seed")
 
 
 # -- deduplicate ---------------------------------------------------------------

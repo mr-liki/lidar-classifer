@@ -36,6 +36,7 @@ import json
 import os
 import re
 import struct
+import sys
 from typing import Dict, List, Optional, Sequence, Set
 
 NATIVE_DIR_REL = os.path.join("native", "naksha_vulkan")
@@ -401,10 +402,24 @@ def assess(project_root: str, dll_path: str = "") -> Dict[str, object]:
             )
 
     stamp = read_build_stamp(paths["stamp"])
+    frozen = bool(getattr(sys, "frozen", False))
     if stamp is None:
         notes.append(
             "no build stamp - source provenance unverified (run "
             "write_native_build_stamp.py after a native rebuild to pin it)"
+        )
+    elif frozen:
+        # A packaged build ships the DLL, the C API header and the stamp, but
+        # not the .cpp/.h sources the stamp was taken over. Recomputing the
+        # digest there would always mismatch, so provenance is reported as
+        # recorded rather than re-derived. The export check above is still a
+        # real verification of the binary, and dev trees are unaffected.
+        report["stamp_present"] = True
+        report["stamp_created"] = str(stamp.get("created", ""))
+        report["stamp_digest"] = str(stamp.get("source_digest", ""))
+        notes.append(
+            "frozen build - build stamp reported as recorded; native sources "
+            "are not shipped, so the source digest is not re-derived"
         )
     else:
         report["stamp_present"] = True

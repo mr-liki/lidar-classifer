@@ -16,6 +16,10 @@ for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS',
 
 # ── 2. Numba: writable cache + frozen-app fixes ─────────────────────
 if getattr(sys, 'frozen', False):
+    # Installed builds use the bundled native renderer without per-machine
+    # environment setup. Keep explicit diagnostic overrides available.
+    os.environ.setdefault('NAKSHA_RENDER_BACKEND', 'vulkan')
+    os.environ.setdefault('NAKSHA_VULKAN_MAIN_VIEWPORT', '1')
     _cache = os.path.join(os.path.expanduser('~'), '.naksha', 'numba_cache')
     os.makedirs(_cache, exist_ok=True)
     os.environ.setdefault('NUMBA_CACHE_DIR', _cache)

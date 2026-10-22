@@ -4,7 +4,7 @@
 ;  Build:  ISCC.exe naksha_setup.iss
 ; ══════════════════════════════════════════════════════════════════
 #define MyAppName      "NakshaAI-LiDAR"
-#define MyAppVersion   "2.0.4"
+#define MyAppVersion   "2.0.5"
 #define MyAppPublisher "NakshaAI"
 ; EXE name matches PyInstaller spec: name='NakshaAI-LiDAR'
 #define MyAppExeName   "NakshaAI-LiDAR.exe"
@@ -22,7 +22,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=installer_output
-OutputBaseFilename=NakshaAI-LiDAR_Setup
+OutputBaseFilename=Setup
 SetupIconFile={#MyAppIcon}
 Compression=lzma2/fast
 SolidCompression=no
@@ -32,6 +32,7 @@ WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
+MinVersion=10.0
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -61,7 +62,7 @@ Source: "snt_core-1.3.1-cp310-cp310-win_amd64.whl"; DestDir: "{app}\_internal\wh
 ; OPTIONAL: Download VC_redist.x64.exe from https://aka.ms/vs/17/release/vc_redist.x64.exe
 ;           and place it in a redist\ subfolder next to this .iss file.
 ;           skipifsourcedoesntexist — build succeeds even without it.
-Source: "redist\VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
+Source: "redist\VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Dirs]
 ; Pre-create the APPDATA log directory so the app always has a writable path on first launch.
@@ -118,6 +119,11 @@ begin
 end;
 
 function RestartAfterUpdate(): Boolean;
+var
+  I: Integer;
 begin
-  Result := CmdLineParamExists('/RESTARTAFTERUPDATE');
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RESTARTAFTERUPDATE') = 0 then
+      Result := True;
 end;

@@ -806,7 +806,7 @@ def encode_surface_preset(payload: dict) -> str:
             "angle": float(payload.get("angle", 45.0)),
             "ambient": float(payload.get("ambient", 0.1)),
             "quality": float(payload.get("quality", 100.0)),
-            "speed": 1,
+            "speed": int(payload.get("speed", 1)),
             "max_edge": float(payload.get("max_edge", 0.0)),
             "classes": classes_json,
         }
@@ -842,7 +842,7 @@ def decode_surface_preset(text):
                 "angle": float(data.get("angle", 45.0)),
                 "ambient": float(data.get("ambient", 0.1)),
                 "quality": float(data.get("quality", 100.0)),
-                "speed": 1,
+                "speed": int(data.get("speed", 1)),
                 "max_edge": float(data.get("max_edge", 0.0)),
                 "classes": classes,
             }
@@ -1676,6 +1676,23 @@ class ClassVisibilityPicker(QDialog):
             self.quality_spin.setValue(100.0)
             shading_layout.addWidget(self.quality_spin, 3, 1)
 
+            shading_layout.addWidget(QLabel("Speed:"), 4, 0)
+            if mode == "shading":
+                self.shading_quality_combo = QComboBox()
+                for label, quality_key in SHADING_QUALITY_CHOICES:
+                    self.shading_quality_combo.addItem(label, quality_key)
+                self.shading_quality_combo.setCurrentIndex(1)
+                self.shading_quality_combo.setToolTip(
+                    "Fast uses 1M representatives, Normal uses 3M, and "
+                    "Slow triangulates every eligible point."
+                )
+                shading_layout.addWidget(self.shading_quality_combo, 4, 1)
+            else:
+                self.speed_spin = QSpinBox()
+                self.speed_spin.setRange(1, 10)
+                self.speed_spin.setValue(1)
+                shading_layout.addWidget(self.speed_spin, 4, 1)
+
             if mode == "surface":
                 shading_layout.addWidget(QLabel("Max Edge:"), 5, 0)
                 self.max_edge_spin = QDoubleSpinBox()
@@ -2444,9 +2461,11 @@ class ClassVisibilityPicker(QDialog):
             "quality": self.quality_spin.value(),
         }
         if self.mode == "shading":
-            params["quality_mode"] = "normal"
+            params["quality_mode"] = str(
+                self.shading_quality_combo.currentData() or "normal"
+            )
         else:
-            params["speed"] = 1
+            params["speed"] = self.speed_spin.value()
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             params["max_edge"] = self.max_edge_spin.value()
         return params
@@ -2476,6 +2495,17 @@ class ClassVisibilityPicker(QDialog):
         self.angle_spin.setValue(params.get("angle", 45.0))
         self.ambient_spin.setValue(params.get("ambient", 0.1))
         self.quality_spin.setValue(params.get("quality", 100.0))
+        if self.mode == "shading":
+            quality_mode = normalize_shading_preset_quality(
+                params.get("quality_mode"),
+                params.get("speed"),
+            )
+            quality_index = self.shading_quality_combo.findData(quality_mode)
+            self.shading_quality_combo.setCurrentIndex(
+                quality_index if quality_index >= 0 else 1
+            )
+        else:
+            self.speed_spin.setValue(params.get("speed", 1))
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             self.max_edge_spin.setValue(params.get("max_edge", 0.0))
 

@@ -19,9 +19,13 @@
 // owner always has all three of its vertices in its point set.
 //
 // THE EDGE FILTER. A Delaunay triangulation also triangulates empty ground (a lake, a building
-// footprint with no returns). A triangle whose longest plan edge exceeds
-// `max_edge_factor` x the tile's MEDIAN longest edge is dropped, which leaves those voids open
-// instead of bridging them with a sliver.
+// footprint with no returns), so long faces are dropped. Which faces count as long is the
+// PARITY decision, not a tuning knob: in the default (VTK) policy the limit is ABSOLUTE,
+// 10 % of the cut's plan extent (20 % with one visible class), and only numerical zero-area
+// faces are rejected - exactly what gui/shading_display.py does for Shaded Classification, so
+// identical panel values produce identical facets. The legacy relative rule
+// (`max_edge_factor` x the tile's MEDIAN longest edge) survives only for callers that leave
+// `max_edge_abs` at 0. audit/tin_policy_parity.py compares the two triangle sets facet by facet.
 //
 // The lighting matches gui/shading_display.py::_compute_shading (the same hillshade the rest of
 // the application uses):  zenith = 90 - elevation;  azimuth maths angle = 360 - azimuth + 90;
@@ -98,7 +102,19 @@ struct SurfaceParams {
     // per-face colours and the mixed-face list are then not built, which saves host RAM.
     bool bake_colors = true;
     bool compact_crisp = false;
-    double halo_fraction = 0.02;        // dense seams still get at least eight local point spacings
+    double halo_fraction = 0.5;         // cap on the halo as a fraction of the tile side
+
+    // VTK crisp-base parity for the CPU-baked colours (`_crisp_shade_chunk`). The VTK
+    // shaded-classification view bakes Sharpness' contrast gain, the over-90 light
+    // elevation and the ambient floor INTO every solid-cell colour, so Azimuth, Sharpness
+    // and Ambient each change the picture even though that actor has lighting off. When
+    // the engine cannot light the mesh itself (single visible class, elevation colouring,
+    // an engine without the crisp path) this bake has to fold in the same terms, otherwise
+    // the Sharpness control silently does nothing and Ambient ignores its floor.
+    // Single-class shading keeps the plain hillshade VTK bakes for that case, so
+    // `crisp_shade` stays off there and `single_elevation_deg` selects the elevation.
+    SurfaceShading surface;
+    bool crisp_shade = false;
 
     SurfaceParams() {
         for (int i = 0; i < 256; ++i) {
@@ -279,12 +295,16 @@ inline void mesh_one_tile(const std::vector<const SurfaceTile*>& tiles, std::siz
     int occupied = 0;
     for (uint8_t o : occ) occupied += o;
     const double spacing = std::sqrt(std::max(occupied, 1) * (wx / G) * (wy / G) / double(n_own));
-    // wider than the longest edge the filter can keep (about 1.8 spacings x max_edge_factor)
-    // With VTK's absolute edge limit the halo widens (up to half the tile) so a void-bridging
-    // triangle still has all three vertices in its owner's point set.
-    double halo = std::min(2.0 * P.max_edge_factor * spacing, 0.5 * std::min(wx, wy));
+    // Wider than the longest edge the filter can keep (about 1.8 spacings x max_edge_factor).
+    // With VTK's absolute edge limit the halo must reach the limit ITSELF, not a fraction of
+    // the tile: VTK keeps a triangle across a void up to 10 % of the cut's extent, and for the
+    // viewport to show the same facets that triangle's three vertices must all be in its
+    // owner's point set. `halo_fraction` stays the hard cap (half the tile by default) - a
+    // wider neighbourhood would let one tile own most of its neighbours.
+    const double halo_cap = std::clamp(P.halo_fraction, 0.01, 0.5) * std::min(wx, wy);
+    double halo = std::min(2.0 * P.max_edge_factor * spacing, halo_cap);
     if (P.max_edge_abs > 0.0)
-        halo = std::max(halo, std::min(P.max_edge_abs, P.halo_fraction * std::min(wx, wy)));
+        halo = std::max(halo, std::min(P.max_edge_abs, halo_cap));
 
     // halo: neighbours' points near this tile's border (any Z: stacked tiles share a column)
     const double emin[2] = {T.cmin[0] - halo, T.cmin[1] - halo};
@@ -487,9 +507,18 @@ inline void mesh_one_tile(const std::vector<const SurfaceTile*>& tiles, std::siz
         double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
         const double nl = std::sqrt(nx * nx + ny * ny + nz * nz);
         if (!(nl > 1e-12)) continue;                     // a sliver with no area
-        if (nz < 0.0) { nx = -nx; ny = -ny; nz = -nz; }  // the surface faces up
+        // This is an XY terrain TIN, so the face normal is the UPWARD one regardless of the
+        // index winding: this Delaunay emits clockwise faces while VTK's Triangle emits
+        // counter-clockwise, and an unflipped steep facet would then be lit from the other
+        // side. surface.frag does exactly the same (`if (c.z < 0) c = -c;`) so the CPU bake
+        // and the GPU cannot disagree here.
+        if (nz < 0.0) { nx = -nx; ny = -ny; nz = -nz; }
         const double ndotl = (nx * L[0] + ny * L[1] + nz * L[2]) / nl;
-        const double shade = std::min(1.0, std::max(ndotl, P.ambient));
+        double shade = std::min(1.0, std::max(ndotl, P.ambient));
+        if (P.crisp_shade && P.color_source == SurfaceColor::Class) {
+            const double unit[3] = {nx / nl, ny / nl, nz / nl};
+            shade = double(crisp_face_shade(P.surface, unit));
+        }
 
         double base[3];
         switch (P.color_source) {

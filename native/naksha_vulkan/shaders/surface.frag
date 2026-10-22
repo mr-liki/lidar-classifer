@@ -212,6 +212,13 @@ void main() {
         const vec3 p0 = crispVertex(i0);
         // Same as the soup upload's CPU face normal: a degenerate face reads as +Z.
         vec3 c = cross(crispVertex(i1) - p0, crispVertex(i2) - p0);
+        // This is an XY terrain TIN: use the upward normal regardless of
+        // index winding. VTK's Triangle mesher emits CCW faces, but native
+        // LNT Delaunay (including persisted tiles) emits CW faces. faceNormal
+        // alone only flips downward normals with |Nz| > 0.3, so steep LNT
+        // facets otherwise keep the opposite lighting direction. Correct
+        // before normalization; covers both live uploads and cached meshes.
+        if (c.z < 0.0) c = -c;
         crispFaceNormal = length(c) < 1e-12 ? vec3(0.0, 0.0, 1.0) : c;
         const uint c0 = crispCol[i0] & 0x00ffffffu;
         const bool mixedFace = c0 != (crispCol[i1] & 0x00ffffffu) ||

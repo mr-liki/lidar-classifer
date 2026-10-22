@@ -358,11 +358,16 @@ def phase_corrupt():
     sys.path.insert(0, str(ROOT))
     h, points, base = header(WORK)
     # Flip one byte in the middle of the first stored tile record.
+    stamp = WORK.stat()
     with open(WORK, 'r+b') as f:
         f.seek(base + 72 + 40)
         b = f.read(1)
         f.seek(base + 72 + 40)
         f.write(bytes([b[0] ^ 0x77]))
+    # Exercise per-record CRC validation even when the file identity stamp
+    # appears unchanged. A changed stamp separately triggers background source
+    # verification and may safely rebuild this tile before trying its cache.
+    os.utime(WORK, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
     v = View(nat, WORK)
     try:
         assert v.nv.set_shading(nat.SHADE_NORMAL)

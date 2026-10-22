@@ -75,6 +75,12 @@ inline Digest settings_digest(const SurfaceParams& p,const std::vector<uint64_t>
     h.value(p.color_source);h.value(p.ramp);h.value(p.z_min);h.value(p.z_max);h.value(p.i_min);h.value(p.i_max);
     h.add(p.class_rgb,sizeof(p.class_rgb));h.add(p.class_visible,sizeof(p.class_visible));
     h.value(p.single_elevation_deg);h.value(p.compact_crisp);h.value(p.halo_fraction);
+    // Baked colours depend on the light model itself: Sharpness changes them even though
+    // azimuth/elevation/ambient did not, so the crisp flag and its parameters must key the
+    // cached mesh or a Sharpness change would reuse the previous bake.
+    h.value(p.crisp_shade);h.value(p.surface.azimuth_deg);h.value(p.surface.sharpness);
+    h.value(p.surface.ambient);h.value(p.surface.light_elevation_deg);
+    h.value(p.surface.ambient_floor);h.value(p.surface.directional_energy);
     const char* halo=std::getenv("NAKSHA_LNT_HALO_FRACTION");if(halo)h.add(halo,std::strlen(halo));
     h.add(ids.data(),ids.size()*sizeof(uint64_t));return h.result();
 }
