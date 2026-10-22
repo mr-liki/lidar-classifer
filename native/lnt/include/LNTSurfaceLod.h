@@ -55,7 +55,7 @@
 namespace lnt { namespace surface_lod {
 using surface_archive::Digest;
 
-constexpr uint32_t kAlgorithm = 2;
+constexpr uint32_t kAlgorithm = 3; // highest visible return at coincident XY
 constexpr uint32_t kFlagExact = 1;
 constexpr unsigned kMaxDepth = 27;
 

@@ -315,13 +315,31 @@ inline void mesh_one_tile(const std::vector<const SurfaceTile*>& tiles, std::siz
         g_mesh_pts.fetch_add(uint64_t(pts.size()), std::memory_order_relaxed);
     }
     const double ox = 0.5 * (T.cmin[0] + T.cmax[0]), oy = 0.5 * (T.cmin[1] + T.cmax[1]);
-    std::vector<double> xy(pts.size() * 2);
-    for (std::size_t i = 0; i < pts.size(); ++i) {
-        xy[2 * i] = pts[i]->x - ox;
-        xy[2 * i + 1] = pts[i]->y - oy;
+    // A 2.5D TIN has one vertex per plan position. Choose the top visible
+    // return explicitly, instead of allowing Delaunay's duplicate suppression
+    // to choose a lower return according to source/flight-line order.
+    std::vector<std::size_t> order(pts.size());
+    for (std::size_t i=0;i<order.size();++i) order[i]=i;
+    std::sort(order.begin(),order.end(),[&](std::size_t a,std::size_t b) {
+        if(pts[a]->x!=pts[b]->x) return pts[a]->x<pts[b]->x;
+        if(pts[a]->y!=pts[b]->y) return pts[a]->y<pts[b]->y;
+        if(pts[a]->z!=pts[b]->z) return pts[a]->z>pts[b]->z;
+        return a<b;
+    });
+    std::vector<std::size_t> representatives;
+    std::vector<double> xy;
+    representatives.reserve(pts.size()); xy.reserve(pts.size()*2);
+    for(auto i:order) {
+        if(!representatives.empty()) {
+            const auto* previous=pts[representatives.back()];
+            if(previous->x==pts[i]->x && previous->y==pts[i]->y) continue;
+        }
+        representatives.push_back(i);
+        xy.push_back(pts[i]->x-ox); xy.push_back(pts[i]->y-oy);
     }
     Delaunay2D tri(xy);
-    const auto& tr = tri.triangles();
+    auto tr = tri.triangles();
+    for(auto& i:tr) i=representatives[i];
     const std::size_t nt = tr.size() / 3;
     {
         const auto now = mesh_clk::now();

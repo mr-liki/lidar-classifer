@@ -70,7 +70,7 @@ inline Digest source_digest(const Reader& rd){
     return h.result();
 }
 inline Digest settings_digest(const SurfaceParams& p,const std::vector<uint64_t>& ids){
-    Hash h;uint32_t algorithm=1;h.value(algorithm);
+    Hash h;uint32_t algorithm=2;h.value(algorithm); // upper-envelope duplicate XY
     h.value(p.method);h.value(p.azimuth_deg);h.value(p.elevation_deg);h.value(p.ambient);h.value(p.max_edge_factor);
     h.value(p.color_source);h.value(p.ramp);h.value(p.z_min);h.value(p.z_max);h.value(p.i_min);h.value(p.i_max);
     h.add(p.class_rgb,sizeof(p.class_rgb));h.add(p.class_visible,sizeof(p.class_visible));
