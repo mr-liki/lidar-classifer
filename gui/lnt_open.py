@@ -1042,6 +1042,16 @@ class LntMainView(QObject):
         now = time.perf_counter()
         dt, self._t = now - self._t, now
         if nv.frame(dt):
+            # Native LNT frames bypass VulkanRenderBackend.request_render.
+            # Advance its projection cache and refresh overlays here too.
+            backend = getattr(self, '_vector_backend', None)
+            if backend is not None:
+                backend.present_count += 1
+                for overlay in tuple(getattr(backend, '_frame_overlays', ())):
+                    try:
+                        overlay._follow(immediate=True)
+                    except (RuntimeError, ReferenceError):
+                        pass
             self._fails = 0
             self._n += 1
             surface_mode = self.shading_name in ("shaded", "shaded_class", "surface")
