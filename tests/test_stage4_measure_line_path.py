@@ -263,6 +263,27 @@ def test_native_measure_point_undo_redo_and_after_finish(native_module):
     assert len(m.completed) == 1
 
 
+def test_clear_all_measurements_is_undoable_and_redoable(native_module):
+    mod, qt = native_module
+    m = mod.NativeMeasure(Canvas())
+    click(m, qt, (0, 0)); click(m, qt, (3, 4)); click(m, qt, (0, 0), qt.RightButton)
+    m.grids.append({
+        'points': [(0., 0.), (2., 0.), (2., 2.), (0., 2.)],
+        'label': 'G01', 'area': 4., 'kind': 'grid',
+    })
+
+    m.clear()
+    assert not m.completed and not m.grids
+    assert m.can_history(redo=False)
+
+    assert m.history(redo=False)
+    assert len(m.completed) == 1 and len(m.grids) == 1
+    assert m.can_history(redo=True)
+
+    assert m.history(redo=True)
+    assert not m.completed and not m.grids
+
+
 def test_measure_history_cannot_redo_undone_point_into_new_measurement(native_module):
     mod, qt = native_module
     m = mod.NativeMeasure(Canvas())
