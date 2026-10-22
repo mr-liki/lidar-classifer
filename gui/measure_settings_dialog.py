@@ -36,10 +36,12 @@ DEFAULT_MEASURE_STYLE = {
         'unit': 'm',
     },
     'block': {
+        'color': (1.0, 0.55, 0.0),
         'unit': 'm',
         'label_font_size': 24,
     },
     'grid': {
+        'color': (0.3, 1.0, 0.85),
         'unit': 'm',
         'label_font_size': 24,
     },
@@ -112,6 +114,14 @@ def load_measure_settings():
         'label_font_size': int(s.value("measure_style/grid/label_font_size", dflt_grid['label_font_size'])),
     }
 
+    for section in ('block', 'grid'):
+        color_name = s.value(f'measure_style/{section}/color', None)
+        color = QColor(color_name) if color_name else None
+        out[section]['color'] = (
+            _qcolor_to_vtk(color) if color is not None and color.isValid()
+            else DEFAULT_MEASURE_STYLE[section]['color']
+        )
+
     return out
 
 
@@ -131,6 +141,10 @@ def save_measure_settings(style):
             s.setValue(f"measure_style/{section}/label_font_size", int(sec['label_font_size']))
         if 'unit' in sec:
             s.setValue(f"measure_style/{section}/unit", sec['unit'])
+
+    for section in ('block', 'grid'):
+        if 'color' in style.get(section, {}):
+            s.setValue(f'measure_style/{section}/color', _vtk_to_qcolor(style[section]['color']).name())
 
     block = style.get('block', {})
     if 'unit' in block:
@@ -360,11 +374,12 @@ class _MeasureSectionWidget(QGroupBox):
 # ──────────────────────────────────────────────────────────────────
 
 class _BlockSectionWidget(QGroupBox):
-    """Minimal section for Block: only Measurement Unit."""
+    """Color, measurement unit and label size for Block or Grid."""
 
     def __init__(self, initial: dict, parent=None, *, title="Block", section_key="block"):
         super().__init__(title, parent)
         self._section_key = section_key
+        self._color = _vtk_to_qcolor(initial.get('color', DEFAULT_MEASURE_STYLE[section_key]['color']))
         self._build(initial)
 
     def _build(self, initial: dict):
@@ -373,6 +388,15 @@ class _BlockSectionWidget(QGroupBox):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(8)
         form.setContentsMargins(15, 10, 15, 12)
+
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(56, 30)
+        self._color_btn.setCursor(Qt.PointingHandCursor)
+        self._color_btn.setToolTip("Click to pick a measurement colour")
+        self._color_btn.setObjectName("colorSwatch")
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._choose_color)
+        form.addRow("Line Color:", self._color_btn)
 
         self._unit_combo = QComboBox()
         for label, value in _UNIT_OPTIONS:
@@ -392,14 +416,20 @@ class _BlockSectionWidget(QGroupBox):
         self._font_spin.setToolTip("Area label font size in points")
         form.addRow("Label Size:", self._font_spin)
 
+    _refresh_color_btn = _MeasureSectionWidget._refresh_color_btn
+    _choose_color = _MeasureSectionWidget._choose_color
+
     def get_style(self) -> dict:
         return {
+            'color': _qcolor_to_vtk(self._color),
             'unit': self._unit_combo.currentData(),
             'label_font_size': self._font_spin.value()
         }
 
     def reset_to_defaults(self):
         dflt = DEFAULT_MEASURE_STYLE[self._section_key]
+        self._color = _vtk_to_qcolor(dflt['color'])
+        self._refresh_color_btn()
         for i, (_, v) in enumerate(_UNIT_OPTIONS):
             if v == dflt.get('unit', 'm'):
                 self._unit_combo.setCurrentIndex(i)
@@ -534,6 +564,12 @@ class MeasureSettingsDialog(QDialog):
                 mt._measure_style = style
                 if hasattr(mt, 'apply_style'):
                     mt.apply_style(style)
+            native_views = [getattr(app, '_lnt_main_view', None)]
+            native_views.extend(getattr(getattr(app, '_native_sections', None), 'views', {}).values())
+            for view in native_views:
+                measurement = getattr(view, 'measurement', None)
+                if measurement is not None:
+                    measurement._paint()
             cs_measure = getattr(app, 'cross_section_measurement_tool', None)
             if cs_measure is not None and hasattr(cs_measure, 'apply_style'):
                 cs_measure.apply_style(style)

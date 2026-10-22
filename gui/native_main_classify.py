@@ -31,7 +31,8 @@ class MainCanvas:
 
     @property
     def frame_backend(self):
-        return getattr(self.view.owner, 'vulkan_backend', None)
+        from gui.native_vector_overlay import _backend
+        return _backend(self.view.app) or getattr(self.view.owner, 'vulkan_backend', None)
 
     def section_at(self, x, y):
         ratio = self.widget.devicePixelRatioF()
@@ -48,8 +49,14 @@ class MainCanvas:
         return pixel[0]/ratio, pixel[1]/ratio
 
     def projection_snapshot(self):
-        getter = getattr(self.view.native, 'projection_snapshot', None)
-        snapshot = getter() if getter is not None else None
+        # The controller can already contain the next pan/zoom target. Use
+        # the same rendered MVP as the point cloud, once for the whole paint.
+        from gui.native_vector_overlay import _MvpScreenMapping
+        mapping = getattr(self, '_frame_mapping', None)
+        if mapping is None:
+            mapping = self._frame_mapping = _MvpScreenMapping(SimpleNamespace(
+                vulkan_backend=self.frame_backend, vulkan_widget=self.widget))
+        snapshot = mapping.projection_snapshot()
         if snapshot is None:
             return None
         key, project = snapshot

@@ -1104,7 +1104,7 @@ class MeasurementTool(AreaIndex):
                         pass
         return None
 
-    def _create_block_outline_actor(self, polygon_points, z_value):
+    def _create_block_outline_actor(self, polygon_points, z_value, *, style_key="block"):
         """Create a highlighted outline actor for the selected block polygon."""
         if len(polygon_points) < 3:
             return None
@@ -1131,7 +1131,7 @@ class MeasurementTool(AreaIndex):
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(1.0, 0.55, 0.0)
+        actor.GetProperty().SetColor(*self._measure_style.get(style_key, {}).get('color', (1.0, 0.55, 0.0)))
         actor.GetProperty().SetLineWidth(4.0)
         actor.GetProperty().SetOpacity(1.0)
         actor.GetProperty().SetLighting(False)
@@ -1253,7 +1253,7 @@ class MeasurementTool(AreaIndex):
         )
         centroid_x, centroid_y = grid["centroid"]
         label_position = (float(centroid_x), float(centroid_y), z_value)
-        outline_actor = self._create_block_outline_actor(grid["points"], z_value)
+        outline_actor = self._create_block_outline_actor(grid["points"], z_value, style_key="grid")
         label_actor = self._create_area_label(label_position, grid["area"], style_key="grid")
         self._scene_add(outline_actor)
         self._scene_add(label_actor)
@@ -1505,7 +1505,10 @@ class MeasurementTool(AreaIndex):
             centroid_x, centroid_y = self._calculate_polygon_centroid_2d(polygon_points)
             label_position = (float(centroid_x), float(centroid_y), z_value)
 
-            outline_actor = self._create_block_outline_actor(polygon_points, z_value)
+            outline_actor = self._create_block_outline_actor(
+                polygon_points, z_value,
+                style_key="grid" if measurement_type == "measure_grid_area" else "block",
+            )
             label_actor = self._create_area_label(
                 label_position,
                 area,
@@ -1659,8 +1662,7 @@ class MeasurementTool(AreaIndex):
                 if color and 'line' in label_data:
                     line = label_data['line']
                     try:
-                        if m_type not in ('measure_block_area', 'measure_grid_area'):
-                            line.GetProperty().SetColor(*color)
+                        line.GetProperty().SetColor(*color)
                         if width:
                             line.GetProperty().SetLineWidth(width)
                     except Exception:
