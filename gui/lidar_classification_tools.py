@@ -1721,7 +1721,8 @@ class FenceSelectorWidget(QWidget):
                     native_picker_sel[sid] = shape
                 else:
                     native_picker_sel.pop(sid, None)
-                sync_native_fence_highlights(dlg, native_picker_sel.values())
+                from gui.native_fence_selection import preview_native_fence_highlights
+                preview_native_fence_highlights(dlg, native_picker_sel.values())
                 return
 
             if not checked:
@@ -1944,9 +1945,11 @@ class FenceSelectorWidget(QWidget):
                 self._sel_actors[stable_key] = ac_
                 self._fence_id_to_uuid[sid_] = stable_key  # bridge: id→uuid
             picker_sel.clear()
-            self._update_status()
             if use_native_picker:
+                from gui.native_fence_selection import sync_native_fence_highlights
+                sync_native_fence_highlights(self, self.selected_fences)
                 clear_native_fence_highlights(dlg)
+            self._update_status()
             try: self.app.vtk_widget.render()
             except: pass
             dlg.close()
@@ -2007,9 +2010,9 @@ class FenceSelectorWidget(QWidget):
             dlg.move(child_x, child_y)
 
     def _update_status(self):
-        """Update status label with fence counts."""
-        from gui.native_fence_selection import sync_native_fence_highlights
-        sync_native_fence_highlights(self, self.selected_fences)
+        """Update status without resurrecting previous cyan fence selections."""
+        from gui.native_fence_selection import restore_native_fence_highlights
+        restore_native_fence_highlights(self)
         if not self.selected_fences:
             self.status_lbl.setText(self.empty_status_text)
             self.status_lbl.setStyleSheet("color:#888; font-size:10px; padding:2px 0;")
@@ -5798,6 +5801,10 @@ class _BaseClassifyDialog(QDialog):
             return
 
         from gui.native_byclass_fences import fence_identity
+        from gui.native_draw import get_native_draw
+        native = get_native_draw(self.app, create=False) is not None
+        if native:
+            fence_sel.selected_fences = []  # Explicit new group, not append.
         existing_ids = {fence_identity(f) for f in fence_sel.selected_fences}
         added = 0
         for shape in fence_shapes:
@@ -5821,6 +5828,9 @@ class _BaseClassifyDialog(QDialog):
 
         fence_sel.select_btn.setVisible(True)
         fence_sel.clear_btn.setVisible(True)
+        if native:
+            from gui.native_fence_selection import sync_native_fence_highlights
+            sync_native_fence_highlights(fence_sel, fence_sel.selected_fences)
         fence_sel._update_status()
 
         self.show()

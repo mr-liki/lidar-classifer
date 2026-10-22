@@ -4755,6 +4755,10 @@ class NakshaApp(QMainWindow):
         if dlg is None:
             dlg = SelectionModeDialog(self)
             self._element_selection_dialog = dlg
+        # Opening Element Selection intentionally does not auto-arm a picker.
+        # A minimized chip merely restores the existing dialog state.
+        if not (dlg.windowState() & Qt.WindowMinimized) and hasattr(dlg, "reset_pick_method"):
+            dlg.reset_pick_method()
         if hasattr(dlg, "restore_from_chip"):
             dlg.restore_from_chip()
         elif dlg.windowState() & Qt.WindowMinimized:

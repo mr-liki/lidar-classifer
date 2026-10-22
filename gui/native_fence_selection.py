@@ -70,33 +70,163 @@ def selected_fence_shapes(selected, *, native_draw=None, digitizer=None):
     return result
 
 
-def sync_native_fence_highlights(owner, fences):
-    """Show the exact selected boundaries in native Vulkan, never VTK actors.
+def _native_draw(app, *, create=False):
+    if app is None:
+        return None
+    from gui.native_draw import get_native_draw
+    return get_native_draw(app, create=create)
 
-    Return True when the active main viewport is native. False means the VTK
-    UI should retain its current VTK highlight handling.
+
+def _sync_canvas_selection(draw, fences, owner):
+    """Keep the cyan Draw/Element Selection overlay in sync with fence pickers.
+
+    The manager paints selected Draw objects on its own, independently of the
+    classification dialog's cyan strokes. Otherwise it can keep rendering an
+    obsolete circle even after the dialogue selection has changed to triangle.
+    """
+    bridge = getattr(draw, '_selection_bridge', None)
+    manager = getattr(bridge, 'selection_manager', None)
+    if manager is not None and manager is not owner:
+        wanted = {id(shape['native_ref']) for shape in fences
+                  if isinstance(shape, dict) and shape.get('native_ref') is not None}
+        chosen = {}
+        for index, drawing in enumerate(getattr(draw, 'drawings', ())):
+            if id(drawing) in wanted:
+                feature = bridge._native_feature(index, drawing)
+                chosen[feature['key']] = feature
+        current = getattr(manager, '_selected', {})
+        if set(current) != set(chosen):
+            manager._selected = chosen
+            signal = getattr(manager, 'selection_changed', None)
+            if signal is not None:
+                signal.emit(len(chosen))
+    # Standalone Draw > Select is separate from the Element Selection manager.
+    # Its previous selected flag must not re-paint an obsolete cyan outline.
+    current_ref = getattr(draw, '_selected_native_ref', None)
+    if current_ref is not None and not any(
+            isinstance(shape, dict) and shape.get('native_ref') is current_ref
+            for shape in fences):
+        draw._selected_native_ref = None
+        draw.selected = None
+
+
+def propagate_native_fence_selection(app, fences):
+    """Mirror CURRENT fence membership into already-created classification UIs.
+
+    Visual selection and persisted `classified_fence` are independent. Direct
+    canvas selection, a picker Apply, and Element Selection all update the same
+    group, so reopening an old dialog cannot silently resurrect old fences.
+    No VTK fallback and no point classes/drawing metadata are modified.
+    """
+    from gui.native_draw import get_native_draw
+    draw = get_native_draw(app, create=False) if app is not None else None
+    if draw is None:
+        return
+    revision = getattr(draw, '_fence_selection_revision', 0)
+    live = list(fences)
+    seen = set()
+    dialogs = []
+    ribbons = getattr(getattr(app, 'ribbon_manager', None), 'ribbons', {}) or {}
+    ribbon = ribbons.get('by_class') if hasattr(ribbons, 'get') else None
+    if ribbon is not None:
+        for attr in ('inside_fence_dialog', 'height_convert_dialog',
+                     'closed_by_class_dialog'):
+            dialogs.append(getattr(ribbon, attr, None))
+    # The LiDAR Classification tools may use a shared FenceSelectorWidget.
+    for attr in ('_classify_low_points_dlg', '_classify_isolated_points_dlg',
+                 '_classify_ground_dlg', '_classify_surface_points_dlg',
+                 '_classify_below_surface_dlg'):
+        dialogs.append(getattr(app, attr, None))
+    for dialog in dialogs:
+        if dialog is None or id(dialog) in seen:
+            continue
+        seen.add(id(dialog))
+        if hasattr(dialog, 'selected_fences'):
+            dialog.selected_fences = list(live)
+        widget = getattr(dialog, '_fence_sel', None)
+        if widget is not None and hasattr(widget, 'selected_fences'):
+            widget.selected_fences = list(live)
+            widget._native_fence_selection_revision = revision
+        dialog._native_fence_selection_revision = revision
+        badge = getattr(dialog, 'fence_count_badge', None)
+        if badge is not None and hasattr(badge, 'setText'):
+            badge.setText(str(len(live)))
+
+
+def sync_native_fence_highlights(owner, fences):
+    """Commit a new active fence group in the actual Vulkan viewport.
+
+    New picks REPLACE prior picks from any other dialog. Multiple fences in
+    `fences` remain selected together. Classification point data is untouched.
+    VTK keeps its original selection/highlight handling.
     """
     app = getattr(owner, 'app', None)
-    if app is None:
-        return False
-    from gui.native_draw import get_native_draw
     fence_list = list(fences)
-    draw = get_native_draw(app, create=bool(fence_list))
+    draw = _native_draw(app, create=bool(fence_list))
     if draw is None:
         return False
-    draw.set_classification_fence_highlights(owner, fence_list)
+    _sync_canvas_selection(draw, fence_list, owner)
+    draw.set_classification_fence_highlights(owner, fence_list, replace=True)
+    propagate_native_fence_selection(app, fence_list)
+    try:
+        owner._native_fence_selection_revision = draw._fence_selection_revision
+    except (AttributeError, TypeError):
+        pass
+    return True
+
+
+def preview_native_fence_highlights(owner, fences):
+    """Noncommittal picker checkbox preview; cancel retains prior selection."""
+    draw = _native_draw(getattr(owner, 'app', None), create=bool(fences))
+    if draw is None:
+        return False
+    draw.set_classification_fence_highlights(owner, list(fences), preview=True)
+    return True
+
+
+def restore_native_fence_highlights(owner):
+    """Reconcile an old dialog to the latest native selection, not vice versa.
+
+    Reopening a minimized Fence/Close/Height dialog must never restore a stale
+    cyan circle after the user has selected a new triangle group.
+    """
+    draw = _native_draw(getattr(owner, 'app', None), create=False)
+    if draw is None:
+        return False
+    revision = getattr(draw, '_fence_selection_revision', 0)
+    if getattr(owner, '_native_fence_selection_revision', None) != revision:
+        current = list(getattr(draw, '_active_fence_shapes', ()))
+        if hasattr(owner, 'selected_fences'):
+            owner.selected_fences = list(current)
+        widget = getattr(owner, '_fence_sel', None)
+        if widget is not None and hasattr(widget, 'selected_fences'):
+            widget.selected_fences = list(current)
+        try:
+            owner._native_fence_selection_revision = revision
+        except (AttributeError, TypeError):
+            pass
+        badge = getattr(owner, 'fence_count_badge', None)
+        if badge is not None and hasattr(badge, 'setText'):
+            badge.setText(str(len(current)))
     return True
 
 
 def clear_native_fence_highlights(owner):
-    app = getattr(owner, 'app', None)
-    if app is None:
-        return False
-    from gui.native_draw import get_native_draw
-    draw = get_native_draw(app, create=False)
+    draw = _native_draw(getattr(owner, 'app', None), create=False)
     if draw is None:
         return False
+    # Picker preview cleanup must never clear the committed selection.
+    if getattr(draw, '_fence_picker_preview_owner', None) == id(owner):
+        draw._fence_picker_preview_owner = None
+        draw._fence_picker_preview_rings = []
+        draw._paint()
+        return True
+    was_active = getattr(draw, '_active_fence_highlight_owner', None) == id(owner)
+    if was_active:
+        _sync_canvas_selection(draw, (), owner)
     draw.set_classification_fence_highlights(owner, ())
+    if was_active:
+        propagate_native_fence_selection(getattr(owner, 'app', None), ())
     return True
 
 
