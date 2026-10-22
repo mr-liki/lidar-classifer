@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gui.native_highlight import NativeHighlightOverlay
+from gui.prj_block_identifier import PRJBlockIdentifierDialog
 
 
 def test_prj_identify_blue_width_six_and_three_blinks(monkeypatch):
@@ -44,3 +45,42 @@ def test_native_overlay_does_not_import_vtk():
             assert all(alias.name != "vtk" for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             assert node.module != "vtk"
+
+
+def test_native_prj_navigation_is_repeatable_without_attachment_layer(monkeypatch):
+    frames = []
+    modes = []
+
+    native = SimpleNamespace(
+        frame_region=lambda x, y, width: frames.append((x, y, width))
+    )
+    widget = SimpleNamespace(width=lambda: 1200, height=lambda: 600)
+    view = SimpleNamespace(
+        native=native,
+        owner=SimpleNamespace(vulkan_widget=widget),
+        set_2d=lambda enabled: modes.append(enabled),
+    )
+    history = []
+    app = SimpleNamespace(
+        _lnt_main_view=view,
+        _prj_fly_camera_active=True,
+        _commit_main_view_history=lambda reason: history.append(reason),
+    )
+    dialog = PRJBlockIdentifierDialog.__new__(PRJBlockIdentifierDialog)
+    dialog.app = app
+
+    monkeypatch.setattr("gui.native_attachments.is_native_main", lambda _app: True)
+    # If camera navigation regresses to constructing an attachment overlay,
+    # this sentinel turns the old failure into a focused test failure.
+    monkeypatch.setattr(
+        "gui.native_attachments.layer_for",
+        lambda _app: (_ for _ in ()).throw(AssertionError("attachment layer used")),
+    )
+
+    dialog.fly_to_location(100.0, 200.0, target_scale=100.0)
+    dialog.fly_to_location(300.0, 400.0, target_scale=50.0)
+
+    assert frames == [(100.0, 200.0, 400.0), (300.0, 400.0, 200.0)]
+    assert modes == [True, True]
+    assert history == ["prj_fly_to", "prj_fly_to"]
+    assert app._prj_fly_camera_active is False
