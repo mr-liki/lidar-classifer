@@ -7,7 +7,7 @@ point_source_id.  Unsupported input is rejected BEFORE any class write.
 Small clouds use one exact snapshot. Larger clouds use an independently
 validated, fence-scoped LNT leaf reader for Fence/Close/Height, a read-only
 neighborhood envelope for fenced Low Points/Isolated, or a class-only streamed
-Convert planner. Algorithms without auditable finite scope remain guarded.
+Convert planner, or a two-pass streamed Ctrline vertex classifier. Algorithms without auditable finite scope remain guarded.
 No unsafe approximate tile seams or partial classification are permitted.
 """
 from __future__ import annotations
@@ -458,7 +458,7 @@ def _report(dialog, message, error=False):
 
 
 def _with_progress(dialog, name, operation, preview=False, scope_polygons=None,
-                   convert_spec=None):
+                   convert_spec=None, corridor_spec=None, centerline_spec=None, algorithm_spec=None):
     """One GUI-thread query + compute + write, with cancellation before write."""
     from PySide6.QtWidgets import QApplication, QProgressDialog
     from PySide6.QtCore import Qt
@@ -499,7 +499,119 @@ def _with_progress(dialog, name, operation, preview=False, scope_polygons=None,
             fence_polygons = _polygon_coords(dialog)
         else:
             fence_polygons = None
-        if fence_polygons:
+        planned_find_wires = None
+        planned_centerline = None
+        planned_spatial = None
+        if algorithm_spec is not None:
+            from gui.native_by_class import cloud_bbox
+            view = _available_cloud(app, allow_busy=True)
+            total = cloud_bbox(view)[4]
+            if total > MAX_EXACT_POINTS:
+                from gui.native_ground_below_stream import (plan_streamed_ground,
+                                                            plan_streamed_below_surface)
+                operation_type = algorithm_spec['type']
+                planner = (plan_streamed_ground if operation_type == 'ground'
+                           else plan_streamed_below_surface)
+                try:
+                    planned_spatial, info = planner(
+                        view.lnt_path, algorithm_spec['polygons'],
+                        algorithm_spec['params'], expected_total=total,
+                        max_changes=MAX_EXACT_POINTS, progress=report,
+                        cancelled=progress.wasCanceled)
+                except Exception as exc:
+                    if progress.wasCanceled():
+                        raise NativeByClassCancelled(
+                            f'{name} cancelled before writing.') from exc
+                    raise NativeByClassError(
+                        f'{name} bounded LNT analysis failed: {exc} '
+                        'No changes were made.') from exc
+                tile = dict(node=planned_spatial['node'],
+                            local=planned_spatial['local'],
+                            classification=planned_spatial['old_classes'],
+                            file_stat=planned_spatial['file_stat'])
+                print(f'[Native {name}] bounded exact LNT plan: '
+                      f'{len(tile["node"]):,} changes, '
+                      f'{planned_spatial["stats"]}, '
+                      f'{info["nodes"]:,} verified directory nodes')
+            else:
+                view, tile = read_snapshot(app, progress=report)
+        elif centerline_spec is not None:
+            from gui.native_by_class import cloud_bbox
+            view = _available_cloud(app, allow_busy=True)
+            total = cloud_bbox(view)[4]
+            if total > MAX_EXACT_POINTS:
+                from gui.native_lnt_directory import plan_streamed_centerline_poles
+                palette = getattr(app, 'class_palette', None)
+                visible = (None if not isinstance(palette, dict) or not palette
+                           else [int(code) for code, cfg in palette.items()
+                                 if isinstance(cfg, dict) and cfg.get('show', True)])
+                try:
+                    planned_centerline, info = plan_streamed_centerline_poles(
+                        view.lnt_path,
+                        centerline_coords=centerline_spec['lines'],
+                        radius=centerline_spec['radius'],
+                        down_height=centerline_spec['down_height'],
+                        from_classes=centerline_spec['from_classes'],
+                        to_class=centerline_spec['to_class'],
+                        visible_classes=visible,
+                        expected_total=total, max_changes=MAX_EXACT_POINTS,
+                        progress=report, cancelled=progress.wasCanceled)
+                except Exception as exc:
+                    if progress.wasCanceled():
+                        raise NativeByClassCancelled('Ctrline cancelled before writing.') from exc
+                    raise NativeByClassError(
+                        f'Ctrline streamed LNT analysis failed: {exc} '
+                        'No changes were made.') from exc
+                tile = dict(node=planned_centerline['node'],
+                            local=planned_centerline['local'],
+                            classification=planned_centerline['old_classes'],
+                            file_stat=planned_centerline['file_stat'])
+                print('[Native Ctrline] streamed exact LNT plan: '
+                      f'{planned_centerline["stats"]["vertices"]:,} distinct vertices, '
+                      f'{planned_centerline["stats"]["touched_vertices"]:,} with sources, '
+                      f'{len(tile["node"]):,} changes planned across '
+                      f'{info["nodes"]:,} verified directory nodes')
+            else:
+                view, tile = read_snapshot(app, progress=report)
+        elif corridor_spec is not None:
+            from gui.native_by_class import cloud_bbox
+            view = _available_cloud(app, allow_busy=True)
+            total = cloud_bbox(view)[4]
+            if total > MAX_EXACT_POINTS:
+                from gui.native_lnt_directory import plan_streamed_find_wires
+                try:
+                    planned_find_wires, info = plan_streamed_find_wires(
+                        view.lnt_path,
+                        alignment_coords=corridor_spec['lines'],
+                        corridor_width=corridor_spec['width'],
+                        from_classes=corridor_spec['from_classes'],
+                        to_class=corridor_spec['to_class'],
+                        ground_class=corridor_spec['ground_class'],
+                        min_height_above_ground=corridor_spec['hag'],
+                        expected_total=total, max_changes=MAX_EXACT_POINTS,
+                        progress=report, cancelled=progress.wasCanceled)
+                except Exception as exc:
+                    if progress.wasCanceled():
+                        raise NativeByClassCancelled('Find Wires cancelled before writing.') from exc
+                    raise NativeByClassError(
+                        f'Find Wires streamed LNT analysis failed: {exc}. '
+                        'No changes were made.') from exc
+                # The only in-memory arrays are changed point IDs and old/new
+                # classes, NOT the 51m+ ground buffer or full 47m cloud.
+                tile = {
+                    'node': planned_find_wires['node'],
+                    'local': planned_find_wires['local'],
+                    'classification': planned_find_wires['old_classes'],
+                    'file_stat': planned_find_wires['file_stat'],
+                }
+                print('[Native Find Wires] streamed exact LNT plan: '
+                      f'{planned_find_wires["stats"]["candidate_points"]:,} '
+                      f'corridor candidates, '
+                      f'{len(tile["node"]):,} changed identities '
+                      f'across {info["nodes"]:,} verified directory nodes')
+            else:
+                view, tile = read_snapshot(app, progress=report)
+        elif fence_polygons:
             view, tile = read_snapshot(app, progress=report,
                                        fence_polygons=fence_polygons,
                                        cancelled=progress.wasCanceled,
@@ -511,14 +623,30 @@ def _with_progress(dialog, name, operation, preview=False, scope_polygons=None,
         # Mark *only* this operation's file-backed fence snapshot; the
         # classifier uses this to reject unsafe large-cloud TIN fallback.
         app._height_file_backed = bool(tile.get('file_stat'))
-        xyz = tile['xyz']
         original = tile['classification'].copy()
-        updated = original.copy()
-        if preview:
-            report(30, 'Computing exact preview...')
+        if planned_spatial is not None:
+            # The scoped planner already ran the Ground TIN or certified KNN
+            # over full neighborhood context. Re-running it on changed points
+            # would be invalid because the reference points are not in tile.
+            updated = planned_spatial['new_classes']
+        elif planned_centerline is not None:
+            # Two-pass exact planner already applied every vertex's highest-Z
+            # source/height-down rule; changed identities are the only payload.
+            updated = planned_centerline['new_classes']
+        elif planned_find_wires is not None:
+            # The read-only streaming planner has already applied the exact
+            # centerline, PTC class, nearest-Ground and HAG eligibility rules.
+            # Do NOT pass only changed points to the legacy classifier: it
+            # would have no Ground references and reject every point.
+            updated = planned_find_wires['new_classes']
         else:
-            report(30, 'Running the original classification rules...')
-        operation(xyz, updated, report, progress.wasCanceled)
+            xyz = tile['xyz']
+            updated = original.copy()
+            if preview:
+                report(30, 'Computing exact preview...')
+            else:
+                report(30, 'Running the original classification rules...')
+            operation(xyz, updated, report, progress.wasCanceled)
         if progress.wasCanceled():
             raise NativeByClassCancelled('Cancelled; no changes were written.')
         changed = np.flatnonzero(updated != original)
@@ -634,8 +762,21 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
                 'Original VTK classifier rules will be used. Changes are written '
                 'to the LNT file and can be undone. Back up the point cloud first.'):
             return True
+        find_wires = getattr(func, '__name__', '') == 'classify_find_wires'
+        ground_algo = getattr(func, '__name__', '') == 'classify_ground_ptd'
+        below_algo = getattr(func, '__name__', '') == 'classify_below_surface'
+        centerline_poles = getattr(func, '__name__', '') == 'classify_poles_by_centerline'
         def calculate(xyz, updated, report, cancelled):
-            eligible = _palette_eligible(dialog.app, updated) & _fence_mask(xyz, polygons)
+            # Find Wires honors the explicit From selection regardless of
+            # display visibility. Ground points remain available as READ-ONLY
+            # local height references, including when hidden in the palette.
+            eligible = _fence_mask(xyz, polygons)
+            # Explicit Ground and Below Surface source-class selections are
+            # authoritative. Their trusted Ground and KNN references must
+            # remain available even when palette classes are hidden.
+            if not find_wires:
+                if not (ground_algo or below_algo):
+                    eligible &= _palette_eligible(dialog.app, updated)
             if not np.any(eligible):
                 return
             before = updated.copy()
@@ -657,7 +798,33 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
                 'classify_low_points', 'classify_isolated_points'):
             scoped_context = _bounded_neighborhood_scope(
                 polygons, kwargs.get('within', 5.0))
-        if scoped_context is None:
+        if ground_algo or below_algo:
+            # The fence is the WRITE scope, never a prerequisite for the
+            # neighborhood/TIN reference context. The large-cloud planner
+            # handles a selected polygon and a whole-cloud run independently.
+            count = _with_progress(dialog, name, calculate, algorithm_spec={
+                'type': 'ground' if ground_algo else 'below_surface',
+                'params': kwargs,
+                'polygons': polygons,
+            })
+        elif find_wires:
+            count = _with_progress(dialog, name, calculate, corridor_spec={
+                'lines': kwargs['alignment_coords'],
+                'width': float(kwargs['corridor_width']),
+                'from_classes': kwargs['from_classes'],
+                'to_class': int(kwargs['to_class']),
+                'ground_class': int(kwargs['ground_class']),
+                'hag': float(kwargs['min_height_above_ground']),
+            })
+        elif centerline_poles:
+            count = _with_progress(dialog, name, calculate, centerline_spec={
+                'lines': kwargs['centerline_coords'],
+                'radius': float(kwargs['radius']),
+                'down_height': float(kwargs['down_height']),
+                'from_classes': kwargs['from_classes'],
+                'to_class': int(kwargs['to_class']),
+            })
+        elif scoped_context is None:
             count = _with_progress(dialog, name, calculate)
         else:
             count = _with_progress(dialog, name, calculate,
