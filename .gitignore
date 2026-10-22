@@ -116,7 +116,7 @@ native/naksha_vulkan/build_msvc/*
 !native/naksha_vulkan/build_msvc/naksha_vulkan.dll
 !native/naksha_vulkan/build_msvc/native_build_stamp.json
 
-# Keep root compiled point shaders
+# Keep root compiled point shadershere 
 !native/naksha_vulkan/build_msvc/*.spv
 !native/naksha_vulkan/build_msvc/point.vert.spv
 !native/naksha_vulkan/build_msvc/point.frag.spv

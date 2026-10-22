@@ -9236,20 +9236,28 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         try:
             from PySide6.QtCore import QTimer
 
-            from gui.native_attachments import is_native_main, layer_for
+            from gui.native_attachments import is_native_main
             if is_native_main(self.app):
                 view = self.app._lnt_main_view
                 widget = view.owner.vulkan_widget
-                ratio = float(widget.devicePixelRatioF())
-                projected = view.native.world_to_screen(float(x), float(y))
-                if projected is not None:
-                    centre_x = widget.width() * ratio * 0.5
-                    centre_y = widget.height() * ratio * 0.5
-                    view.native.pan(centre_x - projected[0], centre_y - projected[1])
-                native_layer = layer_for(self.app)
-                if native_layer is not None:
-                    native_layer.refresh()
+                # PRJ navigation owns only the camera.  Do not construct an
+                # attachment layer here: LNT can display the native viewport
+                # while its classification canvas is unavailable (for example
+                # during surface LOD rendering), and layer construction then
+                # raises after the first identify.  frame_region is an exact,
+                # repeatable camera operation and also applies the requested
+                # block scale instead of accumulating screen-space pans.
+                set_2d = getattr(view, "set_2d", None)
+                if callable(set_2d):
+                    set_2d(True)
+                height = max(1.0, float(widget.height()))
+                aspect = max(1.0, float(widget.width()) / height)
+                width_m = max(1.0, 2.0 * float(target_scale or 250.0) * aspect)
+                view.native.frame_region(float(x), float(y), width_m)
                 self.app._prj_fly_camera_active = False
+                commit = getattr(self.app, "_commit_main_view_history", None)
+                if callable(commit):
+                    commit("prj_fly_to")
                 return
 
             if not hasattr(self.app, 'vtk_widget') or not self.app.vtk_widget:

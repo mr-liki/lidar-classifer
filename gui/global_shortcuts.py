@@ -932,14 +932,26 @@ class GlobalShortcutFilter(QObject):
                 # write, and Redo can be routed to a different history stack.
                 if combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
                     if not event.isAutoRepeat():
-                        from gui.native_history_routing import route_native_history
-                        done = route_native_history(
-                            self.app_window, drawing,
-                            redo=event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift',
-                        )
+                        redo = event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift'
+                        # The focused active measurement owns its own edits
+                        # before the Draw/classification timeline. Previously
+                        # this unconditional coordinator call made every native
+                        # measurement report "Nothing to undo".
+                        done = False
+                        if (
+                            measurement is not None
+                            and getattr(measurement, 'active', False)
+                            and getattr(measurement, 'can_history', lambda **_: False)(redo=redo)
+                        ):
+                            done = bool(measurement.history(redo=redo))
+                        else:
+                            from gui.native_history_routing import route_native_history
+                            done = route_native_history(
+                                self.app_window, drawing, redo=redo,
+                            )
                         if not done:
                             self.app_window.statusBar().showMessage(
-                                'Nothing to redo' if (event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift')
+                                'Nothing to redo' if redo
                                 else 'Nothing to undo', 2500)
                     event.accept()
                     return True

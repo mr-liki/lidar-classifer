@@ -1309,6 +1309,10 @@ class NakshaApp(QMainWindow):
         # ✅ ADD THESE 3 LINES HERE:
         self._canvas_cursor_filter = CanvasCursorEventFilter(self)
         self._canvas_tool_cursor = self._create_canvas_tool_cursor()
+        # Section placement is a point-picking action.  Use Qt's native plus
+        # cursor for it so it remains crisp at every Windows DPI scale, while
+        # retaining the established target cursor for all other canvas tools.
+        self._section_tool_cursor = QCursor(Qt.CrossCursor)
         self._cursor_state = False
         self._active_tools = set()
         # Storage initialization
@@ -2268,7 +2272,7 @@ class NakshaApp(QMainWindow):
         return QCursor(pixmap, center, center)
 
     def _iter_canvas_widgets(self):
-        """Yield each live VTK interactor that should show the shared tool cursor."""
+        """Yield every visible-canvas widget that shares the active tool cursor."""
         seen = set()
 
         def _yield_widget(widget):
@@ -2282,6 +2286,27 @@ class NakshaApp(QMainWindow):
 
         main_interactor = getattr(getattr(self, "vtk_widget", None), "interactor", None)
         yield from _yield_widget(main_interactor)
+
+        # An opened .lnt replaces the visible VTK canvas with this native
+        # Vulkan QWidget.  Cursor state must be applied to the widget that is
+        # actually under the pointer, not only to the hidden VTK interactor.
+        native_view = getattr(self, "_lnt_main_view", None)
+        native_owner = getattr(native_view, "owner", None)
+        yield from _yield_widget(getattr(native_owner, "vulkan_widget", None))
+
+        # SNT-only native promotion has no _lnt_main_view; its visible canvas
+        # belongs directly to the render backend.  Deduplication above makes
+        # this safe when both references resolve to the same QWidget.
+        render_owner = getattr(self, "render_backend", None)
+        yield from _yield_widget(getattr(render_owner, "vulkan_widget", None))
+
+        # Native cross-section windows (including CUT_SLOT for Cut-in-Cross
+        # and Cut-in-Cut) are SectionCanvas QWidgets, not entries in the
+        # legacy section_vtks map.  Register the canvases themselves so the
+        # plus cursor follows whichever source view owns the cut gesture.
+        native_sections = getattr(self, "_native_sections", None)
+        for canvas in (getattr(native_sections, "views", None) or {}).values():
+            yield from _yield_widget(canvas)
 
         for vtk_widget in (getattr(self, "section_vtks", None) or {}).values():
             yield from _yield_widget(getattr(vtk_widget, "interactor", None))
@@ -2370,17 +2395,31 @@ class NakshaApp(QMainWindow):
             if hasattr(widget, "testAttribute") and not widget.testAttribute(Qt.WA_WState_Created):
                 return
             desired_custom_cursor = bool(self._cursor_state and active)
-            current_state = widget.property("canvasCursorAppliedState")
-            if current_state is not None and bool(current_state) == desired_custom_cursor:
+            section_cursor_active = bool(
+                desired_custom_cursor
+                and {"cross_section", "cut_section"}.intersection(self._active_tools)
+            )
+            desired_cursor_key = (
+                "section_plus" if section_cursor_active
+                else "tool" if desired_custom_cursor
+                else "default"
+            )
+            if widget.property("canvasCursorAppliedKey") == desired_cursor_key:
                 return
 
             widget.setProperty("canvasCursorMutating", True)
             try:
                 if desired_custom_cursor:
-                    widget.setCursor(self._canvas_tool_cursor)
+                    cursor = (
+                        self._section_tool_cursor
+                        if section_cursor_active
+                        else self._canvas_tool_cursor
+                    )
+                    widget.setCursor(cursor)
                 else:
                     widget.unsetCursor()
                 widget.setProperty("canvasCursorAppliedState", desired_custom_cursor)
+                widget.setProperty("canvasCursorAppliedKey", desired_cursor_key)
             finally:
                 widget.setProperty("canvasCursorMutating", False)
         except Exception:
@@ -4716,6 +4755,10 @@ class NakshaApp(QMainWindow):
         if dlg is None:
             dlg = SelectionModeDialog(self)
             self._element_selection_dialog = dlg
+        # Opening Element Selection intentionally does not auto-arm a picker.
+        # A minimized chip merely restores the existing dialog state.
+        if not (dlg.windowState() & Qt.WindowMinimized) and hasattr(dlg, "reset_pick_method"):
+            dlg.reset_pick_method()
         if hasattr(dlg, "restore_from_chip"):
             dlg.restore_from_chip()
         elif dlg.windowState() & Qt.WindowMinimized:

@@ -16,6 +16,7 @@ class FlightLines:
         self.paths = self.group['paths'] if self.group else [str(path)]
         self.maps = []
         self.sources = []
+        self._unique_ids = None
         for item in self.paths:
             try:
                 with open(str(item)+'.source.json',encoding='utf-8') as f: original=json.load(f)['source']
@@ -44,11 +45,16 @@ class FlightLines:
         return out
 
     def unique(self):
-        return np.unique(np.concatenate([np.unique(m) for m in self.maps]))
+        if self._unique_ids is None:
+            self._unique_ids = np.unique(
+                np.concatenate([np.unique(m) for m in self.maps])
+            )
+        return self._unique_ids
 
     def close(self):
         for mapping in self.maps: mapping._mmap.close()
         self.maps=[]
+        self._unique_ids = None
 
     def source_files(self, nodes):
         paths = self.group.get('sources',self.sources) if self.group else self.sources
@@ -56,6 +62,29 @@ class FlightLines:
         names = np.array([str(p) for p in paths],dtype=object)
         return names[files]
 
+
+def open_existing(view):
+    """Attach valid existing flight-line sidecars without starting a worker.
+
+    Display Mode calls this from an explicit user click.  Opening the tiny
+    sidecar headers/memmaps is immediate and avoids scheduling asynchronous
+    recovery when conversion already produced all required ``.lines`` files.
+    Returns ``None`` when recovery from the original LAS/LAZ is really needed.
+    """
+    current = getattr(view, "flight_lines", None)
+    if current is not None:
+        return current
+    try:
+        current = FlightLines(view.lnt_path)
+    except (OSError, ValueError, struct.error) as exc:
+        print(f"[flight-lines] existing sidecar unavailable: {exc}")
+        return None
+    view.flight_lines = current
+    print(
+        f"[flight-lines] opened existing sidecar: "
+        f"{len(current.unique())} available line(s)"
+    )
+    return current
 
 def ensure_sidecars(view, cancelled=lambda:False):
     """Backfill older caches without rebuilding or changing classified points."""
@@ -170,7 +199,11 @@ def prepare(view, callback, required=True):
                 for fn in worker.callbacks: fn()
             return
         view.flight_lines=result
-        for fn in worker.callbacks: fn()
+        for fn in worker.callbacks:
+            try:
+                fn()
+            except Exception as exc:
+                print(f"[flight-lines] ready callback failed: {exc}")
     worker.ready.connect(done)
     worker.finished.connect(worker.deleteLater)
     view.app.statusBar().showMessage('Preparing flight-line information...',5000)

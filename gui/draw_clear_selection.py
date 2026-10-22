@@ -226,9 +226,10 @@ def prune_removed_native_fences(app, draw, removed_ids):
         if len(kept) == len(fences):
             continue
         owner.selected_fences = kept
-        # Keep exactly this owner's surviving cyan boundaries. An unrelated
-        # dialog's selected fences are not cleared.
-        draw.set_classification_fence_highlights(owner, kept)
+        # Only the ACTUAL current owner may refresh cyan selection. Previously
+        # classified dialogs must not revive their older fence outlines here.
+        if getattr(draw, '_active_fence_highlight_owner', None) == id(owner):
+            draw.set_classification_fence_highlights(owner, kept)
         update = getattr(owner, '_update_status', None)
         if callable(update):
             try:

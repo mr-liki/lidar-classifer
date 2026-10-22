@@ -9,6 +9,7 @@ from gui.lnt_open import _laz_to_las
 
 from gui.grid_label_system import (
     GridLabelManager,
+    _block_hit_priority,
     _buffer_polygon_xy,
     _point_in_polygon_xy,
 )
@@ -28,6 +29,22 @@ def _write_las(path, classes):
     las.z = np.zeros(count, dtype=float)
     las.classification = np.asarray(classes, dtype=np.uint8)
     las.write(path)
+
+
+def test_data_backed_block_has_priority_over_overlapping_grid_polygon():
+    grid = {"source": "prj_boundary", "file_path": None}
+    block_data = {"source": "snt_text", "file_path": "MARCENA000018.laz"}
+
+    assert _block_hit_priority(block_data) > _block_hit_priority(grid)
+
+
+def test_block_hit_polygon_includes_every_corner_and_edge():
+    polygon = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+
+    for point in polygon:
+        assert _point_in_polygon_xy(*point, polygon)
+    assert _point_in_polygon_xy(50.0, 0.0, polygon)
+    assert _point_in_polygon_xy(100.0, 50.0, polygon)
 
 
 def test_legacy_las_extended_class_51_is_not_collapsed_to_19():

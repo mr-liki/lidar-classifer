@@ -489,7 +489,7 @@ class CanvasOverlay(QWidget):
                             font.setPixelSize(max(6, min(512, int(data['font_size']))))
                         font.setBold(bool(data.get('bold',False)))
                         font.setItalic(bool(data.get('italic',False)))
-                    world_sized = data.get('source') == 'attachment' and float(data.get('height', 0.) or 0.) > 0.
+                    world_sized = data.get('source') in ('attachment', 'snt_text_copy') and float(data.get('height', 0.) or 0.) > 0.
                     if world_sized:
                         from gui.native_label_layout import world_text_transform
                         font = QFont(font)

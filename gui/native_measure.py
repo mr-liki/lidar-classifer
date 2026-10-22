@@ -20,7 +20,23 @@ class NativeMeasure:
         self.hover = None
         self.active = True
         self.undone = []
+        self._clear_undo_snapshot = None
+        self._clear_redo_snapshot = None
         self._picker = None
+
+    def can_history(self, redo=False):
+        """Whether Undo/Redo would actually change this measurement overlay."""
+        if redo:
+            return bool(self.undone or self._clear_redo_snapshot is not None)
+        return bool(
+            self.points or self.grids or self.completed
+            or self._clear_undo_snapshot is not None
+        )
+
+    def _new_measurement_action(self):
+        """A fresh edit invalidates redo of an undone Clear transaction."""
+        self._clear_redo_snapshot = None
+        self._clear_undo_snapshot = None
 
     @property
     def app(self):
@@ -113,6 +129,7 @@ class NativeMeasure:
             self._paint()
             return False
         points = list(self.points)
+        self._new_measurement_action()
         self.completed.append(points)
         self.completed_modes.append(bool(self.path))
         # Finishing a draft invalidates its per-vertex redo history. Otherwise
@@ -179,11 +196,13 @@ class NativeMeasure:
             label = str(grid.get('label', ''))
             for index, cell in enumerate(self.grids):
                 if cell['label'] == label and cell.get('kind', 'grid') == kind:
+                    self._new_measurement_action()
                     self.grids.pop(index)
                     self._status(f'{name} {label} deselected', 2000)
                     self._paint()
                     return True
             area = float(grid.get('area', 0.0))
+            self._new_measurement_action()
             self.grids.append({
                 'points': [(float(x), float(y)) for x, y in grid['points']],
                 'label': label,
@@ -215,6 +234,8 @@ class NativeMeasure:
         if self.points and point[0] == self.points[-1][0] and point[1] == self.points[-1][1]:
             return True  # A double-click must not create a zero-length leg.
         self.points.append(point)
+        self._clear_redo_snapshot = None
+        self._clear_undo_snapshot = None
         self.undone.clear()
         if (getattr(self, 'style_key', None) == 'cross_section'
                 and not self.path and len(self.points) == 2):
@@ -279,12 +300,23 @@ class NativeMeasure:
             print(f'⚠️ Measure ribbon sync failed: {exc}')
 
     def clear(self):
+        if self.points or self.completed or self.grids:
+            self._clear_undo_snapshot = (
+                list(self.points),
+                [list(points) for points in self.completed],
+                list(self.completed_modes),
+                [dict(cell, points=list(cell.get('points', []))) for cell in self.grids],
+            )
+        else:
+            self._clear_undo_snapshot = None
+        self._clear_redo_snapshot = None
         self.points, self.completed, self.completed_modes, self.hover = [], [], [], None
         self.grids = []
         self.undone.clear()
         self._paint()
 
     def history(self, redo=False):
+        handled = False
         if redo and self.undone:
             kind, value = self.undone.pop()
             if kind == 'grids':
@@ -295,16 +327,38 @@ class NativeMeasure:
                 self.completed_modes.append(path)
             else:
                 getattr(self, kind).append(value)
+            handled = True
+        elif redo and self._clear_redo_snapshot is not None:
+            snapshot = self._clear_redo_snapshot
+            self._clear_redo_snapshot = None
+            self._clear_undo_snapshot = snapshot
+            self.points, self.completed, self.completed_modes, self.grids = [], [], [], []
+            self.hover = None
+            handled = True
         elif not redo:
             if self.points:
                 self.undone.append(('points', self.points.pop()))
+                handled = True
             elif self.grids:
                 self.undone.append(('grids', self.grids.pop()))
+                handled = True
             elif self.completed:
                 path = self.completed_modes.pop() if self.completed_modes else False
                 self.undone.append(('completed', (self.completed.pop(), path)))
+                handled = True
+            elif self._clear_undo_snapshot is not None:
+                snapshot = self._clear_undo_snapshot
+                self._clear_undo_snapshot = None
+                self._clear_redo_snapshot = snapshot
+                points, completed, modes, grids = snapshot
+                self.points = list(points)
+                self.completed = [list(item) for item in completed]
+                self.completed_modes = list(modes)
+                self.grids = [dict(cell, points=list(cell.get('points', []))) for cell in grids]
+                self.hover = None
+                handled = True
         self._paint()
-        return True
+        return handled
 
     def shutdown(self):
         self.cancel()

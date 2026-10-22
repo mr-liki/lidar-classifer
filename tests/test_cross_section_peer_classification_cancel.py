@@ -2,10 +2,83 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCursor
 
 from gui.app_window import NakshaApp
 from gui.cross_section.interactor_classify import ClassificationInteractor
 
+
+class _CursorCanvas:
+    def __init__(self):
+        self._properties = {}
+        self.cursor = None
+
+    def property(self, name):
+        return self._properties.get(name)
+
+    def setProperty(self, name, value):
+        self._properties[name] = value
+
+    def setCursor(self, cursor):
+        self.cursor = cursor
+
+    def unsetCursor(self):
+        self.cursor = None
+
+
+def test_section_tools_use_plus_cursor_without_changing_other_tool_cursors():
+    app = SimpleNamespace(
+        _shutdown_in_progress=False,
+        _cursor_state=True,
+        _active_tools={"cross_section"},
+        _section_tool_cursor=QCursor(Qt.CrossCursor),
+        _canvas_tool_cursor=QCursor(Qt.PointingHandCursor),
+    )
+    canvas = _CursorCanvas()
+
+    with mock.patch("gui.app_window._qt_object_is_valid", return_value=True):
+        NakshaApp._set_canvas_widget_cursor(app, canvas, active=True)
+        assert canvas.cursor.shape() == Qt.CrossCursor
+
+        # The cursor must refresh even though the shared active flag stays true.
+        app._active_tools = {"draw"}
+        NakshaApp._set_canvas_widget_cursor(app, canvas, active=True)
+        assert canvas.cursor.shape() == Qt.PointingHandCursor
+
+        app._active_tools = {"cut_section"}
+        NakshaApp._set_canvas_widget_cursor(app, canvas, active=True)
+        assert canvas.cursor.shape() == Qt.CrossCursor
+
+
+def test_canvas_cursor_widgets_include_and_deduplicate_native_vulkan_canvas():
+    vtk_canvas = object()
+    native_canvas = object()
+    native_cross_canvas = object()
+    native_cut_canvas = object()
+    app = SimpleNamespace(
+        vtk_widget=SimpleNamespace(interactor=vtk_canvas),
+        _lnt_main_view=SimpleNamespace(
+            owner=SimpleNamespace(vulkan_widget=native_canvas)
+        ),
+        # The LNT owner and render backend normally expose the same widget.
+        render_backend=SimpleNamespace(vulkan_widget=native_canvas),
+        _native_sections=SimpleNamespace(
+            views={1: native_cross_canvas, 9: native_cut_canvas}
+        ),
+        section_vtks={},
+        cut_section_controller=None,
+    )
+
+    with mock.patch("gui.app_window._qt_object_is_valid", return_value=True):
+        widgets = list(NakshaApp._iter_canvas_widgets(app))
+
+    assert widgets == [
+        vtk_canvas,
+        native_canvas,
+        native_cross_canvas,
+        native_cut_canvas,
+    ]
 
 def _bare_interactor(app):
     interactor = ClassificationInteractor.__new__(ClassificationInteractor)
