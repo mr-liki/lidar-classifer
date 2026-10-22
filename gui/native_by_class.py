@@ -70,8 +70,15 @@ def using_vtk_data(app):
 
 
 def want_native(app):
-    """True when By Class must run against the .lnt file instead of app.data."""
-    return native_main_view(app) is not None and not using_vtk_data(app)
+    """Use the active native LNT main cloud, even if VTK arrays remain cached.
+
+    ``app.data`` can be populated by legacy tools, section views or a prior
+    VTK load while the LIVE ``_lnt_main_view`` still owns the main point cloud.
+    It is not a reliable renderer/point-identity selector.  LNT shutdown
+    clears ``_lnt_main_view`` (and ``native``), so an actual VTK session still
+    uses the original array-based classification path.
+    """
+    return native_main_view(app) is not None
 
 
 def cloud_bbox(view):

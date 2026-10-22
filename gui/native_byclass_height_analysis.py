@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 
-def height_analysis_points(app):
+def height_analysis_points(app, fence_polygons=None, progress=None, cancelled=None):
     """Return ``(xyz, classifications, is_native)`` for height analysis.
 
     Native records are read through the existing exact-record safety checks.
@@ -21,7 +21,12 @@ def height_analysis_points(app):
     is_native = bool(want_native(app))
     if is_native:
         from gui.native_byclass_parity import read_snapshot
-        _view, snapshot = read_snapshot(app)
+        if fence_polygons:
+            _view, snapshot = read_snapshot(
+                app, fence_polygons=fence_polygons,
+                progress=progress, cancelled=cancelled)
+        else:
+            _view, snapshot = read_snapshot(app)
         xyz = snapshot.get('xyz')
         classes = snapshot.get('classification')
     else:

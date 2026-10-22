@@ -4,9 +4,11 @@ The original VTK classifier functions are reused unchanged.  This adapter is
 intentionally conservative: LNT stores uint8 classes, and native queries lack
 point_source_id.  Unsupported input is rejected BEFORE any class write.
 
-A single exact snapshot is used so neighbourhood algorithms do not acquire
-approximate tile seams.  Bigger clouds need a separately audited, out-of-core
-implementation and are never partially classified by this adapter.
+Small clouds use one exact snapshot. Larger clouds use an independently
+validated, fence-scoped LNT leaf reader for Fence/Close/Height, a read-only
+neighborhood envelope for fenced Low Points/Isolated, or a class-only streamed
+Convert planner. Algorithms without auditable finite scope remain guarded.
+No unsafe approximate tile seams or partial classification are permitted.
 """
 from __future__ import annotations
 
@@ -92,16 +94,33 @@ def _available_cloud(app, *, allow_busy=False):
     return view
 
 
-def read_snapshot(app, progress=None):
-    """Read all source records with stable native node/local point identities."""
+def read_snapshot(app, progress=None, fence_polygons=None, cancelled=None,
+                  operation_name='Height'):
+    """Read an audited whole-cloud or fence-scoped native point snapshot."""
     from gui.native_by_class import cloud_bbox
     view = _available_cloud(app, allow_busy=True)
     x0, y0, x1, y1, total = cloud_bbox(view)
     if total > MAX_EXACT_POINTS:
-        raise NativeByClassError(
-            f'This cloud contains {total:,} points; the verified exact-query '
-            f'limit is {MAX_EXACT_POINTS:,}. No changes were made. '
-            'Large-cloud parity requires an audited out-of-core implementation.')
+        if not fence_polygons:
+            raise NativeByClassError(
+                f'This cloud contains {total:,} points, exceeding the '
+                f'{MAX_EXACT_POINTS:,}-point whole-cloud exact-query limit. '
+                'For Height/Fence/Close, select a drawing fence and try again. '
+                'No changes were made.')
+        from gui.native_lnt_directory import read_exact_polygon_snapshot
+        try:
+            tile, info = read_exact_polygon_snapshot(
+                view.lnt_path, fence_polygons, expected_total=total,
+                max_points=MAX_EXACT_POINTS, progress=progress,
+                cancelled=cancelled, operation_name=operation_name)
+        except Exception as exc:
+            raise NativeByClassError(
+                f'Large-cloud exact fence read failed: {exc} No changes were made.') from exc
+        print(f'[Native By Class] audited exact fence snapshot: '
+              f'{len(tile["xyz"]):,}/{total:,} records inside '
+              f'{len(fence_polygons)} selected fence(s), '
+              f'{info["nodes"]:,} directory nodes')
+        return view, tile
     if progress is not None:
         progress(1, f'Reading {total:,} exact LNT records')
     # The LAS/LNT header XY range can differ slightly from the coordinates
@@ -268,6 +287,33 @@ def _fence_mask(xyz, polygons):
     return inside
 
 
+def _bounded_neighborhood_scope(polygons, radius):
+    """Exact context envelope for finite-radius neighborhood classifiers.
+
+    A fence restricts writable points; source/reference points within
+    ``radius`` just OUTSIDE the fence must remain visible to the algorithm.
+    Reading only the fence would invent low/isolated points near its edge.
+    Other classifiers with global / unbounded context are NOT eligible for
+    this shortcut.
+    """
+    radius = float(radius)
+    if not np.isfinite(radius) or radius <= 0:
+        raise NativeByClassError('Neighborhood search radius must be positive and finite.')
+    vertices = [np.asarray(poly, dtype=np.float64)[:, :2] for poly in polygons]
+    if not vertices:
+        raise NativeByClassError('A selected fence is required for this scoped query.')
+    xy = np.concatenate(vertices, axis=0)
+    if not np.isfinite(xy).all():
+        raise NativeByClassError('Fence coordinates are not finite.')
+    # Matplotlib Path excludes exact boundary points. Include a small margin
+    # beyond the neighborhood radius so points at exactly radius are retained.
+    margin = radius + max(1e-6, 16 * np.finfo(float).eps * float(np.max(np.abs(xy))))
+    lo = xy.min(axis=0) - margin
+    hi = xy.max(axis=0) + margin
+    return [np.array(((lo[0], lo[1]), (hi[0], lo[1]),
+                      (hi[0], hi[1]), (lo[0], hi[1])), dtype=np.float64)]
+
+
 def _height_mask(xyz, dialog):
     from gui.native_by_class import height_filter_mask
     extra = height_filter_mask(xyz, dialog)
@@ -317,6 +363,45 @@ def compute_close(xyz, classes, eligible, from_classes, to_class, radius,
     hits = inds[distances < radius]
     classes[hits] = to_class
     return int(len(hits))
+
+
+def height_scope_eligibility(app, xyz, classes, from_classes, to_class, polygons):
+    """Preflight native Height against one exact snapshot before any write.
+
+    Analysis is allowed to read hidden classes as reference points, but Height
+    conversion follows VTK: only visible From-class points may be changed.
+    Distinguish an empty fence, absent From class and hidden source class
+    instead of reporting the same misleading 'zero points inside fence'.
+    """
+    inside = _fence_mask(xyz, polygons) if polygons else np.ones(len(classes), dtype=bool)
+    visible = _palette_eligible(app, classes)
+    sources = classes != to_class
+    if from_classes is not None:
+        sources &= np.isin(classes, from_classes)
+    inside_count = int(np.count_nonzero(inside))
+    source_inside = int(np.count_nonzero(inside & sources))
+    visible_inside = int(np.count_nonzero(inside & sources & visible))
+    print(f'[Native By Class Height] exact scope: total={len(classes):,} '
+          f'polygon_count={len(polygons)} inside={inside_count:,} '
+          f'from_inside={source_inside:,} visible_from_inside={visible_inside:,} '
+          f'from_classes={from_classes} to_class={to_class}')
+    if inside_count == 0 and polygons:
+        raise NativeByClassError(
+            'Height: the selected fence covers zero native LNT records. '
+            'Check the drawing world coordinates, selected grid and fence geometry; '
+            'no classification was changed.')
+    if source_inside == 0:
+        raise NativeByClassError(
+            'Height: no selected From-class points (excluding the To class) '
+            'are inside the chosen fence. Check the From class and fence. '
+            'No classification was changed.')
+    if visible_inside == 0:
+        raise NativeByClassError(
+            f'Height: {source_inside:,} From-class point(s) are inside the fence, '
+            'but all are hidden in Display Mode. Enable the From class visibility '
+            'in the active PTC/display palette and try again. '
+            'No classification was changed.')
+    return inside & visible
 
 
 def compute_height(xyz, classes, eligible, from_classes, to_class,
@@ -372,11 +457,21 @@ def _report(dialog, message, error=False):
         QMessageBox.information(dialog, 'Native By Class', message)
 
 
-def _with_progress(dialog, name, operation, preview=False):
+def _with_progress(dialog, name, operation, preview=False, scope_polygons=None,
+                   convert_spec=None):
     """One GUI-thread query + compute + write, with cancellation before write."""
     from PySide6.QtWidgets import QApplication, QProgressDialog
     from PySide6.QtCore import Qt
     app = dialog.app
+    # Keep the Convert gateway inside this shared progress handler. GUI
+    # dialogs still call one function, and small-cloud operation callbacks
+    # retain their historic signature / VTK parity testability.
+    if convert_spec is not None and name.lower() == 'convert':
+        from gui.native_by_class import cloud_bbox
+        view = _available_cloud(app)
+        if cloud_bbox(view)[4] > MAX_EXACT_POINTS:
+            return convert_large_cloud(dialog, convert_spec[0], convert_spec[1],
+                                       preview=preview)
     _available_cloud(app)
     app._native_byclass_busy = True
     progress = QProgressDialog(f'{name}: reading cloud...', 'Cancel', 0, 100, dialog)
@@ -385,15 +480,37 @@ def _with_progress(dialog, name, operation, preview=False):
     progress.setMinimumDuration(0)
     progress.setValue(0)
     progress.show()
+    prior_scope = getattr(app, '_height_file_backed', None)
     try:
         def report(pct, msg=''):
             progress.setValue(max(0, min(100, int(pct))))
             if msg:
                 progress.setLabelText(str(msg)[:180])
             QApplication.processEvents()
-        view, tile = read_snapshot(app, progress=report)
+        # Height, Close and Fence have a finite, selected polygon write scope.
+        # On large clouds the same audited LNT leaf reader used by Height must
+        # be used for Close/Fence too; taking the whole-cloud query first fails
+        # its 8M safeguard before the polygon is even applied.  Low Points and
+        # Isolated may supply a buffered fence AABB so outside-fence neighbors
+        # remain available as READ-ONLY context.
+        if scope_polygons is not None:
+            fence_polygons = scope_polygons
+        elif name.lower() in ('height', 'close', 'fence'):
+            fence_polygons = _polygon_coords(dialog)
+        else:
+            fence_polygons = None
+        if fence_polygons:
+            view, tile = read_snapshot(app, progress=report,
+                                       fence_polygons=fence_polygons,
+                                       cancelled=progress.wasCanceled,
+                                       operation_name=name)
+        else:
+            view, tile = read_snapshot(app, progress=report)
         if progress.wasCanceled():
             raise NativeByClassCancelled('Cancelled before classification.')
+        # Mark *only* this operation's file-backed fence snapshot; the
+        # classifier uses this to reject unsafe large-cloud TIN fallback.
+        app._height_file_backed = bool(tile.get('file_stat'))
         xyz = tile['xyz']
         original = tile['classification'].copy()
         updated = original.copy()
@@ -409,6 +526,19 @@ def _with_progress(dialog, name, operation, preview=False):
             report(100, f'Preview: {len(changed):,} points')
             return len(changed)
         if len(changed):
+            # Progress pumps Qt events: a user can unload/switch datasets
+            # mid-calculation. Never send old node/local IDs to a new view.
+            if _available_cloud(app, allow_busy=True) is not view:
+                raise NativeByClassError(
+                    'Active LNT view changed during classification. No writes were made.')
+            # A file-backed polygon snapshot is valid only for the exact disk
+            # revision we read. Never write against changed node/local rows.
+            initial_stat = tile.get('file_stat')
+            if initial_stat is not None:
+                actual = os.stat(view.lnt_path)
+                if (actual.st_size, actual.st_mtime_ns) != tuple(initial_stat):
+                    raise NativeByClassError(
+                        'LNT changed after fence analysis. No classes were written.')
             report(95, f'Writing {len(changed):,} changed LNT records...')
             nodes = np.ascontiguousarray(tile['node'][changed], dtype=np.uint32)
             locals_ = np.ascontiguousarray(tile['local'][changed], dtype=np.uint32)
@@ -448,6 +578,13 @@ def _with_progress(dialog, name, operation, preview=False):
             pass
         return int(len(changed))
     finally:
+        if prior_scope is None:
+            try:
+                delattr(app, '_height_file_backed')
+            except AttributeError:
+                pass
+        else:
+            app._height_file_backed = prior_scope
         progress.close()
         app._native_byclass_busy = False
 
@@ -511,7 +648,20 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
             # Preserve native scope even for classifiers that only partly
             # implement VTK's fence_mask contract.
             updated[~eligible] = before[~eligible]
-        count = _with_progress(dialog, name, calculate)
+        # Only finite-radius low/isolated routines may use the expanded
+        # fence AABB without sacrificing neighborhood context. Ground/PTD,
+        # kNN surface and macros can depend on data outside any fixed halo:
+        # keep their conservative exact whole-cloud guard for now.
+        scoped_context = None
+        if polygons and getattr(func, '__name__', '') in (
+                'classify_low_points', 'classify_isolated_points'):
+            scoped_context = _bounded_neighborhood_scope(
+                polygons, kwargs.get('within', 5.0))
+        if scoped_context is None:
+            count = _with_progress(dialog, name, calculate)
+        else:
+            count = _with_progress(dialog, name, calculate,
+                                   scope_polygons=scoped_context)
         # Only a successful nonempty exact native point write makes a fence
         # "used for classification". Preview/selection/cancellation do not.
         # Saved macros store their step fence coordinates without Python refs;
@@ -532,6 +682,109 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
     except Exception as exc:
         _report(dialog, str(exc), error=True)
     return True
+
+
+def convert_large_cloud(dialog, sources, target, preview=False):
+    """Exact class-only conversion of a large native LNT cloud.
+
+    Convert is intentionally UNFENCED. Preflight scans the *entire* validated
+    leaf directory and plans eligible native node/local IDs in bounded blocks.
+    No write occurs until the plan is complete, unchanged, and within the
+    reversible in-memory Undo budget. This is not an unsafe approximate tile
+    conversion or a silent 8M cap bump. If the changed-point set is larger
+    than the history budget, fail closed instead of partially classifying.
+    """
+    from PySide6.QtWidgets import QApplication, QProgressDialog
+    from PySide6.QtCore import Qt
+    from gui.native_lnt_directory import plan_exact_class_conversion
+    from gui.native_by_class import cloud_bbox
+
+    app = dialog.app
+    view = _available_cloud(app)
+    total = cloud_bbox(view)[4]
+    if total <= MAX_EXACT_POINTS:
+        raise NativeByClassError('Large-cloud conversion invoked on a small cloud.')
+    app._native_byclass_busy = True
+    progress = QProgressDialog('Convert: scanning exact LNT classes...', 'Cancel',
+                               0, 100, dialog)
+    progress.setWindowTitle('Convert (Vulkan large cloud)')
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.show()
+    try:
+        def report(pct, message=''):
+            progress.setValue(max(0, min(100, int(pct))))
+            if message:
+                progress.setLabelText(str(message)[:180])
+            QApplication.processEvents()
+        palette = getattr(app, 'class_palette', None)
+        visible = (None if not isinstance(palette, dict) or not palette
+                   else [int(code) for code, cfg in palette.items()
+                         if isinstance(cfg, dict) and cfg.get('show', True)])
+        plan, info = plan_exact_class_conversion(
+            view.lnt_path, sources, target, visible_classes=visible,
+            expected_total=total, max_changes=MAX_EXACT_POINTS,
+            progress=report, cancelled=progress.wasCanceled)
+        amount = len(plan['node'])
+        if progress.wasCanceled():
+            raise NativeByClassCancelled('Convert cancelled. Nothing was written.')
+        if preview or amount == 0:
+            report(100, f'Convert preview: {amount:,} points' if preview
+                   else 'Convert: no eligible source points')
+            return amount
+        if _available_cloud(app, allow_busy=True) is not view:
+            raise NativeByClassError(
+                'Active LNT view changed during Convert. No writes were made.')
+        state = os.stat(view.lnt_path)
+        if (state.st_size, state.st_mtime_ns) != plan['file_stat']:
+            raise NativeByClassError('LNT file changed during Convert preflight; no writes.')
+        report(94, f'Convert: writing {amount:,} exact point classifications')
+        nodes = np.ascontiguousarray(plan['node'], dtype=np.uint32)
+        locals_ = np.ascontiguousarray(plan['local'], dtype=np.uint32)
+        old = np.ascontiguousarray(plan['old_classes'], dtype=np.uint8)
+        new = np.full(amount, target, dtype=np.uint8)
+        # Match the existing native classification write/history contract.
+        if not view.native.set_classes(nodes, locals_, new):
+            # A failed native writer may have partially edited; request an
+            # immediate original-class restore, then require manual audit.
+            restored = view.native.set_classes(nodes, locals_, old)
+            raise NativeByClassError(
+                'Native Convert write failed; rollback ' +
+                ('was submitted' if restored else 'also failed') +
+                '. Audit the test file before continuing. ' +
+                str(getattr(view.native, 'last_error', '')))
+        app.undo_stack.append(dict(lnt_path=view.lnt_path, lnt_node=nodes,
+                                   lnt_local=locals_, old_classes=old,
+                                   new_classes=new))
+        from gui.native_history_routing import record_native_action
+        record_native_action(app, 'classification')
+        for stack in (getattr(app, 'redo_stack', None),
+                      getattr(app, 'redostack', None)):
+            if isinstance(stack, list):
+                stack.clear()
+        from gui.memory_manager import trim_undo_stack
+        trim_undo_stack(app)
+        app.classification_revision = int(getattr(app, 'classification_revision', 0)) + 1
+        from gui.lnt_ai_bridge import sync_store_rows
+        sync_store_rows(app, view, nodes, locals_, new)
+        view.native.frame(0.0)
+        try:
+            from gui.point_count_widget import refresh_point_statistics
+            refresh_point_statistics(app)
+        except Exception:
+            pass
+        report(100, f'Convert: {amount:,} points changed')
+        try:
+            app.statusBar().showMessage(
+                f'Convert (Vulkan): {amount:,} records reclassified', 7000)
+        except Exception:
+            pass
+        print(f'[Native By Class] streamed Convert: {amount:,}/{total:,} changed; '
+              f'{info["nodes"]:,} verified LNT directory nodes')
+        return amount
+    finally:
+        progress.close()
+        app._native_byclass_busy = False
 
 
 def route_convert_dialog(dialog, mode, preview=False):
@@ -594,6 +847,10 @@ def route_convert_dialog(dialog, mode, preview=False):
                       f'{len(polygons)} selected fence(s)')
                 report(32, f'{len(polygons)} fence(s): {n_inside:,} points inside')
                 if (mode == 'fence' and not preview and n_inside == len(xyz)
+                        # A large-file scoped snapshot ALREADY contains only
+                        # in-fence points. 'All points' here means all points
+                        # in the selected scope, not the entire source cloud.
+                        and not getattr(dialog.app, '_height_file_backed', False)
                         and not _ask(dialog, 'Fence Includes Every Point',
                             f'Your selected fence(s) include all {len(xyz):,} '
                             'LNT records. Convert all eligible points anyway?')):
@@ -624,8 +881,26 @@ def route_convert_dialog(dialog, mode, preview=False):
                     compute_convert(xyz, updated,
                         eligible & _height_mask(xyz, dialog), sources, target)
             elif mode == 'height':
-                if polygons:
-                    eligible &= _fence_mask(xyz, polygons)
+                eligible = height_scope_eligibility(
+                    dialog.app, xyz, initial, sources, target, polygons)
+                # Large-cloud file-backed reads include only the exact fence.
+                # The reference TIN is therefore LOCAL by construction; it
+                # must be supported and small enough for an exact Delaunay,
+                # otherwise refuse rather than silently inventing a surface.
+                if len(xyz) and getattr(dialog.app, '_height_file_backed', False):
+                    from gui.height_reference_surface import has_tin_xy_support
+                    local_refs = xyz[initial == ground]
+                    if not has_tin_xy_support(local_refs):
+                        raise NativeByClassError(
+                            'Large-cloud Height: fewer than 3 non-collinear '
+                            'reference-class points lie inside the selected '
+                            'fence. Expand the fence around suitable reference '
+                            'points. No classes were changed.')
+                    if len(local_refs) > 500_000:
+                        raise NativeByClassError(
+                            f'Large-cloud Height: {len(local_refs):,} reference '
+                            'points exceed the 500,000-point exact TIN safety '
+                            'budget. Narrow the fence; no classes were changed.')
                 compute_height(xyz, updated, eligible, sources, target, ground,
                      dialog.min_height_spin.value(), dialog.max_height_spin.value(),
                      dialog.max_triangle_spin.value(), fence_polys=polygons)
@@ -633,7 +908,11 @@ def route_convert_dialog(dialog, mode, preview=False):
                 raise NativeByClassError(f'Unsupported By Class mode: {mode}')
             if cancelled():
                 raise NativeByClassCancelled('Cancelled; nothing written.')
-        count = _with_progress(dialog, mode.title(), calculate, preview=preview)
+        if mode == 'convert':
+            count = _with_progress(dialog, mode.title(), calculate,
+                                   preview=preview, convert_spec=(sources, target))
+        else:
+            count = _with_progress(dialog, mode.title(), calculate, preview=preview)
         if not preview and count > 0 and mode != 'convert' and polygons:
             fences_used = getattr(dialog, 'selected_fences', None)
             if not fences_used:
