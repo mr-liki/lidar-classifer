@@ -2458,9 +2458,13 @@ class DisplayModeDialog(QDialog):
         app = self._get_app_window()
         view = getattr(app,'_lnt_main_view',None)
         if int(getattr(self,'current_slot',0)) == 0 and view is not None and getattr(view,'flight_lines',None) is None:
-            from gui.native_flight_lines import prepare
-            prepare(view,self._open_lines_dialog)
-            return
+            from gui.native_flight_lines import open_existing, prepare
+            if open_existing(view) is None:
+                # Only old/missing sidecars require the potentially expensive
+                # LAS/LAZ recovery worker.  Its callback re-enters this method
+                # and opens the populated selector when preparation completes.
+                prepare(view,self._open_lines_dialog)
+                return
         """Open a persistent selector; changes commit only when OK is clicked."""
         app = self._get_app_window()
         canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(self.current_slot)
