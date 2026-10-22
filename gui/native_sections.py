@@ -784,6 +784,36 @@ class SectionCanvas(QWidget):
         self.backend.request_render()
         self._dirty = getattr(self.backend, 'present_count', 0) == presented
 
+    @property
+    def frame_backend(self):
+        return self.backend
+
+    def projection_snapshot(self):
+        """Freeze the rendered camera, rather than the next interaction target."""
+        frame = getattr(self.backend, 'present_count', 0)
+        ratio = self.devicePixelRatioF()
+        token = (frame, self.width(), self.height(), ratio)
+        if token == getattr(self, '_projection_token', None):
+            return self._projection_value
+        mvp = self.backend.get_last_mvp()
+        if mvp is None:
+            return None
+        mvp = np.array(mvp, dtype=np.float64, copy=True)
+        origin = np.array(self.backend.get_render_origin_xyz(), dtype=np.float64, copy=True)
+        w, h = self.width(), self.height()
+        def project(horizontal, elevation):
+            # Section records are (horizontal, depth, elevation); depth does
+            # not change XY in this orthographic view.
+            x, z = float(horizontal) - origin[0], float(elevation) - origin[2]
+            clip = mvp @ np.array((x, 0., z, 1.))
+            if abs(float(clip[3])) < 1e-12:
+                return -1.e9, -1.e9
+            return ((clip[0] / clip[3] * .5 + .5) * w,
+                    (clip[1] / clip[3] * .5 + .5) * h)
+        self._projection_token = token
+        self._projection_value = (mvp.tobytes(), origin.tobytes(), w, h), project
+        return self._projection_value
+
     # Orthographic mapping (camera looks along +depth, up = elevation):
     # screen x -> horizontal, screen y -> elevation; logical Qt pixels.
     def world_per_pixel(self):
