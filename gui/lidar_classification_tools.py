@@ -4905,14 +4905,17 @@ class _BaseClassifyDialog(QDialog):
                 return
             kwargs["fence_mask"] = user_fence & line_mask
 
-        # Restrict fence to visible classes, including an all-hidden palette.
-        _palette = getattr(self.app, "class_palette", None)
-        if isinstance(_palette, dict) and _palette:
-            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get("show", True)]
-            if "classification" in kwargs:
-                _vis_mask = np.isin(kwargs["classification"], _vis)
-                _cur = kwargs.get("fence_mask")
-                kwargs["fence_mask"] = (_vis_mask & _cur) if _cur is not None else _vis_mask
+        # Find Wires uses explicit user-chosen From classes, even if their
+        # display palette visibility is off. Other tools retain their current
+        # visibility policy for VTK/Vulkan parity.
+        if func is not classify_find_wires:
+            _palette = getattr(self.app, "class_palette", None)
+            if isinstance(_palette, dict) and _palette:
+                _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get("show", True)]
+                if "classification" in kwargs:
+                    _vis_mask = np.isin(kwargs["classification"], _vis)
+                    _cur = kwargs.get("fence_mask")
+                    kwargs["fence_mask"] = (_vis_mask & _cur) if _cur is not None else _vis_mask
 
         self._prog = QProgressDialog(f"Running {name}…", "Cancel", 0, 100, self.app)
         self._prog.setWindowModality(Qt.NonModal)
@@ -7192,8 +7195,10 @@ def _make_alignment_highlight_actor(dialog, coords):
 
 
 def _clear_alignment_highlight(dialog):
-    if _native_byclass_line_highlights(dialog):
-        return
+    # A dialog can have an old VTK preview actor even after the main view
+    # transitions to Vulkan. Clear *both* independently: a native repaint
+    # must not skip removing a stale VTK cyan actor.
+    _native_byclass_line_highlights(dialog)
     actor = getattr(dialog, "_alignment_highlight_actor", None)
     if actor is None:
         return
@@ -7311,7 +7316,15 @@ def _normalize_centerline_collection(coords):
 def classify_find_wires(xyz, classification, from_classes, to_class,
                         alignment_coords, corridor_width=3.0,
                         min_height_above_ground=15.0, fence_mask=None,
-                        progress_cb=None, abort_check=None):
+                        progress_cb=None, abort_check=None,
+                        ground_class=2, max_ground_distance=None):
+    """Reclassify eligible wire points with local, auditable HAG references.
+
+    The source classes are explicit user choices (including hidden classes).
+    Ground and already-target points are protected. With no explicit distance
+    restriction, the nearest Ground class point is used exactly as the legacy
+    Find Wires HAG rule; the optional limit remains for API compatibility.
+    """
     xyz = np.asarray(xyz)
     cls = np.asarray(classification)
     empty = np.empty(0, dtype=np.intp)
@@ -7323,11 +7336,20 @@ def classify_find_wires(xyz, classification, from_classes, to_class,
         return {**base, "stop_reason": "invalid corridor width"}
     if not np.isfinite(min_height_above_ground) or min_height_above_ground < 0:
         return {**base, "stop_reason": "invalid height threshold"}
+    if max_ground_distance is not None and (
+            not np.isfinite(max_ground_distance) or max_ground_distance <= 0):
+        return {**base, "stop_reason": "invalid ground reference distance"}
+    if int(ground_class) != ground_class or not 0 <= int(ground_class) <= 255:
+        return {**base, "stop_reason": "invalid ground class"}
     if abort_check and abort_check():
         return {**base, "stop_reason": "cancelled"}
 
     valid = np.all(np.isfinite(xyz[:, :3]), axis=1)
-    source = valid & np.isin(cls, list(from_classes))
+    # Explicit From Class selections must not be silently disabled by display
+    # palette visibility, and must never overwrite ground reference points.
+    any_class = from_classes is None or None in from_classes
+    source = valid.copy() if any_class else valid & np.isin(cls, list(from_classes))
+    source &= (cls != int(ground_class)) & (cls != int(to_class))
     if fence_mask is not None:
         source &= np.asarray(fence_mask, dtype=bool)
     candidates = np.flatnonzero(source)
@@ -7361,21 +7383,44 @@ def classify_find_wires(xyz, classification, from_classes, to_class,
     if abort_check and abort_check():
         return {**base, "stop_reason": "cancelled"}
 
-    ground = np.flatnonzero(valid & (cls == 2))
+    ground = np.flatnonzero(valid & (cls == int(ground_class)))
     if not len(ground):
-        return {**base, "stop_reason": "class-2 ground points required"}
+        return {**base, "stop_reason":
+                f"No Ground reference points in class {int(ground_class)} "
+                f"within the selected centerline search region"}
     if progress_cb:
-        progress_cb(70, f"Checking height above ground for {len(candidates):,} corridor points")
+        progress_cb(70, f"Checking HAG for {len(candidates):,} corridor points "
+                         f"(Ground class {int(ground_class)})")
     ground_tree = cKDTree(xyz[ground, :2])
-    _, nearest = ground_tree.query(xyz[candidates, :2], k=1, workers=-1)
-    height = xyz[candidates, 2] - xyz[ground[np.asarray(nearest)], 2]
-    changed = candidates[height >= float(min_height_above_ground)].astype(np.intp, copy=False)
+    distances, nearest = ground_tree.query(
+        xyz[candidates, :2], k=1, workers=-1,
+        distance_upper_bound=(float(max_ground_distance)
+                              if max_ground_distance is not None else np.inf))
+    # KD-tree returns an out-of-range index when there is no ground within
+    # the distance bound. Never dereference that index or invent a HAG value.
+    has_ground = np.isfinite(distances) & (np.asarray(nearest) < len(ground))
+    if not np.any(has_ground):
+        return {**base, "stop_reason":
+                (f"No Ground class {int(ground_class)} points within "
+                 f"{max_ground_distance:g} m of the selected corridor"
+                 if max_ground_distance is not None else
+                 f"No Ground class {int(ground_class)} reference points available")}
+    referenced = candidates[has_ground]
+    height = xyz[referenced, 2] - xyz[ground[np.asarray(nearest)[has_ground]], 2]
+    changed = referenced[height >= float(min_height_above_ground)].astype(
+        np.intp, copy=False)
     if abort_check and abort_check():
         return {**base, "stop_reason": "cancelled"}
     cls[changed] = int(to_class)
+    missing_ground = int(np.count_nonzero(~has_ground))
     if progress_cb:
-        progress_cb(100, f"Find Wires complete - {len(changed):,} points -> class {to_class}")
-    return {"routine": "find_wires", "changed": int(len(changed)), "indices": changed}
+        suffix = (f"; {missing_ground:,} without nearby Ground skipped"
+                  if missing_ground else "")
+        progress_cb(100, f"Find Wires: {len(changed):,} points -> class "
+                         f"{to_class}{suffix}")
+    return {"routine": "find_wires", "changed": int(len(changed)),
+            "indices": changed, "missing_ground": missing_ground,
+            "ground_class": int(ground_class)}
 
 
 
@@ -7438,31 +7483,52 @@ def _native_byclass_pick_view(app):
 
 
 def _native_byclass_line_highlights(dialog, clear=False):
-    """Cyan line feedback on the native Qt overlay, not hidden VTK actors."""
-    view = _native_byclass_pick_view(dialog.app)
-    if view is None:
+    """Draw or clear only this By Class dialog's temporary cyan line overlay.
+
+    A closing picker must never recreate its own cyan highlight, including
+    during signal-driven shutdown and any later render callback.  Cleanup
+    must not create a native Draw instance if the viewport is already gone.
+    """
+    clear = bool(clear or getattr(dialog, "_line_picker_closed", False))
+    if not clear and _native_byclass_pick_view(dialog.app) is None:
         return False
     from gui.native_draw import get_native_draw
-    draw = get_native_draw(dialog.app, create=not clear)
-    if draw is None:
-        return True
+    # Keep a reference to the painter that actually received the highlight.
+    # A classification refresh can replace the active Vulkan view before
+    # Close is received; looking up only the current painter then leaves the
+    # old painter's cyan aux shape untouched.
+    previous = getattr(dialog, '_byclass_picker_native_draw', None)
+    try:
+        draw = get_native_draw(dialog.app, create=not clear)
+    except RuntimeError:
+        draw = None  # Native QWidget may already have been destroyed.
+    painters = []
+    for candidate in (previous, draw):
+        if candidate is not None and all(candidate is not item for item in painters):
+            painters.append(candidate)
     identity = id(dialog)
-    draw.aux_shapes = [shape for shape in draw.aux_shapes
-                       if not (len(shape) == 3 and isinstance(shape[2], dict)
-                               and shape[2].get('_byclass_line_picker') == identity)]
-    if not clear:
-        sources = list(getattr(dialog, '_selected_lines', {}).values())
-        hovered = getattr(dialog, '_hover_source', None)
-        if hovered is not None and hovered['key'] not in getattr(dialog, '_selected_lines', {}):
-            sources.append(hovered)
-        for source in sources:
-            coords = source['coords']
-            draw.aux_shapes.append(('drawing', coords,
-                 {'type': 'polyline', 'color': '#00ffff', 'width': 4,
-                  'show_vertices': False, '_byclass_line_picker': identity,
-                  'world_z': float(coords[0, 2]) if len(coords) else None}))
-    draw._paint()
-    return True
+    for painter in painters:
+        try:
+            painter.aux_shapes = [shape for shape in painter.aux_shapes
+                                  if not (len(shape) == 3 and isinstance(shape[2], dict)
+                                          and shape[2].get('_byclass_line_picker') == identity)]
+            if painter is draw and not clear:
+                sources = list(getattr(dialog, '_selected_lines', {}).values())
+                hovered = getattr(dialog, '_hover_source', None)
+                if hovered is not None and hovered['key'] not in getattr(dialog, '_selected_lines', {}):
+                    sources.append(hovered)
+                for source in sources:
+                    coords = source['coords']
+                    painter.aux_shapes.append(('drawing', coords,
+                         {'type': 'polyline', 'color': '#00ffff', 'width': 4,
+                          'show_vertices': False, '_byclass_line_picker': identity,
+                          'world_z': float(coords[0, 2]) if len(coords) else None}))
+            painter._paint()
+        except RuntimeError:
+            # The C++ viewport may already be gone; don't block Qt shutdown.
+            pass
+    dialog._byclass_picker_native_draw = None if clear else draw
+    return bool(painters)
 
 
 class _CanvasLinePicker:
@@ -7474,6 +7540,7 @@ class _CanvasLinePicker:
 
     def _init_line_picker(self, row, label="Select CL"):
         self._pick_active = False
+        self._line_picker_closed = False
         self._pick_sources = []
         self._selected_lines = {}
         self._selected_line_actors = {}
@@ -7639,6 +7706,9 @@ class _CanvasLinePicker:
         if active == self._pick_active:
             return
         if active:
+            # Stage 1 removes cyan on completion/Close. A deliberate new
+            # Select CL operation may draw selected lines again while picking.
+            self._line_picker_closed = False
             self._deactivate_other_tools_for_line_pick()
         self._pick_active = active
         self.select_line_button.blockSignals(True)
@@ -7796,15 +7866,20 @@ class _CanvasLinePicker:
         return [source["coords"].copy() for source in self._selected_lines.values()]
 
     def _close_line_picker(self):
-        _native_byclass_line_highlights(self, clear=True)
+        # Mark the picker closed BEFORE disabling mouse events: that path and
+        # the final repaint both redraw selected lines unless suppressed.
+        # Never change original SNT/drawing styles or classification results.
+        self._line_picker_closed = True
         if getattr(self, "_pick_active", False):
             self._toggle_line_picker(False)
+        self._hover_source = None
         _clear_alignment_highlight(self)
         for key in list(self._selected_line_actors):
             actor = self._selected_line_actors.pop(key)
             digitizer = getattr(self.app, "digitizer", None)
             if digitizer is not None:
                 digitizer._remove_actor_from_overlay(actor)
+        _native_byclass_line_highlights(self, clear=True)
         self._render_selected_lines()
 
 
@@ -7816,29 +7891,45 @@ class FindWiresDialog(_CanvasLinePicker, _BaseClassifyDialog):
         super().__init__(app, "Find Wires", parent)
         self.setWindowModality(Qt.NonModal)
         self._build_ui()
-        self.setMinimumSize(520, 360)
-        self.resize(600, 420)
+        # Readable at standard desktop sizes; the existing scroll area still
+        # handles unusually small displays without covering the footer.
+        self.setMinimumSize(560, 440)
+        self.resize(690, 580)
 
     def _build_ui(self):
         layout = self._content_layout
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(8)
         settings = QGroupBox("")
         form = QFormLayout(settings)
-        form.setLabelAlignment(Qt.AlignRight)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(9)
+        form.setContentsMargins(12, 6, 12, 12)
+
         from_row, self._get_from = _make_class_row(
             self.app, [4], multi=True, persist_key=self._pk("from_class"), extended=True)
         to_row, self._get_to = _make_class_row(
-            self.app, [14], multi=False, single_default=14, persist_key=self._pk("to_class"))
+            self.app, [14], multi=False, single_default=14,
+            persist_key=self._pk("to_class"))
         form.addRow("From class:", _w(from_row))
         form.addRow("To class:", _w(to_row))
+
         line_row = QHBoxLayout()
+        line_row.setSpacing(12)
         self._init_line_picker(line_row)
+        self.select_line_button.setMinimumWidth(84)
+        self.selected_lines_list.setMinimumWidth(180)
+        self.selected_lines_list.setMinimumHeight(90)
         form.addRow("Centerline:", _w(line_row))
 
         self.width_spin = QDoubleSpinBox()
         self.width_spin.setDecimals(2)
         self.width_spin.setRange(0.01, 1000.0)
         self.width_spin.setSuffix(" m")
-        self.width_spin.setToolTip("Total corridor width, shared equally on both sides of the selected centerline")
+        self.width_spin.setToolTip(
+            "Total corridor width: half is applied on each side of the selected centerline")
         self._persist_spin(self.width_spin, "corridor_width", 3.0)
         form.addRow("Total width:", self.width_spin)
 
@@ -7846,12 +7937,30 @@ class FindWiresDialog(_CanvasLinePicker, _BaseClassifyDialog):
         self.height_spin.setDecimals(2)
         self.height_spin.setRange(0.0, 1000.0)
         self.height_spin.setSuffix(" m")
-        self.height_spin.setToolTip("Minimum height above the nearest class-2 ground point")
+        self.height_spin.setToolTip(
+            "Minimum height above the nearest ground point from the active PTC Ground class")
         self._persist_spin(self.height_spin, "height_above_ground", 15.0)
         form.addRow("Height above ground:", self.height_spin)
+
+        self.ground_reference_label = QLabel()
+        self.ground_reference_label.setWordWrap(True)
+        self._refresh_ground_reference_label()
+        form.addRow("Ground reference:", self.ground_reference_label)
+        classes_loaded = getattr(getattr(self.app, 'display_mode_dialog', None),
+                                 'classes_loaded', None)
+        if classes_loaded is not None and hasattr(classes_loaded, 'connect'):
+            classes_loaded.connect(self._refresh_ground_reference_label)
+
         layout.addWidget(settings)
         layout.addStretch()
-        self._make_buttons()
+        self._make_buttons()  # fixed footer, outside the scrollable content
+
+    def _refresh_ground_reference_label(self, *args):
+        _, ground_class = _resolve_ground_class_defaults(self.app)
+        classes = _get_las_classes(self.app)
+        self.ground_reference_label.setText(
+            f"{ground_class} — {classes.get(ground_class, 'Ground')} "
+            "(active PTC)")
 
     def closeEvent(self, event):
         self._close_line_picker()
@@ -7864,20 +7973,36 @@ class FindWiresDialog(_CanvasLinePicker, _BaseClassifyDialog):
     def _on_ok(self):
         alignments = self._selected_lines_coords()
         if not alignments:
-            QMessageBox.warning(self, "No Centerline", "Select an SNT CL or drawing line in the view first.")
+            QMessageBox.warning(
+                self, "No Centerline", "Select an SNT CL or drawing line in the view first.")
             return
-        data = getattr(self.app, "data", None)
-        classes = data.get("classification") if isinstance(data, dict) else None
-        if classes is not None and not np.any(np.asarray(classes) == 2):
-            QMessageBox.warning(self, "No Ground", "Class-2 ground points are required to measure height above ground.")
+        from_classes = self._get_from()
+        if not from_classes:
+            QMessageBox.warning(self, "No From Class",
+                                "Select one or more From classes first.")
             return
-        self._run_algorithm(classify_find_wires, {
-            "from_classes": self._get_from(),
-            "to_class": self._get_to()[0],
-            "alignment_coords": alignments,
-            "corridor_width": self.width_spin.value(),
-            "min_height_above_ground": self.height_spin.value(),
-        }, "Find Wires")
+        to_classes = self._get_to()
+        if not to_classes:
+            QMessageBox.warning(self, "No To Class", "Select a destination class first.")
+            return
+        _, ground_class = _resolve_ground_class_defaults(self.app)
+        self._refresh_ground_reference_label()
+        # Do not run the legacy app.data class-2 preflight here.  For Vulkan
+        # the authoritative classifications live in LNT, and even on VTK the
+        # algorithm needs to validate ground *near the selected corridor*.
+        try:
+            self._run_algorithm(classify_find_wires, {
+                "from_classes": from_classes,
+                "to_class": to_classes[0],
+                "alignment_coords": alignments,
+                "corridor_width": self.width_spin.value(),
+                "min_height_above_ground": self.height_spin.value(),
+                "ground_class": ground_class,
+            }, "Find Wires")
+        finally:
+            # Applying/classification should not leave a cyan line visible.
+            # Preserve the selected CL list and the original SNT line color.
+            self._close_line_picker()
 
 
 class ClassifyByCenterlineDialog(_CanvasLinePicker, _BaseClassifyDialog):
@@ -7938,13 +8063,20 @@ class ClassifyByCenterlineDialog(_CanvasLinePicker, _BaseClassifyDialog):
         if not centerlines:
             QMessageBox.warning(self, "No Centerline", "Select an SNT CL or drawing line in the view first.")
             return
-        self._run_algorithm(classify_poles_by_centerline, {
-            "from_classes": self._get_from(),
-            "to_class": self._get_to()[0],
-            "centerline_coords": centerlines,
-            "radius": self.radius_spin.value(),
-            "down_height": self.depth_spin.value(),
-        }, "Classify by Centerline")
+        try:
+            self._run_algorithm(classify_poles_by_centerline, {
+                "from_classes": self._get_from(),
+                "to_class": self._get_to()[0],
+                "centerline_coords": centerlines,
+                "radius": self.radius_spin.value(),
+                "down_height": self.depth_spin.value(),
+            }, "Classify by Centerline")
+        finally:
+            # Ctrline keeps its dialog open after Apply. Stop previewing its
+            # selected line even if native classification raises or is blocked.
+            # Keep the selected CL coordinates for a later Apply and don't
+            # touch its original SNT/drawing style or point classifications.
+            self._close_line_picker()
 
 # PUBLIC API  — restore-aware open helpers
 # ═══════════════════════════════════════════════════════════════════════
