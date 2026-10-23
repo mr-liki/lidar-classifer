@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QInputDialog
 
 from gui.native_selection_targets import (
     close_freehand, snap_draft_closure, editable_draw, parallel_line_source,
+    drawn_open_line_source,
 )
 from gui.native_stroke_geometry import (
     catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
@@ -745,7 +746,7 @@ class NativeDraw:
     def _pick_editable_draw(self, p, tolerance=None):
         """Standalone Draw > Select cannot pick imported SNT reference blocks.
 
-        The Parallel/Centerline/Hatch pickers retain their separate SNT inputs.
+        The Hatch picker retains its separate SNT inputs.
         The Element Selection panel additionally supports measured Line/Path.
         """
         if tolerance is None:
@@ -877,8 +878,30 @@ class NativeDraw:
 
     def _snap_at(self,p,mode,tol):
         features=list(self._near_scene(p,tol))
+        if mode=='center':
+            # Line stores independent edges. A completed closed chain is
+            # still a closed Draw figure even when no edge is near the click.
+            chains={}
+            for drawing in getattr(self,'drawings',()):
+                chain=drawing.get('line_chain')
+                if (chain and drawing.get('type')=='line' and
+                        not drawing.get('imported') and editable_draw(drawing)):
+                    chains.setdefault(chain,[]).append(drawing)
+            for chain,edges in chains.items():
+                ring=[]
+                for edge in edges:
+                    coords=edge.get('coords',[])
+                    if len(coords)<2 or (ring and tuple(ring[-1])!=tuple(coords[0])):
+                        break
+                    ring.extend(coords if not ring else coords[1:])
+                else:
+                    if len(ring)>=4 and tuple(ring[0])==tuple(ring[-1]):
+                        features.append(dict(source='native',type='polyline',
+                            coords=ring,key=('line_chain',chain)))
         best=None
         endpoint=None
+        containing_center=None
+        line_keypoint=None
         def offer(q, vertex=False):
             nonlocal best, endpoint
             distance=math.dist(p,q)
@@ -924,16 +947,40 @@ class NativeDraw:
                         controls = feature.get('drawing', {}).get('coords', ())
                         vertex_coords = ([controls[0], controls[-1]] if controls
                                          else ())
+                    if mode=='keypoint' and len(coords)>=2 and len(vertex_coords):
+                        hit=nearest_segment(p,coords)
+                        if hit is not None and hit[0]<=tol:
+                            # Pick the line by its stroke, then its nearest
+                            # real vertex. Vertex distance has no radius cap.
+                            vertex=min((tuple(q[:2]) for q in vertex_coords),
+                                       key=lambda q: math.dist(p,q))
+                            rank=(hit[0],math.dist(p,vertex),vertex)
+                            if line_keypoint is None or rank<line_keypoint:
+                                line_keypoint=rank
                     for q in vertex_coords:
                         if recent_line and tuple(q[:2]) == self.points[-1]:
                             continue
                         offer(tuple(q[:2]), vertex=True)
                 if mode == 'center':
+                    center=None
+                    inside=False
                     if feature.get('type')=='circle' and feature['source']=='native':
-                        offer(feature['drawing']['coords'][0][:2])
+                        controls=feature['drawing']['coords']
+                        center=tuple(controls[0][:2])
+                        if len(controls)>=2:
+                            radius=math.dist(center,controls[1][:2])
+                            inside=radius>0. and math.dist(p,center)<=radius
                     elif len(coords)>=4 and coords[0]==coords[-1]:
                         center=polygon_centroid(coords)
-                        if center is not None:offer(center)
+                        inside=_inside_polygon(p,coords[:-1])
+                    if center is not None:
+                        if inside and feature.get('source')=='native':
+                            # Interior selection is by figure containment,
+                            # independent of the normal pixel snap radius.
+                            rank=(math.dist(p,center),tuple(center))
+                            if containing_center is None or rank<containing_center:
+                                containing_center=rank
+                        offer(center)
                 for a,b in zip(coords,coords[1:]):
                     if recent_line:
                         continue
@@ -944,6 +991,10 @@ class NativeDraw:
             # recent vertex (which would prevent drawing the next segment).
             if mode in ('nearby','keypoint') and self.tool not in ('freehand', 'curve'):
                 for q in self.points[:-1]:offer(q,vertex=True)
+        if containing_center is not None:
+            return containing_center[1]
+        if line_keypoint is not None:
+            return line_keypoint[2]
         if mode=='nearby' and endpoint is not None:
             return endpoint[1]
         return best[1] if best else None
@@ -954,6 +1005,16 @@ class NativeDraw:
         did_snap=False
         self._snap_target=None
         digitizer=getattr(self.app,'digitizer',None)
+        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
+        exact_snap_mode = getattr(digitizer,'snap_mode',None) if explicit_snap else None
+        if (snap and exact_snap_mode in ('center','keypoint') and
+                self.tool not in ('select','parallel','centerline')):
+            candidate=self._snap_at(p,exact_snap_mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
+            if candidate is not None:
+                # Explicit geometric targets win over draft closure and
+                # angle/axis constraints, so placement stays on the target.
+                self._snap_target=candidate
+                return candidate
         # Both Smart Line AND Line snap automatically in the VTK digitizer.
         # Text placement and Vertex insertion also need endpoint magnetism.
         # Explicit Snap mode takes priority over this nearby default.
@@ -967,11 +1028,10 @@ class NativeDraw:
                 self._snap_target = tuple(closure[:2])
                 return self._snap_target
         smart_auto = self.tool in ('smartline', 'line', 'text', 'vertex', 'freehand', 'curve')
-        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
         if (snap and self.tool not in ('select','parallel','centerline')
                 and (smart_auto or explicit_snap)):
             mode=(getattr(digitizer,'snap_mode',None) or 'nearby') if explicit_snap else 'nearby'
-            if mode in ('nearby','keypoint','midpoint','center','intercept'):
+            if mode in ('nearby','midpoint','intercept'):
                 candidate=self._snap_at(p,mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
                 if candidate is not None:
                     p=candidate;did_snap=True;self._snap_target=p
@@ -1299,6 +1359,31 @@ class NativeDraw:
                 coords[vi] = destination
         new_obj = dict(original, coords=coords)
         self.drawings[di] = new_obj
+        if original.get('type') == 'line' and self._vertex_move_before is not None:
+            # Line commits each edge separately. Move a shared chain corner
+            # on every incident edge, as Smart Line does within one record.
+            origin = tuple(original['coords'][vi][:2])
+            chain = original.get('line_chain')
+            for other_di, other in enumerate(self._vertex_move_before):
+                if other_di == di or other.get('type') != 'line':
+                    continue
+                if other.get('imported') or other.get('source') in (
+                        'block_creation', 'cell_creation', 'snt', 'snt_readonly'):
+                    continue
+                if chain is not None:
+                    if other.get('line_chain') != chain:
+                        continue
+                elif other.get('line_chain') is not None or abs(other_di - di) != 1:
+                    # Older drawings have no chain ID. Consecutively stored
+                    # edges sharing this corner are the recoverable topology.
+                    continue
+                other_coords = list(other.get('coords', []))
+                matches = [i for i, point in enumerate(other_coords)
+                           if tuple(point[:2]) == origin]
+                if matches:
+                    for i in matches:
+                        other_coords[i] = destination
+                    self.drawings[other_di] = dict(other, coords=other_coords)
         self._paint()
         return True
 
@@ -1320,9 +1405,10 @@ class NativeDraw:
             # The edited dict replaced the selected object. Retire any old
             # highlight/fence identity; stale highlights can draw a synthetic
             # closing edge across an otherwise OPEN edited polyline.
-            self._prune_deleted_native_refs({id(original)})
+            self._prune_deleted_native_refs({id(old) for old, new in
+                zip(before, self.drawings) if old is not new})
         else:
-            self.drawings[di] = original
+            self.drawings[:] = before
         self.vertex_target = None
         self._vertex_move_before = None
         self._vertex_move_original = None
@@ -1459,7 +1545,7 @@ class NativeDraw:
                     p = self.canvas.section_at(pos.x(), pos.y())
                     feature = self._pick_feature(
                         p, open_only=self.tool == 'centerline',
-                        predicate=parallel_line_source if self.tool == 'parallel' else None,
+                        predicate=drawn_open_line_source,
                     )
                 except (RuntimeError, TypeError, ValueError):
                     feature = None
@@ -1541,7 +1627,7 @@ class NativeDraw:
             if self._parallel_source is None:
                 source=self._pick_feature(p,open_only=True, predicate=parallel_line_source)
                 if source is None:
-                    self.app.statusBar().showMessage('Click an existing open SNT/native line first',3500)
+                    self.app.statusBar().showMessage('Click an open line drawn with the Draw tools first',3500)
                     return True
                 self._store_selection(source)
                 self._parallel_source=self._selected_feature()
@@ -1561,19 +1647,22 @@ class NativeDraw:
             # Stay in Parallel so users can place another offset from source.
             return True
         if self.tool == 'centerline':
-            if self._centerline_first is not None and not self._valid_source(self._centerline_first):
+            if self._centerline_first is not None and not (
+                    drawn_open_line_source(self._centerline_first) and
+                    self._valid_source(self._centerline_first)):
                 self._centerline_first=None
                 self._store_selection(None)
             if self._centerline_first is None:
-                first=self._pick_feature(p,open_only=True)
+                first=self._pick_feature(p,open_only=True, predicate=drawn_open_line_source)
                 if first is None:
-                    self.app.statusBar().showMessage('Click the first existing open SNT/native line',3500)
+                    self.app.statusBar().showMessage('Click the first open line drawn with the Draw tools',3500)
                     return True
                 self._store_selection(first)
                 self._centerline_first=self._selected_feature()
                 self.app.statusBar().showMessage('Click a second DIFFERENT open line',4000)
                 return True
-            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first)
+            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first,
+                                      predicate=drawn_open_line_source)
             if second is None:
                 self.app.statusBar().showMessage('Choose a different open line for Centerline',3500)
                 return True
@@ -1724,7 +1813,12 @@ class NativeDraw:
                 return True
             self.point_redo.clear()
             self._line_session_undone.clear()
-            self._commit('line', [start, p])
+            # Persist chain identity so later vertex edits do not pull an
+            # unrelated Line figure that happens to touch the same point.
+            from uuid import uuid4
+            chain = (self._line_session_refs[0].get('line_chain')
+                     if self._line_session_refs else None) or uuid4().hex
+            self._commit('line', [start, p], line_chain=chain)
             self._line_session_refs.append(self.drawings[-1])
             if len(self._line_session_refs) > 100:
                 del self._line_session_refs[:-100]
@@ -2433,7 +2527,7 @@ def native_plan_view(app, allow_snt=False):
 
 
 def get_native_draw(app, create=False, allow_snt=False):
-    """Find Draw on the visible Vulkan viewport without hijacking VTK."""
+    """Find Draw on Vulkan; explicit creation promotes an empty viewport."""
     view = getattr(app, '_lnt_main_view', None)
 
     if view is not None:
@@ -2443,6 +2537,14 @@ def get_native_draw(app, create=False, allow_snt=False):
     else:
         owner = getattr(app, 'render_backend', None)
         view = None
+
+        if create and owner is not None:
+            # Match Measure on a fresh launch: install the native canvas
+            # before checking visibility/camera ownership. Promotion refuses
+            # a loaded legacy cloud or an engine without the vector pass.
+            from gui.native_vector_overlay import promote_snt_viewport, snt_viewport_active
+            if not snt_viewport_active(app):
+                promote_snt_viewport(app)
 
         if (owner is not None and
                 getattr(owner, 'active', False) and
@@ -2491,5 +2593,7 @@ def get_native_draw(app, create=False, allow_snt=False):
 
 
 def activate_native_draw(app, tool):
+    if str(tool or '').lower().replace(' ', '_') not in TOOL_MAP:
+        return False
     draw = get_native_draw(app, create=True)
     return bool(draw and draw.activate(tool))

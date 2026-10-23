@@ -10,6 +10,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+from gui.native_selection_targets import drawn_open_line_source
 
 try:
     from PySide6.QtCore import Qt, QTimer
@@ -275,12 +276,12 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         self.activateWindow()
 
     def _on_native_feature_picked(self, feature):
-        """Pick two actual SNT/native open lines for original interpolation."""
+        """Pick two open Draw lines for interpolation, excluding attachments."""
         draw = self._native_draw
         if draw is None or not self._select_mode:
             return
-        if feature is None or not self._is_open_line_feature(feature):
-            self._show_message('Choose an open line or polyline (not a polygon).')
+        if not drawn_open_line_source(feature) or not self._is_open_line_feature(feature):
+            self._show_message('Choose an open line drawn with the Draw tools. Attached SNT layers cannot be selected.')
             return
         if not draw._valid_source(feature):
             self._show_message('Line is no longer visible or attached.')
@@ -512,8 +513,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
 
         first, second = self._selected_drawings[:2]
         if self._native_draw is not None and not all(
-                self._native_draw._valid_source(f) for f in (first, second)):
-            self._show_message('Source changed or was hidden. Select two visible lines again.')
+                drawn_open_line_source(f) and self._native_draw._valid_source(f)
+                for f in (first, second)):
+            self._show_message('Select two open lines drawn with the Draw tools again.')
             self.apply_btn.setEnabled(False)
             return
         center_coords = self._compute_centerline_coords(
@@ -689,8 +691,9 @@ class CenterlineToolDialog(MinimizableDialogMixin, QDialog):
         color, width, line_style = self._get_centerline_style()
         if self._native_draw is not None:
             from PySide6.QtGui import QColor
-            if not all(self._native_draw._valid_source(f) for f in (first, second)):
-                self._show_message('Source lines are no longer visible or attached.')
+            if not all(drawn_open_line_source(f) and self._native_draw._valid_source(f)
+                       for f in (first, second)):
+                self._show_message('Select two open lines drawn with the Draw tools again.')
                 return False
             self._native_draw._commit(
                 'centerline', [(float(p[0]), float(p[1])) for p in coords],
