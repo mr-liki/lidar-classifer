@@ -901,6 +901,7 @@ class NativeDraw:
         best=None
         endpoint=None
         containing_center=None
+        line_keypoint=None
         def offer(q, vertex=False):
             nonlocal best, endpoint
             distance=math.dist(p,q)
@@ -946,6 +947,16 @@ class NativeDraw:
                         controls = feature.get('drawing', {}).get('coords', ())
                         vertex_coords = ([controls[0], controls[-1]] if controls
                                          else ())
+                    if mode=='keypoint' and len(coords)>=2 and len(vertex_coords):
+                        hit=nearest_segment(p,coords)
+                        if hit is not None and hit[0]<=tol:
+                            # Pick the line by its stroke, then its nearest
+                            # real vertex. Vertex distance has no radius cap.
+                            vertex=min((tuple(q[:2]) for q in vertex_coords),
+                                       key=lambda q: math.dist(p,q))
+                            rank=(hit[0],math.dist(p,vertex),vertex)
+                            if line_keypoint is None or rank<line_keypoint:
+                                line_keypoint=rank
                     for q in vertex_coords:
                         if recent_line and tuple(q[:2]) == self.points[-1]:
                             continue
@@ -982,6 +993,8 @@ class NativeDraw:
                 for q in self.points[:-1]:offer(q,vertex=True)
         if containing_center is not None:
             return containing_center[1]
+        if line_keypoint is not None:
+            return line_keypoint[2]
         if mode=='nearby' and endpoint is not None:
             return endpoint[1]
         return best[1] if best else None
@@ -993,12 +1006,13 @@ class NativeDraw:
         self._snap_target=None
         digitizer=getattr(self.app,'digitizer',None)
         explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
-        center_snap = explicit_snap and getattr(digitizer,'snap_mode',None)=='center'
-        if snap and center_snap and self.tool not in ('select','parallel','centerline'):
-            candidate=self._snap_at(p,'center',max(self.canvas.world_per_pixel()*14.,1.e-9))
+        exact_snap_mode = getattr(digitizer,'snap_mode',None) if explicit_snap else None
+        if (snap and exact_snap_mode in ('center','keypoint') and
+                self.tool not in ('select','parallel','centerline')):
+            candidate=self._snap_at(p,exact_snap_mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
             if candidate is not None:
-                # Explicit Center Snap wins over draft closure and angle/axis
-                # constraints: every placement inside the figure uses its center.
+                # Explicit geometric targets win over draft closure and
+                # angle/axis constraints, so placement stays on the target.
                 self._snap_target=candidate
                 return candidate
         # Both Smart Line AND Line snap automatically in the VTK digitizer.
@@ -1017,7 +1031,7 @@ class NativeDraw:
         if (snap and self.tool not in ('select','parallel','centerline')
                 and (smart_auto or explicit_snap)):
             mode=(getattr(digitizer,'snap_mode',None) or 'nearby') if explicit_snap else 'nearby'
-            if mode in ('nearby','keypoint','midpoint','intercept'):
+            if mode in ('nearby','midpoint','intercept'):
                 candidate=self._snap_at(p,mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
                 if candidate is not None:
                     p=candidate;did_snap=True;self._snap_target=p
