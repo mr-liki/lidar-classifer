@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QInputDialog
 
 from gui.native_selection_targets import (
     close_freehand, snap_draft_closure, editable_draw, parallel_line_source,
+    drawn_open_line_source,
 )
 from gui.native_stroke_geometry import (
     catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
@@ -745,7 +746,7 @@ class NativeDraw:
     def _pick_editable_draw(self, p, tolerance=None):
         """Standalone Draw > Select cannot pick imported SNT reference blocks.
 
-        The Parallel/Centerline/Hatch pickers retain their separate SNT inputs.
+        The Hatch picker retains its separate SNT inputs.
         The Element Selection panel additionally supports measured Line/Path.
         """
         if tolerance is None:
@@ -1459,7 +1460,7 @@ class NativeDraw:
                     p = self.canvas.section_at(pos.x(), pos.y())
                     feature = self._pick_feature(
                         p, open_only=self.tool == 'centerline',
-                        predicate=parallel_line_source if self.tool == 'parallel' else None,
+                        predicate=drawn_open_line_source,
                     )
                 except (RuntimeError, TypeError, ValueError):
                     feature = None
@@ -1541,7 +1542,7 @@ class NativeDraw:
             if self._parallel_source is None:
                 source=self._pick_feature(p,open_only=True, predicate=parallel_line_source)
                 if source is None:
-                    self.app.statusBar().showMessage('Click an existing open SNT/native line first',3500)
+                    self.app.statusBar().showMessage('Click an open line drawn with the Draw tools first',3500)
                     return True
                 self._store_selection(source)
                 self._parallel_source=self._selected_feature()
@@ -1561,19 +1562,22 @@ class NativeDraw:
             # Stay in Parallel so users can place another offset from source.
             return True
         if self.tool == 'centerline':
-            if self._centerline_first is not None and not self._valid_source(self._centerline_first):
+            if self._centerline_first is not None and not (
+                    drawn_open_line_source(self._centerline_first) and
+                    self._valid_source(self._centerline_first)):
                 self._centerline_first=None
                 self._store_selection(None)
             if self._centerline_first is None:
-                first=self._pick_feature(p,open_only=True)
+                first=self._pick_feature(p,open_only=True, predicate=drawn_open_line_source)
                 if first is None:
-                    self.app.statusBar().showMessage('Click the first existing open SNT/native line',3500)
+                    self.app.statusBar().showMessage('Click the first open line drawn with the Draw tools',3500)
                     return True
                 self._store_selection(first)
                 self._centerline_first=self._selected_feature()
                 self.app.statusBar().showMessage('Click a second DIFFERENT open line',4000)
                 return True
-            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first)
+            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first,
+                                      predicate=drawn_open_line_source)
             if second is None:
                 self.app.statusBar().showMessage('Choose a different open line for Centerline',3500)
                 return True

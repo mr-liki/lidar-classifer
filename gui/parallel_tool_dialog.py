@@ -1928,7 +1928,7 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             return
         from gui.native_selection_targets import parallel_line_source
         if not parallel_line_source(feature):
-            self._set_status('Pick an OPEN drawing/SNT line (not a block or trajectory).')
+            self._set_status('Pick an open line drawn with the Draw tools. Attached SNT layers cannot be selected.')
             return
         if not draw._valid_source(feature):
             self._set_status('Source is no longer attached or visible; select again.')
@@ -2316,9 +2316,11 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             self._selected_drawing = self._selected_drawings[-1]
 
         drawing = self._selected_drawing
-        if self._native_draw is not None and not self._native_draw._valid_source(drawing):
-            self._set_status('Selected geometry is no longer visible or attached. Reselect it.')
-            return
+        if self._native_draw is not None:
+            from gui.native_selection_targets import parallel_line_source
+            if not (parallel_line_source(drawing) and self._native_draw._valid_source(drawing)):
+                self._set_status('Select an open line drawn with the Draw tools.')
+                return
         coords = np.asarray(self._drawing_coords(drawing), dtype=np.float64)
         if coords.ndim != 2 or coords.shape[0] < 2:
             self._set_status("Selected drawing has no usable coordinates.")

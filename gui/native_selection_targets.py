@@ -101,16 +101,14 @@ def box_overlap(a,b,inside=False):
     return not (a[1]<b[0] or a[0]>b[1] or a[3]<b[2] or a[2]>b[3])
 
 
-# Parallel is a *line* operation. An imported SNT record may carry a valid
-# 2-D polyline even when it represents a survey trajectory, grid tile or PRJ
-# block edge. Keep source eligibility separate from the global snap index:
-# Centerline/Hatch and other tools legitimately need those SNT geometries.
+# Parallel/Centerline accept only figures created by Draw, never attached SNT records.
+# Keep source eligibility separate from the global snap index:
+# Hatch and other tools legitimately need those SNT geometries.
 _PARALLEL_NATIVE_LINE_TYPES = frozenset({
     'line', 'line_segment', 'smartline', 'smart_line', 'polyline',
     'lwpolyline', 'curve', 'parallel', 'parallel_line', 'centerline',
     'freehand', 'accudraw',
 })
-_PARALLEL_SNT_LINE_TYPES = frozenset({'line', 'polyline', 'lwpolyline'})
 _PARALLEL_FORBIDDEN_ORIGINS = frozenset({
     'block_creation', 'cell_creation', 'snt_readonly',
     'measure_selection', 'snt_block', 'trajectory', 'flightline',
@@ -118,32 +116,30 @@ _PARALLEL_FORBIDDEN_ORIGINS = frozenset({
 
 
 def parallel_line_source(feature):
-    """True only for an open, nondegenerate line eligible for *Vulkan* Parallel.
+    """True only for an open, nondegenerate native Draw line for Parallel."""
+    return drawn_open_line_source(feature)
 
-    This is intentionally *not* a global SNT filter. Without authoritative
-    entity roles we can reject well-identified block/trajectory layers, but a
-    generic SNT polyline on an unlabelled layer is indistinguishable from a
-    survey path. Its source would need an explicit role for perfect filtering.
-    """
+
+def drawn_open_line_source(feature):
+    """Accept live Draw line descriptors, excluding imports and creation bounds."""
     if not isinstance(feature, dict):
         return False
     origin = str(feature.get('source', '') or '').lower()
-    if origin not in ('native', 'snt'):
+    if origin != 'native':
         return False
     # Older callers may pass a flat native Draw descriptor rather than the
     # canonical {'drawing': original} wrapper. The dialog's _valid_source()
     # still independently validates live object identity before committing.
-    record = (feature.get('drawing') or feature) if origin == 'native' else feature.get('entity')
+    record = feature.get('drawing') or feature
     if not isinstance(record, dict):
         return False
     kind = str(feature.get('type') or record.get('type') or '').lower()
-    if kind not in (_PARALLEL_NATIVE_LINE_TYPES if origin == 'native'
-                    else _PARALLEL_SNT_LINE_TYPES):
+    if kind not in _PARALLEL_NATIVE_LINE_TYPES:
         return False
     source = str(record.get('source', '') or '').lower()
     if source in _PARALLEL_FORBIDDEN_ORIGINS:
         return False
-    if bool(record.get('imported')) and origin == 'native':
+    if bool(record.get('imported')) or source in ('snt', 'snt_import'):
         return False
     if bool(record.get('closed')) or bool(record.get('is_closed')):
         return False
@@ -163,29 +159,4 @@ def parallel_line_source(feature):
             return False
     except (IndexError, TypeError, ValueError, OverflowError):
         return False
-    if origin == 'snt':
-        # Prefer authoritative metadata when the loader provides it. Since
-        # SNT lines share the same geometry payload as flight paths, layer
-        # names remain a necessary conservative exclusion fallback.
-        markers = (
-            feature.get('layer'), record.get('layer'), record.get('level'),
-            record.get('feature_type'), record.get('geometry_role'),
-            record.get('role'), record.get('purpose'), record.get('category'),
-            record.get('source_layer'), record.get('name'),
-        )
-        for marker in markers:
-            key = str(marker or '').strip().upper().replace('-', '_').replace(' ', '_')
-            if not key:
-                continue
-            if (key.startswith('BL') or key.endswith('_BL') or
-                    any(token in key for token in (
-                        'BLOCK', 'GRID', 'TILE', 'BBOX', 'BOUND',
-                        'TRAJECTORY', 'TRAJ', 'FLIGHT', 'TRACKLINE',
-                        'TRACK_LINE', 'TRACK_PATH', 'GPS_PATH', 'SCANLINE',
-                    ))):
-                return False
-        if (record.get('_prj_block_label') or record.get('block_id') or
-                record.get('_block_boundary') or record.get('is_block_boundary') or
-                record.get('is_trajectory')):
-            return False
     return True
