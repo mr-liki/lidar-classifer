@@ -2468,7 +2468,7 @@ def native_plan_view(app, allow_snt=False):
 
 
 def get_native_draw(app, create=False, allow_snt=False):
-    """Find Draw on the visible Vulkan viewport without hijacking VTK."""
+    """Find Draw on Vulkan; explicit creation promotes an empty viewport."""
     view = getattr(app, '_lnt_main_view', None)
 
     if view is not None:
@@ -2478,6 +2478,14 @@ def get_native_draw(app, create=False, allow_snt=False):
     else:
         owner = getattr(app, 'render_backend', None)
         view = None
+
+        if create and owner is not None:
+            # Match Measure on a fresh launch: install the native canvas
+            # before checking visibility/camera ownership. Promotion refuses
+            # a loaded legacy cloud or an engine without the vector pass.
+            from gui.native_vector_overlay import promote_snt_viewport, snt_viewport_active
+            if not snt_viewport_active(app):
+                promote_snt_viewport(app)
 
         if (owner is not None and
                 getattr(owner, 'active', False) and
@@ -2526,5 +2534,7 @@ def get_native_draw(app, create=False, allow_snt=False):
 
 
 def activate_native_draw(app, tool):
+    if str(tool or '').lower().replace(' ', '_') not in TOOL_MAP:
+        return False
     draw = get_native_draw(app, create=True)
     return bool(draw and draw.activate(tool))
