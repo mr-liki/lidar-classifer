@@ -878,8 +878,29 @@ class NativeDraw:
 
     def _snap_at(self,p,mode,tol):
         features=list(self._near_scene(p,tol))
+        if mode=='center':
+            # Line stores independent edges. A completed closed chain is
+            # still a closed Draw figure even when no edge is near the click.
+            chains={}
+            for drawing in getattr(self,'drawings',()):
+                chain=drawing.get('line_chain')
+                if (chain and drawing.get('type')=='line' and
+                        not drawing.get('imported') and editable_draw(drawing)):
+                    chains.setdefault(chain,[]).append(drawing)
+            for chain,edges in chains.items():
+                ring=[]
+                for edge in edges:
+                    coords=edge.get('coords',[])
+                    if len(coords)<2 or (ring and tuple(ring[-1])!=tuple(coords[0])):
+                        break
+                    ring.extend(coords if not ring else coords[1:])
+                else:
+                    if len(ring)>=4 and tuple(ring[0])==tuple(ring[-1]):
+                        features.append(dict(source='native',type='polyline',
+                            coords=ring,key=('line_chain',chain)))
         best=None
         endpoint=None
+        containing_center=None
         def offer(q, vertex=False):
             nonlocal best, endpoint
             distance=math.dist(p,q)
@@ -930,11 +951,25 @@ class NativeDraw:
                             continue
                         offer(tuple(q[:2]), vertex=True)
                 if mode == 'center':
+                    center=None
+                    inside=False
                     if feature.get('type')=='circle' and feature['source']=='native':
-                        offer(feature['drawing']['coords'][0][:2])
+                        controls=feature['drawing']['coords']
+                        center=tuple(controls[0][:2])
+                        if len(controls)>=2:
+                            radius=math.dist(center,controls[1][:2])
+                            inside=radius>0. and math.dist(p,center)<=radius
                     elif len(coords)>=4 and coords[0]==coords[-1]:
                         center=polygon_centroid(coords)
-                        if center is not None:offer(center)
+                        inside=_inside_polygon(p,coords[:-1])
+                    if center is not None:
+                        if inside and feature.get('source')=='native':
+                            # Interior selection is by figure containment,
+                            # independent of the normal pixel snap radius.
+                            rank=(math.dist(p,center),tuple(center))
+                            if containing_center is None or rank<containing_center:
+                                containing_center=rank
+                        offer(center)
                 for a,b in zip(coords,coords[1:]):
                     if recent_line:
                         continue
@@ -945,6 +980,8 @@ class NativeDraw:
             # recent vertex (which would prevent drawing the next segment).
             if mode in ('nearby','keypoint') and self.tool not in ('freehand', 'curve'):
                 for q in self.points[:-1]:offer(q,vertex=True)
+        if containing_center is not None:
+            return containing_center[1]
         if mode=='nearby' and endpoint is not None:
             return endpoint[1]
         return best[1] if best else None
@@ -955,6 +992,15 @@ class NativeDraw:
         did_snap=False
         self._snap_target=None
         digitizer=getattr(self.app,'digitizer',None)
+        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
+        center_snap = explicit_snap and getattr(digitizer,'snap_mode',None)=='center'
+        if snap and center_snap and self.tool not in ('select','parallel','centerline'):
+            candidate=self._snap_at(p,'center',max(self.canvas.world_per_pixel()*14.,1.e-9))
+            if candidate is not None:
+                # Explicit Center Snap wins over draft closure and angle/axis
+                # constraints: every placement inside the figure uses its center.
+                self._snap_target=candidate
+                return candidate
         # Both Smart Line AND Line snap automatically in the VTK digitizer.
         # Text placement and Vertex insertion also need endpoint magnetism.
         # Explicit Snap mode takes priority over this nearby default.
@@ -968,11 +1014,10 @@ class NativeDraw:
                 self._snap_target = tuple(closure[:2])
                 return self._snap_target
         smart_auto = self.tool in ('smartline', 'line', 'text', 'vertex', 'freehand', 'curve')
-        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
         if (snap and self.tool not in ('select','parallel','centerline')
                 and (smart_auto or explicit_snap)):
             mode=(getattr(digitizer,'snap_mode',None) or 'nearby') if explicit_snap else 'nearby'
-            if mode in ('nearby','keypoint','midpoint','center','intercept'):
+            if mode in ('nearby','keypoint','midpoint','intercept'):
                 candidate=self._snap_at(p,mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
                 if candidate is not None:
                     p=candidate;did_snap=True;self._snap_target=p
