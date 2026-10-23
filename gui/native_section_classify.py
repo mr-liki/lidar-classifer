@@ -481,25 +481,32 @@ class CanvasOverlay(QWidget):
                     angle = -float(data.get('rotation', 0.) or 0.)
                     transform = QTransform().translate(qpts[0].x(), qpts[0].y()).rotate(angle)
                     font = QFont(painter.font())
-                    # Native Text uses the VTK text palette's font settings;
-                    # imported world-height SNT labels retain their own sizing.
-                    if data.get('source') != 'attachment':
-                        font.setFamily(str(data.get('font_family',font.family())))
-                        if data.get('font_size') is not None:
-                            font.setPixelSize(max(6, min(512, int(data['font_size']))))
-                        font.setBold(bool(data.get('bold',False)))
-                        font.setItalic(bool(data.get('italic',False)))
-                    world_sized = data.get('source') in ('attachment', 'snt_text_copy') and float(data.get('height', 0.) or 0.) > 0.
-                    if world_sized:
-                        from gui.native_label_layout import world_text_transform
-                        font = QFont(font)
-                        font.setPixelSize(64)
-                        metrics = QFontMetricsF(font)
-                        transform = world_text_transform(to_qt, *pts[0], float(data['height']),
-                                                         -angle, metrics.capHeight())
-                        screen_height = math.hypot(transform.m21(), transform.m22()) * metrics.capHeight()
-                        if screen_height < 2.:
-                            continue
+                    if data.get('source') not in ('attachment', 'snt_text_copy'):
+                        # Use EXACTLY the same world anchor, size and rotation
+                        # as the native text hit-test / edit route.
+                        from gui.native_label_layout import native_draw_text_layout
+                        font, transform = native_draw_text_layout(to_qt, pts[0], data, font)
+                    else:
+                        # Imported CAD labels keep the existing SNT world-height
+                        # behavior, without inheriting native Draw font settings.
+                        if data.get('source') != 'attachment':
+                            font.setFamily(str(data.get('font_family', font.family())))
+                            font.setBold(bool(data.get('bold', False)))
+                            font.setItalic(bool(data.get('italic', False)))
+                        world_sized = float(data.get('height', 0.) or 0.) > 0.
+                        if not world_sized and data.get('source') == 'snt_text_copy':
+                            if data.get('font_size') is not None:
+                                font.setPixelSize(max(6, min(512, int(data['font_size']))))
+                        if world_sized:
+                            from gui.native_label_layout import world_text_transform
+                            font.setPixelSize(64)
+                            metrics = QFontMetricsF(font)
+                            transform = world_text_transform(to_qt, *pts[0],
+                                                             float(data['height']), -angle,
+                                                             metrics.capHeight())
+                            screen_height = math.hypot(transform.m21(), transform.m22()) * metrics.capHeight()
+                            if screen_height < 2.:
+                                continue
                     if data.get('source') == 'attachment':
                         rect = transform.mapRect(QFontMetricsF(font).boundingRect(text))
                         if not rect.intersects(QRectF(self.rect())):

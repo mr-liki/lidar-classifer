@@ -2636,22 +2636,19 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
 
     def _resolve_source_style(self, drawing):
         """Use the source drawing's persisted style so generated geometry restores correctly."""
-        style = dict(self.digitizer._get_draw_style("line") or {})
         if self._native_draw is not None:
             from PySide6.QtGui import QColor
-            origin = drawing.get('drawing') or drawing
-            raw = origin.get('color', origin.get('original_color'))
-            if isinstance(raw, str):
-                qc = QColor(raw)
-                if qc.isValid():
-                    raw = (qc.redF(), qc.greenF(), qc.blueF())
-                else:
-                    raw = None
-            if raw is None:
-                raw = style.get('color', (1., 0., 0.))
-            return (tuple(float(v) for v in raw[:3]),
-                    max(1., float(origin.get('width', style.get('width', 2)))),
-                    origin.get('line_style', style.get('style', 'solid')))
+            # The Vulkan-selected feature can be a native Draw shape OR an SNT
+            # entity. Do not read the legacy VTK digitizer's default Line style:
+            # it may not describe the chosen object's displayed appearance.
+            visible = self._native_draw._source_visual_style(drawing)
+            qc = QColor(str(visible.get('color') or '#ffffff'))
+            if not qc.isValid():
+                qc = QColor('#ffffff')
+            return ((qc.redF(), qc.greenF(), qc.blueF()),
+                    max(1., float(visible.get('width', 2))),
+                    str(visible.get('style') or 'solid'))
+        style = dict(self.digitizer._get_draw_style("line") or {})
         color = drawing.get("original_color")
         width = drawing.get("original_width")
         line_style = drawing.get("original_style")
@@ -2882,7 +2879,9 @@ class ParallelToolDialog(MinimizableDialogMixin, QDialog):
             self._native_draw._commit(
                 'parallel', xy,
                 color=QColor.fromRgbF(*color).name(), width=width,
-                line_style=line_style, source_type=orig_dtype,
+                # The Qt/Vulkan overlay reads 'style'; retaining 'line_style'
+                # also preserves compatibility with existing source metadata.
+                style=line_style, line_style=line_style, source_type=orig_dtype,
                 source_key=source['key'],
                 source_layer=source.get('layer'),
                 offset_distance=float(self.distance_spin.value()),

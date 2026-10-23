@@ -16519,8 +16519,10 @@ class TextEditDialog(QDialog):
         font_size_layout = QHBoxLayout()
         font_size_layout.addWidget(QLabel("Size:"))
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(0, 999)
-        self.size_spin.setValue(int(75 if current_size is None else current_size))
+        # A zero-point font is invalid; keep all accepted text sizes positive.
+        # This guards the palette but does not diagnose unrelated font warnings.
+        self.size_spin.setRange(1, 999)
+        self.size_spin.setValue(max(1, int(75 if current_size is None else current_size)))
         self.size_spin.setSuffix(" pt")
         font_size_layout.addWidget(self.size_spin)
         font_size_layout.addStretch()

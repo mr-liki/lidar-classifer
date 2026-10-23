@@ -489,6 +489,12 @@ class _InputFilter(QObject):
         if t == E.MouseButtonRelease:
             self._last = None
             if context_click:
+                # An idle Draw object still owns its native text glyphs: the
+                # ordinary LNT context menu should run only when no label hit.
+                draw = getattr(self.view, 'drawing', None)
+                if (draw is not None and not draw.active() and
+                        draw.try_text_context(ev.position())):
+                    return True
                 x, y = float(ev.position().x()), float(ev.position().y())
                 QTimer.singleShot(0, lambda: self._show_snt_context_menu(x, y))
             return True

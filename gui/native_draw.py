@@ -32,6 +32,8 @@ TOOL_MAP = {
     'curve_point': 'curve', 'curve': 'curve', 'hatcharea': 'hatch',
     'accudraw': 'accudraw',
     'parallel': 'parallel', 'centerline': 'centerline',
+    # Internal interactive operation, entered only from a native text menu.
+    'movetext': 'movetext', 'move_text': 'movetext',
 }
 
 
@@ -141,6 +143,11 @@ class NativeDraw:
         self._vertex_move_dragged = False
         self._vertex_insert_pending = False
         self._text_options = None
+        # Move native text by replacing its immutable world-coordinate record.
+        # No LiDAR/classification/SNT entity is edited.
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self.aux_shapes = []
         self._selection_bridge = None  # active Vulkan-only Select panel
         # The legacy Parallel/Centerline dialogs own interaction when Vulkan is
@@ -180,6 +187,252 @@ class NativeDraw:
             style['fill_color'] = QColor.fromRgbF(*style['fill_color']).name()
         return style
 
+    def _source_visual_style(self, feature):
+        """Copy the visible appearance of the selected native or SNT line.
+
+        Parallel is a derived CAD entity, not a transient rubber-band. Its
+        authored appearance must survive style edits to unrelated tools.
+        """
+        if feature.get('source') == 'native':
+            drawing = feature['drawing']
+            configured = self._style(drawing.get('type'))
+            configured.update({k: drawing[k] for k in ('color', 'width', 'style')
+                               if drawing.get(k) is not None})
+            # Older ParallelToolDialog records persisted 'line_style' only.
+            # Their original stroke must remain inheritable too.
+            if drawing.get('style') is None and drawing.get('line_style') is not None:
+                configured['style'] = drawing['line_style']
+            rgb = configured.get('color')
+            if isinstance(rgb, (tuple, list)) and len(rgb) >= 3:
+                # Native records may carry byte RGB or normalized RGB values.
+                components = [float(c) for c in rgb[:3]]
+                if all(0. <= c <= 1. for c in components):
+                    components = [255. * c for c in components]
+                configured['color'] = '#%02x%02x%02x' % tuple(
+                    max(0, min(255, round(c))) for c in components)
+            return {k: configured[k] for k in ('color', 'width', 'style')
+                    if k in configured}
+        if feature.get('source') == 'snt':
+            entity = feature.get('entity') or {}
+            # Use the *same* normalization and lineweight mapping used by the
+            # Vulkan SNT vector renderer, not the Parallel tool's defaults.
+            from gui.native_vector_overlay import _entity_rgb, _line_width_px
+            r, g, b = (int(v) for v in _entity_rgb(entity))
+            result = {'color': f'#{r:02x}{g:02x}{b:02x}',
+                      'width': max(1, round(_line_width_px(entity.get('_lineweight', 0))))}
+            raw = str(entity.get('style') or entity.get('line_style') or 'solid').lower()
+            raw = {'dash': 'dashed', 'dot': 'dotted', 'dashdot': 'dash-dot',
+                   'dashdotdot': 'dash-dot-dot'}.get(raw, raw)
+            result['style'] = (raw if raw in ('solid', 'dashed', 'dotted',
+                                             'dash-dot', 'dash-dot-dot') else 'solid')
+            return result
+        return {}
+
+    def _native_text_at(self, pos):
+        """Pick actual screen-space glyph bounds at *any* camera zoom.
+
+        Unlike an ordinary drawing's one-point geometry, a label is picked
+        throughout its text, not only within 12 px of its insertion anchor.
+        This uses the same projection/transform as CanvasOverlay.paintEvent.
+        """
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QFontMetricsF
+        from gui.native_label_layout import native_draw_text_layout
+        from gui.draw_clear_selection import is_clearable_draw
+        snapshot = self.canvas.projection_snapshot()
+        project = snapshot[1] if snapshot is not None else self.canvas.screen_from_section
+        screen = QPointF(pos.x(), pos.y())
+        for drawing in reversed(self.drawings):
+            if (drawing.get('type') != 'text' or
+                    not is_clearable_draw(drawing)):
+                continue
+            coords = drawing.get('coords')
+            if coords is None or len(coords) == 0 or not str(drawing.get('text', '')).strip():
+                continue
+            font, transform = native_draw_text_layout(project, coords[0], drawing,
+                                                      self.overlay.font())
+            bounds = QFontMetricsF(font).boundingRect(str(drawing['text']))
+            if not transform.mapRect(bounds).adjusted(-4, -4, 4, 4).contains(screen):
+                continue
+            inverse, ok = transform.inverted()
+            if not ok:
+                continue
+            # Precise rotated hit-test, with a small screen-pixel allowance.
+            scale = max(0.1, min(math.hypot(transform.m11(), transform.m12()),
+                                 math.hypot(transform.m21(), transform.m22())))
+            pad = 4. / scale
+            if bounds.adjusted(-pad, -pad, pad, pad).contains(inverse.map(screen)):
+                return drawing
+        return None
+
+    def try_text_context(self, pos):
+        """Consume a right-click ONLY when it hits an editable native label."""
+        if getattr(self, '_shutting_down', False):
+            return False
+        drawing = self._native_text_at(pos)
+        if drawing is None:
+            return False
+        # Showing QMenu synchronously from MouseButtonPress creates a nested
+        # event loop before button release on Windows; defer it one Qt tick.
+        from PySide6.QtCore import QTimer
+        global_pos = self.canvas.widget.mapToGlobal(pos.toPoint())
+        # Keep the original local hit position to preserve the user's grab
+        # point when Move Text is selected from the context menu.
+        from PySide6.QtCore import QPointF
+        hit_pos = QPointF(pos)
+        QTimer.singleShot(0, lambda d=drawing, p=global_pos, h=hit_pos:
+                          self._show_text_context_menu(d, p, h))
+        return True
+
+    def _show_text_context_menu(self, drawing, global_pos, hit_pos=None):
+        if getattr(self, '_shutting_down', False) or not any(
+                d is drawing for d in self.drawings):
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self.app)
+        edit_action = menu.addAction('Edit Text...')
+        move_action = menu.addAction('Move Text...')
+        delete_action = menu.addAction('Delete Text')
+        chosen = menu.exec(global_pos)
+        if chosen == edit_action:
+            self._edit_native_text(drawing)
+        elif chosen == move_action:
+            self._begin_native_text_move(drawing, hit_pos)
+        elif chosen == delete_action:
+            self.delete_drawings([id(drawing)])
+
+    def _begin_native_text_move(self, drawing, hit_pos=None):
+        """Arm a single text relocation, preserving the grabbed glyph position.
+
+        This internal tool receives input through both native LNT and promoted
+        Vulkan viewport routes; the prior Draw/Select tool is deactivated via
+        the ordinary activation path. Original geometry is unchanged until
+        the destination click, so Cancel cannot damage the document.
+        """
+        if not any(item is drawing for item in self.drawings):
+            return False
+        coords = drawing.get('coords') or ()
+        if not coords or drawing.get('type') != 'text':
+            return False
+        anchor = tuple(coords[0])
+        if len(anchor) < 2:
+            return False
+        delta = (0., 0.)
+        if hit_pos is not None:
+            try:
+                picked = self.canvas.section_at(hit_pos.x(), hit_pos.y())
+                delta = (float(anchor[0])-float(picked[0]),
+                         float(anchor[1])-float(picked[1]))
+            except (RuntimeError, TypeError, ValueError):
+                pass  # Fall back to selecting a new anchor directly.
+        if not self.activate('movetext'):
+            return False
+        self._moving_text_ref = drawing
+        self._moving_text_grab_offset = delta
+        self._moving_text_hover = (float(anchor[0]), float(anchor[1]))
+        self.app.statusBar().showMessage(
+            'Move Text: move pointer and left-click to place; Esc/right-click cancels',
+            7000)
+        self._paint()
+        return True
+
+    def _text_move_world_at(self, pos):
+        """Project cursor to XY without snapping to the label being moved."""
+        world = self.canvas.section_at(pos.x(), pos.y())
+        dx, dy = self._moving_text_grab_offset
+        return (float(world[0]) + dx, float(world[1]) + dy)
+
+    def _commit_native_text_move(self, pos):
+        """Commit the new world position as exactly one Draw Undo/Redo step."""
+        original = self._moving_text_ref
+        if original is None or not any(d is original for d in self.drawings):
+            self.cancel()
+            return True
+        try:
+            xy = self._text_move_world_at(pos)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.app.statusBar().showMessage(f'Move Text: cannot project point: {exc}', 3000)
+            return True  # Keep the active move; user can try again or cancel.
+        old_coords = list(original['coords'])
+        old_anchor = tuple(old_coords[0])
+        tolerance = max(1.e-10, 0.1 * self.canvas.world_per_pixel())
+        if math.dist(xy, old_anchor[:2]) <= tolerance:
+            self.cancel()
+            self.app.statusBar().showMessage('Move Text: position unchanged', 2500)
+            return True
+        old_coords[0] = (xy[0], xy[1], *old_anchor[2:])
+        before = list(self.drawings)
+        replacement = dict(original, coords=old_coords)
+        index = next(i for i, d in enumerate(self.drawings) if d is original)
+        self.drawings[index] = replacement
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self.record_object_change(before)
+        self._prune_deleted_native_refs({id(original)})
+        self.cancel()
+        self.app.statusBar().showMessage('Text moved (Ctrl+Z to undo)', 3500)
+        return True
+
+    def _edit_native_text(self, drawing):
+        """Reopen the existing editor; commit one immutable Undo/Redo step."""
+        if not any(d is drawing for d in self.drawings):
+            return False
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QDialog
+        from gui.digitize_tools import TextEditDialog
+        raw_color = drawing.get('color')
+        if raw_color is None:
+            raw_color = '#ff0000'
+        if isinstance(raw_color, (tuple, list)) and len(raw_color) >= 3:
+            channels = [float(v) for v in raw_color[:3]]
+            if all(0. <= c <= 1. for c in channels):
+                color = QColor.fromRgbF(*channels)
+            else:
+                color = QColor(*(max(0, min(255, round(c))) for c in channels))
+        else:
+            color = QColor(str(raw_color))
+        if not color.isValid():
+            color = QColor('#ff0000')
+        dialog = TextEditDialog(
+            current_text=str(drawing.get('text', '')),
+            current_size=max(1, int(drawing.get('font_size') or 75)),
+            current_font=drawing.get('font_family', 'Arial'),
+            current_bold=bool(drawing.get('bold', False)),
+            current_italic=bool(drawing.get('italic', False)),
+            current_color=(color.redF(), color.greenF(), color.blueF()),
+            parent=self.app,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        values = dialog.get_values()
+        if not str(values.get('text', '')).strip():
+            self.app.statusBar().showMessage('Text cannot be empty; edit cancelled.', 3000)
+            return False
+        old_size = max(1, int(drawing.get('font_size') or 75))
+        new_size = max(1, int(values.get('font_size') or old_size))
+        old_height = float(drawing.get('height') or 0.)
+        from gui.native_label_layout import native_draw_text_height
+        # Existing world-sized text must not jump in size when editing at a
+        # different zoom. First-time edits to old records establish a height.
+        new_height = (old_height * new_size / old_size if old_height > 0. else
+                      native_draw_text_height(values, self.canvas.world_per_pixel()))
+        rgb = values.get('color', (1., 0., 0.))
+        hex_color = '#%02x%02x%02x' % tuple(
+            max(0, min(255, round(float(c) * 255))) for c in rgb[:3])
+        before = list(self.drawings)
+        replacement = dict(drawing, text=values['text'], color=hex_color,
+                           font_family=values.get('font_family', 'Arial'),
+                           font_size=new_size, bold=bool(values.get('bold')),
+                           italic=bool(values.get('italic')), height=new_height)
+        idx = next(i for i, d in enumerate(self.drawings) if d is drawing)
+        self.drawings[idx] = replacement
+        self.record_object_change(before)
+        # No in-place mutation: the previous object remains valid in Undo.
+        # Remove only stale UI selection references, not unrelated fences.
+        self._prune_deleted_native_refs({id(drawing)})
+        self.app.statusBar().showMessage('Text updated (Ctrl+Z to undo)', 3000)
+        return True
+
     def activate(self, name):
         tool = TOOL_MAP.get(str(name or '').lower().replace(' ', '_'))
         if tool is None:
@@ -207,6 +460,9 @@ class NativeDraw:
             if getattr(self._selection_bridge,'_intersect_mode',False):
                 self._selection_bridge.exit_intersect_mode(commit=True)
         self.cancel(stand_down=False)
+        # Pick up settings saved while this native viewport was not visible.
+        from gui.draw_settings_dialog import load_draw_settings
+        self.styles = load_draw_settings()
         self._hover_selected_native_ref = None
         self._hover_pick_at = 0.0
         if tool != 'select' and self._selection_bridge is not None:
@@ -1148,6 +1404,16 @@ class NativeDraw:
     def press(self, pos, button):
         if not self.active() or button == Qt.MiddleButton:
             return False
+        if self.tool == 'movetext':
+            if button == Qt.RightButton:
+                self.cancel()  # Right-click cancels without opening another menu.
+                return True
+            return self._commit_native_text_move(pos) if button == Qt.LeftButton else False
+        # Existing text is editable on right-click even when the Text tool is
+        # still armed. Never hijack Right-click Finish for another Draw tool.
+        if button == Qt.RightButton and self.tool in ('text', 'select'):
+            if self.try_text_context(pos):
+                return True
         if self.tool == 'select' and self._selection_bridge is not None:
             return self._selection_bridge.press(pos,button)
         dialog = self._legacy_tool_dialog
@@ -1249,8 +1515,9 @@ class NativeDraw:
                 self.app.statusBar().showMessage('Choose an offset point away from the source line',3000)
                 return True
             points,distance=result
-            self._commit('parallel',points, offset_distance=distance,
-                         source_key=self._parallel_source['key'])
+            self._commit('parallel', points, offset_distance=distance,
+                         source_key=self._parallel_source['key'],
+                         **self._source_visual_style(self._parallel_source))
             self._last_pointer_pos=None
             self._paint()
             self.app.statusBar().showMessage(f'Parallel offset: {distance:.3f} drawing units',4000)
@@ -1384,11 +1651,16 @@ class NativeDraw:
             red, green, blue = options.get('color', (1., 0., 0.))
             hex_color = '#%02x%02x%02x' % tuple(
                 max(0, min(255, round(float(c)*255))) for c in (red,green,blue))
+            from gui.native_label_layout import native_draw_text_height
+            # Freeze label height in CAD/world units at the moment of placement.
+            # The font size remains an editable typographic point value.
+            font_size = max(1, int(options.get('font_size') or 75))
+            height = native_draw_text_height(options, self.canvas.world_per_pixel())
             self._commit('text', [p], text=options['text'], color=hex_color,
-                         font_family=options.get('font_family','Arial'),
-                         font_size=int(options.get('font_size',75)),
-                         bold=bool(options.get('bold',False)),
-                         italic=bool(options.get('italic',False)))
+                         font_family=options.get('font_family', 'Arial'),
+                         font_size=font_size, height=height,
+                         bold=bool(options.get('bold', False)),
+                         italic=bool(options.get('italic', False)))
             return True
         if self.tool == 'point':
             self._commit('point', [p])
@@ -1448,6 +1720,21 @@ class NativeDraw:
     def move(self, pos, buttons=Qt.NoButton):
         if not self.active() or buttons & Qt.MiddleButton:
             return False
+        if self.tool == 'movetext':
+            if self._moving_text_ref is None or not any(
+                    d is self._moving_text_ref for d in self.drawings):
+                self.cancel()
+                return True
+            try:
+                xy = self._text_move_world_at(pos)
+            except (RuntimeError, TypeError, ValueError):
+                return True
+            last = self._moving_text_hover
+            if last is None or math.dist(last, xy) > max(
+                    0.5 * self.canvas.world_per_pixel(), 1.e-10):
+                self._moving_text_hover = xy
+                self._paint()
+            return True
         if self.tool == 'select':
             if self._selection_bridge is not None:
                 return self._selection_bridge.move(pos, buttons)
@@ -1664,6 +1951,11 @@ class NativeDraw:
             self._paint()
             return True
 
+        if self.tool == 'movetext' and self._moving_text_ref is not None:
+            # No history entry until placed; Undo/Redo only cancels the preview.
+            self.cancel()
+            return True
+
         if self.vertex_target is not None and self._vertex_move_before is not None:
             # Ctrl+Z during a pending mouse drag cancels the preview; it must
             # not undo an unrelated already-completed geometry object.
@@ -1780,6 +2072,9 @@ class NativeDraw:
         self.points, self.hover = [], None
         self.point_redo.clear(); self._z_redo.clear(); self._z_points.clear()
         self._last_pointer_pos = None
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self._store_selection(None)
         self._paint()
 
@@ -1793,6 +2088,9 @@ class NativeDraw:
         self._vertex_move_dragged = False
         self._vertex_insert_pending = False
         self._text_options = None
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self._close_palettes()
         self.points, self.hover, self.dragging, self.vertex_target = [], None, False, None
         self.point_redo.clear(); self._z_redo.clear(); self._z_points.clear()
@@ -1890,12 +2188,18 @@ class NativeDraw:
                        getattr(self, '_hover_selected_native_ref', None)
                        if bridge is None and self.tool == 'select' else None)
         for i, drawing in enumerate(self.drawings):
+            if drawing is self._moving_text_ref and self._moving_text_hover is not None:
+                continue  # The live preview replaces the original, not duplicates it.
             if id(drawing) in hidden_in_intersect:
                 continue  # VTK-style overlay replaces original with split pieces.
             if gpu_blocks and drawing.get('source') == 'block_creation':
                 continue
             data = self._style(drawing.get('type'))
             data.update(drawing)
+            # Backward compatibility with lines saved by the old Parallel
+            # dialog, which used 'line_style' instead of the overlay's 'style'.
+            if drawing.get('style') is None and drawing.get('line_style') is not None:
+                data['style'] = drawing['line_style']
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
                                 else not picker_preview and i == self.selected
                                 and drawing is self._selected_native_ref)
@@ -1912,6 +2216,15 @@ class NativeDraw:
                 data['control_points'] = list(coords)
                 coords = _catmull_rom(coords)
             shapes.append(('drawing', coords, data))
+        if self._moving_text_ref is not None and self._moving_text_hover is not None:
+            # Only the placement preview moves; original world coordinates and
+            # every font/style field remain immutable until the left-click.
+            label = self._moving_text_ref
+            data = dict(self._style('text'), **label)
+            data['show_vertices'] = False
+            data['selected'] = False
+            data['hovered'] = False
+            shapes.append(('drawing_preview', [self._moving_text_hover], data))
         if self.points:
             preview = self.points + ([self.hover] if self.hover else [])
             # Draw Polyline is the polygon tool in the ribbon. Show the closing
@@ -1951,7 +2264,8 @@ class NativeDraw:
                 parallel=None
             if parallel is not None and abs(parallel[1])>1.e-9:
                 shapes.append(('drawing_preview', parallel[0],
-                               {'type':'parallel','color':'#39ffc0','width':2}))
+                               {'type': 'parallel', 'show_vertices': False,
+                                **self._source_visual_style(self._parallel_source)}))
         if self._snap_target is not None and self.tool not in ('select','parallel','centerline'):
             shapes.append(('drawing_preview',[self._snap_target],
                            {'type':'point','color':'#00e676','width':3}))

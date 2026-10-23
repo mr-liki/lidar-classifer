@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import QWidget, QDockWidget, QVBoxLayout, QLabel, QMessageBox
 from PySide6.QtWidgets import QComboBox, QDialog
 
@@ -874,7 +874,10 @@ class SectionCanvas(QWidget):
             return False
         if not backend.vector_upload_strip(0, 6, xyz, rgb, 0, 8, indices):
             return False
-        centre_px = 2. if self.slot == CUT_SLOT else 1.
+        # Keep the centre line equally visible in Cut-from-Cross and
+        # Cut-in-Cut.  The old 1 px cross-view line disappeared against dense
+        # towers/conductors while the cut-view's 2 px line remained obvious.
+        centre_px = 2.
         if half is None:
             return backend.vector_set_draw_ranges([0], [2], [centre_px])
         # The depth edges coincide with the centre at zero/small depth. Draw
@@ -909,6 +912,14 @@ class SectionCanvas(QWidget):
 
     def mousePressEvent(self, event):
         self.setFocus()
+        cross_cut_active = self.owner.route_cross_cut_to_canvas(
+            self, event.position())
+        # Once the centre has been placed, the operation is locked to its
+        # source view. Do not let a click in another cross view start locate,
+        # classification or another tool underneath the pending cut.
+        if cross_cut_active and not self.cut_armed:
+            event.accept()
+            return
         self.owner.active_slot = self.slot
         if self._pan_tool_input(event):
             return
@@ -951,6 +962,11 @@ class SectionCanvas(QWidget):
             self.drag = event.position()
 
     def mouseMoveEvent(self, event):
+        cross_cut_active = self.owner.route_cross_cut_to_canvas(
+            self, event.position())
+        if cross_cut_active and not self.cut_armed:
+            event.accept()
+            return
         if self._pan_tool_input(event):
             return
         measurement = getattr(self, 'measurement', None)
@@ -1499,7 +1515,54 @@ class NativeSections:
         if hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(True, 'cut_section')
         canvas.setFocus()
+        # Do not wait for a future MouseMoveEvent before showing feedback.
+        # Shortcut activation commonly happens while the pointer is outside
+        # the chosen cross-section canvas, which previously left Cut-from-
+        # Cross looking inactive.  Use the current pointer when it is inside
+        # the source canvas, otherwise start at the visible viewport centre.
+        cursor = canvas.mapFromGlobal(QCursor.pos())
+        preview_x = (cursor.x() if canvas.rect().contains(cursor)
+                     else canvas.width() * .5)
+        canvas.show_cut_preview(canvas.horizontal_at(preview_x))
         self.app.statusBar().showMessage('Cut: click the centre, then click to set depth; right-click cancels', 6000)
+        return True
+
+    def route_cross_cut_to_canvas(self, canvas, position):
+        """Move an uncommitted Cut-in-Cross gesture to the hovered view.
+
+        With several cross-section docks open, activating the tool must not
+        permanently bind it to whichever dock happened to own focus. Before
+        the first click the mouse owns routing; after the centre click the
+        chosen canvas remains locked through depth selection/finalization.
+
+        Returns True while a non-nested Cut-in-Cross operation owns section
+        input, including on a non-owner canvas after the centre is locked.
+        """
+        if (not getattr(self.app, 'cut_section_mode_on', False)
+                or self._nested_cut_active or canvas.slot == CUT_SLOT):
+            return False
+        if canvas.slot not in self.views or not len(canvas.indices):
+            return False
+
+        armed = next((view for view in self.views.values()
+                      if view.slot != CUT_SLOT and view.cut_armed), None)
+        # The first click commits the source view. Cursor travel during the
+        # depth step must not steal the operation into another section.
+        if armed is not None and armed.cut_centre is not None:
+            return True
+
+        if armed is not canvas:
+            if armed is not None:
+                armed.cut_armed = False
+                armed.cut_centre = None
+                armed.clear_cut_preview()
+            canvas.cut_armed = True
+            canvas.cut_centre = None
+            self.active_slot = canvas.slot
+            canvas.setFocus()
+
+        x = max(0.0, min(float(position.x()), float(max(0, canvas.width() - 1))))
+        canvas.show_cut_preview(canvas.horizontal_at(x))
         return True
 
     def cancel_cut(self):

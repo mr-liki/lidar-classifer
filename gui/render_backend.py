@@ -3821,6 +3821,14 @@ class _VulkanSurfaceWidget(_QWidget):
             return
         if is_right_click and self._owner is not None:
             pos = self._event_pos(event)
+            # When the Draw tool is idle, no active controller receives the
+            # press. Still allow editing an existing native label before the
+            # generic SNT/block context menu processes the same right-click.
+            view = getattr(self._owner, '_plan_draw_view', None)
+            native_draw = getattr(view, 'drawing', None)
+            if (native_draw is not None and not native_draw.active() and
+                    native_draw.try_text_context(pos)):
+                return
             x, y = float(pos.x()), float(pos.y())
             w, h = max(1, self.width()), max(1, self.height())
             # Defer one event-loop turn so the release finishes before a menu
