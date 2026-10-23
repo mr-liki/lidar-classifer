@@ -5056,10 +5056,12 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     from gui.theme_manager import ThemeColors
     from PySide6.QtWidgets import QLabel as QLabel2
 
-    renderer = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
+    from gui.native_draw import get_native_draw
+    native_picker_draw = get_native_draw(owner.app, create=True)
+    use_native_picker = native_picker_draw is not None
 
     def _add_actor_to_renderer(actor):
-        if actor is None:
+        if use_native_picker or actor is None:
             return
         r = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
         if r is None:
@@ -5073,7 +5075,7 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             pass
 
     def _remove_actor_from_renderer(actor):
-        if actor is None:
+        if use_native_picker or actor is None:
             return
         r = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
         if r is None:
@@ -5092,6 +5094,8 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             pass
 
     def _render_view():
+        if use_native_picker:
+            return
         try:
             owner.app.vtk_widget.render()
         except Exception:
@@ -5157,14 +5161,12 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
     from gui.native_fence_selection import (
         sync_native_fence_highlights, clear_native_fence_highlights,
     )
-    # VTK actors are not visible above the Vulkan main viewport.
-    from gui.native_draw import get_native_draw
-    use_native_picker = get_native_draw(owner.app, create=True) is not None
 
 
     def highlight_fence_in_3d(shape):
         if use_native_picker:
-            return  # Hover never changes selected-fence cyan state.
+            native_picker_draw.set_classification_fence_hover(dialog, shape)
+            return
         if current_hover_actor[0] is not None:
             _remove_actor_from_renderer(current_hover_actor[0])
             current_hover_actor[0] = None
@@ -5174,7 +5176,7 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         coords = shape.get("coords", [])
         if not coords:
             return
-        highlight_actor = _make_highlight_actor(coords, (1, 1, 0), 6)
+        highlight_actor = _make_highlight_actor(coords, (0, 1, 1), 6)
         if highlight_actor is not None:
             _add_actor_to_renderer(highlight_actor)
             current_hover_actor[0] = highlight_actor
@@ -5398,7 +5400,7 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
             def eventFilter(self, obj, event):
                 if event.type() == QEvent.Enter:
                     highlight_fence_in_3d(self.shape_data)
-                elif event.type() == QEvent.Leave:
+                elif event.type() in (QEvent.Leave, QEvent.Hide):
                     highlight_fence_in_3d(None)
                 return super().eventFilter(obj, event)
 
@@ -5553,6 +5555,14 @@ def _show_fence_selection_dialog(owner, window_title, info_text):
         _set_fence_picker_button_state(owner, False)
 
     dialog.finished.connect(on_dialog_finished)
+
+    class PickerHoverCleanup(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() in (QEvent.Hide, QEvent.Close, QEvent.WindowDeactivate):
+                highlight_fence_in_3d(None)
+            return super().eventFilter(obj, event)
+
+    dialog.installEventFilter(PickerHoverCleanup(dialog))
 
     def select_focused_or_first_fence():
         row = fence_list.currentRow()
@@ -8696,12 +8706,18 @@ class ClosedByClassDialog(QDialog):
             QMessageBox.warning(self, "Invalid Selection", f"Cannot analyze class {to_class} to itself")
             return
         
-        classification = self.app.data.get("classification")
-        xyz = self.app.data.get("xyz")
-        
-        if classification is None or xyz is None:
+        # The native LNT view owns its points; app.data may be None or stale.
+        # Read exact native records without creating VTK data or changing classes.
+        try:
+            from gui.native_byclass_height_analysis import height_analysis_points
+            self.distance_info_label.setText("Reading points for distance analysis...")
+            QApplication.processEvents()
+            xyz, classification, _native = height_analysis_points(self.app)
+        except Exception as exc:
+            self.distance_info_label.setText(f"Distance analysis unavailable: {exc}")
+            QMessageBox.warning(self, "Distance Analysis Unavailable", str(exc))
             return
-        
+
         print(f"\n{'='*60}")
         print(f"📊 ANALYZING POINT-TO-POINT DISTANCES")
         print(f"{'='*60}")
@@ -12213,29 +12229,24 @@ class InsideFenceDialog(QDialog):
             QMessageBox.warning(self, "No Fence", "Please select at least one fence first")
             return
         
-        # Use first fence for height analysis
-        fence_coords = self.selected_fences[0]['coords']  # ← ADD THIS LINE
-        
         from_classes = self._get_selected_from_classes()
-        if not from_classes:
+        if from_classes == []:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
             return
-        
-        classification = self.app.data.get("classification")
-        xyz = self.app.data.get("xyz")
-        
-        if classification is None or xyz is None:
-            QMessageBox.warning(self, "No Data", "No point cloud data available")
-            return
-        
+
         try:
-            # Get fence coordinates
-          
-            if isinstance(fence_coords, list):
-                fence_coords = np.array(fence_coords)
-            
+            from gui.native_byclass_height_analysis import height_analysis_points
+            from gui.native_byclass_parity import _polygon_coords, _fence_mask
+            polygons = _polygon_coords(self)
+            self.height_stats_label.setText("Reading points for height analysis...")
+            QApplication.processEvents()
+            xyz, classification, _native = height_analysis_points(
+                self.app, fence_polygons=polygons)
+
             # Get From class points
-            from_class_mask = np.isin(classification, from_classes)
+            from_class_mask = (np.ones(len(classification), dtype=bool)
+                               if from_classes is None else
+                               np.isin(classification, from_classes))
             from_class_xyz = xyz[from_class_mask]
             
             if len(from_class_xyz) == 0:
@@ -12243,7 +12254,7 @@ class InsideFenceDialog(QDialog):
                 return
             
             # Check which points are inside fence
-            inside_mask = self._points_inside_polygon(from_class_xyz, fence_coords)
+            inside_mask = _fence_mask(from_class_xyz, polygons)
             inside_points = from_class_xyz[inside_mask]
             
             if len(inside_points) == 0:
@@ -12284,6 +12295,7 @@ class InsideFenceDialog(QDialog):
             print(f"   Min: {min_h:.2f}m, Max: {max_h:.2f}m, Mean: {mean_h:.2f}m")
             
         except Exception as e:
+            self.height_stats_label.setText(f"Height analysis unavailable: {e}")
             print(f"❌ Height analysis failed: {e}")
             import traceback
             traceback.print_exc()

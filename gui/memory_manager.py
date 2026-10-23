@@ -113,6 +113,9 @@ class ObserverRegistry:
 def _free_undo_entry(entry: dict) -> None:
     if not isinstance(entry, dict):
         return
+    journal = entry.pop('lnt_conversion', None)
+    if journal is not None:
+        journal.close()
     for key in ("mask", "indices", "old_classes", "new_classes", "old", "new", "classification"):
         arr = entry.pop(key, None)
         if arr is not None:

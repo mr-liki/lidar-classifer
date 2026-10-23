@@ -33,7 +33,7 @@ def _exactly(handle, size, label):
     return data
 
 
-def inspect_directory(path, max_points=8_000_000):
+def inspect_directory(path, max_points=8_000_000, max_nodes=2_000_000):
     """Validate the directory and return exact leaf metadata (no payload read)."""
     path = Path(path)
     before = path.stat()
@@ -47,11 +47,11 @@ def inspect_directory(path, max_points=8_000_000):
             raise LNTDirectoryError('LNT directory offset exceeds the file.')
         handle.seek(index_at)
         total, num_nodes = DIR.unpack(_exactly(handle, DIR.size, 'directory header'))
-        if total > max_points:
+        if max_points is not None and total > max_points:
             raise LNTDirectoryError(f'{total:,} LNT points exceed exact-read limit {max_points:,}.')
         if num_nodes > (before.st_size - index_at - DIR.size) // ENTRY.size:
             raise LNTDirectoryError('LNT node directory is truncated.')
-        if num_nodes > 2_000_000:
+        if max_nodes is not None and num_nodes > max_nodes:
             raise LNTDirectoryError('Unreasonably large LNT directory; refusing inspection.')
         raw_entries = _exactly(handle, num_nodes * ENTRY.size, 'node directory')
     leaves = []
@@ -972,18 +972,13 @@ def plan_streamed_centerline_poles(
                 file_stat=(info['size'], info['mtime_ns']), stats=stats), info
 
 def plan_exact_class_conversion(path, from_classes, to_class, visible_classes=None,
-                                expected_total=None, max_changes=8_000_000,
-                                progress=None, cancelled=None, chunk_size=250_000):
-    """Plan an exact unfenced Convert against all LNT leaf classifications.
+                                expected_total=None, max_changes=None,
+                                progress=None, cancelled=None, chunk_size=250_000, journal=None):
+    """Audit every leaf and plan exact class edits without a default point cap.
 
-    Directory and leaf totals are verified first; only class bytes and stable
-    directory node / leaf-local indices are retained for changed records.
-    This never edits disk. It explicitly rejects more than ``max_changes``
-    changes because the current native Undo stack is array-backed.
-
-    A full-cloud read cap must NOT be confused with a cap on the number of
-    records we can *inspect*: a 237M-point file with fewer than 8M edits can
-    be classified safely after one complete read-only scan.
+    A supplied disk journal retains original classes and stable identities in
+    bounded batches. The array result remains available for small audit callers.
+    An explicit max_changes is optional; production Convert uses no count limit.
     """
     target = int(to_class)
     if not 0 <= target <= 255:
@@ -1004,12 +999,14 @@ def plan_exact_class_conversion(path, from_classes, to_class, visible_classes=No
                 raise LNTDirectoryError('Visible class outside uint8 range.')
             visibility[val] = True
         allowed &= visibility
+    target_selected = bool(allowed[target])
     allowed[target] = False
-    max_changes = int(max_changes)
-    if max_changes < 1:
-        raise LNTDirectoryError('Convert requires a positive Undo-memory budget.')
+    if max_changes is not None:
+        max_changes = int(max_changes)
+        if max_changes < 1:
+            raise LNTDirectoryError('Convert requires a positive explicit edit budget.')
     chunk_size = max(1, min(int(chunk_size), 500_000))
-    info = inspect_directory(path, max_points=2**63 - 1)
+    info = inspect_directory(path, max_points=None, max_nodes=None)
     total = info['total']
     if expected_total is not None and total != int(expected_total):
         raise LNTDirectoryError('Active LNT point count disagrees with its validated directory.')
@@ -1018,6 +1015,7 @@ def plan_exact_class_conversion(path, from_classes, to_class, visible_classes=No
     node_parts, local_parts, old_parts = [], [], []
     visited = 0
     count = 0
+    already_target = 0
     with open(path, 'rb') as handle:
         for leaf_no, (node_index, offset, points, _center, _half) in enumerate(info['leaves']):
             if cancelled is not None and cancelled():
@@ -1034,18 +1032,24 @@ def plan_exact_class_conversion(path, from_classes, to_class, visible_classes=No
                 block = np.frombuffer(_exactly(handle, size * POINT.itemsize,
                     f'Convert leaf {node_index} points {start}+{size}'), dtype=POINT)
                 classes = block['classification']
+                if target_selected:
+                    already_target += int(np.count_nonzero(classes == target))
                 rows = np.flatnonzero(allowed[classes])
                 count += len(rows)
-                if count > max_changes:
+                if max_changes is not None and count > max_changes:
                     raise LNTDirectoryError(
-                        f'Convert would change over {max_changes:,} points, '
-                        'exceeding the current reversible Undo-memory budget. '
-                        'Narrow the From class selection or use a smaller file. '
-                        'No changes were made.')
+                        f'Convert exceeds the explicitly requested {max_changes:,}-edit '
+                        'budget. No changes were made.')
                 if len(rows):
-                    node_parts.append(np.full(len(rows), node_index, dtype=np.uint32))
-                    local_parts.append((rows + start).astype(np.uint32))
-                    old_parts.append(classes[rows].copy())
+                    nodes = np.full(len(rows), node_index, dtype=np.uint32)
+                    local = (rows + start).astype(np.uint32)
+                    old = classes[rows].copy()
+                    if journal is not None:
+                        journal.append(nodes, local, old)
+                    else:
+                        node_parts.append(nodes)
+                        local_parts.append(local)
+                        old_parts.append(old)
                 visited += size
     if visited != total:
         raise LNTDirectoryError('Convert leaf scan did not read the complete LNT file.')
@@ -1054,9 +1058,13 @@ def plan_exact_class_conversion(path, from_classes, to_class, visible_classes=No
         raise LNTDirectoryError('LNT changed while Convert was reading; no changes made.')
     if cancelled is not None and cancelled():
         raise LNTDirectoryError('Convert cancelled before classification; no changes made.')
+    stats = dict(scanned=visited, matched=count + already_target,
+                 changed=count, already_target=already_target)
+    if journal is not None:
+        return dict(journal=journal, stats=stats, file_stat=(info['size'], info['mtime_ns'])), info
     def combine(parts, dtype):
         return np.concatenate(parts) if parts else np.empty(0, dtype=dtype)
-    return dict(node=combine(node_parts, np.uint32),
+    return dict(stats=stats, node=combine(node_parts, np.uint32),
                 local=combine(local_parts, np.uint32),
                 old_classes=combine(old_parts, np.uint8),
                 file_stat=(info['size'], info['mtime_ns'])), info
