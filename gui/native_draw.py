@@ -1300,6 +1300,31 @@ class NativeDraw:
                 coords[vi] = destination
         new_obj = dict(original, coords=coords)
         self.drawings[di] = new_obj
+        if original.get('type') == 'line' and self._vertex_move_before is not None:
+            # Line commits each edge separately. Move a shared chain corner
+            # on every incident edge, as Smart Line does within one record.
+            origin = tuple(original['coords'][vi][:2])
+            chain = original.get('line_chain')
+            for other_di, other in enumerate(self._vertex_move_before):
+                if other_di == di or other.get('type') != 'line':
+                    continue
+                if other.get('imported') or other.get('source') in (
+                        'block_creation', 'cell_creation', 'snt', 'snt_readonly'):
+                    continue
+                if chain is not None:
+                    if other.get('line_chain') != chain:
+                        continue
+                elif other.get('line_chain') is not None or abs(other_di - di) != 1:
+                    # Older drawings have no chain ID. Consecutively stored
+                    # edges sharing this corner are the recoverable topology.
+                    continue
+                other_coords = list(other.get('coords', []))
+                matches = [i for i, point in enumerate(other_coords)
+                           if tuple(point[:2]) == origin]
+                if matches:
+                    for i in matches:
+                        other_coords[i] = destination
+                    self.drawings[other_di] = dict(other, coords=other_coords)
         self._paint()
         return True
 
@@ -1321,9 +1346,10 @@ class NativeDraw:
             # The edited dict replaced the selected object. Retire any old
             # highlight/fence identity; stale highlights can draw a synthetic
             # closing edge across an otherwise OPEN edited polyline.
-            self._prune_deleted_native_refs({id(original)})
+            self._prune_deleted_native_refs({id(old) for old, new in
+                zip(before, self.drawings) if old is not new})
         else:
-            self.drawings[di] = original
+            self.drawings[:] = before
         self.vertex_target = None
         self._vertex_move_before = None
         self._vertex_move_original = None
@@ -1728,7 +1754,12 @@ class NativeDraw:
                 return True
             self.point_redo.clear()
             self._line_session_undone.clear()
-            self._commit('line', [start, p])
+            # Persist chain identity so later vertex edits do not pull an
+            # unrelated Line figure that happens to touch the same point.
+            from uuid import uuid4
+            chain = (self._line_session_refs[0].get('line_chain')
+                     if self._line_session_refs else None) or uuid4().hex
+            self._commit('line', [start, p], line_chain=chain)
             self._line_session_refs.append(self.drawings[-1])
             if len(self._line_session_refs) > 100:
                 del self._line_session_refs[:-100]
