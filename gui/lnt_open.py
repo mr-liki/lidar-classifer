@@ -328,6 +328,9 @@ class _InputFilter(QObject):
         nv = self.view.native
         if nv is not None:
             nv.pan(dx, dy)
+            schedule = getattr(self.view.app, '_schedule_main_view_history_commit', None)
+            if callable(schedule):
+                schedule('native_pan', delay_ms=120)
 
     def _show_snt_context_menu(self, x, y):
         if not self.view.mode_2d or self.view.native is None:
@@ -512,6 +515,10 @@ class _InputFilter(QObject):
                 # 2D plan mode: middle-drag is the sole pan gesture.
                 if b & Qt.MiddleButton:
                     nv.pan(dx, dy)
+                    schedule = getattr(
+                        self.view.app, '_schedule_main_view_history_commit', None)
+                    if callable(schedule):
+                        schedule('native_middle_pan', delay_ms=120)
             elif b & Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
                 nv.orbit(dx, dy)
             elif b & (Qt.RightButton | Qt.MiddleButton) or (
@@ -529,9 +536,22 @@ class _InputFilter(QObject):
                 ratio = 1.0
             if not nv.zoom_at(steps, pos.x() * ratio, pos.y() * ratio):
                 nv.zoom(steps)
+            schedule = getattr(self.view.app, '_schedule_main_view_history_commit', None)
+            if callable(schedule):
+                schedule('native_wheel_zoom', delay_ms=150)
             return True
         if t == E.KeyPress:
             k = ev.key()
+            if k in (Qt.Key_Left, Qt.Key_Right):
+                navigate = getattr(
+                    self.view.app,
+                    ('go_to_previous_main_view' if k == Qt.Key_Left
+                     else 'go_to_next_main_view'),
+                    None,
+                )
+                if callable(navigate):
+                    navigate()
+                return True
             if k == Qt.Key_Escape and getattr(self.view, "picker", None) is not None:
                 try:
                     self.view.picker.cancel()
@@ -729,8 +749,12 @@ class LntMainView(QObject):
                       "native_layer_pick"):
             try:
                 _tool = getattr(self, _attr, None)
-                if _tool is not None and hasattr(_tool, "cancel"):
-                    _tool.cancel()
+                if _tool is not None:
+                    shutdown = getattr(_tool, "shutdown", None)
+                    if callable(shutdown):
+                        shutdown()
+                    elif hasattr(_tool, "cancel"):
+                        _tool.cancel()
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -1327,6 +1351,12 @@ def close_lnt_view(app, flush_pending=True, reopening=False, keep_native_viewpor
               + ("; native viewport kept (empty canvas)"
                  if keep_native_viewport else "; main viewport returned to VTK"))
         if not reopening:
+            reset_history = getattr(app, "_reset_main_view_history_baseline", None)
+            if callable(reset_history):
+                # A retained empty Vulkan canvas has no LntMainView camera to
+                # capture.  Clear stale cloud history now and prime only when
+                # ownership has actually returned to VTK.
+                reset_history(prime=not keep_native_viewport)
             _keep_vector_overlay(app)
             _refresh_total_points(app)
 
@@ -1458,6 +1488,9 @@ def _show(app, lnt_path, name):
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
     app._lnt_main_view = view
+    reset_history = getattr(app, "_reset_main_view_history_baseline", None)
+    if callable(reset_history):
+        reset_history()
     if restore_applied_palette and restore_palette:
         # Restore all three owners of Main View presentation state atomically.
         # If the dialog keeps its neutral/reinitialised checkbox snapshot, its

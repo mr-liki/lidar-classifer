@@ -3945,6 +3945,13 @@ class GlobalShortcutFilter(QObject):
         """
         import numpy as np
 
+        # The visible LNT canvas owns a native Vulkan camera, independent of
+        # the hidden VTK camera below it.  Use the same canonical app action as
+        # the ribbon Fit button so keyboard and UI behaviour stay identical.
+        lnt_view = getattr(self.app_window, "_lnt_main_view", None)
+        if getattr(lnt_view, "native", None) is not None:
+            return self.app_window.fit_view_with_2d_lock(source="shift_f")
+
         already_locked = getattr(self.app_window, '_main_view_2d_locked', False)
 
         print(f"\n{'='*60}")

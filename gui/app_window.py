@@ -1925,7 +1925,7 @@ class NakshaApp(QMainWindow):
         self._last_changed_mask = None
         self._last_changed_indices = None
         self.classification_revision = 0
-        self._max_undo_steps = 10  # Global cap for classification undo/redo (max 10 undos/redos)
+        self._max_undo_steps = 20  # Global cap for classification undo/redo
         # Aliases — point to the SAME list objects (never reassign, always use .clear())
         self.undostack = self.undo_stack
         self.redostack = self.redo_stack
@@ -3773,6 +3773,33 @@ class NakshaApp(QMainWindow):
 
     def _capture_main_camera(self):
         """Capture current main-view camera (zoom/pan/orientation)."""
+        # An open LNT owns a separate native camera.  The VTK widget beneath
+        # it is hidden and its camera does not move when NativePanGesture calls
+        # lnt_view_pan, so reading VTK here makes every native pan look equal.
+        lnt_view = getattr(self, '_lnt_main_view', None)
+        native = getattr(lnt_view, 'native', None) if lnt_view is not None else None
+        if native is not None and getattr(lnt_view, 'mode_2d', False):
+            try:
+                width = float(getattr(native, '_w', 0) or 0)
+                height = float(getattr(native, '_h', 0) or 0)
+                centre = native.screen_to_world(width * .5, height * .5)
+                probe = native.screen_to_world(width * .5 + 1.0, height * .5)
+                if centre is not None and probe is not None and width > 0:
+                    metres_per_pixel = abs(float(probe[0]) - float(centre[0]))
+                    if metres_per_pixel > 0 and np.isfinite(metres_per_pixel):
+                        return {
+                            'pos': (float(centre[0]), float(centre[1]), 1.0),
+                            'fp': (float(centre[0]), float(centre[1]), 0.0),
+                            'up': (0.0, 1.0, 0.0),
+                            'ps': metres_per_pixel * height * .5,
+                            'pp': 1,
+                            'va': 30.0,
+                            'native_lnt': True,
+                            'native_center': (float(centre[0]), float(centre[1])),
+                            'native_width': metres_per_pixel * width,
+                        }
+            except (RuntimeError, AttributeError, TypeError, ValueError):
+                pass
         try:
             renderer = self.vtk_widget.renderer
             cam = renderer.GetActiveCamera()
@@ -3859,9 +3886,10 @@ class NakshaApp(QMainWindow):
         self._view_forward_stack = []
         self._view_history_current_state = None
         self._view_history_restoring = False
-        # Keep only a small rolling history so repeated pan/zoom sessions
-        # don't accumulate a large camera-state cache in memory.
-        self._view_history_max_steps = 15
+        # Camera states contain only a handful of scalars, so retaining 25
+        # navigation steps is inexpensive and remains completely independent
+        # of the classification undo/redo stacks (which can own point arrays).
+        self._view_history_max_steps = 25
         self._view_history_pending_reason = "view_change"
 
         self._view_history_timer = QTimer(self)
@@ -3923,11 +3951,31 @@ class NakshaApp(QMainWindow):
         if state is not None:
             self._view_history_current_state = self._copy_camera_state(state)
 
+    def _reset_main_view_history_baseline(self, prime=True):
+        """Start history from the camera owned by the current main viewport.
+
+        VTK and the Vulkan LNT canvas have independent cameras.  Carrying a
+        state across that ownership change would put an invisible renderer in
+        the Back stack and make the first navigation appear to do nothing.
+        """
+        timer = getattr(self, "_view_history_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._view_history_pending_reason = "view_change"
+        self._view_back_stack = []
+        self._view_forward_stack = []
+        self._view_history_current_state = None
+        if prime:
+            self._prime_main_view_history()
+
     def _copy_camera_state(self, state):
         if not state:
             return None
 
-        return {
+        copied = {
             "pos": tuple(float(v) for v in state.get("pos", (0.0, 0.0, 1.0))),
             "fp": tuple(float(v) for v in state.get("fp", (0.0, 0.0, 0.0))),
             "up": tuple(float(v) for v in state.get("up", (0.0, 1.0, 0.0))),
@@ -3935,10 +3983,30 @@ class NakshaApp(QMainWindow):
             "pp": int(state.get("pp", 1)),
             "va": float(state.get("va", 30.0)),
         }
+        if state.get('native_lnt'):
+            copied['native_lnt'] = True
+            copied['native_center'] = tuple(
+                float(v) for v in state.get('native_center', (0.0, 0.0)))
+            copied['native_width'] = float(state.get('native_width', 1.0))
+        return copied
 
     def _camera_states_equal(self, a, b, eps=1e-6):
         if not a or not b:
             return False
+
+        if bool(a.get('native_lnt')) != bool(b.get('native_lnt')):
+            return False
+        if a.get('native_lnt'):
+            ac, bc = a.get('native_center'), b.get('native_center')
+            if ac is None or bc is None:
+                return False
+            scale = max(1.0, abs(float(a.get('native_width', 1.0))),
+                        abs(float(b.get('native_width', 1.0))))
+            tolerance = max(eps, scale * 1e-10)
+            return (abs(float(ac[0]) - float(bc[0])) <= tolerance
+                    and abs(float(ac[1]) - float(bc[1])) <= tolerance
+                    and abs(float(a.get('native_width', 0.0))
+                            - float(b.get('native_width', 0.0))) <= tolerance)
 
         for key in ("pos", "fp", "up"):
             av = a.get(key)
@@ -3973,7 +4041,7 @@ class NakshaApp(QMainWindow):
 
         self._view_back_stack.append(state)
 
-        max_steps = int(getattr(self, "_view_history_max_steps", 15))
+        max_steps = int(getattr(self, "_view_history_max_steps", 25))
         if len(self._view_back_stack) > max_steps:
             self._view_back_stack.pop(0)
 
@@ -4064,6 +4132,18 @@ class NakshaApp(QMainWindow):
         if getattr(self, "_view_history_restoring", False):
             return False
 
+        # Pan/wheel commits are debounced. A user can press Back before that
+        # timer fires; commit the just-finished physical view first so the
+        # action never incorrectly reports an empty history stack.
+        timer = getattr(self, '_view_history_timer', None)
+        try:
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, '_view_history_pending_reason', 'view_change'))
+        except (RuntimeError, AttributeError):
+            pass
+
         if not getattr(self, "_view_back_stack", None):
             try:
                 self.statusBar().showMessage("No previous view", 1200)
@@ -4100,6 +4180,15 @@ class NakshaApp(QMainWindow):
 
         if getattr(self, "_view_history_restoring", False):
             return False
+
+        timer = getattr(self, '_view_history_timer', None)
+        try:
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, '_view_history_pending_reason', 'view_change'))
+        except (RuntimeError, AttributeError):
+            pass
 
         if not getattr(self, "_view_forward_stack", None):
             try:
@@ -4145,6 +4234,17 @@ class NakshaApp(QMainWindow):
         self._view_history_restoring = True
 
         try:
+            if state.get('native_lnt'):
+                lnt_view = getattr(self, '_lnt_main_view', None)
+                native = getattr(lnt_view, 'native', None) if lnt_view is not None else None
+                centre = state.get('native_center')
+                width = float(state.get('native_width', 0.0))
+                if native is None or centre is None or width <= 0:
+                    return False
+                native.frame_region(float(centre[0]), float(centre[1]), width)
+                native.frame(0.0)
+                return True
+
             renderer = self.vtk_widget.renderer
             interactor = self.vtk_widget.interactor
             camera = renderer.GetActiveCamera()
@@ -12097,7 +12197,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 10))
+            max_steps = int(getattr(self, '_max_undo_steps', 20))
         while len(self.redo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.redo_stack.pop(0))
@@ -12331,7 +12431,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 10))
+            max_steps = int(getattr(self, '_max_undo_steps', 20))
         while len(self.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.undo_stack.pop(0))
@@ -19800,6 +19900,45 @@ class NakshaApp(QMainWindow):
         except Exception as e:
             print(f"⚠️ Magnifier Error: {e}")
 
+    def _fit_native_lnt_view(self, source: str = "fit") -> bool:
+        """Fit the visible Vulkan LNT camera, if it owns the main viewport."""
+        lnt_view = getattr(self, "_lnt_main_view", None)
+        native = getattr(lnt_view, "native", None) if lnt_view is not None else None
+        if native is None:
+            return False
+
+        try:
+            # Preserve the exact pre-fit camera as the Back destination even
+            # when the user's last pan/zoom debounce has not fired yet.
+            timer = getattr(self, "_view_history_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, "_view_history_pending_reason", "view_change"))
+
+            # reset() uses the LNT's authoritative envelope, centres the
+            # camera, fits the complete cloud and restores orthographic plan
+            # mode.  set_2d() keeps the Python interaction mode in sync with
+            # that native camera state.
+            native.reset()
+            lnt_view.set_2d(True)
+            native.frame(0.0)
+            self._main_view_2d_locked = True
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
+
+            self._schedule_main_view_history_commit(
+                f"{source}_native_lnt", delay_ms=120)
+            if hasattr(self, "statusBar"):
+                self.statusBar().showMessage(
+                    "View fitted to the complete point cloud", 2000)
+            print(f"[LNT] native Vulkan view fitted ({source})")
+            return True
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            print(f"[LNT] native Vulkan fit failed ({source}): {exc}")
+            return False
+
     def fit_view(self):
         """
         Fit main view to visible data.
@@ -19809,6 +19948,11 @@ class NakshaApp(QMainWindow):
         Camera-only operation. Maintains 2D lock if active.
         Safe to call anytime.
         """
+        # The promoted LNT viewport has its own Vulkan camera.  Fitting the
+        # hidden VTK renderer has no visible effect, so route to its owner.
+        if self._fit_native_lnt_view(source="fit_view"):
+            return True
+
         try:
             import numpy as np
             
@@ -20067,6 +20211,9 @@ class NakshaApp(QMainWindow):
         Canonical "fit + keep main view 2D" entrypoint.
         Used by ribbon Fit and can be reused by future UI triggers.
         """
+        if self._fit_native_lnt_view(source=source):
+            return True
+
         try:
             short_filter = getattr(self, "short_cut_filter", None)
             if short_filter and hasattr(short_filter, "_fit_main_view_with_2d_lock"):

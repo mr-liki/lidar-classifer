@@ -7983,7 +7983,7 @@ def _apply_classification(app, update_selection, from_classes, to_class: int) ->
         from gui.memory_manager import current_recommended_undo_steps
         max_undo = int(current_recommended_undo_steps(app))
     except Exception:
-        max_undo = int(getattr(app, '_max_undo_steps', 10))
+        max_undo = int(getattr(app, '_max_undo_steps', 20))
     while len(app.undo_stack) > max_undo:
         app.undo_stack.pop(0)
 
@@ -9112,7 +9112,7 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
         from gui.memory_manager import current_recommended_undo_steps
         max_steps = int(current_recommended_undo_steps(app))
     except Exception:
-        max_steps = int(getattr(app, '_max_undo_steps', 10))
+        max_steps = int(getattr(app, '_max_undo_steps', 20))
     while len(app.undo_stack) > max_steps:
         from gui.memory_manager import _free_undo_entry
         _free_undo_entry(app.undo_stack.pop(0))
