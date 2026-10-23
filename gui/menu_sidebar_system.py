@@ -8706,12 +8706,18 @@ class ClosedByClassDialog(QDialog):
             QMessageBox.warning(self, "Invalid Selection", f"Cannot analyze class {to_class} to itself")
             return
         
-        classification = self.app.data.get("classification")
-        xyz = self.app.data.get("xyz")
-        
-        if classification is None or xyz is None:
+        # The native LNT view owns its points; app.data may be None or stale.
+        # Read exact native records without creating VTK data or changing classes.
+        try:
+            from gui.native_byclass_height_analysis import height_analysis_points
+            self.distance_info_label.setText("Reading points for distance analysis...")
+            QApplication.processEvents()
+            xyz, classification, _native = height_analysis_points(self.app)
+        except Exception as exc:
+            self.distance_info_label.setText(f"Distance analysis unavailable: {exc}")
+            QMessageBox.warning(self, "Distance Analysis Unavailable", str(exc))
             return
-        
+
         print(f"\n{'='*60}")
         print(f"📊 ANALYZING POINT-TO-POINT DISTANCES")
         print(f"{'='*60}")
@@ -12223,29 +12229,24 @@ class InsideFenceDialog(QDialog):
             QMessageBox.warning(self, "No Fence", "Please select at least one fence first")
             return
         
-        # Use first fence for height analysis
-        fence_coords = self.selected_fences[0]['coords']  # ← ADD THIS LINE
-        
         from_classes = self._get_selected_from_classes()
-        if not from_classes:
+        if from_classes == []:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
             return
-        
-        classification = self.app.data.get("classification")
-        xyz = self.app.data.get("xyz")
-        
-        if classification is None or xyz is None:
-            QMessageBox.warning(self, "No Data", "No point cloud data available")
-            return
-        
+
         try:
-            # Get fence coordinates
-          
-            if isinstance(fence_coords, list):
-                fence_coords = np.array(fence_coords)
-            
+            from gui.native_byclass_height_analysis import height_analysis_points
+            from gui.native_byclass_parity import _polygon_coords, _fence_mask
+            polygons = _polygon_coords(self)
+            self.height_stats_label.setText("Reading points for height analysis...")
+            QApplication.processEvents()
+            xyz, classification, _native = height_analysis_points(
+                self.app, fence_polygons=polygons)
+
             # Get From class points
-            from_class_mask = np.isin(classification, from_classes)
+            from_class_mask = (np.ones(len(classification), dtype=bool)
+                               if from_classes is None else
+                               np.isin(classification, from_classes))
             from_class_xyz = xyz[from_class_mask]
             
             if len(from_class_xyz) == 0:
@@ -12253,7 +12254,7 @@ class InsideFenceDialog(QDialog):
                 return
             
             # Check which points are inside fence
-            inside_mask = self._points_inside_polygon(from_class_xyz, fence_coords)
+            inside_mask = _fence_mask(from_class_xyz, polygons)
             inside_points = from_class_xyz[inside_mask]
             
             if len(inside_points) == 0:
@@ -12294,6 +12295,7 @@ class InsideFenceDialog(QDialog):
             print(f"   Min: {min_h:.2f}m, Max: {max_h:.2f}m, Mean: {mean_h:.2f}m")
             
         except Exception as e:
+            self.height_stats_label.setText(f"Height analysis unavailable: {e}")
             print(f"❌ Height analysis failed: {e}")
             import traceback
             traceback.print_exc()
