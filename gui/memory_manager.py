@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - optional at runtime
 MAX_UNDO_STEPS = 20
 # Classification tools (VTK, native .lnt, AI, conversions) share app.undo_stack /
 # app.redo_stack: at most this many undos and redos are kept, oldest dropped first.
-MAX_CLASSIFY_UNDO_STEPS = 10
+MAX_CLASSIFY_UNDO_STEPS = 20
 GC_INTERVAL_MS = 30_000
 RAM_CHECK_MS = 30_000
 RAM_WARN_PERCENT = 80
@@ -152,29 +152,17 @@ def _cloud_point_count(app) -> int:
 
 def _recommended_undo_steps(app, ram_pct: float) -> int:
     """
-    Adaptive undo depth:
-    - large clouds keep fewer snapshots to prevent long-session RAM growth
-    - tighten further under RAM pressure
+    Keep the user-visible classification history at its configured 20 steps.
+
+    The emergency cleanup in MemoryLeakGuard still trims aggressively at 85%
+    system RAM, where preserving process stability must take precedence.  At
+    ordinary memory levels, cloud size or a 70% warning must not silently turn
+    a documented 20-step history back into 10 steps.
     """
-    n_points = _cloud_point_count(app)
-
-    if n_points >= 12_000_000:
-        steps = 12
-    elif n_points >= 8_000_000:
-        steps = 15
-    elif n_points >= 4_000_000:
-        steps = 20
-    else:
-        steps = MAX_UNDO_STEPS
-
-    if ram_pct >= 80:
-        steps = min(steps, 6)
-    elif ram_pct >= 70:
-        steps = min(steps, 10)
-
-    # Classification undo/redo is capped at MAX_CLASSIFY_UNDO_STEPS: oldest steps
-    # are dropped first, so the user can undo/redo at most that many steps.
-    return max(4, min(int(steps), MAX_CLASSIFY_UNDO_STEPS))
+    del app  # kept in the signature for callers and future policy telemetry
+    if ram_pct >= 85:
+        return 4
+    return MAX_CLASSIFY_UNDO_STEPS
 
 
 def current_recommended_undo_steps(app) -> int:

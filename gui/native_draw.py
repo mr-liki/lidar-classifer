@@ -7,7 +7,9 @@ from functools import lru_cache
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QInputDialog
 
-from gui.native_selection_targets import close_freehand, snap_draft_closure, editable_draw
+from gui.native_selection_targets import (
+    close_freehand, snap_draft_closure, editable_draw, parallel_line_source,
+)
 from gui.native_stroke_geometry import (
     catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
 )
@@ -754,11 +756,13 @@ class NativeDraw:
         info=nearest_segment(p,coords)
         return info[0] if info else math.inf
 
-    def _pick_feature(self, p, tolerance=None, open_only=False, exclude=None):
+    def _pick_feature(self, p, tolerance=None, open_only=False, exclude=None, predicate=None):
         if tolerance is None:
             tolerance=max(self.canvas.world_per_pixel()*12., 1.e-9)
         best=None
         for feature in self._near_scene(p, tolerance):
+            if predicate is not None and not predicate(feature):
+                continue
             coords=feature['coords']
             if open_only and (len(coords)<2 or coords[0]==coords[-1]):
                 continue
@@ -776,6 +780,8 @@ class NativeDraw:
             return None
         # Second pass: a click inside a closed polygon selects the polygon.
         for feature in self._near_scene(p,tolerance):
+            if predicate is not None and not predicate(feature):
+                continue
             coords=feature['coords']
             if len(coords)>=4 and coords[0]==coords[-1] and _inside_polygon(p,coords[:-1]):
                 return feature
@@ -1294,6 +1300,10 @@ class NativeDraw:
             moved = new_obj['coords'][vi] != original['coords'][vi]
         if moved:
             self.record_object_change(before)
+            # The edited dict replaced the selected object. Retire any old
+            # highlight/fence identity; stale highlights can draw a synthetic
+            # closing edge across an otherwise OPEN edited polyline.
+            self._prune_deleted_native_refs({id(original)})
         else:
             self.drawings[di] = original
         self.vertex_target = None
@@ -1430,7 +1440,10 @@ class NativeDraw:
             if getattr(dialog, '_select_mode', False):
                 try:
                     p = self.canvas.section_at(pos.x(), pos.y())
-                    feature = self._pick_feature(p, open_only=self.tool == 'centerline')
+                    feature = self._pick_feature(
+                        p, open_only=self.tool == 'centerline',
+                        predicate=parallel_line_source if self.tool == 'parallel' else None,
+                    )
                 except (RuntimeError, TypeError, ValueError):
                     feature = None
                 if feature is not None and feature['source'] == 'snt':
@@ -1474,7 +1487,12 @@ class NativeDraw:
             self._paint()
             return True
         try:
-            p = self._point(pos)
+            # Add Vertex must pick the clicked CAD edge, not a nearby SNT
+            # trajectory/block endpoint found by the global snap engine.
+            # Pending tap/drag Move Vertex still uses the normal snap path.
+            p = (self.canvas.section_at(pos.x(), pos.y())
+                 if self.tool == 'vertex' and self.vertex_target is None
+                 else self._point(pos))
         except RuntimeError as exc:
             self.app.statusBar().showMessage(str(exc), 4000)
             return True
@@ -1498,11 +1516,13 @@ class NativeDraw:
                 self.app.statusBar().showMessage('Nothing selectable at cursor',2500)
             return True
         if self.tool == 'parallel':
-            if self._parallel_source is not None and not self._valid_source(self._parallel_source):
+            if self._parallel_source is not None and not (
+                    self._valid_source(self._parallel_source) and
+                    parallel_line_source(self._parallel_source)):
                 self._parallel_source=None
                 self._store_selection(None)
             if self._parallel_source is None:
-                source=self._pick_feature(p,open_only=True)
+                source=self._pick_feature(p,open_only=True, predicate=parallel_line_source)
                 if source is None:
                     self.app.statusBar().showMessage('Click an existing open SNT/native line first',3500)
                     return True
@@ -1617,13 +1637,17 @@ class NativeDraw:
                 # editable vertex, never as invalid rectangle control points.
                 coords = (self._native_coords(original) if is_rectangle
                           else list(original['coords']))
-                vertex = foot if is_rectangle else p
+                # Insert ON the selected segment. A click tolerance or a
+                # neighbouring SNT snap must not create a stray zigzag edge.
+                # Users can reposition the new vertex with Move Vertex.
+                vertex = foot
                 coords.insert(si + 1, vertex)
                 new_drawing = dict(original, coords=coords)
                 if is_rectangle:
                     new_drawing['type'] = 'polyline'
                 self.drawings[di] = new_drawing
                 self.record_object_change(before)
+                self._prune_deleted_native_refs({id(original)})
                 if getattr(getattr(self.app, 'digitizer', None), 'vertex_auto_drag', False):
                     self.vertex_target = (di, si+1)
                     self._vertex_move_original = self.drawings[di]
@@ -1635,7 +1659,9 @@ class NativeDraw:
                     segment = nearest_segment(p, feature['coords'])
                     if segment is not None:
                         coords = list(feature['coords'])
-                        coords.insert(segment[1]+1, p)
+                        # The SNT source stays read-only; any new native
+                        # clone subdivides the picked edge without a kink.
+                        coords.insert(segment[1]+1, segment[2])
                         self._commit('polyline', coords, source_key=feature['key'])
                     else:
                         self._commit('point', [p])
@@ -2300,10 +2326,24 @@ class NativeDraw:
         selection_refs = {key[1] for key in chosen if key[0] == 'native'}
         if bridge is None and getattr(self, '_selected_native_ref', None) is not None and getattr(self, 'selected', None) is not None:
             selection_refs.add(id(self._selected_native_ref))
+        # Fence classification may close an OPEN line into an area, but that
+        # virtual closure is not a real Draw edge. Repaint native reference
+        # highlights using their exact stored/display geometry instead.
+        live_native = ({id(d): d for d in self.drawings} if active_rings else {})
         for i, ring in enumerate(active_rings):
-            if i < len(active_refs) and active_refs[i] in selection_refs:
+            ref_id = active_refs[i] if i < len(active_refs) else None
+            if ref_id in selection_refs:
                 continue
-            shapes.append(('drawing', ring, {
+            if ref_id is not None:
+                real_drawing = live_native.get(ref_id)
+                if real_drawing is None:
+                    continue  # An obsolete selected object was edited away.
+                visible_coords = self._native_coords(real_drawing)
+                if not visible_coords:
+                    continue
+            else:
+                visible_coords = ring  # Explicit classification fence shape.
+            shapes.append(('drawing', visible_coords, {
                 'type': 'polyline', 'color': '#00ffff', 'selected': True,
                 'highlight_scope': 'draw', 'width': 4,
                 'show_vertices': False,
@@ -2343,8 +2383,8 @@ class NativeDraw:
             layer.remove('drawing', '__native_created_blocks__')
         self._block_vector_layer = None
         self._block_vector_signature = None
-        self.overlay._timer.stop()
-        self.overlay.close()
+        self.canvas._closed = True
+        self.overlay.shutdown()
 
 
 def native_plan_view(app, allow_snt=False):

@@ -662,8 +662,12 @@ class NativeSelectionController(QObject):
             dx=self._hover[0]-self._offset_origin[0]
             dy=self._hover[1]-self._offset_origin[1]
             for feat in self.selection_manager.get_features()[:100]:
+                # The preview is still smooth/render-sampled, but must not
+                # advertise its samples as new editable control vertices.
+                is_curve = feat.get('source') == 'native' and feat.get('type') == 'curve'
                 shapes.append(('drawing_preview',translate(feat['coords'],dx,dy),
-                               {'type':'polyline','color':'#79d6ff','width':2}))
+                               {'type':'polyline','color':'#79d6ff','width':2,
+                                'show_vertices': not is_curve}))
         if pts:
             if self._method in ('block','snt_text') and len(pts)>=2:
                 a,b=pts[0],pts[-1]
@@ -724,7 +728,13 @@ class NativeSelectionController(QObject):
         before=list(self.draw.drawings)
         replaced=[];created=[];imported=0
         for feat in selected:
-            coords=feat['coords']
+            # `feat['coords']` is the *rendered*, 20-samples-per-span curve.
+            # It is valid for hit-testing, never for storing an editable copy.
+            # Use original control vertices for native curves instead.
+            if feat['source'] == 'native' and feat['drawing'].get('type') == 'curve':
+                coords = feat['drawing'].get('coords', ())
+            else:
+                coords = feat['coords']
             if not coords:continue
             result=transform(coords)
             if not result or any(not math.isfinite(v) for p in result for v in p[:2]):
@@ -732,12 +742,17 @@ class NativeSelectionController(QObject):
             if feat['source']=='native':
                 orig=feat['drawing']
                 new=dict(orig,coords=list(result))
-                # Circle/rectangle/hatch/curve have non-vertex source data.
-                # They must be stored as transformed polyline geometry, not
-                # left with a stale centre/radius, hatch scanlines or spline.
-                if orig.get('type') in ('circle','rectangle','hatch','curve'):
+                # Circle/rectangle/hatch store special non-vertex geometry.
+                # Preserve the old VTK-compatible polyline conversion there.
+                # A Curve, however, stores real control vertices in 'coords'.
+                # Keep type='curve' so the native renderer samples the same
+                # Catmull-Rom spline on the translated/rotated/mirrored copy.
+                if orig.get('type') in ('circle','rectangle','hatch'):
                     new['type']='polyline'
                     new.pop('hatch_segments',None)
+                elif orig.get('type') == 'curve':
+                    new.pop('interpolated', None)
+                    new.pop('control_points', None)
                 if not copy:replaced.append(orig)
             elif feat['source']=='measure':
                 # Copying a measurement yields an independent Draw overlay;

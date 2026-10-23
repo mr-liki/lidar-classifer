@@ -362,8 +362,7 @@ class NativeMeasure:
 
     def shutdown(self):
         self.cancel()
-        self.overlay._timer.stop()
-        self.overlay.close()
+        self.overlay.shutdown()
 
 
 class NativeMeasureInput(QObject):

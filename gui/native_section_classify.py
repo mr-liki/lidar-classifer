@@ -278,6 +278,7 @@ class CanvasOverlay(QWidget):
         self._content_revision = 0
         self._follow_state = None
         self._paint_projection = None
+        self._shutdown = False
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._follow)
@@ -290,14 +291,40 @@ class CanvasOverlay(QWidget):
             overlays.add(self)
 
     def set_shapes(self, shapes):
+        if self._shutdown:
+            return
         self.shapes = list(shapes)
         self._changed()
 
     def set_marks(self, marks):
+        if self._shutdown:
+            return
         self.marks = [list(m) for m in marks]
         self._changed()
 
+    def shutdown(self):
+        """Stop callbacks and retire this native tool window exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.shapes = []
+        self.marks = []
+        self._follow_state = None
+        self._paint_projection = None
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass
+        try:
+            self.hide()
+            self.close()
+            self.deleteLater()
+        except (RuntimeError, ReferenceError):
+            pass
+
     def _changed(self):
+        if self._shutdown:
+            return
         self._content_revision += 1
         if self.shapes or self.marks:
             self._follow()
@@ -318,14 +345,16 @@ class CanvasOverlay(QWidget):
         self.update()
 
     def _follow(self, immediate=False):
+        if self._shutdown:
+            return
         canvas = self.canvas
         if not (self.shapes or self.marks) or not canvas.isVisible() or canvas._closed:
             self.hide()
             return
-        top = canvas.window()
-        if self.parentWidget() is not top:
-            # The dock floats as its own window: stay owned by (and above) it.
-            self.setParent(top, self.windowFlags())
+        # This is a native Qt.Tool window. Reparenting it after its platform
+        # QWidgetWindow exists is invalid on Windows ("must be a top level
+        # window") and can later crash inside Shiboken. It is constructed with
+        # the correct owner; global positioning does not require reparenting.
         top_left = canvas.mapToGlobal(canvas.rect().topLeft())
         if self.pos() != top_left:
             self.move(top_left)
@@ -1812,4 +1841,4 @@ class SectionClassifier:
             )
         app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)
-    
+
