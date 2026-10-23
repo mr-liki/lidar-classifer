@@ -167,6 +167,8 @@ class NativeDraw:
         self._fence_selection_revision = 0
         self._fence_picker_preview_owner = None
         self._fence_picker_preview_rings = []
+        self._fence_picker_hover_owner = None
+        self._fence_picker_hover_ring = None
         self._object_actions = []
         self._object_redo = []
         self._shutting_down = False
@@ -570,6 +572,21 @@ class NativeDraw:
         if self._legacy_tool_dialog is not dialog:
             return
         self._legacy_dialog_highlights = list(features)
+        self._paint()
+
+    def set_classification_fence_hover(self, owner, shape=None):
+        """Preview one picker row without changing selected fences or drawings."""
+        from gui.native_byclass_fences import _valid_ring
+        key = id(owner)
+        if shape is None:
+            if getattr(self, '_fence_picker_hover_owner', None) != key:
+                return
+            self._fence_picker_hover_owner = None
+            self._fence_picker_hover_ring = None
+        else:
+            ring = _valid_ring(shape.get('coords', ()))
+            self._fence_picker_hover_owner = key if ring else None
+            self._fence_picker_hover_ring = ring
         self._paint()
 
     def set_classification_fence_highlights(self, owner, fences, *,
@@ -2317,6 +2334,13 @@ class NativeDraw:
                 'show_vertices': False,
             }))
         shapes.extend(self.aux_shapes)
+        hover_ring = getattr(self, '_fence_picker_hover_ring', None)
+        if hover_ring:
+            shapes.append(('drawing', hover_ring, {
+                'type': 'polyline', 'color': '#00ffff', 'width': 6,
+                'style': 'solid', 'show_vertices': False,
+                'source': 'fence_picker_hover',
+            }))
         self.overlay.set_shapes(shapes)
 
     def shutdown(self):
@@ -2332,6 +2356,8 @@ class NativeDraw:
         self._active_fence_shapes = []
         self._fence_picker_preview_owner = None
         self._fence_picker_preview_rings = []
+        self._fence_picker_hover_owner = None
+        self._fence_picker_hover_ring = None
         if dialog is not None:
             try:
                 dialog.close()

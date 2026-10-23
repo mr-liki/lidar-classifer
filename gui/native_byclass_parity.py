@@ -69,14 +69,14 @@ def validate_class_parameters(params):
         validate_class_parameters(step.get('params', {}))
 
 
-def _available_cloud(app, *, allow_busy=False):
+def _available_cloud(app, *, allow_busy=False, class_wide=False):
     from gui.native_by_class import native_main_view
     from gui.flight_line_filter import flight_line_visibility_for_slot
     view = native_main_view(app)
     if view is None:
         raise NativeByClassError('Native LNT query/write API is not available.')
     hidden = [key for key, on in flight_line_visibility_for_slot(app, 0).items() if not on]
-    if hidden:
+    if hidden and not class_wide:
         raise NativeByClassError(
             'Cannot exactly honor hidden flight lines: the native query API '
             'does not supply point_source_id. Re-enable all flight lines or '
@@ -463,15 +463,12 @@ def _with_progress(dialog, name, operation, preview=False, scope_polygons=None,
     from PySide6.QtWidgets import QApplication, QProgressDialog
     from PySide6.QtCore import Qt
     app = dialog.app
-    # Keep the Convert gateway inside this shared progress handler. GUI
-    # dialogs still call one function, and small-cloud operation callbacks
-    # retain their historic signature / VTK parity testability.
+    # Every Convert scans the full file. Viewport/LOD queries and display
+    # filters must never decide which selected source-class records are edited.
     if convert_spec is not None and name.lower() == 'convert':
-        from gui.native_by_class import cloud_bbox
-        view = _available_cloud(app)
-        if cloud_bbox(view)[4] > MAX_EXACT_POINTS:
-            return convert_large_cloud(dialog, convert_spec[0], convert_spec[1],
-                                       preview=preview)
+        dialog._native_convert_stats = None
+        return convert_large_cloud(dialog, convert_spec[0], convert_spec[1],
+                                   preview=preview)
     _available_cloud(app)
     app._native_byclass_busy = True
     progress = QProgressDialog(f'{name}: reading cloud...', 'Cancel', 0, 100, dialog)
@@ -852,77 +849,65 @@ def route_algorithm_dialog(dialog, func, kwargs, name):
 
 
 def convert_large_cloud(dialog, sources, target, preview=False):
-    """Exact class-only conversion of a large native LNT cloud.
-
-    Convert is intentionally UNFENCED. Preflight scans the *entire* validated
-    leaf directory and plans eligible native node/local IDs in bounded blocks.
-    No write occurs until the plan is complete, unchanged, and within the
-    reversible in-memory Undo budget. This is not an unsafe approximate tile
-    conversion or a silent 8M cap bump. If the changed-point set is larger
-    than the history budget, fail closed instead of partially classifying.
-    """
+    """Convert all matching native records with bounded RAM and disk-backed Undo."""
     from PySide6.QtWidgets import QApplication, QProgressDialog
     from PySide6.QtCore import Qt
     from gui.native_lnt_directory import plan_exact_class_conversion
+    from gui.native_conversion_history import ConversionJournal, ConversionCancelled
     from gui.native_by_class import cloud_bbox
 
     app = dialog.app
-    view = _available_cloud(app)
+    view = _available_cloud(app, class_wide=True)
     total = cloud_bbox(view)[4]
-    if total <= MAX_EXACT_POINTS:
-        raise NativeByClassError('Large-cloud conversion invoked on a small cloud.')
     app._native_byclass_busy = True
     progress = QProgressDialog('Convert: scanning exact LNT classes...', 'Cancel',
                                0, 100, dialog)
-    progress.setWindowTitle('Convert (Vulkan large cloud)')
-    progress.setWindowModality(Qt.WindowModal)
+    progress.setWindowTitle('Convert (Vulkan)')
+    progress.setWindowModality(Qt.ApplicationModal)
     progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
     progress.show()
+    journal = None
+    retained = False
     try:
+        journal = ConversionJournal(target)
         def report(pct, message=''):
             progress.setValue(max(0, min(100, int(pct))))
             if message:
                 progress.setLabelText(str(message)[:180])
             QApplication.processEvents()
-        palette = getattr(app, 'class_palette', None)
-        visible = (None if not isinstance(palette, dict) or not palette
-                   else [int(code) for code, cfg in palette.items()
-                         if isinstance(cfg, dict) and cfg.get('show', True)])
         plan, info = plan_exact_class_conversion(
-            view.lnt_path, sources, target, visible_classes=visible,
-            expected_total=total, max_changes=MAX_EXACT_POINTS,
+            view.lnt_path, sources, target,
+            expected_total=total, journal=journal,
             progress=report, cancelled=progress.wasCanceled)
-        amount = len(plan['node'])
+        journal.seal()
+        amount = journal.count
+        dialog._native_convert_stats = plan['stats']
         if progress.wasCanceled():
             raise NativeByClassCancelled('Convert cancelled. Nothing was written.')
         if preview or amount == 0:
             report(100, f'Convert preview: {amount:,} points' if preview
                    else 'Convert: no eligible source points')
             return amount
-        if _available_cloud(app, allow_busy=True) is not view:
+        if _available_cloud(app, allow_busy=True, class_wide=True) is not view:
             raise NativeByClassError(
                 'Active LNT view changed during Convert. No writes were made.')
         state = os.stat(view.lnt_path)
         if (state.st_size, state.st_mtime_ns) != plan['file_stat']:
             raise NativeByClassError('LNT file changed during Convert preflight; no writes.')
-        report(94, f'Convert: writing {amount:,} exact point classifications')
-        nodes = np.ascontiguousarray(plan['node'], dtype=np.uint32)
-        locals_ = np.ascontiguousarray(plan['local'], dtype=np.uint32)
-        old = np.ascontiguousarray(plan['old_classes'], dtype=np.uint8)
-        new = np.full(amount, target, dtype=np.uint8)
-        # Match the existing native classification write/history contract.
-        if not view.native.set_classes(nodes, locals_, new):
-            # A failed native writer may have partially edited; request an
-            # immediate original-class restore, then require manual audit.
-            restored = view.native.set_classes(nodes, locals_, old)
-            raise NativeByClassError(
-                'Native Convert write failed; rollback ' +
-                ('was submitted' if restored else 'also failed') +
-                '. Audit the test file before continuing. ' +
-                str(getattr(view.native, 'last_error', '')))
-        app.undo_stack.append(dict(lnt_path=view.lnt_path, lnt_node=nodes,
-                                   lnt_local=locals_, old_classes=old,
-                                   new_classes=new))
+        from gui.lnt_ai_bridge import sync_store_rows
+        try:
+            journal.replay(
+                view.native, progress=lambda done, count: report(
+                    85 + int(14 * done / count),
+                    f'Convert: writing {done:,}/{count:,} classifications'),
+                cancelled=progress.wasCanceled,
+                sync=lambda n, l, c: sync_store_rows(app, view, n, l, c))
+        except ConversionCancelled as error:
+            raise NativeByClassCancelled(str(error)) from error
+        app.undo_stack.append(dict(lnt_path=view.lnt_path, lnt_conversion=journal))
+        retained = True
         from gui.native_history_routing import record_native_action
         record_native_action(app, 'classification')
         for stack in (getattr(app, 'redo_stack', None),
@@ -932,8 +917,6 @@ def convert_large_cloud(dialog, sources, target, preview=False):
         from gui.memory_manager import trim_undo_stack
         trim_undo_stack(app)
         app.classification_revision = int(getattr(app, 'classification_revision', 0)) + 1
-        from gui.lnt_ai_bridge import sync_store_rows
-        sync_store_rows(app, view, nodes, locals_, new)
         view.native.frame(0.0)
         try:
             from gui.point_count_widget import refresh_point_statistics
@@ -950,8 +933,17 @@ def convert_large_cloud(dialog, sources, target, preview=False):
               f'{info["nodes"]:,} verified LNT directory nodes')
         return amount
     finally:
+        if journal is not None and not retained:
+            journal.close()
         progress.close()
         app._native_byclass_busy = False
+
+
+def _conversion_summary(stats, preview=False):
+    action = 'Would change' if preview else 'Changed'
+    return (f'Scanned {stats["scanned"]:,} points; matched {stats["matched"]:,}.\n'
+            f'{action} {stats["changed"]:,}; already in target class: '
+            f'{stats["already_target"]:,}.')
 
 
 def route_convert_dialog(dialog, mode, preview=False):
@@ -993,19 +985,20 @@ def route_convert_dialog(dialog, mode, preview=False):
         if mode in ('height', 'close', 'fence') and sources is not None and target in sources:
             raise NativeByClassError('To class must not be among From classes.')
         scope_note = (
-            '\n\nConvert is class-wide when no fence is selected. '
-            'For a polygon-limited conversion, use By Class > Fence.'
+            '\n\nConvert scans the entire loaded file, including hidden classes '
+            'and off-screen points. For a polygon-limited conversion, use By Class > Fence.'
             if mode == 'convert' and not polygons else ''
         )
         if not preview and not _ask(dialog, f'{mode.title()} on Vulkan',
                     f'Apply {mode.title()} to the LNT point cloud?\n\n'
-                    'This uses the original VTK operation rules with the exact '
-                    'native records. The LNT file will be changed; keep a backup.'
+                    'This uses exact native records. '
+                    'The LNT file will be changed; keep a backup.'
                     + scope_note):
             return True
         def calculate(xyz, updated, report, cancelled):
             initial = updated.copy()
-            eligible = _palette_eligible(dialog.app, initial)
+            eligible = (np.ones(len(initial), dtype=bool) if mode == 'convert'
+                        else _palette_eligible(dialog.app, initial))
             if polygons and mode != 'height':
                 inside = _fence_mask(xyz, polygons)
                 n_inside = int(np.count_nonzero(inside))
@@ -1088,14 +1081,23 @@ def route_convert_dialog(dialog, mode, preview=False):
             if fences_used:
                 from gui.draw_clear_selection import mark_used_classification_fences
                 mark_used_classification_fences(dialog.app, fences_used, operation=mode)
+        stats = getattr(dialog, '_native_convert_stats', None) if mode == 'convert' else None
+        summary = (_conversion_summary(stats, preview) if stats is not None else
+                   f'{"Preview" if preview else "Converted"}: {count:,} points')
         label = getattr(dialog, 'preview_label', None) or getattr(dialog, 'info_label', None)
         if label is not None:
-            label.setText(f'{"Preview" if preview else "Converted"}: {count:,} points')
+            label.setText(summary)
+            if stats is not None:
+                label.setWordWrap(True)
         if not preview:
             ribbon = getattr(dialog, 'ribbon_parent', None)
             if ribbon is not None:
-                ribbon.update_status(f'Converted {count:,} native points', 'success')
-            _report(dialog, f'{mode.title()}: {count:,} native records reclassified.')
+                ribbon.update_status(
+                    f'{stats["matched"]:,} matched; {count:,} changed; '
+                    f'{stats["already_target"]:,} already target' if stats is not None
+                    else f'Converted {count:,} native points', 'success')
+            _report(dialog, summary if stats is not None else
+                    f'{mode.title()}: {count:,} native records reclassified.')
     except NativeByClassCancelled:
         pass
     except Exception as exc:

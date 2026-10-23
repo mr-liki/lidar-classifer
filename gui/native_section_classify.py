@@ -18,7 +18,7 @@ import time
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
 from gui.native_measure_geometry import measurement_labels, measurement_text
@@ -270,6 +270,8 @@ class CanvasOverlay(QWidget):
         super().__init__(canvas.window(), Qt.Tool | Qt.FramelessWindowHint |
                          Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.canvas = canvas
+        self._owner_window = canvas.window()
+        self._owner_window.installEventFilter(self)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -317,15 +319,33 @@ class CanvasOverlay(QWidget):
             self._paint_projection = None
         self.update()
 
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, '_owner_window', None):
+            kind = event.type()
+            if (kind in (QEvent.Hide, QEvent.Close)
+                    or (kind == QEvent.WindowStateChange and watched.isMinimized())):
+                # Hide immediately, preserving shapes for the owner's restore.
+                self.hide()
+        return super().eventFilter(watched, event)
+
     def _follow(self, immediate=False):
         canvas = self.canvas
         if not (self.shapes or self.marks) or not canvas.isVisible() or canvas._closed:
             self.hide()
             return
         top = canvas.window()
+        if self._owner_window is not top:
+            self._owner_window.removeEventFilter(self)
+            self._owner_window = top
+            top.installEventFilter(self)
         if self.parentWidget() is not top:
             # The dock floats as its own window: stay owned by (and above) it.
             self.setParent(top, self.windowFlags())
+        # Qt keeps children logically visible while their window is minimized.
+        # Timer/present callbacks must not re-show the transparent tool window.
+        if not top.isVisible() or top.isMinimized():
+            self.hide()
+            return
         top_left = canvas.mapToGlobal(canvas.rect().topLeft())
         if self.pos() != top_left:
             self.move(top_left)

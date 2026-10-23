@@ -133,8 +133,14 @@ def native_classification_history(app, redo=False):
     store = getattr(app, '_lnt_section_store', None)
     if view is None or getattr(view, 'native', None) is None:
         return False
+    if getattr(app, '_native_byclass_busy', False):
+        app.statusBar().showMessage('Wait for the current classification operation.', 3000)
+        return True
     source = getattr(app, 'redo_stack' if redo else 'undo_stack', [])
     destination = getattr(app, 'undo_stack' if redo else 'redo_stack', [])
+    if source and isinstance(source[-1], dict) and 'lnt_conversion' in source[-1]:
+        from gui.native_conversion_history import conversion_history
+        return conversion_history(app, view, source, destination, redo)
     if source and isinstance(source[-1], dict) and 'lnt_node' in source[-1]:
         return _native_ai_history(app, view, source, destination, redo)
     if store is None or not source:
