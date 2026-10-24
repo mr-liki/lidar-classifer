@@ -459,6 +459,43 @@ class GlobalShortcutFilter(QObject):
 
         return False
 
+    def _dismiss_focused_gis_panel(self, obj) -> bool:
+        """Escape closes the focused GIS panel before reaching canvas tools."""
+        from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+        if QApplication.activeModalWidget() or QApplication.activePopupWidget():
+            return False
+        focus = QApplication.focusWidget()
+        if focus is None and isinstance(obj, QWidget):
+            focus = obj
+        for attr, label in (("_gis_catalog_dock", "Catalog"),
+                            ("_gis_layers_panel", "Layers")):
+            panel = getattr(self.app_window, attr, None)
+            if panel is None or not panel.isVisible():
+                continue
+            if focus is not panel and (focus is None or not panel.isAncestorOf(focus)):
+                continue
+            panel.hide()
+            if label == "Layers":
+                sync = getattr(self.app_window, "_sync_activity_bar", None)
+                if callable(sync):
+                    sync()
+            manager = getattr(self.app_window, "ribbon_manager", None)
+            ribbon = getattr(manager, "ribbons", {}).get("file")
+            if ribbon is not None:
+                for button in ribbon.findChildren(QPushButton):
+                    if button.property("ribbonText") == label:
+                        blocked = button.blockSignals(True)
+                        button.setChecked(False)
+                        button.blockSignals(blocked)
+                        section = button.parentWidget()
+                        while section is not None:
+                            if getattr(section, "active_button", None) is button:
+                                section.active_button = None
+                                break
+                            section = section.parentWidget()
+            return True
+        return False
+
     def _is_runtime_shortcut_suspended(self) -> bool:
         """
         Temporarily suppress runtime shortcuts while the user is editing
@@ -471,6 +508,14 @@ class GlobalShortcutFilter(QObject):
             # Fallback guard: if an SNT layer-name input dialog is modal/active,
             # avoid firing runtime shortcuts for typed characters.
             from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit
+            # Configure Shortcuts owns its keys, including Escape to close.
+            # Runtime classification/tool handlers must not consume them first.
+            manager = getattr(self.app_window, "shortcut_manager", None)
+            if manager is not None and manager.isVisible():
+                focus = QApplication.focusWidget()
+                if (QApplication.activeWindow() is manager or focus is manager
+                        or (focus is not None and manager.isAncestorOf(focus))):
+                    return True
             modal = QApplication.activeModalWidget()
             if isinstance(modal, QInputDialog):
                 title = str(modal.windowTitle() or "").strip().lower()
@@ -621,6 +666,10 @@ class GlobalShortcutFilter(QObject):
 
 
         if event.type() == QEvent.KeyPress:
+            if (event.key() == Qt.Key_Escape and event.modifiers() == Qt.NoModifier
+                    and self._dismiss_focused_gis_panel(obj)):
+                event.accept()
+                return True
             if event.key() == Qt.Key_Escape and getattr(
                 self.app_window, "_left_pan_shortcut_active", False
             ):

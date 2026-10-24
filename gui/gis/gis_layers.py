@@ -2663,6 +2663,7 @@ def show_gis_layers_panel(app):
                 pass
             apply_gis_dock_style(_panel)
             _panel.show()
+            _panel.setFocus(Qt.OtherFocusReason)
             if hasattr(app, "_sync_activity_bar"):
                 try:
                     app._sync_activity_bar()
@@ -2710,6 +2711,7 @@ def show_gis_layers_panel(app):
             pass
     apply_gis_dock_style(panel)
     panel.show()
+    panel.setFocus(Qt.OtherFocusReason)
     if hasattr(app, "_sync_activity_bar"):
         try:
             app._sync_activity_bar()

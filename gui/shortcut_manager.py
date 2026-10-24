@@ -8,7 +8,7 @@ from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QTimer
 from PySide6.QtWidgets import QGraphicsOpacityEffect
 from PySide6.QtWidgets import QFrame, QAbstractItemView
 from PySide6.QtCore import Signal, Qt, QSettings, QEvent
-from PySide6.QtGui import QColor, QAction, QActionGroup
+from PySide6.QtGui import QColor, QAction, QActionGroup, QKeySequence, QShortcut
 
 from .class_picker import ClassPicker, resolve_class_catalog
 from .theme_manager import get_dialog_stylesheet
@@ -3012,6 +3012,9 @@ class ShortcutManager(QWidget):
         self.apply_btn  = QPushButton("Apply");            self.apply_btn.setObjectName("primaryBtn")
         self.cancel_btn = QPushButton("Close");            self.cancel_btn.setObjectName("secondaryBtn")
         self.cancel_btn.clicked.connect(self.close)
+        self._escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self._escape_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._escape_shortcut.activated.connect(self.close)
 
         footer_buttons = [
             self.add_btn, self.del_btn, self.load_btn, self.save_btn,

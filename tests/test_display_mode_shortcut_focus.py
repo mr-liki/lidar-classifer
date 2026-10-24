@@ -2,15 +2,18 @@ import ast
 import builtins
 from pathlib import Path
 import sys
+import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QWidget, QMainWindow
+from PySide6.QtTest import QTest
 
+from gui.shortcut_manager import ShortcutManager
 from gui.global_shortcuts import GlobalShortcutFilter
 from gui.native_section_classify import SectionClassifier
 
@@ -216,3 +219,137 @@ def test_escape_clears_native_rectangle_preview_without_vtk(monkeypatch, route, 
         for canvas in canvases:
             canvas.classifier.overlay.shutdown()
             canvas.close()
+
+
+class ShortcutEditorEscapeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.qapp = QApplication.instance() or QApplication([])
+
+    def test_escape_closes_editor_from_child_controls_without_running_tools(self):
+        entries = [dict(modifier='alt', key='F1', tool='Rectangle')]
+        settings = SimpleNamespace(value=lambda key, default=None:
+                                   entries if key == 'shortcuts' else default)
+        app = QMainWindow()
+        app.class_palette, app.view_palettes, app.shortcuts = {}, {}, {}
+        app.active_classify_tool = 'rectangle'
+        app.deactivate_classification_tool = Mock()
+        with patch('gui.shortcut_manager.QSettings', return_value=settings):
+            manager = ShortcutManager(app)
+        guard = GlobalShortcutFilter(app)
+        self.qapp.installEventFilter(guard)
+        apply = Mock()
+        manager.applied.connect(apply)
+        try:
+            targets = [manager.search_box,
+                       manager.table.cellWidget(0, manager.COL_KEY),
+                       manager.cancel_btn, manager]
+            # Repeat after reopening and in key capture mode, as well as typing mode.
+            for capture in (False, True):
+                for target in targets:
+                    with self.subTest(capture=capture, control=type(target).__name__):
+                        manager.show()
+                        manager.activateWindow()
+                        self.qapp.setActiveWindow(manager)
+                        manager.capture_mode_check.setChecked(capture)
+                        target.setFocus()
+                        self.qapp.processEvents()
+                        self.assertTrue(manager.isVisible())
+                        self.assertTrue(guard._is_runtime_shortcut_suspended())
+                        QTest.keyClick(target, Qt.Key_Escape)
+                        self.qapp.processEvents()
+                        self.assertFalse(manager.isVisible())
+                        self.assertEqual(app.active_classify_tool, 'rectangle')
+                        app.deactivate_classification_tool.assert_not_called()
+                        apply.assert_not_called()
+            self.assertFalse(guard._is_runtime_shortcut_suspended())
+            # With the editor closed, Escape still reaches runtime classification.
+            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier)
+            self.assertTrue(guard.eventFilter(app, event))
+            app.deactivate_classification_tool.assert_called_once_with(
+                preserve_cross_section=True, cancel_pending_brush=True)
+        finally:
+            self.qapp.removeEventFilter(guard)
+            manager.close()
+            manager.deleteLater()
+            app.close()
+
+
+@pytest.mark.parametrize("kind,floating", [("Layers", False), ("Catalog", False),
+                                           ("Catalog", True)])
+def test_gis_panel_escape_closes_focused_panel_and_resets_ribbon(monkeypatch, kind, floating):
+    from PySide6.QtWidgets import QSplitter, QTreeWidget, QVBoxLayout
+    from gui.gis import gis_layers, catalog_browser
+
+    qt = QApplication.instance() or QApplication([])
+    app = QMainWindow()
+    app.resize(900, 600)
+    app.splitter = QSplitter()
+    viewport = QWidget()
+    app.splitter.addWidget(viewport)
+    app.setCentralWidget(app.splitter)
+    app.gis_layers = []
+    app.active_classify_tool = "rectangle"
+    app.deactivate_classification_tool = Mock()
+    app._sync_activity_bar = Mock()
+    ribbon = QWidget(app)
+    section = QWidget(ribbon)
+    buttons = {}
+    for name in ("Layers", "Catalog"):
+        button = QPushButton(section)
+        button.setProperty("ribbonText", name)
+        button.setCheckable(True)
+        buttons[name] = button
+    app.ribbon_manager = SimpleNamespace(ribbons={"file": ribbon})
+    settings = SimpleNamespace(value=lambda key, default=None, **kw: default,
+                               setValue=Mock())
+    monkeypatch.setattr(catalog_browser, "QSettings", lambda *args: settings)
+    monkeypatch.setattr(catalog_browser, "list_folder_items", lambda *args, **kw: [])
+    guard = GlobalShortcutFilter(app)
+    qt.installEventFilter(guard)
+    panels = []
+    app.show()
+    qt.setActiveWindow(app)
+    try:
+        # Keep both panels open: Esc must dismiss only the panel that owns focus.
+        layers = gis_layers.show_gis_layers_panel(app)
+        qt.processEvents()
+        catalog = catalog_browser.show_catalog_panel(app)
+        panels.extend([layers, catalog])
+        qt.processEvents()
+        panel = layers if kind == "Layers" else catalog
+        other = catalog if kind == "Layers" else layers
+        if floating:
+            catalog.setFloating(True)
+        targets = [panel, panel.findChild(QTreeWidget)]
+        if kind == "Catalog":
+            targets.append(catalog.path_edit)
+        for target in targets:
+            if kind == "Layers":
+                gis_layers.show_gis_layers_panel(app)
+            else:
+                catalog_browser.show_catalog_panel(app)
+            qt.processEvents()
+            qt.setActiveWindow(panel.window())
+            target.setFocus()
+            qt.processEvents()
+            buttons[kind].setChecked(True)
+            section.active_button = buttons[kind]
+            # A real Escape key reaches the application filter with a canvas
+            # classification tool still armed behind this panel.
+            QTest.keyClick(target, Qt.Key_Escape)
+            qt.processEvents()
+            assert not panel.isVisible()
+            assert other.isVisible()
+            assert not buttons[kind].isChecked()
+            assert section.active_button is None
+            assert app.active_classify_tool == "rectangle"
+            app.deactivate_classification_tool.assert_not_called()
+        if kind == "Layers":
+            assert app._sync_activity_bar.call_count >= len(targets)
+    finally:
+        qt.removeEventFilter(guard)
+        for panel in panels:
+            panel.hide()
+        app.close()
+        app.deleteLater()
