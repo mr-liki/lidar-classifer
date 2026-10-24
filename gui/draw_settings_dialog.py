@@ -506,6 +506,10 @@ class DrawToolSettingsDialog(QDialog):
 
             # Persist to QSettings
             save_curve_settings(self._working_styles['curve'])
+            # Vulkan reads the same per-tool QSettings schema as other Draw
+            # tools. Preserve legacy curve_style/* for the VTK curve tool.
+            save_draw_settings({'curve': self._working_styles['curve']})
+            self._refresh_native_draw_styles()
             print(f"✅ Curve settings saved: color={self.current_color.name()}, width={self.current_width}px")
 
             # Also push the (updated) curve style into the digitizer's
@@ -574,6 +578,7 @@ class DrawToolSettingsDialog(QDialog):
 
         # Persist to QSettings (always works regardless of digitizer ref)
         save_draw_settings(self._working_styles)
+        self._refresh_native_draw_styles()
 
         tool_label = "All Tools" if self.selected_tool_key == "__global__" else TOOL_DISPLAY_NAMES.get(self.selected_tool_key, self.selected_tool_key)
         print(f"✅ Draw settings saved for {tool_label}")
@@ -587,6 +592,21 @@ class DrawToolSettingsDialog(QDialog):
             self.app.statusBar().showMessage("✅ Draw tool settings saved", 2000)
         except Exception:
             pass
+
+    def _refresh_native_draw_styles(self):
+        """Notify the VISIBLE Vulkan CAD overlay after settings are persisted.
+
+        The legacy VTK digitizer is a different renderer, and changing its
+        actor properties does not change NativeDraw.styles or its Qt overlay.
+        Never create a native viewport merely to apply styles.
+        """
+        try:
+            from gui.native_draw import get_native_draw
+            draw = get_native_draw(self.app, create=False, allow_snt=True)
+            if draw is not None:
+                draw.reload_styles()
+        except (AttributeError, RuntimeError, ImportError) as exc:
+            print(f'[Draw Settings] Native style refresh deferred: {exc}')
 
     def _reset_settings(self):
         """Reset all tools to their factory defaults."""

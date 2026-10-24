@@ -99,3 +99,64 @@ def box_overlap(a,b,inside=False):
     """(minx,maxx,miny,maxy) in both boxes; Inside requires full containment."""
     if inside:return b[0]<=a[0] and a[1]<=b[1] and b[2]<=a[2] and a[3]<=b[3]
     return not (a[1]<b[0] or a[0]>b[1] or a[3]<b[2] or a[2]>b[3])
+
+
+# Parallel/Centerline accept only figures created by Draw, never attached SNT records.
+# Keep source eligibility separate from the global snap index:
+# Hatch and other tools legitimately need those SNT geometries.
+_PARALLEL_NATIVE_LINE_TYPES = frozenset({
+    'line', 'line_segment', 'smartline', 'smart_line', 'polyline',
+    'lwpolyline', 'curve', 'parallel', 'parallel_line', 'centerline',
+    'freehand', 'accudraw',
+})
+_PARALLEL_FORBIDDEN_ORIGINS = frozenset({
+    'block_creation', 'cell_creation', 'snt_readonly',
+    'measure_selection', 'snt_block', 'trajectory', 'flightline',
+})
+
+
+def parallel_line_source(feature):
+    """True only for an open, nondegenerate native Draw line for Parallel."""
+    return drawn_open_line_source(feature)
+
+
+def drawn_open_line_source(feature):
+    """Accept live Draw line descriptors, excluding imports and creation bounds."""
+    if not isinstance(feature, dict):
+        return False
+    origin = str(feature.get('source', '') or '').lower()
+    if origin != 'native':
+        return False
+    # Older callers may pass a flat native Draw descriptor rather than the
+    # canonical {'drawing': original} wrapper. The dialog's _valid_source()
+    # still independently validates live object identity before committing.
+    record = feature.get('drawing') or feature
+    if not isinstance(record, dict):
+        return False
+    kind = str(feature.get('type') or record.get('type') or '').lower()
+    if kind not in _PARALLEL_NATIVE_LINE_TYPES:
+        return False
+    source = str(record.get('source', '') or '').lower()
+    if source in _PARALLEL_FORBIDDEN_ORIGINS:
+        return False
+    if bool(record.get('imported')) or source in ('snt', 'snt_import'):
+        return False
+    if bool(record.get('closed')) or bool(record.get('is_closed')):
+        return False
+    coords = feature.get('coords')
+    if coords is None:
+        coords = record.get('coords') or record.get('points') or record.get('vertices')
+    try:
+        if coords is None or len(coords) < 2:
+            return False
+        first = (float(coords[0][0]), float(coords[0][1]))
+        last = (float(coords[-1][0]), float(coords[-1][1]))
+        if not all(math.isfinite(x) for p in coords for x in p[:2]):
+            return False
+        if first == last or not any(
+                math.hypot(float(p[0]) - first[0], float(p[1]) - first[1]) > 1e-10
+                for p in coords[1:]):
+            return False
+    except (IndexError, TypeError, ValueError, OverflowError):
+        return False
+    return True

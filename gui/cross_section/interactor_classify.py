@@ -11481,7 +11481,7 @@ class ClassificationInteractor:
                     from gui.memory_manager import current_recommended_undo_steps
                     max_steps = int(current_recommended_undo_steps(self.app))
                 except Exception:
-                    max_steps = int(getattr(self.app, "_max_undo_steps", 10))
+                    max_steps = int(getattr(self.app, "_max_undo_steps", 20))
                 while len(self.app.undo_stack) > max_steps:
                     from gui.memory_manager import _free_undo_entry
                     _free_undo_entry(self.app.undo_stack.pop(0))
@@ -17257,7 +17257,7 @@ class ClassificationInteractor:
             from gui.memory_manager import current_recommended_undo_steps
             _max_undo = int(current_recommended_undo_steps(self.app))
         except Exception:
-            _max_undo = int(getattr(self.app, '_max_undo_steps', 10))
+            _max_undo = int(getattr(self.app, '_max_undo_steps', 20))
         while len(self.app.undo_stack) > _max_undo:
             self.app.undo_stack.pop(0)
 
@@ -20518,7 +20518,7 @@ class ClassificationInteractor:
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self.app))
         except Exception:
-            max_steps = int(getattr(self.app, '_max_undo_steps', 10))
+            max_steps = int(getattr(self.app, '_max_undo_steps', 20))
         while len(self.app.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.app.undo_stack.pop(0))

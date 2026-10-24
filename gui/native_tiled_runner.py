@@ -145,7 +145,7 @@ def push_native_undo(app, indices, old_classes, new_classes):
             from gui.memory_manager import trim_undo_stack  # noqa: PLC0415
             trim_undo_stack(app)
         except Exception:
-            max_steps = getattr(app, "_max_undo_steps", 10)
+            max_steps = getattr(app, "_max_undo_steps", 20)
             try:
                 while len(stack) > max_steps:
                     stack.pop(0)

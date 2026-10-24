@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import QWidget, QDockWidget, QVBoxLayout, QLabel, QMessageBox
 from PySide6.QtWidgets import QComboBox, QDialog
 
@@ -680,6 +680,22 @@ class SectionCanvas(QWidget):
                 QTimer.singleShot(0, dialog._open_lines_dialog)
 
     def _load_source_lines(self, store):
+        from gui.native_flight_lines import prepare
+        app=self.owner.app
+        view=getattr(app,'_lnt_main_view',None)
+        if view is not None and getattr(view,'flight_lines',None) is not None:
+            from gui.lnt_class_counts import read_directory
+            _, entries=read_directory(view.lnt_path)
+            self._source_ids=view.flight_lines.ids(store.node[self.indices],store.local[self.indices],entries)
+            self.apply_palette(self.palette,self.mode,sync=False)
+            if getattr(self,'_open_lines_when_ready',False):
+                self._open_lines_when_ready=False
+                dialog=getattr(app,'display_mode_dialog',None)
+                if dialog is not None: QTimer.singleShot(0,dialog._open_lines_dialog)
+            return
+        if view is not None and hasattr(view,'app') and hasattr(store,'node'):
+            prepare(view,lambda:self._load_source_lines(store) if not self._closed else None)
+            return
         import os
         from gui.native_section_display import source_line_ids
         from gui.lnt_class_counts import read_directory
@@ -768,6 +784,36 @@ class SectionCanvas(QWidget):
         self.backend.request_render()
         self._dirty = getattr(self.backend, 'present_count', 0) == presented
 
+    @property
+    def frame_backend(self):
+        return self.backend
+
+    def projection_snapshot(self):
+        """Freeze the rendered camera, rather than the next interaction target."""
+        frame = getattr(self.backend, 'present_count', 0)
+        ratio = self.devicePixelRatioF()
+        token = (frame, self.width(), self.height(), ratio)
+        if token == getattr(self, '_projection_token', None):
+            return self._projection_value
+        mvp = self.backend.get_last_mvp()
+        if mvp is None:
+            return None
+        mvp = np.array(mvp, dtype=np.float64, copy=True)
+        origin = np.array(self.backend.get_render_origin_xyz(), dtype=np.float64, copy=True)
+        w, h = self.width(), self.height()
+        def project(horizontal, elevation):
+            # Section records are (horizontal, depth, elevation); depth does
+            # not change XY in this orthographic view.
+            x, z = float(horizontal) - origin[0], float(elevation) - origin[2]
+            clip = mvp @ np.array((x, 0., z, 1.))
+            if abs(float(clip[3])) < 1e-12:
+                return -1.e9, -1.e9
+            return ((clip[0] / clip[3] * .5 + .5) * w,
+                    (clip[1] / clip[3] * .5 + .5) * h)
+        self._projection_token = token
+        self._projection_value = (mvp.tobytes(), origin.tobytes(), w, h), project
+        return self._projection_value
+
     # Orthographic mapping (camera looks along +depth, up = elevation):
     # screen x -> horizontal, screen y -> elevation; logical Qt pixels.
     def world_per_pixel(self):
@@ -828,7 +874,10 @@ class SectionCanvas(QWidget):
             return False
         if not backend.vector_upload_strip(0, 6, xyz, rgb, 0, 8, indices):
             return False
-        centre_px = 2. if self.slot == CUT_SLOT else 1.
+        # Keep the centre line equally visible in Cut-from-Cross and
+        # Cut-in-Cut.  The old 1 px cross-view line disappeared against dense
+        # towers/conductors while the cut-view's 2 px line remained obvious.
+        centre_px = 2.
         if half is None:
             return backend.vector_set_draw_ranges([0], [2], [centre_px])
         # The depth edges coincide with the centre at zero/small depth. Draw
@@ -863,6 +912,14 @@ class SectionCanvas(QWidget):
 
     def mousePressEvent(self, event):
         self.setFocus()
+        cross_cut_active = self.owner.route_cross_cut_to_canvas(
+            self, event.position())
+        # Once the centre has been placed, the operation is locked to its
+        # source view. Do not let a click in another cross view start locate,
+        # classification or another tool underneath the pending cut.
+        if cross_cut_active and not self.cut_armed:
+            event.accept()
+            return
         self.owner.active_slot = self.slot
         if self._pan_tool_input(event):
             return
@@ -905,6 +962,11 @@ class SectionCanvas(QWidget):
             self.drag = event.position()
 
     def mouseMoveEvent(self, event):
+        cross_cut_active = self.owner.route_cross_cut_to_canvas(
+            self, event.position())
+        if cross_cut_active and not self.cut_armed:
+            event.accept()
+            return
         if self._pan_tool_input(event):
             return
         measurement = getattr(self, 'measurement', None)
@@ -1453,7 +1515,54 @@ class NativeSections:
         if hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(True, 'cut_section')
         canvas.setFocus()
+        # Do not wait for a future MouseMoveEvent before showing feedback.
+        # Shortcut activation commonly happens while the pointer is outside
+        # the chosen cross-section canvas, which previously left Cut-from-
+        # Cross looking inactive.  Use the current pointer when it is inside
+        # the source canvas, otherwise start at the visible viewport centre.
+        cursor = canvas.mapFromGlobal(QCursor.pos())
+        preview_x = (cursor.x() if canvas.rect().contains(cursor)
+                     else canvas.width() * .5)
+        canvas.show_cut_preview(canvas.horizontal_at(preview_x))
         self.app.statusBar().showMessage('Cut: click the centre, then click to set depth; right-click cancels', 6000)
+        return True
+
+    def route_cross_cut_to_canvas(self, canvas, position):
+        """Move an uncommitted Cut-in-Cross gesture to the hovered view.
+
+        With several cross-section docks open, activating the tool must not
+        permanently bind it to whichever dock happened to own focus. Before
+        the first click the mouse owns routing; after the centre click the
+        chosen canvas remains locked through depth selection/finalization.
+
+        Returns True while a non-nested Cut-in-Cross operation owns section
+        input, including on a non-owner canvas after the centre is locked.
+        """
+        if (not getattr(self.app, 'cut_section_mode_on', False)
+                or self._nested_cut_active or canvas.slot == CUT_SLOT):
+            return False
+        if canvas.slot not in self.views or not len(canvas.indices):
+            return False
+
+        armed = next((view for view in self.views.values()
+                      if view.slot != CUT_SLOT and view.cut_armed), None)
+        # The first click commits the source view. Cursor travel during the
+        # depth step must not steal the operation into another section.
+        if armed is not None and armed.cut_centre is not None:
+            return True
+
+        if armed is not canvas:
+            if armed is not None:
+                armed.cut_armed = False
+                armed.cut_centre = None
+                armed.clear_cut_preview()
+            canvas.cut_armed = True
+            canvas.cut_centre = None
+            self.active_slot = canvas.slot
+            canvas.setFocus()
+
+        x = max(0.0, min(float(position.x()), float(max(0, canvas.width() - 1))))
+        canvas.show_cut_preview(canvas.horizontal_at(x))
         return True
 
     def cancel_cut(self):

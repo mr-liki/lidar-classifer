@@ -32,20 +32,51 @@ FIELDS = {
 }
 DEFAULTS = {'Convert':([1],2),'Fence':([1],2),'Height':([3,4],5),'Close':([1],2),'Low Points':([1],7),'Isolated':([1],7),'Ground':([1],2),'Surface Points':([1],2),'Below Surface':([1],7),'Find Wires':([4],14),'Classify by Centerline':([3,4],16)}
 LINE_OPS = {'Find Wires','Classify by Centerline'}
-GEOMETRY_OPS = LINE_OPS | {'Fence'}
+# Close and Height may also receive step-specific fence polygons. Their fence
+# selection is optional for backward-compatible loading of existing macros.
+GEOMETRY_OPS = LINE_OPS | {'Fence', 'Close', 'Height'}
+REQUIRED_GEOMETRY_OPS = LINE_OPS | {'Fence'}
 
 def _collect_fence_sources(app):
+    """Fetch VTK and Vulkan Draw fences as real world-coordinate polygons."""
+    from gui.native_byclass_fences import NATIVE_FENCE_TYPES, _valid_ring
     sources = []
-    for index,drawing in enumerate(getattr(getattr(app,'digitizer',None),'drawings',[]) or [],1):
-        if not isinstance(drawing,dict): continue
-        kind = str(drawing.get('type','')).lower()
-        if kind not in {'polygon','rectangle','rect','fence','closed_polyline'}: continue
-        try: coords = np.asarray(drawing.get('coords'),dtype=float)
-        except (TypeError,ValueError): continue
-        if coords.ndim != 2 or len(coords) < 3 or coords.shape[1] < 2: continue
-        if not np.all(np.isfinite(coords)): continue
-        sources.append({'label':f'Drawing {index}: {kind}', 'coords':coords,
-                        'key':tuple(np.round(coords[:,:2].ravel(),3))})
+    digitizer = getattr(app, 'digitizer', None)
+    drawings = list(getattr(digitizer, 'drawings', []) or [])
+    for index, drawing in enumerate(drawings, 1):
+        if not isinstance(drawing, dict):
+            continue
+        kind = str(drawing.get('type', '')).lower()
+        if (kind not in NATIVE_FENCE_TYPES | {'rect', 'fence', 'closed_polyline'}
+                or drawing.get('source') in ('cell_creation', 'block_creation')):
+            continue
+        try:
+            getter = getattr(digitizer, '_get_drawing_coords', None)
+            raw = getter(drawing) if callable(getter) else drawing.get('coords')
+            if _valid_ring(raw) is None:
+                continue
+            coords = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if coords.ndim != 2 or len(coords) < 3 or coords.shape[1] < 2:
+            continue
+        if not np.all(np.isfinite(coords)):
+            continue
+        sources.append({'label': f'Drawing {index}: {kind}', 'coords': coords,
+                        'key': tuple(np.round(coords[:, :2].ravel(), 3))})
+
+    # Native Draw stores rectangle/circle as two compact points. Reuse the
+    # same expansion as FenceSelectorWidget and the By Class popup rather
+    # than copying raw two-point control geometry to saved macros.
+    try:
+        from gui.native_byclass_fences import native_fence_records
+        for index, fence in enumerate(native_fence_records(app), 1):
+            coords = np.asarray(fence['coords'], dtype=float)
+            sources.append({'label': f"Vulkan Draw {index}: {fence['type']}",
+                            'coords': coords,
+                            'key': tuple(np.round(coords[:, :2].ravel(), 3))})
+    except Exception as exc:
+        print(f'[Native By Class] macro fence enumeration failed: {exc}')
     return sources
 
 def _inside_polygon(xy,polygon):
@@ -185,10 +216,13 @@ def validate_step(step):
             if not np.isfinite(number) or not low <= number <= high: raise ValueError('Invalid '+key)
     if op == 'Height' and params['min_height'] > params['max_height']: raise ValueError('Minimum height exceeds maximum height.')
     if op in GEOMETRY_OPS:
-        if not step.get('lines'): raise ValueError('Select geometry for '+op)
-        for line in step['lines']:
+        if op in REQUIRED_GEOMETRY_OPS and not step.get('lines'):
+            raise ValueError('Select geometry for '+op)
+        for line in step.get('lines', []):
             coords = np.asarray(line.get('coords'),dtype=float)
-            if coords.ndim != 2 or len(coords) < (3 if op == 'Fence' else 2) or coords.shape[1] < 2 or not np.all(np.isfinite(coords)): raise ValueError('Invalid geometry coordinates.')
+            minimum = 3 if op in {'Fence', 'Close', 'Height'} else 2
+            if coords.ndim != 2 or len(coords) < minimum or coords.shape[1] < 2 or not np.all(np.isfinite(coords)):
+                raise ValueError('Invalid geometry coordinates.')
 
 def save_macro(path,steps):
     if not steps: raise ValueError('Add an operation first.')
@@ -226,26 +260,45 @@ def run_macro(xyz,classification,steps,fence_mask=None,progress_cb=None,abort_ch
             if op in {'Convert','Close','Height','Fence'}:
                 mask = eligible & (cls != target)
                 if source is not None: mask &= np.isin(cls,source)
-                if op == 'Fence':
+                # Step-specific fences use world XY; they constrain output for
+                # Fence, Close, and Height. Convert remains class-wide.
+                step_polys = step.get('lines', []) if op != 'Convert' else []
+                if op == 'Fence' or (op in {'Close','Height'} and step_polys):
                     candidates = np.flatnonzero(mask & np.all(np.isfinite(xyz[:,:2]),axis=1))
                     mask[:] = False
                     if len(candidates):
                         inside = np.zeros(len(candidates),dtype=bool)
-                        for shape in step['lines']:
+                        for shape in step_polys:
                             inside |= _inside_polygon(xyz[candidates,:2],shape['coords'])
                         mask[candidates[inside]] = True
-                elif op == 'Close':
+                if op == 'Close':
                     from scipy.spatial import cKDTree
                     finite = np.all(np.isfinite(xyz[:,:3]),axis=1)
-                    refs = xyz[(cls == target)&finite&eligible]; candidates = np.flatnonzero(mask&finite)
-                    if len(refs):
-                        mask[:] = False
-                        if len(candidates):
-                            dist,_ = cKDTree(refs[:,:3]).query(xyz[candidates,:3],distance_upper_bound=params['radius'])
-                            mask[candidates[dist < params['radius']]] = True
+                    refs_mask = (cls == target) & finite & eligible
+                    if step_polys:
+                        inside_refs = np.zeros(len(xyz),dtype=bool)
+                        valid_refs = np.flatnonzero(refs_mask)
+                        for shape in step_polys:
+                            inside_refs[valid_refs] |= _inside_polygon(xyz[valid_refs,:2],shape['coords'])
+                        refs_mask &= inside_refs
+                    refs = xyz[refs_mask]; candidates = np.flatnonzero(mask & finite)
+                    if len(candidates) and not len(refs):
+                        raise ValueError(f'Step {index+1}: no To-class reference points in Close scope; refusing class-wide fallback.')
+                    mask[:] = False
+                    if len(candidates):
+                        dist,_ = cKDTree(refs[:,:3]).query(xyz[candidates,:3],distance_upper_bound=params['radius'])
+                        mask[candidates[dist < params['radius']]] = True
                 elif op == 'Height':
                     finite = np.all(np.isfinite(xyz[:,:3]),axis=1)
-                    refs = xyz[(cls == params['reference_class'])&finite]; candidates = np.flatnonzero(mask&finite)
+                    refs = xyz[(cls == params['reference_class']) & finite]
+                    if step_polys:
+                        local_refs = np.zeros(len(refs), dtype=bool)
+                        for shape in step_polys:
+                            local_refs |= _inside_polygon(refs[:,:2],shape['coords'])
+                        from gui.height_reference_surface import has_tin_xy_support
+                        if has_tin_xy_support(refs[local_refs]):
+                            refs = refs[local_refs]  # fallback if fence reference points cannot form TIN
+                    candidates = np.flatnonzero(mask & finite)
                     if not len(refs): raise ValueError(f'Step {index+1}: reference class has no points.')
                     mask[:] = False
                     if len(candidates):
@@ -429,12 +482,13 @@ class ByClassMacroDialog(_BaseClassifyDialog):
             self.lines_list.setSelectionMode(QAbstractItemView.MultiSelection)
             self.lines_list.setMinimumHeight(110)
             selected = {tuple(np.round(np.asarray(line['coords'])[:,:2].ravel(),3)) for line in step['lines']}
-            self.line_sources = _collect_fence_sources(self.app) if op == 'Fence' else _collect_alignment_sources(self.app)
+            self.line_sources = (_collect_fence_sources(self.app) if op in {'Fence','Close','Height'}
+                                 else _collect_alignment_sources(self.app))
             for source in self.line_sources:
                 self.lines_list.addItem(source['label'])
                 if source['key'] in selected: self.lines_list.item(self.lines_list.count()-1).setSelected(True)
             self.lines_list.itemSelectionChanged.connect(self._geometry_selection_changed)
-            self.form.addRow('Drawn fence:' if op == 'Fence' else 'SNT / drawn CL:',self.lines_list)
+            self.form.addRow('Drawn fence:' if op in {'Fence','Close','Height'} else 'SNT / drawn CL:',self.lines_list)
             actions = QWidget(); actions_row = QHBoxLayout(actions); actions_row.setContentsMargins(0,0,0,0)
             refresh = QPushButton('Refresh'); refresh.clicked.connect(lambda: self._show_step(self.steps_list.currentRow()))
             clear = QPushButton('Clear selection'); clear.clicked.connect(self._clear_geometry_selection)

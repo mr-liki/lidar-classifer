@@ -18,7 +18,8 @@ access goes through the native Vulkan pipeline:
 
 The native format stores 11 bytes per record (relative XYZ, RGB, intensity,
 class), so the table offers exactly those attributes - the .lnt does not keep
-the LAS extras (time, line, echo, amplitude, ...).
+the other LAS extras (time, echo, amplitude, ...). Flight-line IDs are read
+from the per-source .lnt.lines sidecar, including multi-file selections.
 """
 from __future__ import annotations
 
@@ -50,9 +51,12 @@ K_FLOAT3 = "float3"      # XYZ, 3 decimals
 K_INT0 = "int0"          # integer attribute, 0 decimals
 K_RGB = "rgb"            # "R.. G.. B.."
 K_HSV = "hsv"            # "H S V"
+K_TEXT = 'text'
 
 # Ordered column definitions (header, kind, source key).
 COLUMN_DEFS = [
+    ('Flight Line', K_INT0, 'point_source_id'),
+    ('Source File', K_TEXT, 'source_file'),
     ("Class", K_CODE, "classification"),
     ("Description", K_DESC, "classification"),
     ("Easting", K_FLOAT3, "x"),
@@ -67,6 +71,8 @@ COLUMN_DEFS = [
 # The names are the reference's, so the shared "view_fields/checked" setting
 # keeps working for both implementations.
 NATIVE_FIELD_SPECS = [
+    ('Flight Line', ('point_source_id',), True),
+    ('Source File', ('source_file',), True),
     ("Class", ("classification",), True),
     ("Description", ("classification",), True),
     ("Easting", ("x",), True),
@@ -108,7 +114,10 @@ def point_text(point, kind, key, codes, names):
         axis = {"x": 0, "y": 1, "z": 2}[key]
         return "%.3f" % float(point["xyz"][axis])
     if kind == K_INT0:
-        return "%d" % int(point["intensity"])
+        value=point.get(key)
+        return 'Unavailable' if value is None else str(int(value))
+    if kind == K_TEXT:
+        return str(point.get(key,'Unavailable'))
     if kind == K_RGB:
         return "R%d G%d B%d" % (int(point["rgb"][0]), int(point["rgb"][1]),
                                 int(point["rgb"][2]))
@@ -129,14 +138,21 @@ class NativeFieldsReader:
 
     def __init__(self, path):
         self.path = str(path)
-        with open(path, "rb") as stream:
-            magic, version, _, _, *bounds = struct.unpack("<4sHHQ6d", stream.read(64))
+        from gui.lnt_collection import is_collection, read_collection
+        self.group=read_collection(path) if is_collection(path) else None
+        if self.group:
+            raw=self.group['header']
+        else:
+            with open(path,'rb') as stream: raw=stream.read(64)
+        if not isinstance(raw,bytes): raw=struct.pack('<4sHHQ6d',*raw)
+        magic, version, _, _, *bounds = struct.unpack('<4sHHQ6d',raw)
         if magic != b"LNT\0" or version != 2:
             raise ValueError("Unsupported native point-cloud format")
         self.origin = np.asarray(bounds[:3], dtype=np.float64)
         self.bounds_min = self.origin
         self.bounds_max = np.asarray(bounds[3:6], dtype=np.float64)
         _, entries = read_directory(path)
+        self.entries=entries
         self.nodes = np.flatnonzero((entries["children_mask"] == 0)
                                     & (entries["point_count"] > 0))
         self.leaves = entries[self.nodes]
@@ -144,17 +160,22 @@ class NativeFieldsReader:
         self.count = int(self.ends[-1]) if len(self.ends) else 0
         self.starts = (np.concatenate(([0], self.ends[:-1])) if self.count
                        else np.empty(0, dtype=np.int64))
-        self._bytes = np.memmap(path, dtype=np.uint8, mode="r")
+        self._bytes = np.memmap(path, dtype=np.uint8, mode="r") if not self.group else None
+        from gui.native_flight_lines import FlightLines
+        try: self.flight=FlightLines(path)
+        except (OSError,ValueError,struct.error): self.flight=None
         self._cache = OrderedDict()
         self._leaf_start = {int(node): int(self.starts[index])
                             for index, node in enumerate(self.nodes.tolist())}
         for leaf in self.leaves:
-            if int(leaf["byte_offset"]) + int(leaf["point_count"]) * POINT.itemsize > len(self._bytes):
+            if self._bytes is not None and int(leaf["byte_offset"]) + int(leaf["point_count"]) * POINT.itemsize > len(self._bytes):
                 self.close()
                 raise ValueError("Truncated native point records")
 
     def close(self):
         self._cache.clear()
+        if getattr(self,'flight',None) is not None:
+            self.flight.close(); self.flight=None
         data = getattr(self, "_bytes", None)
         if data is not None:
             mmap = getattr(data, "_mmap", None)
@@ -176,15 +197,24 @@ class NativeFieldsReader:
         local = rows - self.starts[leaf_idx]
         leaf = self.leaves[leaf_idx]
         offsets = leaf["byte_offset"].astype(np.int64) + local * POINT.itemsize
-        raw = np.asarray(self._bytes[offsets[:, None] + np.arange(POINT.itemsize)]).copy()
+        addresses=offsets[:, None]+np.arange(POINT.itemsize)
+        if self.group:
+            from gui.lnt_collection import payload_bytes
+            raw=payload_bytes(self.path,addresses,self.group)
+        else: raw=np.asarray(self._bytes[addresses]).copy()
         points = raw.reshape(-1).view(POINT)
         half = leaf["half_size"].astype(np.float64)[:, None]
         xyz = (self.origin + leaf["center"].astype(np.float64) - half
                + points["rel"] * (2 * half / 65535.))
+        node_ids=self.nodes[leaf_idx].astype(np.uint32)
+        extra={}
+        if self.flight:
+            extra['point_source_id']=self.flight.ids(node_ids,local,self.entries)
+            extra['source_file']=self.flight.source_files(node_ids)
         return dict(xyz=xyz, classification=points["classification"].copy(),
                     intensity=points["intensity"].copy(), rgb=points["rgb"].copy(),
                     node=self.nodes[leaf_idx].astype(np.uint32),
-                    local=local.astype(np.uint32))
+                    local=local.astype(np.uint32), **extra)
 
     def point(self, row):
         page = int(row) // self.PAGE
@@ -229,7 +259,9 @@ class NativeFieldsReader:
             count = int(leaf["point_count"])
             if count:
                 start = int(leaf["byte_offset"]) + CLASS_BYTE
-                classes = np.asarray(self._bytes[start:start + POINT.itemsize * count:POINT.itemsize])
+                if self.group:
+                    classes=self.read(np.arange(row,row+count))['classification']
+                else: classes = np.asarray(self._bytes[start:start + POINT.itemsize * count:POINT.itemsize])
                 hits = np.flatnonzero(wanted[classes])
                 if hits.size:
                     found.append(hits.astype(np.int64) + row)
@@ -466,7 +498,7 @@ class FieldsTask(QThread):
 
     # -- sorting ------------------------------------------------------------
     def _sort(self, reader):
-        keys = np.empty(reader.count, dtype=np.float64)
+        keys = np.empty(reader.count, dtype=object if self.kind == K_TEXT else np.float64)
         code_map = np.asarray(self.codes, dtype=np.float64)
         for start in range(0, reader.count, reader.PAGE):
             if self.isInterruptionRequested():
@@ -479,7 +511,9 @@ class FieldsTask(QThread):
                 axis = {"x": 0, "y": 1, "z": 2}[self.key]
                 keys[rows] = data["xyz"][:, axis]
             elif self.kind == K_INT0:
-                keys[rows] = data["intensity"]
+                keys[rows] = data.get(self.key,np.full(len(rows),-1))
+            elif self.kind == K_TEXT:
+                keys[rows] = data.get(self.key,np.full(len(rows),''))
             else:                       # rgb / hsv: sort by luminance
                 rgb = data["rgb"].astype(np.float64)
                 keys[rows] = (rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587
@@ -1231,6 +1265,10 @@ def open_native_fields(app):
     if view is None or getattr(view, "native", None) is None:
         QMessageBox.information(app, "View Fields",
                                 "Load a native point cloud first to view its fields.")
+        return
+    if getattr(view,'flight_lines',None) is None and not getattr(view,'_flight_unavailable',False):
+        from gui.native_flight_lines import prepare
+        prepare(view,lambda:open_native_fields(app),required=False)
         return
     existing = getattr(app, "_view_fields_table_dialog", None)
     if isinstance(existing, NativeFieldsDialog) and existing.view is view:

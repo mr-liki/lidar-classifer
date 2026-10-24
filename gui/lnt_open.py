@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from PySide6.QtCore import QEvent, QObject, QThread, Qt, QTimer, Slot, Signal
-from PySide6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from gui import lnt_native as nat
 from gui.laspy_compat import install_opaque_extra_bytes_fix
@@ -56,6 +56,71 @@ LNT_FORMAT_VERSION = 2      # points carry a classification byte (11 B/pt)
 LNT_CLASS_SEMANTICS = "legacy-packed-class-v1"
 
 
+def _copy_session_file(source, destination, progress=None, copied=0, total=1):
+    """Copy one session file in bounded chunks and report byte progress."""
+    chunk = 8 * 1024**2
+    with open(source, "rb") as src, open(destination, "wb") as dst:
+        while True:
+            block = src.read(chunk)
+            if not block:
+                break
+            dst.write(block)
+            copied += len(block)
+            if progress is not None:
+                progress(min(99, int(copied * 100 / max(1, total))))
+    shutil.copystat(source, destination)
+    return copied
+
+
+def _session_lnt_copy(lnt_path, progress=None):
+    """Return a private writable copy of an LNT for this process.
+
+    The native renderer updates classification bytes in its open document.  It
+    must therefore never be pointed at the user's cache/source document: an
+    abnormal process termination cannot run rollback code.  A session copy is
+    the only crash-safe boundary; explicit Save still publishes through
+    ``native_save.write_pair``.
+    """
+    source = os.path.realpath(os.fspath(lnt_path))
+    if not os.path.isfile(source):
+        raise FileNotFoundError(source)
+    root = os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "NakshaAI", "lnt_sessions",
+    )
+    os.makedirs(root, exist_ok=True)
+    companions = [source + ".lines"] if os.path.isfile(source + ".lines") else []
+    total = os.path.getsize(source) + sum(os.path.getsize(path) for path in companions)
+    required = total + 8 * 1024**2
+    if shutil.disk_usage(root).free < required:
+        raise OSError(
+            "Not enough free space for the crash-safe working copy of "
+            f"{os.path.basename(source)} (need about {required / 1024**3:.2f} GiB)."
+        )
+    session_dir = tempfile.mkdtemp(prefix=f"{os.getpid()}_", dir=root)
+    working = os.path.join(session_dir, os.path.basename(source))
+    try:
+        copied = _copy_session_file(source, working, progress, total=total)
+        # Flight-line identity is part of the native document's presentation.
+        if companions:
+            _copy_session_file(companions[0], working + ".lines", progress,
+                               copied=copied, total=total)
+        if progress is not None:
+            progress(100)
+        return working, session_dir
+    except Exception:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise
+
+
+def _discard_session_lnt(view):
+    """Best-effort removal after the renderer has released its private file."""
+    session_dir = getattr(view, "_session_lnt_dir", None)
+    if session_dir:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        view._session_lnt_dir = None
+
+
 def lnt_file_version(path):
     """Format version of a structurally complete cache, or 0 if truncated."""
     try:
@@ -93,7 +158,7 @@ def _source_cache_current(source, lnt):
 
 
 def _class_semantics_path(lnt):
-    return lnt + '.class-semantics'
+    return os.fspath(lnt) + '.class-semantics'
 
 
 def _has_current_class_semantics(lnt):
@@ -117,8 +182,27 @@ def _publish_source_cache(source, staged, destination, signature):
     with open(marker, 'w', encoding='ascii') as f:
         f.write(LNT_CLASS_SEMANTICS + '\n')
     os.replace(staged, destination)
+    if os.path.isfile(os.fspath(staged) + '.lines'):
+        os.replace(os.fspath(staged) + '.lines', os.fspath(destination) + '.lines')
     os.replace(metadata, os.fspath(destination) + '.source.json')
     os.replace(marker, _class_semantics_path(destination))
+
+
+def stamp_source_cache(source, lnt):
+    """Re-bind an existing cache to the current bytes of its source file.
+
+    Saving classification edits rewrites the LAS/LAZ, which changes its size and
+    mtime. Without a fresh fingerprint the next open sees a "different source"
+    and rebuilds the whole cache.
+    """
+    source, lnt = os.fspath(source), os.fspath(lnt)
+    signature = _source_signature(source)
+    for path, text in ((lnt + '.source.json', json.dumps(signature, sort_keys=True)),
+                       (_class_semantics_path(lnt), LNT_CLASS_SEMANTICS + '\n')):
+        temp = path + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(temp, path)
 
 
 def lnt_is_current(source):
@@ -309,6 +393,9 @@ class _InputFilter(QObject):
         nv = self.view.native
         if nv is not None:
             nv.pan(dx, dy)
+            schedule = getattr(self.view.app, '_schedule_main_view_history_commit', None)
+            if callable(schedule):
+                schedule('native_pan', delay_ms=120)
 
     def _show_snt_context_menu(self, x, y):
         if not self.view.mode_2d or self.view.native is None:
@@ -470,6 +557,12 @@ class _InputFilter(QObject):
         if t == E.MouseButtonRelease:
             self._last = None
             if context_click:
+                # An idle Draw object still owns its native text glyphs: the
+                # ordinary LNT context menu should run only when no label hit.
+                draw = getattr(self.view, 'drawing', None)
+                if (draw is not None and not draw.active() and
+                        draw.try_text_context(ev.position())):
+                    return True
                 x, y = float(ev.position().x()), float(ev.position().y())
                 QTimer.singleShot(0, lambda: self._show_snt_context_menu(x, y))
             return True
@@ -487,6 +580,10 @@ class _InputFilter(QObject):
                 # 2D plan mode: middle-drag is the sole pan gesture.
                 if b & Qt.MiddleButton:
                     nv.pan(dx, dy)
+                    schedule = getattr(
+                        self.view.app, '_schedule_main_view_history_commit', None)
+                    if callable(schedule):
+                        schedule('native_middle_pan', delay_ms=120)
             elif b & Qt.LeftButton and not (ev.modifiers() & Qt.ShiftModifier):
                 nv.orbit(dx, dy)
             elif b & (Qt.RightButton | Qt.MiddleButton) or (
@@ -504,9 +601,22 @@ class _InputFilter(QObject):
                 ratio = 1.0
             if not nv.zoom_at(steps, pos.x() * ratio, pos.y() * ratio):
                 nv.zoom(steps)
+            schedule = getattr(self.view.app, '_schedule_main_view_history_commit', None)
+            if callable(schedule):
+                schedule('native_wheel_zoom', delay_ms=150)
             return True
         if t == E.KeyPress:
             k = ev.key()
+            if k in (Qt.Key_Left, Qt.Key_Right):
+                navigate = getattr(
+                    self.view.app,
+                    ('go_to_previous_main_view' if k == Qt.Key_Left
+                     else 'go_to_next_main_view'),
+                    None,
+                )
+                if callable(navigate):
+                    navigate()
+                return True
             if k == Qt.Key_Escape and getattr(self.view, "picker", None) is not None:
                 try:
                     self.view.picker.cancel()
@@ -527,17 +637,17 @@ class _InputFilter(QObject):
             elif k == Qt.Key_D:
                 self.view.set_2d(not self.view.mode_2d)
             elif k == Qt.Key_1:
-                self.view.apply_shading("class")
+                self.view.set_app_display_mode("class")
             elif k == Qt.Key_2:
-                self.view.apply_shading("intensity")
+                self.view.set_app_display_mode("intensity")
             elif k == Qt.Key_3:
-                self.view.apply_shading("elevation")
+                self.view.set_app_display_mode("elevation")
             elif k == Qt.Key_4:
-                self.view.apply_shading("rgb")
+                self.view.set_app_display_mode("rgb")
             elif k == Qt.Key_5:
-                self.view.apply_shading("shaded")
+                self.view.set_app_display_mode("shaded_class")
             elif k == Qt.Key_6:
-                self.view.apply_shading("surface")
+                self.view.set_app_display_mode("surface")
             elif k in (Qt.Key_BracketRight, Qt.Key_Up):
                 self.view.adjust_sse(+1)
             elif k in (Qt.Key_BracketLeft, Qt.Key_Down):
@@ -670,6 +780,16 @@ class LntMainView(QObject):
         .lnt open) never bounce through the VTK viewport and back - clearing
         data must not change which viewport the session lives in.
         """
+        self._flight_closing=True
+        flight_worker=getattr(self,'_flight_worker',None)
+        if flight_worker is not None and flight_worker.isRunning():
+            flight_worker.requestInterruption()
+            flight_worker.wait()
+        flight=getattr(self,'flight_lines',None)
+        if flight is not None:
+            flight.close(); self.flight_lines=None
+        fields=getattr(self.app,'_view_fields_table_dialog',None)
+        if fields is not None and getattr(fields,'view',None) is self: fields.close()
         try:
             from gui.lnt_ai_bridge import active_bridge
             bridge = active_bridge(self.app)
@@ -694,8 +814,12 @@ class LntMainView(QObject):
                       "native_layer_pick"):
             try:
                 _tool = getattr(self, _attr, None)
-                if _tool is not None and hasattr(_tool, "cancel"):
-                    _tool.cancel()
+                if _tool is not None:
+                    shutdown = getattr(_tool, "shutdown", None)
+                    if callable(shutdown):
+                        shutdown()
+                    elif hasattr(_tool, "cancel"):
+                        _tool.cancel()
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -753,6 +877,7 @@ class LntMainView(QObject):
             except Exception as exc:   # noqa: BLE001
                 print(f"[LNT] could not restore Naksha's renderer cleanly: {exc}")
         self.owner = None
+        _discard_session_lnt(self)
 
     # -- colour ----------------------------------------------------------
     def _luts_for(self, source):
@@ -803,6 +928,11 @@ class LntMainView(QObject):
                     except (TypeError, ValueError):
                         raw = 1.0
                     weights[code] = np.float32(max(0.1, min(raw, 12.0)))
+            # "Load selected classifications" (Read points): classes left out at
+            # import stay hidden on the GPU, whatever a later Display Apply says.
+            for code in getattr(self.app, "_import_class_blocked", None) or ():
+                if 0 <= int(code) < 256:
+                    packed[int(code), 3] = 0
             # Only the CLASS palette comes from the Display dialog. The elevation and
             # intensity ramps are generated on the GPU by apply_shading(); the VTK-side
             # tables built by build_point_luts() must not overwrite them.
@@ -839,16 +969,32 @@ class LntMainView(QObject):
         the same azimuth / Sharpness / Ambient. Falls back to the VTK defaults when the
         application has never exposed those controls."""
         app = self.app
-        azimuth = getattr(app, "last_shade_azimuth", None)
-        sharpness = getattr(app, "shading_sharpness_angle", None)
-        ambient = getattr(app, "shade_ambient", None)
-        light_elevation = getattr(app, "shading_light_elevation", None)
+        # Read the controls through the SAME derivations the VTK view uses. Reading the raw
+        # attributes is not equivalent: Sharpness is clipped to 0..999 and falls back to
+        # last_shade_angle, and the base light elevation honours
+        # NAKSHA_SHADING_LIGHT_ELEVATION and clamps to 5..85. Pushing the raw values made
+        # the two renderers disagree whenever those details mattered.
+        from gui.shading_display import (
+            _shading_fixed_light_elevation,
+            _shading_sharpness_angle,
+        )
+
+        def _control(reader, current):
+            try:
+                value = reader()
+            except Exception:   # noqa: BLE001
+                return current
+            return value if value is not None else current
+
         try:
-            self.shading_azimuth = float(azimuth if azimuth is not None else self.shading_azimuth)
-            self.shading_sharpness = float(
-                sharpness if sharpness is not None else self.shading_sharpness)
-            self.shading_ambient = float(ambient if ambient is not None else self.shading_ambient)
-            elevation = float(light_elevation) if light_elevation is not None else 0.0
+            self.shading_azimuth = float(_control(
+                lambda: getattr(app, "last_shade_azimuth", None), self.shading_azimuth))
+            self.shading_sharpness = float(_control(
+                lambda: _shading_sharpness_angle(app), self.shading_sharpness))
+            self.shading_ambient = float(_control(
+                lambda: getattr(app, "shade_ambient", None), self.shading_ambient))
+            elevation = float(_control(
+                lambda: _shading_fixed_light_elevation(app), 0.0))
         except Exception:   # noqa: BLE001
             return False
         if self.native is None:
@@ -867,6 +1013,21 @@ class LntMainView(QObject):
         """Select a native presentation mode. Shaded builds a triangulated, lit
         surface from the visible .lnt cut; other modes update GPU uniforms."""
         name = str(ui_mode or "").strip().lower()
+        if name == 'line':
+            from gui.native_flight_lines import prepare
+            self.shading_name='line'
+            def ready():
+                if self.shading_name != 'line' or self.native is None: return
+                from gui.native_section_display import line_colors
+                ids=np.arange(65536,dtype=np.uint32)
+                colors=line_colors(ids,getattr(self.app,'flight_line_colors',{}))
+                visible=np.ones(65536,dtype=np.uint8)
+                for key,show in getattr(self.app,'flight_line_visibility_by_slot',{}).get(0,getattr(self.app,'flight_line_visibility',{})).items():
+                    if 0<=int(key)<65536: visible[int(key)]=int(bool(show))
+                if not self.native.set_lines(colors,visible):
+                    self.app.statusBar().showMessage('Native flight-line rendering is unavailable; rebuild the LNT viewer.',10000)
+            prepare(self,ready)
+            return True
         if name == "depth":
             # Genuine Vulkan view-space depth. It is derived in the point
             # shader from resident XYZ and the live native camera; no VTK
@@ -932,6 +1093,10 @@ class LntMainView(QObject):
             self.app.display_mode = normalized
         except Exception:   # noqa: BLE001
             pass
+        dialog = (getattr(self.app, "display_mode_dialog", None)
+                  or getattr(self.app, "display_dialog", None))
+        if dialog is not None:
+            dialog.sync_with_app_state()
         print(f"[LNT] display mode -> {normalized} (native Vulkan)")
         return True
 
@@ -989,6 +1154,16 @@ class LntMainView(QObject):
         now = time.perf_counter()
         dt, self._t = now - self._t, now
         if nv.frame(dt):
+            # Native LNT frames bypass VulkanRenderBackend.request_render.
+            # Advance its projection cache and refresh overlays here too.
+            backend = getattr(self, '_vector_backend', None)
+            if backend is not None:
+                backend.present_count += 1
+                for overlay in tuple(getattr(backend, '_frame_overlays', ())):
+                    try:
+                        overlay._follow(immediate=True)
+                    except (RuntimeError, ReferenceError):
+                        pass
             self._fails = 0
             self._n += 1
             surface_mode = self.shading_name in ("shaded", "shaded_class", "surface")
@@ -1059,6 +1234,8 @@ class _BuildUi(QObject):
             pass
         self.dlg.close()
         self.mw._lnt_build = None
+        if error:
+            self.mw._lnt_import_class_filter = None   # never leak into a later reopen
         if error == "cancelled":
             print("[LNT] build cancelled")
         elif error:
@@ -1143,6 +1320,62 @@ def open_with_lnt(main_window, source):
     return True
 
 
+def set_import_class_filter(app, import_options):
+    """Record the Read points class choice for the next native open (File >
+    Open, Load Block Data). Applied by _show() once the view exists."""
+    opts = import_options if isinstance(import_options, dict) else {}
+    codes = (opts.get("class_codes") or []) if opts.get("only_class") else []
+    app._lnt_import_class_filter = {int(c) for c in codes}   # empty = no filter
+
+
+def _apply_import_class_filter(app, view):
+    """Show only the classes picked in Read points - on the native GPU class
+    LUT (alpha = visible), no VTK. Every other class code is blocked, which the
+    native Cross/Cut Sections and the Display dialog already honour. Opens
+    that did not go through Read points (Save reopening) keep the current state."""
+    selected = getattr(app, "_lnt_import_class_filter", None)
+    if selected is None:
+        return
+    app._lnt_import_class_filter = None
+    try:
+        from gui.unified_actor_manager import set_import_blocked_classes
+    except Exception:   # noqa: BLE001
+        set_import_blocked_classes = None
+    if not selected:
+        app._import_class_blocked = None
+        if set_import_blocked_classes:
+            set_import_blocked_classes(())
+        return
+    from gui.display_mode import clone_palette
+    dialog = getattr(app, "display_mode_dialog", None)
+    source = None
+    for slot0 in ((getattr(app, "view_palettes", None) or {}).get(0),
+                  (getattr(dialog, "view_palettes", None) or {}).get(0),
+                  getattr(app, "class_palette", None)):
+        if isinstance(slot0, dict) and slot0:
+            source = slot0
+            break
+    palette = clone_palette(source or {})
+    for code, entry in palette.items():
+        entry["show"] = int(code) in selected
+    app._import_class_blocked = {c for c in range(256) if c not in selected}
+    if set_import_blocked_classes:
+        set_import_blocked_classes(app._import_class_blocked)
+    app.class_palette = palette
+    if not isinstance(getattr(app, "view_palettes", None), dict):
+        app.view_palettes = {}
+    app.view_palettes[0] = clone_palette(palette)
+    if dialog is not None:
+        if not isinstance(getattr(dialog, "view_palettes", None), dict):
+            dialog.view_palettes = {}
+        dialog.view_palettes[0] = clone_palette(palette)
+        if hasattr(dialog, "sync_slot_visibility_from_palette"):
+            dialog.sync_slot_visibility_from_palette(0, palette)
+    if view._push_applied_palette():
+        view.apply_shading(view.shading_name or "class")
+    print(f"[LNT] Read points: showing only classes {sorted(selected)}")
+
+
 def _keep_vector_overlay(app):
     """The renderer behind the viewport was replaced: re-upload attached SNT/DXF
     linework to the one now drawing, so it does not vanish."""
@@ -1184,6 +1417,12 @@ def close_lnt_view(app, flush_pending=True, reopening=False, keep_native_viewpor
               + ("; native viewport kept (empty canvas)"
                  if keep_native_viewport else "; main viewport returned to VTK"))
         if not reopening:
+            reset_history = getattr(app, "_reset_main_view_history_baseline", None)
+            if callable(reset_history):
+                # A retained empty Vulkan canvas has no LntMainView camera to
+                # capture.  Clear stale cloud history now and prime only when
+                # ownership has actually returned to VTK.
+                reset_history(prime=not keep_native_viewport)
             _keep_vector_overlay(app)
             _refresh_total_points(app)
 
@@ -1292,17 +1531,74 @@ def _show(app, lnt_path, name):
             restore_palette = clone_palette(getattr(app, "class_palette", {}) or {})
         except Exception as exc:  # noqa: BLE001
             print(f"[LNT] could not snapshot the applied PTC before reopen: {exc}")
+    elif getattr(app, "active_ptc_schema", None):
+        # A PTC was Applied earlier in this session (possibly before the
+        # project was cleared or while no cloud was open). Every cloud opened
+        # later must use it without another Display Mode > Apply.
+        try:
+            from gui.display_mode import clone_palette
+            restore_palette = clone_palette(
+                getattr(app, "class_palette", None) or app.active_ptc_schema)
+            restore_applied_palette = bool(restore_palette)
+            print(f"[LNT] auto-applying the session PTC: {getattr(app, 'active_ptc_path', '')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[LNT] could not prepare the session PTC for the new cloud: {exc}")
     close_lnt_view(app, reopening=True)
-    view = LntMainView(app, lnt_path, name)
+    original_lnt = os.path.realpath(os.fspath(lnt_path))
+    load_dialog = QProgressDialog(
+        f"Loading {os.path.basename(original_lnt)}...", "Cancel", 0, 100, app
+    )
+    load_dialog.setWindowTitle("Loading point cloud")
+    load_dialog.setWindowModality(Qt.WindowModal)
+    load_dialog.setMinimumDuration(0)
+    load_dialog.setAutoClose(False)
+    load_dialog.setAutoReset(False)
+    load_dialog.setValue(0)
+
+    def report_copy(percent):
+        load_dialog.setValue(int(percent))
+        load_dialog.setLabelText(
+            f"Loading {os.path.basename(original_lnt)}... {int(percent)}%"
+        )
+        QApplication.processEvents()
+        if load_dialog.wasCanceled():
+            raise Cancelled()
+
+    try:
+        working_lnt, session_dir = _session_lnt_copy(original_lnt, report_copy)
+    except Cancelled:
+        load_dialog.close()
+        print(f"[LNT] loading cancelled: {original_lnt}")
+        return
+    except Exception as exc:  # noqa: BLE001 - fail closed, never open original writable
+        load_dialog.close()
+        print(f"[LNT] cannot create crash-safe working document: {exc}")
+        QMessageBox.critical(
+            app, "Open point cloud",
+            "Could not create the private working copy required to protect the "
+            f"original file:\n\n{exc}",
+        )
+        return
+    load_dialog.setLabelText(f"Opening {os.path.basename(original_lnt)}...")
+    load_dialog.setValue(100)
+    QApplication.processEvents()
+    view = LntMainView(app, working_lnt, name)
+    view._session_lnt_dir = session_dir
+    view.original_lnt_path = original_lnt
     try:
         view.start()
     except Exception as exc:   # noqa: BLE001 - surfaced to the user
         view.stop()
+        load_dialog.close()
         _keep_vector_overlay(app)
         print(f"[LNT] cannot show {lnt_path}: {exc}")
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
+    load_dialog.close()
     app._lnt_main_view = view
+    reset_history = getattr(app, "_reset_main_view_history_baseline", None)
+    if callable(reset_history):
+        reset_history()
     if restore_applied_palette and restore_palette:
         # Restore all three owners of Main View presentation state atomically.
         # If the dialog keeps its neutral/reinitialised checkbox snapshot, its
@@ -1331,6 +1627,7 @@ def _show(app, lnt_path, name):
             )
         else:
             print("[LNT] could not restore the applied PTC palette after document reopen")
+    _apply_import_class_filter(app, view)
     from gui.native_border import apply_border
     apply_border(app, 0)
     _keep_vector_overlay(app)
@@ -1340,7 +1637,6 @@ def _show(app, lnt_path, name):
     _refresh_total_points(app)
     if not getattr(app, "_lnt_quit_hook", False):
         app._lnt_quit_hook = True
-        from PySide6.QtWidgets import QApplication
         # Free the LNT renderer before Qt tears the window down at exit.
         QApplication.instance().aboutToQuit.connect(
             lambda: getattr(app, "_lnt_main_view", None)

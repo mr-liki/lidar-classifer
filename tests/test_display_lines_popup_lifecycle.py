@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 from PySide6.QtCore import Qt
 from gui.display_mode import DisplayModeDialog
+from gui import native_flight_lines
 
 
 class _LinesPopup:
@@ -48,6 +51,9 @@ class _Window:
     def isWindow(self):
         return True
 
+    def windowType(self):
+        return Qt.Window
+
     def raise_(self):
         self.raise_count += 1
 
@@ -66,3 +72,27 @@ def test_owner_activation_raises_display_mode_and_visible_child_popups():
     assert popup.raise_count == 1
     assert hidden_popup.raise_count == 0
     assert popup.activation_count == 1
+
+
+def test_existing_flight_line_sidecar_is_attached_without_worker(monkeypatch):
+    calls = []
+
+    class _ExistingLines:
+        def __init__(self, path):
+            calls.append(path)
+
+        def unique(self):
+            return [7, 19, 42]
+
+    monkeypatch.setattr(native_flight_lines, "FlightLines", _ExistingLines)
+    view = SimpleNamespace(lnt_path="project.lnt", flight_lines=None)
+
+    result = native_flight_lines.open_existing(view)
+
+    assert isinstance(result, _ExistingLines)
+    assert view.flight_lines is result
+    assert calls == ["project.lnt"]
+
+    # A second Lines click reuses the attached metadata.
+    assert native_flight_lines.open_existing(view) is result
+    assert calls == ["project.lnt"]

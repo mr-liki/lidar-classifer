@@ -891,7 +891,8 @@ class GlobalShortcutFilter(QObject):
                     if _native_plan_escape:
                         _native_plan_draw.cancel()
                     elif not event.isAutoRepeat():
-                        _native_plan_draw.history(
+                        from gui.native_history_routing import route_native_history
+                        route_native_history(self.app_window, _native_plan_draw,
                             redo=event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift')
                     event.accept()
                     return True
@@ -904,6 +905,15 @@ class GlobalShortcutFilter(QObject):
                 native_canvas = focused_canvas(self.app_window)
                 measurement = getattr(native_canvas if native_canvas is not None else native_view, 'measurement', None)
                 drawing = getattr(native_view, 'drawing', None)
+                if drawing is None and (
+                    getattr(native_view, '_draw_saved_history', None) or
+                    getattr(native_view, '_draw_saved_shapes', None)
+                ):
+                    # A viewport replacement retains Draw objects/history,
+                    # but no longer has a live controller. Restore it so
+                    # Ctrl+Z/Y continues to reverse the actual last action.
+                    from gui.native_draw import get_native_draw
+                    drawing = get_native_draw(self.app_window, create=True)
                 # Shift+P is a preserved application shortcut. It must win over
                 # stale/imported user mappings and always put the native main
                 # viewport into 3D perspective/orbit mode.
@@ -915,6 +925,35 @@ class GlobalShortcutFilter(QObject):
                     if hasattr(self.app_window, 'statusBar'):
                         self.app_window.statusBar().showMessage(
                             '3D View (Shift+P)', 3000)
+                    return True
+                # Ctrl+Z/Y in a native point-cloud session always goes through
+                # the chronological Draw/classification history coordinator.
+                # Otherwise an armed Draw tool shadows the most recent By Class
+                # write, and Redo can be routed to a different history stack.
+                if combo[0] in ('ctrl', 'ctrl+shift') and event.key() in (Qt.Key_Z, Qt.Key_Y):
+                    if not event.isAutoRepeat():
+                        redo = event.key() == Qt.Key_Y or combo[0] == 'ctrl+shift'
+                        # The focused active measurement owns its own edits
+                        # before the Draw/classification timeline. Previously
+                        # this unconditional coordinator call made every native
+                        # measurement report "Nothing to undo".
+                        done = False
+                        if (
+                            measurement is not None
+                            and getattr(measurement, 'active', False)
+                            and getattr(measurement, 'can_history', lambda **_: False)(redo=redo)
+                        ):
+                            done = bool(measurement.history(redo=redo))
+                        else:
+                            from gui.native_history_routing import route_native_history
+                            done = route_native_history(
+                                self.app_window, drawing, redo=redo,
+                            )
+                        if not done:
+                            self.app_window.statusBar().showMessage(
+                                'Nothing to redo' if redo
+                                else 'Nothing to undo', 2500)
+                    event.accept()
                     return True
                 if configured_shortcut:
                     if event.isAutoRepeat():
@@ -3905,6 +3944,13 @@ class GlobalShortcutFilter(QObject):
         ✅ Uses app_window.fit_view() which includes Point Cloud + DXF + SNT bounds
         """
         import numpy as np
+
+        # The visible LNT canvas owns a native Vulkan camera, independent of
+        # the hidden VTK camera below it.  Use the same canonical app action as
+        # the ribbon Fit button so keyboard and UI behaviour stay identical.
+        lnt_view = getattr(self.app_window, "_lnt_main_view", None)
+        if getattr(lnt_view, "native", None) is not None:
+            return self.app_window.fit_view_with_2d_lock(source="shift_f")
 
         already_locked = getattr(self.app_window, '_main_view_2d_locked', False)
 

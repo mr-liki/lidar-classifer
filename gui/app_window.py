@@ -945,6 +945,43 @@ class _CRSStatusClickFilter(QObject):
         return False
 
 
+class _NativeBackupWorker(QThread):
+    """Writes the classified native point cloud to a backup file.
+
+    The native engine's own exporter does the work: it reads the native
+    document and its LAS/LAZ source and writes a NEW file. Neither the loaded
+    document nor its source is touched, and no VTK readback is involved.
+
+    The GUI-thread reads (the class map, the digitizer drawings) are taken by
+    the caller before the worker starts; everything here is file work.
+    """
+    finished_ok = Signal(str)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(self, app, destination, mapping=None, drawings=None):
+        super().__init__()
+        self.setObjectName("NakshaNativeBackupWorker")
+        # A backup must never compete with the interactive rendering.
+        self.setPriority(QThread.LowPriority)
+        self._app = app
+        self._destination = destination
+        self._mapping = mapping
+        self._drawings = drawings
+        self.error = ""
+
+    def run(self):
+        try:
+            from gui import native_backup
+            native_backup.export_backup(self._app, self._destination, flush=False,
+                                        mapping=self._mapping, drawings=self._drawings,
+                                        progress=lambda n, text: self.progress.emit(n, text))
+            self.finished_ok.emit(self._destination)
+        except Exception as exc:  # noqa: BLE001 - reported through the signal
+            self.error = str(exc)
+            self.failed.emit(str(exc))
+
+
 class _BackupWorker(QThread):
     """
     Writes LAZ backup in a background thread.
@@ -960,6 +997,8 @@ class _BackupWorker(QThread):
                  runtime_crs_wkt=None, output_crs_wkt=None):
         super().__init__()
         self.setObjectName("NakshaBackupWorker")
+        # A backup must never compete with the interactive rendering.
+        self.setPriority(QThread.LowPriority)
         self._snapshot = snapshot
         self._path = path
         self._las_version = las_version
@@ -1270,6 +1309,10 @@ class NakshaApp(QMainWindow):
         # ✅ ADD THESE 3 LINES HERE:
         self._canvas_cursor_filter = CanvasCursorEventFilter(self)
         self._canvas_tool_cursor = self._create_canvas_tool_cursor()
+        # Section placement is a point-picking action.  Use Qt's native plus
+        # cursor for it so it remains crisp at every Windows DPI scale, while
+        # retaining the established target cursor for all other canvas tools.
+        self._section_tool_cursor = QCursor(Qt.CrossCursor)
         self._cursor_state = False
         self._active_tools = set()
         # Storage initialization
@@ -1882,7 +1925,7 @@ class NakshaApp(QMainWindow):
         self._last_changed_mask = None
         self._last_changed_indices = None
         self.classification_revision = 0
-        self._max_undo_steps = 10  # Global cap for classification undo/redo (max 10 undos/redos)
+        self._max_undo_steps = 20  # Global cap for classification undo/redo
         # Aliases — point to the SAME list objects (never reassign, always use .clear())
         self.undostack = self.undo_stack
         self.redostack = self.redo_stack
@@ -2229,7 +2272,7 @@ class NakshaApp(QMainWindow):
         return QCursor(pixmap, center, center)
 
     def _iter_canvas_widgets(self):
-        """Yield each live VTK interactor that should show the shared tool cursor."""
+        """Yield every visible-canvas widget that shares the active tool cursor."""
         seen = set()
 
         def _yield_widget(widget):
@@ -2243,6 +2286,27 @@ class NakshaApp(QMainWindow):
 
         main_interactor = getattr(getattr(self, "vtk_widget", None), "interactor", None)
         yield from _yield_widget(main_interactor)
+
+        # An opened .lnt replaces the visible VTK canvas with this native
+        # Vulkan QWidget.  Cursor state must be applied to the widget that is
+        # actually under the pointer, not only to the hidden VTK interactor.
+        native_view = getattr(self, "_lnt_main_view", None)
+        native_owner = getattr(native_view, "owner", None)
+        yield from _yield_widget(getattr(native_owner, "vulkan_widget", None))
+
+        # SNT-only native promotion has no _lnt_main_view; its visible canvas
+        # belongs directly to the render backend.  Deduplication above makes
+        # this safe when both references resolve to the same QWidget.
+        render_owner = getattr(self, "render_backend", None)
+        yield from _yield_widget(getattr(render_owner, "vulkan_widget", None))
+
+        # Native cross-section windows (including CUT_SLOT for Cut-in-Cross
+        # and Cut-in-Cut) are SectionCanvas QWidgets, not entries in the
+        # legacy section_vtks map.  Register the canvases themselves so the
+        # plus cursor follows whichever source view owns the cut gesture.
+        native_sections = getattr(self, "_native_sections", None)
+        for canvas in (getattr(native_sections, "views", None) or {}).values():
+            yield from _yield_widget(canvas)
 
         for vtk_widget in (getattr(self, "section_vtks", None) or {}).values():
             yield from _yield_widget(getattr(vtk_widget, "interactor", None))
@@ -2331,17 +2395,31 @@ class NakshaApp(QMainWindow):
             if hasattr(widget, "testAttribute") and not widget.testAttribute(Qt.WA_WState_Created):
                 return
             desired_custom_cursor = bool(self._cursor_state and active)
-            current_state = widget.property("canvasCursorAppliedState")
-            if current_state is not None and bool(current_state) == desired_custom_cursor:
+            section_cursor_active = bool(
+                desired_custom_cursor
+                and {"cross_section", "cut_section"}.intersection(self._active_tools)
+            )
+            desired_cursor_key = (
+                "section_plus" if section_cursor_active
+                else "tool" if desired_custom_cursor
+                else "default"
+            )
+            if widget.property("canvasCursorAppliedKey") == desired_cursor_key:
                 return
 
             widget.setProperty("canvasCursorMutating", True)
             try:
                 if desired_custom_cursor:
-                    widget.setCursor(self._canvas_tool_cursor)
+                    cursor = (
+                        self._section_tool_cursor
+                        if section_cursor_active
+                        else self._canvas_tool_cursor
+                    )
+                    widget.setCursor(cursor)
                 else:
                     widget.unsetCursor()
                 widget.setProperty("canvasCursorAppliedState", desired_custom_cursor)
+                widget.setProperty("canvasCursorAppliedKey", desired_cursor_key)
             finally:
                 widget.setProperty("canvasCursorMutating", False)
         except Exception:
@@ -3695,6 +3773,33 @@ class NakshaApp(QMainWindow):
 
     def _capture_main_camera(self):
         """Capture current main-view camera (zoom/pan/orientation)."""
+        # An open LNT owns a separate native camera.  The VTK widget beneath
+        # it is hidden and its camera does not move when NativePanGesture calls
+        # lnt_view_pan, so reading VTK here makes every native pan look equal.
+        lnt_view = getattr(self, '_lnt_main_view', None)
+        native = getattr(lnt_view, 'native', None) if lnt_view is not None else None
+        if native is not None and getattr(lnt_view, 'mode_2d', False):
+            try:
+                width = float(getattr(native, '_w', 0) or 0)
+                height = float(getattr(native, '_h', 0) or 0)
+                centre = native.screen_to_world(width * .5, height * .5)
+                probe = native.screen_to_world(width * .5 + 1.0, height * .5)
+                if centre is not None and probe is not None and width > 0:
+                    metres_per_pixel = abs(float(probe[0]) - float(centre[0]))
+                    if metres_per_pixel > 0 and np.isfinite(metres_per_pixel):
+                        return {
+                            'pos': (float(centre[0]), float(centre[1]), 1.0),
+                            'fp': (float(centre[0]), float(centre[1]), 0.0),
+                            'up': (0.0, 1.0, 0.0),
+                            'ps': metres_per_pixel * height * .5,
+                            'pp': 1,
+                            'va': 30.0,
+                            'native_lnt': True,
+                            'native_center': (float(centre[0]), float(centre[1])),
+                            'native_width': metres_per_pixel * width,
+                        }
+            except (RuntimeError, AttributeError, TypeError, ValueError):
+                pass
         try:
             renderer = self.vtk_widget.renderer
             cam = renderer.GetActiveCamera()
@@ -3781,9 +3886,10 @@ class NakshaApp(QMainWindow):
         self._view_forward_stack = []
         self._view_history_current_state = None
         self._view_history_restoring = False
-        # Keep only a small rolling history so repeated pan/zoom sessions
-        # don't accumulate a large camera-state cache in memory.
-        self._view_history_max_steps = 15
+        # Camera states contain only a handful of scalars, so retaining 25
+        # navigation steps is inexpensive and remains completely independent
+        # of the classification undo/redo stacks (which can own point arrays).
+        self._view_history_max_steps = 25
         self._view_history_pending_reason = "view_change"
 
         self._view_history_timer = QTimer(self)
@@ -3845,11 +3951,31 @@ class NakshaApp(QMainWindow):
         if state is not None:
             self._view_history_current_state = self._copy_camera_state(state)
 
+    def _reset_main_view_history_baseline(self, prime=True):
+        """Start history from the camera owned by the current main viewport.
+
+        VTK and the Vulkan LNT canvas have independent cameras.  Carrying a
+        state across that ownership change would put an invisible renderer in
+        the Back stack and make the first navigation appear to do nothing.
+        """
+        timer = getattr(self, "_view_history_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._view_history_pending_reason = "view_change"
+        self._view_back_stack = []
+        self._view_forward_stack = []
+        self._view_history_current_state = None
+        if prime:
+            self._prime_main_view_history()
+
     def _copy_camera_state(self, state):
         if not state:
             return None
 
-        return {
+        copied = {
             "pos": tuple(float(v) for v in state.get("pos", (0.0, 0.0, 1.0))),
             "fp": tuple(float(v) for v in state.get("fp", (0.0, 0.0, 0.0))),
             "up": tuple(float(v) for v in state.get("up", (0.0, 1.0, 0.0))),
@@ -3857,10 +3983,30 @@ class NakshaApp(QMainWindow):
             "pp": int(state.get("pp", 1)),
             "va": float(state.get("va", 30.0)),
         }
+        if state.get('native_lnt'):
+            copied['native_lnt'] = True
+            copied['native_center'] = tuple(
+                float(v) for v in state.get('native_center', (0.0, 0.0)))
+            copied['native_width'] = float(state.get('native_width', 1.0))
+        return copied
 
     def _camera_states_equal(self, a, b, eps=1e-6):
         if not a or not b:
             return False
+
+        if bool(a.get('native_lnt')) != bool(b.get('native_lnt')):
+            return False
+        if a.get('native_lnt'):
+            ac, bc = a.get('native_center'), b.get('native_center')
+            if ac is None or bc is None:
+                return False
+            scale = max(1.0, abs(float(a.get('native_width', 1.0))),
+                        abs(float(b.get('native_width', 1.0))))
+            tolerance = max(eps, scale * 1e-10)
+            return (abs(float(ac[0]) - float(bc[0])) <= tolerance
+                    and abs(float(ac[1]) - float(bc[1])) <= tolerance
+                    and abs(float(a.get('native_width', 0.0))
+                            - float(b.get('native_width', 0.0))) <= tolerance)
 
         for key in ("pos", "fp", "up"):
             av = a.get(key)
@@ -3895,7 +4041,7 @@ class NakshaApp(QMainWindow):
 
         self._view_back_stack.append(state)
 
-        max_steps = int(getattr(self, "_view_history_max_steps", 15))
+        max_steps = int(getattr(self, "_view_history_max_steps", 25))
         if len(self._view_back_stack) > max_steps:
             self._view_back_stack.pop(0)
 
@@ -3986,6 +4132,18 @@ class NakshaApp(QMainWindow):
         if getattr(self, "_view_history_restoring", False):
             return False
 
+        # Pan/wheel commits are debounced. A user can press Back before that
+        # timer fires; commit the just-finished physical view first so the
+        # action never incorrectly reports an empty history stack.
+        timer = getattr(self, '_view_history_timer', None)
+        try:
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, '_view_history_pending_reason', 'view_change'))
+        except (RuntimeError, AttributeError):
+            pass
+
         if not getattr(self, "_view_back_stack", None):
             try:
                 self.statusBar().showMessage("No previous view", 1200)
@@ -4022,6 +4180,15 @@ class NakshaApp(QMainWindow):
 
         if getattr(self, "_view_history_restoring", False):
             return False
+
+        timer = getattr(self, '_view_history_timer', None)
+        try:
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, '_view_history_pending_reason', 'view_change'))
+        except (RuntimeError, AttributeError):
+            pass
 
         if not getattr(self, "_view_forward_stack", None):
             try:
@@ -4067,6 +4234,17 @@ class NakshaApp(QMainWindow):
         self._view_history_restoring = True
 
         try:
+            if state.get('native_lnt'):
+                lnt_view = getattr(self, '_lnt_main_view', None)
+                native = getattr(lnt_view, 'native', None) if lnt_view is not None else None
+                centre = state.get('native_center')
+                width = float(state.get('native_width', 0.0))
+                if native is None or centre is None or width <= 0:
+                    return False
+                native.frame_region(float(centre[0]), float(centre[1]), width)
+                native.frame(0.0)
+                return True
+
             renderer = self.vtk_widget.renderer
             interactor = self.vtk_widget.interactor
             camera = renderer.GetActiveCamera()
@@ -4677,6 +4855,10 @@ class NakshaApp(QMainWindow):
         if dlg is None:
             dlg = SelectionModeDialog(self)
             self._element_selection_dialog = dlg
+        # Opening Element Selection intentionally does not auto-arm a picker.
+        # A minimized chip merely restores the existing dialog state.
+        if not (dlg.windowState() & Qt.WindowMinimized) and hasattr(dlg, "reset_pick_method"):
+            dlg.reset_pick_method()
         if hasattr(dlg, "restore_from_chip"):
             dlg.restore_from_chip()
         elif dlg.windowState() & Qt.WindowMinimized:
@@ -7066,7 +7248,13 @@ class NakshaApp(QMainWindow):
         native_single = len(filenames) == 1 and os.path.splitext(filenames[0])[1].lower() in (".las", ".laz", ".lnt", ".lntset")
         native_batch = len(filenames) > 1 and all(os.path.splitext(path)[1].lower() in (".las", ".laz", ".lnt") for path in filenames)
         if native_single or native_batch:
-            from gui.lnt_open import open_with_lnt
+            # "Read points" dialog first (LAS/LAZ only); Cancel aborts the open.
+            import_options = self._prompt_lidar_import_options_for_files(filenames)
+            if import_options is None:
+                print("   User cancelled import setup")
+                return
+            from gui.lnt_open import open_with_lnt, set_import_class_filter
+            set_import_class_filter(self, import_options)
             open_with_lnt(self, filenames if native_batch else filenames[0])
             return
 
@@ -12009,7 +12197,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 10))
+            max_steps = int(getattr(self, '_max_undo_steps', 20))
         while len(self.redo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.redo_stack.pop(0))
@@ -12243,7 +12431,7 @@ class NakshaApp(QMainWindow):
             from gui.memory_manager import current_recommended_undo_steps
             max_steps = int(current_recommended_undo_steps(self))
         except Exception:
-            max_steps = int(getattr(self, '_max_undo_steps', 10))
+            max_steps = int(getattr(self, '_max_undo_steps', 20))
         while len(self.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.undo_stack.pop(0))
@@ -13924,6 +14112,17 @@ class NakshaApp(QMainWindow):
             print("Auto-backup deferred - dataset load is still in progress")
             return
 
+        # Native sessions own their own data: the VTK snapshot below cannot
+        # see a native cloud (app.data is the section store, i.e. a subset), so
+        # the backup is produced by the native exporter instead.
+        try:
+            from gui import native_backup
+            if native_backup.active(self):
+                self._auto_backup_native()
+                return
+        except Exception as exc:  # noqa: BLE001 - fall through to the VTK path
+            print(f"⚠️ Native auto-backup unavailable: {exc}")
+
         # Guard: prevent overlapping backups
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
@@ -14040,43 +14239,220 @@ class NakshaApp(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
 
     def _compute_backup_path(self) -> str:
-        """Compute the backup file path from saved settings."""
+        """Compute the backup file path from saved settings.
+
+        The Auto-Backup Settings decide the folder (next to the file that was
+        loaded, or the custom folder) and the name (123_backup.laz by
+        default). The native and the VTK path share this, so both honour the
+        same settings.
+        """
         try:
-            import time as _time
-
-            loaded = getattr(self, "loaded_file", None)
-            if not loaded:
-                return None
-
-            base_name = os.path.splitext(os.path.basename(loaded))[0]
-            ext = os.path.splitext(loaded)[1].lower()
-            if ext not in (".las", ".laz"):
-                ext = ".laz"
-
-            naming_format = self.settings.value("backup_naming_format", 0, type=int)
-
-            if naming_format == 1:
-                timestamp = _time.strftime("%Y%m%d_%H%M%S")
-                filename = f"{base_name}_{timestamp}{ext}"
-            elif naming_format == 2:
-                filename = f"{base_name}_autosave{ext}"
+            from gui import native_backup
+            source = None
+            if native_backup.active(self):
+                source = native_backup.source_for(self)
             else:
-                filename = f"{base_name}_backup{ext}"
-
-            use_custom = self.settings.value("backup_use_custom_path", False, type=bool)
-            if use_custom:
-                folder = self.settings.value("backup_custom_path", "", type=str)
-                if not folder:
-                    folder = os.path.dirname(loaded)
-            else:
-                folder = os.path.join(os.path.dirname(loaded), "backup")
-
-            os.makedirs(folder, exist_ok=True)
-            return os.path.join(folder, filename)
-
+                source = getattr(self, "loaded_file", None)
+            return native_backup.backup_path(self, source)
         except Exception as e:
             print(f"⚠️ Failed to compute backup path: {e}")
             return None
+
+    def _auto_backup_native(self):
+        """Periodic backup of a native cloud: the native exporter writes it.
+
+        The pending class edits are flushed on the GUI thread first (the worker
+        only reads the native document from disk), and the export never writes
+        the loaded document or the file it was built from.
+        """
+        from gui import native_backup, native_save
+        if self._backup_worker_running:
+            print("⏭️ Auto-backup skipped — previous still writing")
+            return
+        destination = native_backup.backup_path(self)
+        if not destination:
+            return
+        if not native_backup.has_work(self):
+            print("⏭️ Auto-backup skipped — nothing was classified in this session")
+            return
+        if native_backup.backup_is_current(self, destination):
+            print("⏭️ Auto-backup skipped — the backup already holds this work")
+            return
+        # Flush the pending classifications into the native document on the GUI
+        # thread; the worker then only reads it.
+        try:
+            native_save.flush_edits(self)
+        except Exception as exc:
+            print(f"⚠️ Auto-backup skipped — the classifications are not on disk yet: {exc}")
+            return
+        # These are GUI-thread reads: do them before the worker starts.
+        try:
+            from gui.class_slots import _state
+            mapping = dict(_state(self)["code_to_slot"])
+            from .save_pointcloud import _serialize_drawings
+            drawings = _serialize_drawings(self)
+        except Exception as exc:
+            print(f"⚠️ Auto-backup skipped — {exc}")
+            return
+        self._backup_worker_running = True
+        worker = _NativeBackupWorker(self, destination, mapping=mapping, drawings=drawings)
+        worker.finished_ok.connect(self._on_backup_finished)
+        worker.failed.connect(self._on_backup_failed)
+        worker.finished.connect(self._on_backup_worker_done)
+        self._active_backup_worker = worker
+        worker.start()
+
+    def _backup_progress_dialog(self, destination):
+        """A small progress window for the backup written while closing."""
+        try:
+            from PySide6.QtCore import Qt
+            from PySide6.QtWidgets import QProgressDialog
+            name = os.path.basename(destination)
+            dialog = QProgressDialog(f"Backing up the classified point cloud to {name}…",
+                                     None, 0, 100, self)
+            dialog.setWindowTitle("Auto-Backup")
+            dialog.setWindowModality(Qt.ApplicationModal)
+            dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setValue(0)
+            return dialog
+        except Exception:  # noqa: BLE001 - the backup runs without a dialog then
+            return None
+
+    def _on_backup_progress(self, percent, text):
+        """The backup progress, also shown in the status bar."""
+        try:
+            if text:
+                self.statusBar().showMessage(f"Auto-backup: {text}", 5000)
+        except Exception:
+            pass
+
+    def _backup_on_exit(self):
+        """Save the classified point cloud to its own file when the app closes.
+
+        A native session is backed up by the native exporter (no VTK involved);
+        a VTK session falls back to the VTK snapshot. Either way the file the
+        user loaded is never written - the classifications go to a separate
+        backup file.
+        """
+        try:
+            from gui import native_backup
+            if native_backup.active(self):
+                self._backup_native_on_exit()
+            else:
+                self._backup_vtk_on_exit()
+        except Exception as exc:  # noqa: BLE001 - a failed backup must not block the exit
+            print(f"⚠️ Exit backup failed: {exc}")
+
+    def _backup_vtk_on_exit(self):
+        """The exit backup for a VTK session: the same file the timer writes."""
+        try:
+            from gui import native_backup
+            cfg = native_backup.settings()
+            if not cfg["on_exit"]:
+                print("💾 Exit backup skipped — disabled in the Auto-Backup Settings")
+                return
+            data = getattr(self, "data", None)
+            if data is None or "xyz" not in data:
+                return
+            self._auto_backup()          # snapshot + background writer
+            worker = getattr(self, "_active_backup_worker", None)
+            if worker is not None:
+                worker.wait(600000)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ Exit backup failed: {exc}")
+
+    def _backup_native_on_exit(self):
+        """Write the classified native cloud to a separate backup file on exit.
+
+        The file the user loaded is NEVER written by this path: the classified
+        result goes to 123_backup.laz next to it (the Auto-Backup Settings
+        decide the folder and the name). With "keep the loaded document
+        unchanged" the class edits are rolled back out of the native document
+        afterwards - but only once the backup has actually been written, so the
+        work can never be lost.
+        """
+        try:
+            from gui import native_backup
+            cfg = native_backup.settings()
+            if not cfg["on_exit"]:
+                print("💾 Exit backup skipped — disabled in the Auto-Backup Settings")
+                return
+            if not native_backup.active(self):
+                return
+            if not native_backup.has_work(self):
+                print("💾 Exit backup skipped — nothing was classified in this session")
+                return
+            # A periodic backup may still be writing: let it finish first.
+            running = getattr(self, "_active_backup_worker", None)
+            if running is not None and running.isRunning():
+                running.wait(600000)
+            destination = native_backup.backup_path(self)
+            if not destination:
+                return
+            # End the AI session FIRST: it writes its result into the native
+            # document, and the backup must contain it. Ending it here also
+            # stops the teardown from writing the AI classes again after the
+            # document has been restored.
+            try:
+                from gui.lnt_ai_bridge import active_bridge
+                bridge = active_bridge(self)
+                if bridge is not None and getattr(bridge, "view", None) is getattr(self, "_lnt_main_view", None):
+                    bridge.end()
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ Exit backup: the AI session could not be closed: {exc}")
+            # Flush the pending classifications into the native document (GUI
+            # thread): the worker only reads the document from disk.
+            try:
+                from gui import native_save
+                native_save.flush_edits(self)
+            except Exception as exc:  # noqa: BLE001 - export anyway, the file holds what was written
+                print(f"⚠️ Exit backup: some classifications are not on disk yet: {exc}")
+            from gui.class_slots import _state
+            mapping = dict(_state(self)["code_to_slot"])
+            from .save_pointcloud import _serialize_drawings
+            drawings = _serialize_drawings(self)
+            if native_backup.backup_is_current(self, destination):
+                print("💾 The backup already holds this session's classifications")
+            else:
+                worker = _NativeBackupWorker(self, destination, mapping=mapping, drawings=drawings)
+                self._active_backup_worker = worker
+                # The export rewrites the whole cloud: show the progress so the
+                # closing window does not look frozen.
+                dialog = self._backup_progress_dialog(destination)
+                worker.progress.connect(self._on_backup_progress)
+                if dialog is not None:
+                    worker.progress.connect(dialog.setValue)
+                worker.start()
+                if dialog is not None:
+                    dialog.setValue(0)
+                    dialog.exec()
+                if not worker.wait(1800000):        # the backup must finish before the app goes
+                    print("⚠️ Exit backup timed out; the loaded document was left as it is")
+                    return
+                error = getattr(worker, "error", "")
+                self._active_backup_worker = None
+                if dialog is not None:
+                    dialog.deleteLater()
+                if error:
+                    print(f"⚠️ Exit backup failed: {error}")
+                    return
+                print(f"💾 Classified point cloud saved to {destination} "
+                      f"(the loaded file was not modified)")
+                try:
+                    self.statusBar().showMessage(
+                        f"Classified point cloud saved to {os.path.basename(destination)}", 8000)
+                except Exception:
+                    pass
+            # The renderer works on a private session document, so the loaded
+            # original is already unchanged even after a crash.  This call is
+            # retained only to reset the in-memory section snapshot cleanly;
+            # the old preference must never permit writes to the original.
+            native_backup.restore_loaded_document(self)
+        except Exception as exc:  # noqa: BLE001 - a failed backup must not block the exit
+            print(f"⚠️ Exit backup failed: {exc}")
 
     def _on_backup_finished(self, path: str):
         """Signal handler: backup succeeded (runs on main thread)."""
@@ -14151,10 +14527,10 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"⚠️ Failed to load elevation ramp: {e}")
                     self.elevation_color_ramp = None
-            self.shading_quality = "normal"
+            self.shading_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
             if self.shading_quality not in ("fast", "normal", "slow"):
                 self.shading_quality = "normal"
-            self.surface_quality = "normal"
+            self.surface_quality = str(settings.value("global_surface_quality", "normal") or "normal").lower()
             if self.surface_quality not in ("fast", "normal", "slow"):
                 self.surface_quality = "normal"
 
@@ -14644,8 +15020,13 @@ class NakshaApp(QMainWindow):
         self._shutdown_in_progress = True
         native_view = getattr(self, "_lnt_main_view", None)
         if native_view is not None:
+            # The classified cloud is written to a SEPARATE backup file first:
+            # closing the application must never overwrite the loaded file.
+            self._backup_on_exit()
             native_view.stop(restore=False)
             self._lnt_main_view = None
+        else:
+            self._backup_on_exit()
         renderer_owner = getattr(self, "render_backend", None)
         if renderer_owner is not None:
             renderer_owner.shutdown()
@@ -15567,13 +15948,8 @@ class NakshaApp(QMainWindow):
 
             draw_ribbon.draw_tool_selected.connect(on_draw_tool_selected)
             def clear_drawings():
-                from gui.native_draw import get_native_draw
-                native = get_native_draw(self)
-                if native is not None:
-                    native.clear()
-                    self.statusBar().showMessage('Native drawings cleared', 2500)
-                    return
-                self.digitizer.clear_drawings(record_undo=True, preserve_committed=True)
+                from gui.draw_clear_dialog import show_draw_clear_dialog
+                show_draw_clear_dialog(self)
             draw_ribbon.clear_requested.connect(clear_drawings)
             if hasattr(draw_ribbon, "curve_tool_selected"):
                 draw_ribbon.curve_tool_selected.connect(self.on_curve_button_clicked)
@@ -19527,6 +19903,45 @@ class NakshaApp(QMainWindow):
         except Exception as e:
             print(f"⚠️ Magnifier Error: {e}")
 
+    def _fit_native_lnt_view(self, source: str = "fit") -> bool:
+        """Fit the visible Vulkan LNT camera, if it owns the main viewport."""
+        lnt_view = getattr(self, "_lnt_main_view", None)
+        native = getattr(lnt_view, "native", None) if lnt_view is not None else None
+        if native is None:
+            return False
+
+        try:
+            # Preserve the exact pre-fit camera as the Back destination even
+            # when the user's last pan/zoom debounce has not fired yet.
+            timer = getattr(self, "_view_history_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+                self._commit_main_view_history(
+                    getattr(self, "_view_history_pending_reason", "view_change"))
+
+            # reset() uses the LNT's authoritative envelope, centres the
+            # camera, fits the complete cloud and restores orthographic plan
+            # mode.  set_2d() keeps the Python interaction mode in sync with
+            # that native camera state.
+            native.reset()
+            lnt_view.set_2d(True)
+            native.frame(0.0)
+            self._main_view_2d_locked = True
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
+
+            self._schedule_main_view_history_commit(
+                f"{source}_native_lnt", delay_ms=120)
+            if hasattr(self, "statusBar"):
+                self.statusBar().showMessage(
+                    "View fitted to the complete point cloud", 2000)
+            print(f"[LNT] native Vulkan view fitted ({source})")
+            return True
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            print(f"[LNT] native Vulkan fit failed ({source}): {exc}")
+            return False
+
     def fit_view(self):
         """
         Fit main view to visible data.
@@ -19536,6 +19951,11 @@ class NakshaApp(QMainWindow):
         Camera-only operation. Maintains 2D lock if active.
         Safe to call anytime.
         """
+        # The promoted LNT viewport has its own Vulkan camera.  Fitting the
+        # hidden VTK renderer has no visible effect, so route to its owner.
+        if self._fit_native_lnt_view(source="fit_view"):
+            return True
+
         try:
             import numpy as np
             
@@ -19794,6 +20214,9 @@ class NakshaApp(QMainWindow):
         Canonical "fit + keep main view 2D" entrypoint.
         Used by ribbon Fit and can be reused by future UI triggers.
         """
+        if self._fit_native_lnt_view(source=source):
+            return True
+
         try:
             short_filter = getattr(self, "short_cut_filter", None)
             if short_filter and hasattr(short_filter, "_fit_main_view_with_2d_lock"):

@@ -4829,6 +4829,11 @@ def _polygon_bounds_xy(points_xy: List[Tuple[float, float]]) -> Tuple[float, flo
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _block_hit_priority(block: Dict[str, object]) -> int:
+    """Rank overlapping right-click polygons; real block data wins grids."""
+    return 1 if block.get("file_path") else 0
+
+
 def _bbox_intersects(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], eps: float = 1e-9) -> bool:
     return not (
         a[2] < b[0] - eps or
@@ -7408,10 +7413,15 @@ class GridLabelManager:
         # attachment directory from another location.
         prj_polygons = self._get_prj_block_polygons()
         if prj_polygons:
-            prj_keys = {
+            # A PRJ boundary is allowed to replace the same-name SNT record
+            # only when it resolves to actual point-cloud data.  An unresolved
+            # PRJ polygon is useful navigation/grid geometry, but must not hide
+            # a data-backed SNT block and turn right-clicks inside that block
+            # into a manual-file prompt.
+            resolved_prj_keys = {
                 str(p.get("grid_name") or "").strip().casefold()
                 for p in prj_polygons
-                if str(p.get("grid_name") or "").strip()
+                if str(p.get("grid_name") or "").strip() and p.get("file_path")
             }
 
             snt_aliases = {}
@@ -7419,7 +7429,7 @@ class GridLabelManager:
             replaced = 0
             for blk in block_polygons:
                 key = str(blk.get("grid_name") or "").strip().casefold()
-                if key and key in prj_keys:
+                if key and key in resolved_prj_keys:
                     replaced += 1
                     aliases = snt_aliases.setdefault(key, [])
                     for name in [blk.get("grid_name"), blk.get("block_file"), *(blk.get("alt_names") or [])]:
@@ -7442,10 +7452,12 @@ class GridLabelManager:
                 authoritative_prj.append(item)
 
             block_polygons = kept + authoritative_prj
+            unresolved_count = len(prj_polygons) - len(resolved_prj_keys)
             print(
                 f"[block-click] PRJ authority active: {len(authoritative_prj)} "
                 f"identified PRJ block(s), replaced {replaced} same-name "
-                f"SNT block source(s)"
+                f"SNT block source(s); retained SNT data for "
+                f"{unresolved_count} unresolved PRJ block(s)"
             )
 
         if not block_polygons:
@@ -7464,26 +7476,15 @@ class GridLabelManager:
             print(f"[block-click] world XY = ({wx:.2f}, {wy:.2f}), "
                   f"testing {len(block_polygons)} BL polygons")
 
-            def _pip(px, py, poly):
-                n = len(poly)
-                inside = False
-                j = n - 1
-                for i in range(n):
-                    xi, yi = poly[i]
-                    xj, yj = poly[j]
-                    if ((yi > py) != (yj > py)) and (
-                        px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-12) + xi
-                    ):
-                        inside = not inside
-                    j = i
-                return inside
-
             hit_block = None
             all_hit_alt_names = []
             best_edge_dist = float('inf')
+            best_priority = -1
             for blk in block_polygons:
                 pts = blk.get("points_2d", [])
-                if len(pts) >= 3 and _pip(wx, wy, pts):
+                # Boundary-inclusive: every edge and corner belongs to the
+                # block, matching the visible outline and user expectation.
+                if len(pts) >= 3 and _point_in_polygon_xy(wx, wy, pts):
                     # NEAREST BOUNDARY: pick the polygon whose edge is closest
                     # to the click point. At corners where polygons overlap,
                     # the click is physically closer to the correct block's
@@ -7508,9 +7509,23 @@ class GridLabelManager:
                     print(f"[block-click] polygon '{blk.get('grid_name')}': "
                           f"nearest_edge={edge_m:.1f}m")
 
-                    if hit_block is None or min_edge_dist < best_edge_dist:
+                    # Point-cloud-backed block data wins over grid/navigation
+                    # polygons across the block's whole area, including its
+                    # corners.  Distance is only a tie-breaker between records
+                    # of the same authority; using edge distance globally let
+                    # an overlapping unresolved grid steal the right-click.
+                    candidate_priority = _block_hit_priority(blk)
+                    if (
+                        hit_block is None
+                        or candidate_priority > best_priority
+                        or (
+                            candidate_priority == best_priority
+                            and min_edge_dist < best_edge_dist
+                        )
+                    ):
                         hit_block = blk
                         best_edge_dist = min_edge_dist
+                        best_priority = candidate_priority
                     # Collect alt_names from ALL overlapping polygons
                     for an in blk.get("alt_names", []):
                         if an not in all_hit_alt_names:
@@ -7526,7 +7541,8 @@ class GridLabelManager:
                 return False
 
             print(f"[block-click] WINNER: '{hit_block.get('grid_name')}' "
-                  f"(nearest edge={best_edge_dist**0.5:.1f}m)")
+                  f"(data_backed={bool(hit_block.get('file_path'))}, "
+                  f"nearest edge={best_edge_dist**0.5:.1f}m)")
 
             grid_name = hit_block.get("grid_name")
             file_path = hit_block.get("file_path")
@@ -7543,6 +7559,10 @@ class GridLabelManager:
 
             if not (grid_name or file_path):
                 return False
+
+            from gui.shading_context import show_loaded_block_shading
+            if show_loaded_block_shading(self.app, hit_block):
+                return True
 
             menu = QMenu(self.app)
             menu.setStyleSheet("""
@@ -7885,6 +7905,10 @@ class GridLabelManager:
 
         print(f"[native-right-click] world XY = ({world_xy[0]:.2f}, {world_xy[1]:.2f})")
         if self._block_polygon_hit_click(None, None, None, world_xy=world_xy):
+            return True
+
+        from gui.shading_context import show_shading_at_world
+        if show_shading_at_world(self.app, world_xy):
             return True
 
         actor = self._native_grid_label_near(world_xy, units_per_pixel)
@@ -8711,6 +8735,14 @@ class GridLabelManager:
         las_file = Path(las_file)
         if las_file.suffix.lower() not in LNT_SUFFIXES:
             return False
+        # "Read points" dialog first (LAS/LAZ only; the Load Block/Grid
+        # shortcut skips it). Cancel leaves the current cloud untouched.
+        import_options = self.app._prompt_lidar_import_options_for_files([las_file])
+        if import_options is None:
+            print(f"[block-load] '{grid_name}' cancelled in Read points")
+            return True
+        from gui.lnt_open import set_import_class_filter
+        set_import_class_filter(self.app, import_options)
         self.loaded_grids.clear()
         self.grid_aliases.clear()
         self.app._lnt_block_grid_name = grid_name

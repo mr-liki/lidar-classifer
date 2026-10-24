@@ -339,6 +339,53 @@ def test_measure_move_refused_without_mutating_original(runtime):
     assert 'selection-only' in draw.app.bar.messages[-1]
 
 
+def test_move_copy_preview_replaces_selected_native_sources(runtime):
+    """An active transform paints one ghost, not source plus ghost."""
+    Qt,AppQt,bridge,_=runtime
+    first={'type':'line','coords':[(0,0),(4,0)]}
+    second={'type':'line','coords':[(10,0),(14,0)]}
+    draw=prepared_draw([first,second])
+    tool=controller(bridge,draw,'block')
+    tool.selection_manager.apply([
+        tool._native_feature(0,first), tool._native_feature(1,second)
+    ])
+    tool.enter_copy_mode()
+    assert tool.transform_hidden_drawing_ids()==set()
+    tool._offset_origin=(0.,0.)
+    tool._hover=(5.,5.)
+    assert tool.transform_hidden_drawing_ids()=={id(first),id(second)}
+    previews=tool.preview_shapes()
+    assert len([shape for shape in previews if shape[0]=='drawing_preview'])==2
+    tool.exit_copy_mode()
+    assert tool.transform_hidden_drawing_ids()==set()
+
+
+@pytest.mark.parametrize('copy_mode', [False, True])
+@pytest.mark.parametrize('drag', [False, True])
+def test_transform_commit_matches_preview_in_every_repaint(runtime, copy_mode, drag):
+    Qt,AppQt,bridge,_=runtime
+    original={'type':'line','coords':[(100.,200.),(110.,210.)]}
+    draw=prepared_draw([original])
+    tool=controller(bridge,draw,'block')
+    tool.selection_manager.apply([tool._native_feature(0,original)])
+    (tool.enter_copy_mode if copy_mode else tool.enter_move_mode)()
+    tool.press(Pos(100.,200.),Qt.LeftButton)
+    tool.move(Pos(130.,250.),0)
+    expected=tool.preview_shapes()[0][1]
+    frames=[]
+    draw._paint=lambda:frames.append((tool._offset_origin, tool.preview_shapes()))
+    if drag:
+        tool.release(Pos(130.,250.),Qt.LeftButton)
+    else:
+        tool.press(Pos(130.,250.),Qt.LeftButton)
+        tool.release(Pos(130.,250.),Qt.LeftButton)
+    assert draw.drawings[-1]['coords']==expected
+    assert len(draw.drawings)==(2 if copy_mode else 1)
+    assert original['coords']==[(100.,200.),(110.,210.)]
+    assert frames and all(anchor is None and not shapes for anchor,shapes in frames)
+    assert len(draw.actions)==1
+
+
 def test_text_copy_uses_rendered_entities_without_modifying_them(runtime,monkeypatch):
     Qt,AppQt,bridge,_=runtime
     text={'type':'text','text':'FIRST GRID','position':(10.,20.),'height':4.,'layer':'T'}

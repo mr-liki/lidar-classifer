@@ -7,7 +7,10 @@ from functools import lru_cache
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QInputDialog
 
-from gui.native_selection_targets import close_freehand, snap_draft_closure, editable_draw
+from gui.native_selection_targets import (
+    close_freehand, snap_draft_closure, editable_draw, parallel_line_source,
+    drawn_open_line_source,
+)
 from gui.native_stroke_geometry import (
     catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
 )
@@ -32,6 +35,8 @@ TOOL_MAP = {
     'curve_point': 'curve', 'curve': 'curve', 'hatcharea': 'hatch',
     'accudraw': 'accudraw',
     'parallel': 'parallel', 'centerline': 'centerline',
+    # Internal interactive operation, entered only from a native text menu.
+    'movetext': 'movetext', 'move_text': 'movetext',
 }
 
 
@@ -141,6 +146,11 @@ class NativeDraw:
         self._vertex_move_dragged = False
         self._vertex_insert_pending = False
         self._text_options = None
+        # Move native text by replacing its immutable world-coordinate record.
+        # No LiDAR/classification/SNT entity is edited.
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self.aux_shapes = []
         self._selection_bridge = None  # active Vulkan-only Select panel
         # The legacy Parallel/Centerline dialogs own interaction when Vulkan is
@@ -148,6 +158,20 @@ class NativeDraw:
         # result delivery need an adapter. Never register VTK observers here.
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
+        # Dialog-owned selected fence outlines, independent of the VTK actors.
+        # Geometry is world XY; class colors and native point buffers are untouched.
+        self._classification_fence_highlights = {}
+        self._classification_fence_highlight_refs = {}
+        # Selection is a VIEW state, not a classification/used-fence flag.
+        # Exactly one group owns the permanent cyan selection at a time. The
+        # popup's checkbox preview has a separate temporary overlay.
+        self._active_fence_highlight_owner = None
+        self._active_fence_shapes = []
+        self._fence_selection_revision = 0
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
+        self._fence_picker_hover_owner = None
+        self._fence_picker_hover_ring = None
         self._object_actions = []
         self._object_redo = []
         self._shutting_down = False
@@ -167,6 +191,252 @@ class NativeDraw:
         if 'fill_color' in style:
             style['fill_color'] = QColor.fromRgbF(*style['fill_color']).name()
         return style
+
+    def _source_visual_style(self, feature):
+        """Copy the visible appearance of the selected native or SNT line.
+
+        Parallel is a derived CAD entity, not a transient rubber-band. Its
+        authored appearance must survive style edits to unrelated tools.
+        """
+        if feature.get('source') == 'native':
+            drawing = feature['drawing']
+            configured = self._style(drawing.get('type'))
+            configured.update({k: drawing[k] for k in ('color', 'width', 'style')
+                               if drawing.get(k) is not None})
+            # Older ParallelToolDialog records persisted 'line_style' only.
+            # Their original stroke must remain inheritable too.
+            if drawing.get('style') is None and drawing.get('line_style') is not None:
+                configured['style'] = drawing['line_style']
+            rgb = configured.get('color')
+            if isinstance(rgb, (tuple, list)) and len(rgb) >= 3:
+                # Native records may carry byte RGB or normalized RGB values.
+                components = [float(c) for c in rgb[:3]]
+                if all(0. <= c <= 1. for c in components):
+                    components = [255. * c for c in components]
+                configured['color'] = '#%02x%02x%02x' % tuple(
+                    max(0, min(255, round(c))) for c in components)
+            return {k: configured[k] for k in ('color', 'width', 'style')
+                    if k in configured}
+        if feature.get('source') == 'snt':
+            entity = feature.get('entity') or {}
+            # Use the *same* normalization and lineweight mapping used by the
+            # Vulkan SNT vector renderer, not the Parallel tool's defaults.
+            from gui.native_vector_overlay import _entity_rgb, _line_width_px
+            r, g, b = (int(v) for v in _entity_rgb(entity))
+            result = {'color': f'#{r:02x}{g:02x}{b:02x}',
+                      'width': max(1, round(_line_width_px(entity.get('_lineweight', 0))))}
+            raw = str(entity.get('style') or entity.get('line_style') or 'solid').lower()
+            raw = {'dash': 'dashed', 'dot': 'dotted', 'dashdot': 'dash-dot',
+                   'dashdotdot': 'dash-dot-dot'}.get(raw, raw)
+            result['style'] = (raw if raw in ('solid', 'dashed', 'dotted',
+                                             'dash-dot', 'dash-dot-dot') else 'solid')
+            return result
+        return {}
+
+    def _native_text_at(self, pos):
+        """Pick actual screen-space glyph bounds at *any* camera zoom.
+
+        Unlike an ordinary drawing's one-point geometry, a label is picked
+        throughout its text, not only within 12 px of its insertion anchor.
+        This uses the same projection/transform as CanvasOverlay.paintEvent.
+        """
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QFontMetricsF
+        from gui.native_label_layout import native_draw_text_layout
+        from gui.draw_clear_selection import is_clearable_draw
+        snapshot = self.canvas.projection_snapshot()
+        project = snapshot[1] if snapshot is not None else self.canvas.screen_from_section
+        screen = QPointF(pos.x(), pos.y())
+        for drawing in reversed(self.drawings):
+            if (drawing.get('type') != 'text' or
+                    not is_clearable_draw(drawing)):
+                continue
+            coords = drawing.get('coords')
+            if coords is None or len(coords) == 0 or not str(drawing.get('text', '')).strip():
+                continue
+            font, transform = native_draw_text_layout(project, coords[0], drawing,
+                                                      self.overlay.font())
+            bounds = QFontMetricsF(font).boundingRect(str(drawing['text']))
+            if not transform.mapRect(bounds).adjusted(-4, -4, 4, 4).contains(screen):
+                continue
+            inverse, ok = transform.inverted()
+            if not ok:
+                continue
+            # Precise rotated hit-test, with a small screen-pixel allowance.
+            scale = max(0.1, min(math.hypot(transform.m11(), transform.m12()),
+                                 math.hypot(transform.m21(), transform.m22())))
+            pad = 4. / scale
+            if bounds.adjusted(-pad, -pad, pad, pad).contains(inverse.map(screen)):
+                return drawing
+        return None
+
+    def try_text_context(self, pos):
+        """Consume a right-click ONLY when it hits an editable native label."""
+        if getattr(self, '_shutting_down', False):
+            return False
+        drawing = self._native_text_at(pos)
+        if drawing is None:
+            return False
+        # Showing QMenu synchronously from MouseButtonPress creates a nested
+        # event loop before button release on Windows; defer it one Qt tick.
+        from PySide6.QtCore import QTimer
+        global_pos = self.canvas.widget.mapToGlobal(pos.toPoint())
+        # Keep the original local hit position to preserve the user's grab
+        # point when Move Text is selected from the context menu.
+        from PySide6.QtCore import QPointF
+        hit_pos = QPointF(pos)
+        QTimer.singleShot(0, lambda d=drawing, p=global_pos, h=hit_pos:
+                          self._show_text_context_menu(d, p, h))
+        return True
+
+    def _show_text_context_menu(self, drawing, global_pos, hit_pos=None):
+        if getattr(self, '_shutting_down', False) or not any(
+                d is drawing for d in self.drawings):
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self.app)
+        edit_action = menu.addAction('Edit Text...')
+        move_action = menu.addAction('Move Text...')
+        delete_action = menu.addAction('Delete Text')
+        chosen = menu.exec(global_pos)
+        if chosen == edit_action:
+            self._edit_native_text(drawing)
+        elif chosen == move_action:
+            self._begin_native_text_move(drawing, hit_pos)
+        elif chosen == delete_action:
+            self.delete_drawings([id(drawing)])
+
+    def _begin_native_text_move(self, drawing, hit_pos=None):
+        """Arm a single text relocation, preserving the grabbed glyph position.
+
+        This internal tool receives input through both native LNT and promoted
+        Vulkan viewport routes; the prior Draw/Select tool is deactivated via
+        the ordinary activation path. Original geometry is unchanged until
+        the destination click, so Cancel cannot damage the document.
+        """
+        if not any(item is drawing for item in self.drawings):
+            return False
+        coords = drawing.get('coords') or ()
+        if not coords or drawing.get('type') != 'text':
+            return False
+        anchor = tuple(coords[0])
+        if len(anchor) < 2:
+            return False
+        delta = (0., 0.)
+        if hit_pos is not None:
+            try:
+                picked = self.canvas.section_at(hit_pos.x(), hit_pos.y())
+                delta = (float(anchor[0])-float(picked[0]),
+                         float(anchor[1])-float(picked[1]))
+            except (RuntimeError, TypeError, ValueError):
+                pass  # Fall back to selecting a new anchor directly.
+        if not self.activate('movetext'):
+            return False
+        self._moving_text_ref = drawing
+        self._moving_text_grab_offset = delta
+        self._moving_text_hover = (float(anchor[0]), float(anchor[1]))
+        self.app.statusBar().showMessage(
+            'Move Text: move pointer and left-click to place; Esc/right-click cancels',
+            7000)
+        self._paint()
+        return True
+
+    def _text_move_world_at(self, pos):
+        """Project cursor to XY without snapping to the label being moved."""
+        world = self.canvas.section_at(pos.x(), pos.y())
+        dx, dy = self._moving_text_grab_offset
+        return (float(world[0]) + dx, float(world[1]) + dy)
+
+    def _commit_native_text_move(self, pos):
+        """Commit the new world position as exactly one Draw Undo/Redo step."""
+        original = self._moving_text_ref
+        if original is None or not any(d is original for d in self.drawings):
+            self.cancel()
+            return True
+        try:
+            xy = self._text_move_world_at(pos)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.app.statusBar().showMessage(f'Move Text: cannot project point: {exc}', 3000)
+            return True  # Keep the active move; user can try again or cancel.
+        old_coords = list(original['coords'])
+        old_anchor = tuple(old_coords[0])
+        tolerance = max(1.e-10, 0.1 * self.canvas.world_per_pixel())
+        if math.dist(xy, old_anchor[:2]) <= tolerance:
+            self.cancel()
+            self.app.statusBar().showMessage('Move Text: position unchanged', 2500)
+            return True
+        old_coords[0] = (xy[0], xy[1], *old_anchor[2:])
+        before = list(self.drawings)
+        replacement = dict(original, coords=old_coords)
+        index = next(i for i, d in enumerate(self.drawings) if d is original)
+        self.drawings[index] = replacement
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self.record_object_change(before)
+        self._prune_deleted_native_refs({id(original)})
+        self.cancel()
+        self.app.statusBar().showMessage('Text moved (Ctrl+Z to undo)', 3500)
+        return True
+
+    def _edit_native_text(self, drawing):
+        """Reopen the existing editor; commit one immutable Undo/Redo step."""
+        if not any(d is drawing for d in self.drawings):
+            return False
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QDialog
+        from gui.digitize_tools import TextEditDialog
+        raw_color = drawing.get('color')
+        if raw_color is None:
+            raw_color = '#ff0000'
+        if isinstance(raw_color, (tuple, list)) and len(raw_color) >= 3:
+            channels = [float(v) for v in raw_color[:3]]
+            if all(0. <= c <= 1. for c in channels):
+                color = QColor.fromRgbF(*channels)
+            else:
+                color = QColor(*(max(0, min(255, round(c))) for c in channels))
+        else:
+            color = QColor(str(raw_color))
+        if not color.isValid():
+            color = QColor('#ff0000')
+        dialog = TextEditDialog(
+            current_text=str(drawing.get('text', '')),
+            current_size=max(1, int(drawing.get('font_size') or 75)),
+            current_font=drawing.get('font_family', 'Arial'),
+            current_bold=bool(drawing.get('bold', False)),
+            current_italic=bool(drawing.get('italic', False)),
+            current_color=(color.redF(), color.greenF(), color.blueF()),
+            parent=self.app,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return False
+        values = dialog.get_values()
+        if not str(values.get('text', '')).strip():
+            self.app.statusBar().showMessage('Text cannot be empty; edit cancelled.', 3000)
+            return False
+        old_size = max(1, int(drawing.get('font_size') or 75))
+        new_size = max(1, int(values.get('font_size') or old_size))
+        old_height = float(drawing.get('height') or 0.)
+        from gui.native_label_layout import native_draw_text_height
+        # Existing world-sized text must not jump in size when editing at a
+        # different zoom. First-time edits to old records establish a height.
+        new_height = (old_height * new_size / old_size if old_height > 0. else
+                      native_draw_text_height(values, self.canvas.world_per_pixel()))
+        rgb = values.get('color', (1., 0., 0.))
+        hex_color = '#%02x%02x%02x' % tuple(
+            max(0, min(255, round(float(c) * 255))) for c in rgb[:3])
+        before = list(self.drawings)
+        replacement = dict(drawing, text=values['text'], color=hex_color,
+                           font_family=values.get('font_family', 'Arial'),
+                           font_size=new_size, bold=bool(values.get('bold')),
+                           italic=bool(values.get('italic')), height=new_height)
+        idx = next(i for i, d in enumerate(self.drawings) if d is drawing)
+        self.drawings[idx] = replacement
+        self.record_object_change(before)
+        # No in-place mutation: the previous object remains valid in Undo.
+        # Remove only stale UI selection references, not unrelated fences.
+        self._prune_deleted_native_refs({id(drawing)})
+        self.app.statusBar().showMessage('Text updated (Ctrl+Z to undo)', 3000)
+        return True
 
     def activate(self, name):
         tool = TOOL_MAP.get(str(name or '').lower().replace(' ', '_'))
@@ -195,6 +465,9 @@ class NativeDraw:
             if getattr(self._selection_bridge,'_intersect_mode',False):
                 self._selection_bridge.exit_intersect_mode(commit=True)
         self.cancel(stand_down=False)
+        # Pick up settings saved while this native viewport was not visible.
+        from gui.draw_settings_dialog import load_draw_settings
+        self.styles = load_draw_settings()
         self._hover_selected_native_ref = None
         self._hover_pick_at = 0.0
         if tool != 'select' and self._selection_bridge is not None:
@@ -304,6 +577,95 @@ class NativeDraw:
         self._legacy_dialog_highlights = list(features)
         self._paint()
 
+    def set_classification_fence_hover(self, owner, shape=None):
+        """Preview one picker row without changing selected fences or drawings."""
+        from gui.native_byclass_fences import _valid_ring
+        key = id(owner)
+        if shape is None:
+            if getattr(self, '_fence_picker_hover_owner', None) != key:
+                return
+            self._fence_picker_hover_owner = None
+            self._fence_picker_hover_ring = None
+        else:
+            ring = _valid_ring(shape.get('coords', ()))
+            self._fence_picker_hover_owner = key if ring else None
+            self._fence_picker_hover_ring = ring
+        self._paint()
+
+    def set_classification_fence_highlights(self, owner, fences, *,
+                                            preview=False, replace=False):
+        """Show only the *current* selection in cyan, never historical fences.
+
+        `preview` belongs to a checkbox picker and does not commit selection.
+        A stale dialog clearing/closing cannot erase a newer owner's selection.
+        `replace=True` is used by actual canvas selection (including a click on
+        empty canvas), which must be authoritative even when the set is empty.
+        """
+        from gui.native_byclass_fences import _valid_ring, fence_identity
+        rings, refs, shapes, seen = [], [], [], set()
+        for shape in fences:
+            if not isinstance(shape, dict):
+                continue
+            coords = shape.get('coords')
+            ring = _valid_ring(coords) if coords is not None else None
+            if ring is None:
+                continue
+            identity = fence_identity(shape)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rings.append(ring)
+            shapes.append(shape)
+            ref = shape.get('native_ref')
+            if ref is None and any(shape is obj for obj in getattr(self, 'drawings', ())):
+                ref = shape
+            refs.append(id(ref) if ref is not None else None)
+
+        key = id(owner)
+        # Some older selection/Undo sessions construct an uninitialized
+        # controller before its overlay is attached. Initialize lazily rather
+        # than breaking Stage 1-5 selection tests or viewport restoration.
+        if not hasattr(self, '_classification_fence_highlights'):
+            self._classification_fence_highlights = {}
+        if not hasattr(self, '_classification_fence_highlight_refs'):
+            self._classification_fence_highlight_refs = {}
+        if not hasattr(self, '_active_fence_highlight_owner'):
+            self._active_fence_highlight_owner = None
+        if not hasattr(self, '_fence_picker_preview_owner'):
+            self._fence_picker_preview_owner = None
+            self._fence_picker_preview_rings = []
+        if preview:
+            self._fence_picker_preview_owner = key
+            self._fence_picker_preview_rings = rings
+            self._paint()
+            return
+
+        active = getattr(self, '_active_fence_highlight_owner', None)
+        if not rings and key != active and not replace:
+            # Stale dialog cleanup; an older owner must not clear new picks.
+            if self._fence_picker_preview_owner == key:
+                self._fence_picker_preview_owner = None
+                self._fence_picker_preview_rings = []
+                self._paint()
+            return
+        previous = list(getattr(self, '_active_fence_shapes', ()))
+        previous_ids = [fence_identity(item) for item in previous]
+        new_ids = [fence_identity(item) for item in shapes]
+        # Retire ALL previous dialog outlines rather than rendering their union.
+        self._classification_fence_highlights.clear()
+        self._classification_fence_highlight_refs.clear()
+        if rings:
+            self._classification_fence_highlights[key] = rings
+            self._classification_fence_highlight_refs[key] = refs
+        self._active_fence_highlight_owner = key if rings else None
+        self._active_fence_shapes = shapes
+        if previous_ids != new_ids:
+            self._fence_selection_revision = getattr(self, '_fence_selection_revision', 0) + 1
+        # A new committed selection supersedes any checkbox preview.
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
+        self._paint()
+
     def _scene_token(self):
         """Invalidate imported geometry and selections after SNT load/unload."""
         records = []
@@ -384,7 +746,7 @@ class NativeDraw:
     def _pick_editable_draw(self, p, tolerance=None):
         """Standalone Draw > Select cannot pick imported SNT reference blocks.
 
-        The Parallel/Centerline/Hatch pickers retain their separate SNT inputs.
+        The Hatch picker retains its separate SNT inputs.
         The Element Selection panel additionally supports measured Line/Path.
         """
         if tolerance is None:
@@ -412,11 +774,13 @@ class NativeDraw:
         info=nearest_segment(p,coords)
         return info[0] if info else math.inf
 
-    def _pick_feature(self, p, tolerance=None, open_only=False, exclude=None):
+    def _pick_feature(self, p, tolerance=None, open_only=False, exclude=None, predicate=None):
         if tolerance is None:
             tolerance=max(self.canvas.world_per_pixel()*12., 1.e-9)
         best=None
         for feature in self._near_scene(p, tolerance):
+            if predicate is not None and not predicate(feature):
+                continue
             coords=feature['coords']
             if open_only and (len(coords)<2 or coords[0]==coords[-1]):
                 continue
@@ -434,6 +798,8 @@ class NativeDraw:
             return None
         # Second pass: a click inside a closed polygon selects the polygon.
         for feature in self._near_scene(p,tolerance):
+            if predicate is not None and not predicate(feature):
+                continue
             coords=feature['coords']
             if len(coords)>=4 and coords[0]==coords[-1] and _inside_polygon(p,coords[:-1]):
                 return feature
@@ -482,7 +848,17 @@ class NativeDraw:
             self._selected_native_ref = None
             self._selected_imported = dict(feature,scene_token=self._scene_token())
             self._selection_scene_token = self._scene_token()
-        self._paint()
+        # A standalone Draw > Select click is a new selection, not a request
+        # to keep old cyan fences from a previous By Class dialog. Selection
+        # never undoes a previously applied LiDAR classification.
+        from gui.native_fence_selection import selected_fence_shapes
+        selected_shapes = selected_fence_shapes(
+            [feature['drawing']] if feature is not None
+            and feature.get('source') == 'native' else [], native_draw=self,
+        )
+        self.set_classification_fence_highlights(self, selected_shapes, replace=True)
+        from gui.native_fence_selection import propagate_native_fence_selection
+        propagate_native_fence_selection(self.app, selected_shapes)
 
     @staticmethod
     def _parallel_output(source, click):
@@ -502,8 +878,30 @@ class NativeDraw:
 
     def _snap_at(self,p,mode,tol):
         features=list(self._near_scene(p,tol))
+        if mode=='center':
+            # Line stores independent edges. A completed closed chain is
+            # still a closed Draw figure even when no edge is near the click.
+            chains={}
+            for drawing in getattr(self,'drawings',()):
+                chain=drawing.get('line_chain')
+                if (chain and drawing.get('type')=='line' and
+                        not drawing.get('imported') and editable_draw(drawing)):
+                    chains.setdefault(chain,[]).append(drawing)
+            for chain,edges in chains.items():
+                ring=[]
+                for edge in edges:
+                    coords=edge.get('coords',[])
+                    if len(coords)<2 or (ring and tuple(ring[-1])!=tuple(coords[0])):
+                        break
+                    ring.extend(coords if not ring else coords[1:])
+                else:
+                    if len(ring)>=4 and tuple(ring[0])==tuple(ring[-1]):
+                        features.append(dict(source='native',type='polyline',
+                            coords=ring,key=('line_chain',chain)))
         best=None
         endpoint=None
+        containing_center=None
+        line_keypoint=None
         def offer(q, vertex=False):
             nonlocal best, endpoint
             distance=math.dist(p,q)
@@ -549,16 +947,40 @@ class NativeDraw:
                         controls = feature.get('drawing', {}).get('coords', ())
                         vertex_coords = ([controls[0], controls[-1]] if controls
                                          else ())
+                    if mode=='keypoint' and len(coords)>=2 and len(vertex_coords):
+                        hit=nearest_segment(p,coords)
+                        if hit is not None and hit[0]<=tol:
+                            # Pick the line by its stroke, then its nearest
+                            # real vertex. Vertex distance has no radius cap.
+                            vertex=min((tuple(q[:2]) for q in vertex_coords),
+                                       key=lambda q: math.dist(p,q))
+                            rank=(hit[0],math.dist(p,vertex),vertex)
+                            if line_keypoint is None or rank<line_keypoint:
+                                line_keypoint=rank
                     for q in vertex_coords:
                         if recent_line and tuple(q[:2]) == self.points[-1]:
                             continue
                         offer(tuple(q[:2]), vertex=True)
                 if mode == 'center':
+                    center=None
+                    inside=False
                     if feature.get('type')=='circle' and feature['source']=='native':
-                        offer(feature['drawing']['coords'][0][:2])
+                        controls=feature['drawing']['coords']
+                        center=tuple(controls[0][:2])
+                        if len(controls)>=2:
+                            radius=math.dist(center,controls[1][:2])
+                            inside=radius>0. and math.dist(p,center)<=radius
                     elif len(coords)>=4 and coords[0]==coords[-1]:
                         center=polygon_centroid(coords)
-                        if center is not None:offer(center)
+                        inside=_inside_polygon(p,coords[:-1])
+                    if center is not None:
+                        if inside and feature.get('source')=='native':
+                            # Interior selection is by figure containment,
+                            # independent of the normal pixel snap radius.
+                            rank=(math.dist(p,center),tuple(center))
+                            if containing_center is None or rank<containing_center:
+                                containing_center=rank
+                        offer(center)
                 for a,b in zip(coords,coords[1:]):
                     if recent_line:
                         continue
@@ -569,6 +991,10 @@ class NativeDraw:
             # recent vertex (which would prevent drawing the next segment).
             if mode in ('nearby','keypoint') and self.tool not in ('freehand', 'curve'):
                 for q in self.points[:-1]:offer(q,vertex=True)
+        if containing_center is not None:
+            return containing_center[1]
+        if line_keypoint is not None:
+            return line_keypoint[2]
         if mode=='nearby' and endpoint is not None:
             return endpoint[1]
         return best[1] if best else None
@@ -579,6 +1005,16 @@ class NativeDraw:
         did_snap=False
         self._snap_target=None
         digitizer=getattr(self.app,'digitizer',None)
+        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
+        exact_snap_mode = getattr(digitizer,'snap_mode',None) if explicit_snap else None
+        if (snap and exact_snap_mode in ('center','keypoint') and
+                self.tool not in ('select','parallel','centerline')):
+            candidate=self._snap_at(p,exact_snap_mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
+            if candidate is not None:
+                # Explicit geometric targets win over draft closure and
+                # angle/axis constraints, so placement stays on the target.
+                self._snap_target=candidate
+                return candidate
         # Both Smart Line AND Line snap automatically in the VTK digitizer.
         # Text placement and Vertex insertion also need endpoint magnetism.
         # Explicit Snap mode takes priority over this nearby default.
@@ -592,11 +1028,10 @@ class NativeDraw:
                 self._snap_target = tuple(closure[:2])
                 return self._snap_target
         smart_auto = self.tool in ('smartline', 'line', 'text', 'vertex', 'freehand', 'curve')
-        explicit_snap = bool(digitizer is not None and getattr(digitizer,'snap_enabled',False))
         if (snap and self.tool not in ('select','parallel','centerline')
                 and (smart_auto or explicit_snap)):
             mode=(getattr(digitizer,'snap_mode',None) or 'nearby') if explicit_snap else 'nearby'
-            if mode in ('nearby','keypoint','midpoint','center','intercept'):
+            if mode in ('nearby','midpoint','intercept'):
                 candidate=self._snap_at(p,mode,max(self.canvas.world_per_pixel()*14.,1.e-9))
                 if candidate is not None:
                     p=candidate;did_snap=True;self._snap_target=p
@@ -811,6 +1246,8 @@ class NativeDraw:
             del self._object_actions[:-100]
         self._object_redo.clear()
         self.redo.clear()
+        from gui.native_history_routing import record_native_action
+        record_native_action(self.app, 'draw')
         self._paint()
 
     def _finish_line(self):
@@ -922,6 +1359,31 @@ class NativeDraw:
                 coords[vi] = destination
         new_obj = dict(original, coords=coords)
         self.drawings[di] = new_obj
+        if original.get('type') == 'line' and self._vertex_move_before is not None:
+            # Line commits each edge separately. Move a shared chain corner
+            # on every incident edge, as Smart Line does within one record.
+            origin = tuple(original['coords'][vi][:2])
+            chain = original.get('line_chain')
+            for other_di, other in enumerate(self._vertex_move_before):
+                if other_di == di or other.get('type') != 'line':
+                    continue
+                if other.get('imported') or other.get('source') in (
+                        'block_creation', 'cell_creation', 'snt', 'snt_readonly'):
+                    continue
+                if chain is not None:
+                    if other.get('line_chain') != chain:
+                        continue
+                elif other.get('line_chain') is not None or abs(other_di - di) != 1:
+                    # Older drawings have no chain ID. Consecutively stored
+                    # edges sharing this corner are the recoverable topology.
+                    continue
+                other_coords = list(other.get('coords', []))
+                matches = [i for i, point in enumerate(other_coords)
+                           if tuple(point[:2]) == origin]
+                if matches:
+                    for i in matches:
+                        other_coords[i] = destination
+                    self.drawings[other_di] = dict(other, coords=other_coords)
         self._paint()
         return True
 
@@ -940,8 +1402,13 @@ class NativeDraw:
             moved = new_obj['coords'][vi] != original['coords'][vi]
         if moved:
             self.record_object_change(before)
+            # The edited dict replaced the selected object. Retire any old
+            # highlight/fence identity; stale highlights can draw a synthetic
+            # closing edge across an otherwise OPEN edited polyline.
+            self._prune_deleted_native_refs({id(old) for old, new in
+                zip(before, self.drawings) if old is not new})
         else:
-            self.drawings[di] = original
+            self.drawings[:] = before
         self.vertex_target = None
         self._vertex_move_before = None
         self._vertex_move_original = None
@@ -1050,6 +1517,16 @@ class NativeDraw:
     def press(self, pos, button):
         if not self.active() or button == Qt.MiddleButton:
             return False
+        if self.tool == 'movetext':
+            if button == Qt.RightButton:
+                self.cancel()  # Right-click cancels without opening another menu.
+                return True
+            return self._commit_native_text_move(pos) if button == Qt.LeftButton else False
+        # Existing text is editable on right-click even when the Text tool is
+        # still armed. Never hijack Right-click Finish for another Draw tool.
+        if button == Qt.RightButton and self.tool in ('text', 'select'):
+            if self.try_text_context(pos):
+                return True
         if self.tool == 'select' and self._selection_bridge is not None:
             return self._selection_bridge.press(pos,button)
         dialog = self._legacy_tool_dialog
@@ -1066,7 +1543,10 @@ class NativeDraw:
             if getattr(dialog, '_select_mode', False):
                 try:
                     p = self.canvas.section_at(pos.x(), pos.y())
-                    feature = self._pick_feature(p, open_only=self.tool == 'centerline')
+                    feature = self._pick_feature(
+                        p, open_only=self.tool == 'centerline',
+                        predicate=drawn_open_line_source,
+                    )
                 except (RuntimeError, TypeError, ValueError):
                     feature = None
                 if feature is not None and feature['source'] == 'snt':
@@ -1110,7 +1590,12 @@ class NativeDraw:
             self._paint()
             return True
         try:
-            p = self._point(pos)
+            # Add Vertex must pick the clicked CAD edge, not a nearby SNT
+            # trajectory/block endpoint found by the global snap engine.
+            # Pending tap/drag Move Vertex still uses the normal snap path.
+            p = (self.canvas.section_at(pos.x(), pos.y())
+                 if self.tool == 'vertex' and self.vertex_target is None
+                 else self._point(pos))
         except RuntimeError as exc:
             self.app.statusBar().showMessage(str(exc), 4000)
             return True
@@ -1134,13 +1619,15 @@ class NativeDraw:
                 self.app.statusBar().showMessage('Nothing selectable at cursor',2500)
             return True
         if self.tool == 'parallel':
-            if self._parallel_source is not None and not self._valid_source(self._parallel_source):
+            if self._parallel_source is not None and not (
+                    self._valid_source(self._parallel_source) and
+                    parallel_line_source(self._parallel_source)):
                 self._parallel_source=None
                 self._store_selection(None)
             if self._parallel_source is None:
-                source=self._pick_feature(p,open_only=True)
+                source=self._pick_feature(p,open_only=True, predicate=parallel_line_source)
                 if source is None:
-                    self.app.statusBar().showMessage('Click an existing open SNT/native line first',3500)
+                    self.app.statusBar().showMessage('Click an open line drawn with the Draw tools first',3500)
                     return True
                 self._store_selection(source)
                 self._parallel_source=self._selected_feature()
@@ -1151,27 +1638,31 @@ class NativeDraw:
                 self.app.statusBar().showMessage('Choose an offset point away from the source line',3000)
                 return True
             points,distance=result
-            self._commit('parallel',points, offset_distance=distance,
-                         source_key=self._parallel_source['key'])
+            self._commit('parallel', points, offset_distance=distance,
+                         source_key=self._parallel_source['key'],
+                         **self._source_visual_style(self._parallel_source))
             self._last_pointer_pos=None
             self._paint()
             self.app.statusBar().showMessage(f'Parallel offset: {distance:.3f} drawing units',4000)
             # Stay in Parallel so users can place another offset from source.
             return True
         if self.tool == 'centerline':
-            if self._centerline_first is not None and not self._valid_source(self._centerline_first):
+            if self._centerline_first is not None and not (
+                    drawn_open_line_source(self._centerline_first) and
+                    self._valid_source(self._centerline_first)):
                 self._centerline_first=None
                 self._store_selection(None)
             if self._centerline_first is None:
-                first=self._pick_feature(p,open_only=True)
+                first=self._pick_feature(p,open_only=True, predicate=drawn_open_line_source)
                 if first is None:
-                    self.app.statusBar().showMessage('Click the first existing open SNT/native line',3500)
+                    self.app.statusBar().showMessage('Click the first open line drawn with the Draw tools',3500)
                     return True
                 self._store_selection(first)
                 self._centerline_first=self._selected_feature()
                 self.app.statusBar().showMessage('Click a second DIFFERENT open line',4000)
                 return True
-            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first)
+            second=self._pick_feature(p,open_only=True,exclude=self._centerline_first,
+                                      predicate=drawn_open_line_source)
             if second is None:
                 self.app.statusBar().showMessage('Choose a different open line for Centerline',3500)
                 return True
@@ -1252,13 +1743,17 @@ class NativeDraw:
                 # editable vertex, never as invalid rectangle control points.
                 coords = (self._native_coords(original) if is_rectangle
                           else list(original['coords']))
-                vertex = foot if is_rectangle else p
+                # Insert ON the selected segment. A click tolerance or a
+                # neighbouring SNT snap must not create a stray zigzag edge.
+                # Users can reposition the new vertex with Move Vertex.
+                vertex = foot
                 coords.insert(si + 1, vertex)
                 new_drawing = dict(original, coords=coords)
                 if is_rectangle:
                     new_drawing['type'] = 'polyline'
                 self.drawings[di] = new_drawing
                 self.record_object_change(before)
+                self._prune_deleted_native_refs({id(original)})
                 if getattr(getattr(self.app, 'digitizer', None), 'vertex_auto_drag', False):
                     self.vertex_target = (di, si+1)
                     self._vertex_move_original = self.drawings[di]
@@ -1270,7 +1765,9 @@ class NativeDraw:
                     segment = nearest_segment(p, feature['coords'])
                     if segment is not None:
                         coords = list(feature['coords'])
-                        coords.insert(segment[1]+1, p)
+                        # The SNT source stays read-only; any new native
+                        # clone subdivides the picked edge without a kink.
+                        coords.insert(segment[1]+1, segment[2])
                         self._commit('polyline', coords, source_key=feature['key'])
                     else:
                         self._commit('point', [p])
@@ -1286,11 +1783,16 @@ class NativeDraw:
             red, green, blue = options.get('color', (1., 0., 0.))
             hex_color = '#%02x%02x%02x' % tuple(
                 max(0, min(255, round(float(c)*255))) for c in (red,green,blue))
+            from gui.native_label_layout import native_draw_text_height
+            # Freeze label height in CAD/world units at the moment of placement.
+            # The font size remains an editable typographic point value.
+            font_size = max(1, int(options.get('font_size') or 75))
+            height = native_draw_text_height(options, self.canvas.world_per_pixel())
             self._commit('text', [p], text=options['text'], color=hex_color,
-                         font_family=options.get('font_family','Arial'),
-                         font_size=int(options.get('font_size',75)),
-                         bold=bool(options.get('bold',False)),
-                         italic=bool(options.get('italic',False)))
+                         font_family=options.get('font_family', 'Arial'),
+                         font_size=font_size, height=height,
+                         bold=bool(options.get('bold', False)),
+                         italic=bool(options.get('italic', False)))
             return True
         if self.tool == 'point':
             self._commit('point', [p])
@@ -1311,7 +1813,12 @@ class NativeDraw:
                 return True
             self.point_redo.clear()
             self._line_session_undone.clear()
-            self._commit('line', [start, p])
+            # Persist chain identity so later vertex edits do not pull an
+            # unrelated Line figure that happens to touch the same point.
+            from uuid import uuid4
+            chain = (self._line_session_refs[0].get('line_chain')
+                     if self._line_session_refs else None) or uuid4().hex
+            self._commit('line', [start, p], line_chain=chain)
             self._line_session_refs.append(self.drawings[-1])
             if len(self._line_session_refs) > 100:
                 del self._line_session_refs[:-100]
@@ -1350,6 +1857,21 @@ class NativeDraw:
     def move(self, pos, buttons=Qt.NoButton):
         if not self.active() or buttons & Qt.MiddleButton:
             return False
+        if self.tool == 'movetext':
+            if self._moving_text_ref is None or not any(
+                    d is self._moving_text_ref for d in self.drawings):
+                self.cancel()
+                return True
+            try:
+                xy = self._text_move_world_at(pos)
+            except (RuntimeError, TypeError, ValueError):
+                return True
+            last = self._moving_text_hover
+            if last is None or math.dist(last, xy) > max(
+                    0.5 * self.canvas.world_per_pixel(), 1.e-10):
+                self._moving_text_hover = xy
+                self._paint()
+            return True
         if self.tool == 'select':
             if self._selection_bridge is not None:
                 return self._selection_bridge.move(pos, buttons)
@@ -1566,6 +2088,11 @@ class NativeDraw:
             self._paint()
             return True
 
+        if self.tool == 'movetext' and self._moving_text_ref is not None:
+            # No history entry until placed; Undo/Redo only cancels the preview.
+            self.cancel()
+            return True
+
         if self.vertex_target is not None and self._vertex_move_before is not None:
             # Ctrl+Z during a pending mouse drag cancels the preview; it must
             # not undo an unrelated already-completed geometry object.
@@ -1584,9 +2111,14 @@ class NativeDraw:
         target_actions = self._object_actions if redo else self._object_redo
         if changes:
             before, after = changes.pop()
+            prior = {id(item) for item in self.drawings}
             self.drawings[:] = after if redo else before
             target_actions.append((before,after))
-            if self._selection_bridge is not None:
+            live = {id(item) for item in self.drawings}
+            removed_ids = prior - live
+            if removed_ids:
+                self._prune_deleted_native_refs(removed_ids)
+            elif self._selection_bridge is not None:
                 self._selection_bridge.selection_manager._prune()
             self._paint()
             return True
@@ -1599,6 +2131,74 @@ class NativeDraw:
             self._paint()
         return True
 
+    def _prune_deleted_native_refs(self, removed_ids):
+        """Sync live Draw selection/fence dialogs after shape removal."""
+        selected_ref = getattr(self, '_selected_native_ref', None)
+        if selected_ref is not None and id(selected_ref) in removed_ids:
+            self._store_selection(None)
+        elif selected_ref is not None:
+            self.selected = next((i for i, obj in enumerate(self.drawings)
+                                  if obj is selected_ref), None)
+        hover_ref = getattr(self, '_hover_selected_native_ref', None)
+        if hover_ref is not None and id(hover_ref) in removed_ids:
+            self._hover_selected_native_ref = None
+        all_highlights = getattr(self, '_classification_fence_highlights', {})
+        highlight_refs = getattr(self, '_classification_fence_highlight_refs', {})
+        for key, rings in list(all_highlights.items()):
+            refs = highlight_refs.get(key, [])
+            surviving = [(ring, refs[i] if i < len(refs) else None)
+                         for i, ring in enumerate(rings)
+                         if i >= len(refs) or refs[i] not in removed_ids]
+            if surviving:
+                self._classification_fence_highlights[key] = [item[0] for item in surviving]
+                highlight_refs[key] = [item[1] for item in surviving]
+            else:
+                self._classification_fence_highlights.pop(key, None)
+                highlight_refs.pop(key, None)
+        if not all_highlights:
+            self._active_fence_highlight_owner = None
+        old_fence_count = len(getattr(self, '_active_fence_shapes', ()))
+        self._active_fence_shapes = [shape for shape in
+            getattr(self, '_active_fence_shapes', ())
+            if (shape.get('native_ref') is None or
+                id(shape['native_ref']) not in removed_ids)]
+        if len(self._active_fence_shapes) != old_fence_count:
+            self._fence_selection_revision = getattr(self, '_fence_selection_revision', 0) + 1
+            from gui.native_fence_selection import propagate_native_fence_selection
+            propagate_native_fence_selection(self.app, self._active_fence_shapes)
+        bridge = getattr(self, '_selection_bridge', None)
+        if bridge is not None:
+            bridge.selection_manager._prune()
+        from gui.draw_clear_selection import prune_removed_native_fences
+        prune_removed_native_fences(self.app, self, removed_ids)
+        self._paint()
+
+    def delete_drawings(self, selected_ids):
+        """Delete exactly chosen editable Draw objects; one atomic Undo step.
+
+        Imported SNT, saved/committed objects, point classes, and all unchosen
+        drawings remain untouched. Never compare NumPy-bearing dicts by value.
+        """
+        from gui.draw_clear_selection import select_drawings_by_identity
+        removed = select_drawings_by_identity(self.drawings, selected_ids)
+        if not removed:
+            return 0
+        removed_ids = {id(item) for item in removed}
+        before = list(self.drawings)
+        self.drawings[:] = [item for item in self.drawings if id(item) not in removed_ids]
+        self._line_session_refs[:] = [item for item in self._line_session_refs
+                                      if id(item) not in removed_ids]
+        self._line_session_undone[:] = [item for item in self._line_session_undone
+                                        if id(item) not in removed_ids]
+        # Commit the Undo snapshot before potentially invalid Qt dialogs are
+        # inspected; a stale popup must not make the deletion irreversible.
+        self.record_object_change(before)
+        try:
+            self._prune_deleted_native_refs(removed_ids)
+        except (AttributeError, RuntimeError) as exc:
+            print(f'[Draw Clear] stale selection cleanup warning: {exc}')
+        return len(removed)
+
     def clear(self):
         self._line_session_refs.clear()
         self._line_session_undone.clear()
@@ -1609,6 +2209,9 @@ class NativeDraw:
         self.points, self.hover = [], None
         self.point_redo.clear(); self._z_redo.clear(); self._z_points.clear()
         self._last_pointer_pos = None
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self._store_selection(None)
         self._paint()
 
@@ -1622,6 +2225,9 @@ class NativeDraw:
         self._vertex_move_dragged = False
         self._vertex_insert_pending = False
         self._text_options = None
+        self._moving_text_ref = None
+        self._moving_text_hover = None
+        self._moving_text_grab_offset = (0., 0.)
         self._close_palettes()
         self.points, self.hover, self.dragging, self.vertex_target = [], None, False, None
         self.point_redo.clear(); self._z_redo.clear(); self._z_points.clear()
@@ -1705,6 +2311,11 @@ class NativeDraw:
         shapes = []
         bridge = self._selection_bridge
         chosen = (bridge.selection_manager._selected if bridge is not None else {})
+        # An open picker previews a REPLACEMENT group. Obsolete selection
+        # strokes must not stay cyan behind that preview.
+        picker_preview = getattr(self, '_fence_picker_preview_owner', None) is not None
+        if picker_preview:
+            chosen = {}
         hidden_in_intersect = (bridge._intersect_source_ids if bridge is not None
                                and bridge._intersect_mode else set())
         hovered = (getattr(bridge, '_hover_feature', None) if bridge is not None
@@ -1713,15 +2324,30 @@ class NativeDraw:
                        and hovered.get('source') == 'native' else
                        getattr(self, '_hover_selected_native_ref', None)
                        if bridge is None and self.tool == 'select' else None)
+        transform_hidden = (
+            bridge.transform_hidden_drawing_ids()
+            if bridge is not None and hasattr(bridge, 'transform_hidden_drawing_ids')
+            else set()
+        )
         for i, drawing in enumerate(self.drawings):
+            if (drawing is getattr(self, '_moving_text_ref', None)
+                    and getattr(self, '_moving_text_hover', None) is not None):
+                continue  # The live preview replaces the original, not duplicates it.
+            if id(drawing) in transform_hidden:
+                continue  # Transform preview replaces its committed sources this frame.
             if id(drawing) in hidden_in_intersect:
                 continue  # VTK-style overlay replaces original with split pieces.
             if gpu_blocks and drawing.get('source') == 'block_creation':
                 continue
             data = self._style(drawing.get('type'))
             data.update(drawing)
+            # Backward compatibility with lines saved by the old Parallel
+            # dialog, which used 'line_style' instead of the overlay's 'style'.
+            if drawing.get('style') is None and drawing.get('line_style') is not None:
+                data['style'] = drawing['line_style']
             data['selected'] = (('native', id(drawing)) in chosen if bridge is not None
-                                else i == self.selected and drawing is self._selected_native_ref)
+                                else not picker_preview and i == self.selected
+                                and drawing is self._selected_native_ref)
             # Only editable native Draw objects get cyan. Block/cell geometry
             # and imported SNT linework retain their existing special colors.
             data['highlight_scope'] = 'draw' if editable_draw(drawing) else None
@@ -1735,6 +2361,16 @@ class NativeDraw:
                 data['control_points'] = list(coords)
                 coords = _catmull_rom(coords)
             shapes.append(('drawing', coords, data))
+        if (getattr(self, '_moving_text_ref', None) is not None
+                and getattr(self, '_moving_text_hover', None) is not None):
+            # Only the placement preview moves; original world coordinates and
+            # every font/style field remain immutable until the left-click.
+            label = self._moving_text_ref
+            data = dict(self._style('text'), **label)
+            data['show_vertices'] = False
+            data['selected'] = False
+            data['hovered'] = False
+            shapes.append(('drawing_preview', [self._moving_text_hover], data))
         if self.points:
             preview = self.points + ([self.hover] if self.hover else [])
             # Draw Polyline is the polygon tool in the ribbon. Show the closing
@@ -1774,7 +2410,8 @@ class NativeDraw:
                 parallel=None
             if parallel is not None and abs(parallel[1])>1.e-9:
                 shapes.append(('drawing_preview', parallel[0],
-                               {'type':'parallel','color':'#39ffc0','width':2}))
+                               {'type': 'parallel', 'show_vertices': False,
+                                **self._source_visual_style(self._parallel_source)}))
         if self._snap_target is not None and self.tool not in ('select','parallel','centerline'):
             shapes.append(('drawing_preview',[self._snap_target],
                            {'type':'point','color':'#00e676','width':3}))
@@ -1797,7 +2434,56 @@ class NativeDraw:
                                    {'type':'point' if len(feat['coords'])==1 else 'polyline',
                                     'selected':True,'width':3}))
             shapes.extend(self._selection_bridge.preview_shapes())
+        # The VTK renderer is hidden behind the Vulkan main viewport. Only
+        # the CURRENT fence group is cyan; formerly classified shapes are not
+        # selected just because their class edits are still committed.
+        # The active Draw/Element Selection path already paints a chosen source
+        # object cyan, so skip a second overlay for exactly that same object.
+        active_key = getattr(self, '_active_fence_highlight_owner', None)
+        active_rings = (() if picker_preview else
+                        getattr(self, '_classification_fence_highlights', {}).get(active_key, ()))
+        active_refs = getattr(self, '_classification_fence_highlight_refs', {}).get(active_key, ())
+        selection_refs = {key[1] for key in chosen if key[0] == 'native'}
+        if bridge is None and getattr(self, '_selected_native_ref', None) is not None and getattr(self, 'selected', None) is not None:
+            selection_refs.add(id(self._selected_native_ref))
+        # Fence classification may close an OPEN line into an area, but that
+        # virtual closure is not a real Draw edge. Repaint native reference
+        # highlights using their exact stored/display geometry instead.
+        live_native = ({id(d): d for d in self.drawings} if active_rings else {})
+        for i, ring in enumerate(active_rings):
+            ref_id = active_refs[i] if i < len(active_refs) else None
+            if ref_id in selection_refs:
+                continue
+            if ref_id is not None:
+                real_drawing = live_native.get(ref_id)
+                if real_drawing is None:
+                    continue  # An obsolete selected object was edited away.
+                visible_coords = self._native_coords(real_drawing)
+                if not visible_coords:
+                    continue
+            else:
+                visible_coords = ring  # Explicit classification fence shape.
+            shapes.append(('drawing', visible_coords, {
+                'type': 'polyline', 'color': '#00ffff', 'selected': True,
+                'highlight_scope': 'draw', 'width': 4,
+                'show_vertices': False,
+            }))
+        # The picker is a non-destructive preview. When it closes, the last
+        # committed selection becomes visible again, not an obsolete dialog.
+        for ring in getattr(self, '_fence_picker_preview_rings', ()):
+            shapes.append(('drawing', ring, {
+                'type': 'polyline', 'color': '#00ffff', 'selected': True,
+                'highlight_scope': 'draw', 'width': 4,
+                'show_vertices': False,
+            }))
         shapes.extend(self.aux_shapes)
+        hover_ring = getattr(self, '_fence_picker_hover_ring', None)
+        if hover_ring:
+            shapes.append(('drawing', hover_ring, {
+                'type': 'polyline', 'color': '#00ffff', 'width': 6,
+                'style': 'solid', 'show_vertices': False,
+                'source': 'fence_picker_hover',
+            }))
         self.overlay.set_shapes(shapes)
 
     def shutdown(self):
@@ -1807,6 +2493,14 @@ class NativeDraw:
         dialog = self._legacy_tool_dialog
         self._legacy_tool_dialog = None
         self._legacy_dialog_highlights = []
+        self._classification_fence_highlights.clear()
+        self._classification_fence_highlight_refs.clear()
+        self._active_fence_highlight_owner = None
+        self._active_fence_shapes = []
+        self._fence_picker_preview_owner = None
+        self._fence_picker_preview_rings = []
+        self._fence_picker_hover_owner = None
+        self._fence_picker_hover_ring = None
         if dialog is not None:
             try:
                 dialog.close()
@@ -1818,8 +2512,8 @@ class NativeDraw:
             layer.remove('drawing', '__native_created_blocks__')
         self._block_vector_layer = None
         self._block_vector_signature = None
-        self.overlay._timer.stop()
-        self.overlay.close()
+        self.canvas._closed = True
+        self.overlay.shutdown()
 
 
 def native_plan_view(app, allow_snt=False):
@@ -1842,7 +2536,7 @@ def native_plan_view(app, allow_snt=False):
 
 
 def get_native_draw(app, create=False, allow_snt=False):
-    """Find Draw on the visible Vulkan viewport without hijacking VTK."""
+    """Find Draw on Vulkan; explicit creation promotes an empty viewport."""
     view = getattr(app, '_lnt_main_view', None)
 
     if view is not None:
@@ -1852,6 +2546,14 @@ def get_native_draw(app, create=False, allow_snt=False):
     else:
         owner = getattr(app, 'render_backend', None)
         view = None
+
+        if create and owner is not None:
+            # Match Measure on a fresh launch: install the native canvas
+            # before checking visibility/camera ownership. Promotion refuses
+            # a loaded legacy cloud or an engine without the vector pass.
+            from gui.native_vector_overlay import promote_snt_viewport, snt_viewport_active
+            if not snt_viewport_active(app):
+                promote_snt_viewport(app)
 
         if (owner is not None and
                 getattr(owner, 'active', False) and
@@ -1881,6 +2583,8 @@ def get_native_draw(app, create=False, allow_snt=False):
         # LNT can replace the app's Vulkan QWidget while open. Retire a
         # stale overlay before drawing in the replacement viewport.
         view._draw_saved_shapes = list(draw.drawings)
+        view._draw_saved_history = (list(getattr(draw, '_object_actions', ())),
+                                    list(getattr(draw, '_object_redo', ())))
         draw.shutdown()
         view.drawing = draw = None
     if draw is None and create:
@@ -1888,10 +2592,43 @@ def get_native_draw(app, create=False, allow_snt=False):
         if getattr(view, '_surface_draw', False):
             draw.drawings.extend(getattr(view, '_draw_saved_shapes', ()))
             view._draw_saved_shapes = []
+            saved_history = getattr(view, '_draw_saved_history', None)
+            if saved_history is not None:
+                draw._object_actions[:] = saved_history[0]
+                draw._object_redo[:] = saved_history[1]
+                view._draw_saved_history = None
             draw._paint()
     return draw
 
 
+def _return_to_plan_view_for_draw(app):
+    """Draw places plan XY only. A 3D orbit (D / Shift+P / View ribbon) must
+    not make activation fall through to the VTK digitizer hidden under the
+    Vulkan surface, so a Draw tool brings the main view back to Top."""
+    view = getattr(app, '_lnt_main_view', None)
+    if view is not None:
+        if getattr(view, 'native', None) is None or getattr(view, 'mode_2d', False):
+            return
+    elif getattr(app, 'data', None) or not (
+            getattr(app, 'is_3d_mode', False) or
+            getattr(app, '_main_view_3d_user_enabled', False)):
+        return  # 2D already, or a VTK-rendered cloud keeps the legacy path
+    change = getattr(app, 'handle_view_change', None)
+    if callable(change) and change('top') is not False:
+        if view is None or getattr(view, 'mode_2d', False):
+            return
+    if view is not None:
+        # Renderer without view presets: same as the native TopView shortcut.
+        view.set_2d(True)
+        view.native.plan_view()
+        app.current_view = 'top'
+    app.is_3d_mode = False
+    app._main_view_3d_user_enabled = False
+
+
 def activate_native_draw(app, tool):
+    if str(tool or '').lower().replace(' ', '_') not in TOOL_MAP:
+        return False
+    _return_to_plan_view_for_draw(app)
     draw = get_native_draw(app, create=True)
     return bool(draw and draw.activate(tool))

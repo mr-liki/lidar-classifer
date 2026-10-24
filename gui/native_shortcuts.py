@@ -133,8 +133,14 @@ def native_classification_history(app, redo=False):
     store = getattr(app, '_lnt_section_store', None)
     if view is None or getattr(view, 'native', None) is None:
         return False
+    if getattr(app, '_native_byclass_busy', False):
+        app.statusBar().showMessage('Wait for the current classification operation.', 3000)
+        return True
     source = getattr(app, 'redo_stack' if redo else 'undo_stack', [])
     destination = getattr(app, 'undo_stack' if redo else 'redo_stack', [])
+    if source and isinstance(source[-1], dict) and 'lnt_conversion' in source[-1]:
+        from gui.native_conversion_history import conversion_history
+        return conversion_history(app, view, source, destination, redo)
     if source and isinstance(source[-1], dict) and 'lnt_node' in source[-1]:
         return _native_ai_history(app, view, source, destination, redo)
     if store is None or not source:
@@ -669,14 +675,16 @@ def execute_native_shortcut(app, tool, from_cls=None, to_cls=None, preset=None, 
             sections.apply_sync_map(mapping)
         else:
             app.open_sync_views_dialog()
-    elif name == 'DisplayMode':
+    elif name == 'DisplayMode' or (name == 'Surface' and (preset or {}).get('views')):
         if not preset:
             app.open_display_mode()
             return True
         from gui.shortcut_manager import rebase_display_preset_to_current_ptc
         rebased = rebase_display_preset_to_current_ptc(preset, app)
+        mode = str(rebased.get('display_mode', 'surface' if name == 'Surface' else 'class')
+                   or 'class').strip().lower()
         for slot, palette in rebased.get('views', {}).items():
-            _apply_display(app, view, sections, int(slot), palette, 'class', status)
+            _apply_display(app, view, sections, int(slot), palette, mode, status)
     else:
         mode = 'shaded_class' if name == 'ShadingMode' else DISPLAY_MODES[name]
         slot = int((preset or {}).get('target_view', (preset or {}).get('slot',
@@ -717,6 +725,10 @@ def _apply_display(app, view, sections, slot, palette, mode, status):
         app.class_palette = palette
         view._push_applied_palette()
         view.set_app_display_mode(mode)
+    dialog = (getattr(app, 'display_mode_dialog', None)
+              or getattr(app, 'display_dialog', None))
+    if dialog is not None:
+        dialog.sync_applied_palette(slot, palette, mode)
     status(f'{mode.replace("_", " ").title()} applied to {"Main View" if not slot else "View " + str(slot)}')
 
 

@@ -21,6 +21,16 @@ RUNTIME_PYTHON = Path(os.environ.get(
     str(_external_python if _external_python.is_file() else Path(sys.executable)),
 ))
 RUNTIME_SCRIPT = BUNDLED_VEHICLE_DIR / "vehicle_postfilter_runner.py"
+
+
+def _runtime_command(script_path) -> list[str]:
+    """Interpreter + script. A frozen build re-enters the app exe instead."""
+    cmd = [str(RUNTIME_PYTHON)]
+    if (getattr(sys, "frozen", False)
+            and Path(str(RUNTIME_PYTHON)) == Path(sys.executable)):
+        cmd.append("--run-python-script")
+    cmd.append(str(script_path))
+    return cmd
 WORK_ROOT = Path(os.environ.get(
     "NAKSHA_LIDAR_VEHICLE_WORK",
     str(_external_root / "work" if _external_root.exists() else Path(os.getenv("TEMP", ".")) / "NakshaVehicleAI"),
@@ -101,9 +111,7 @@ def apply_lidar_vehicle_class0_fence(
         if progress:
             progress("LiDAR Vehicle: strict 3D geometry check...")
 
-        cmd = [
-            str(RUNTIME_PYTHON),
-            str(RUNTIME_SCRIPT),
+        cmd = _runtime_command(RUNTIME_SCRIPT) + [
             "--classified", str(Path(classified_path)),
             "--restrict-indices", str(restrict_path),
             "--output-indices", str(output_path),

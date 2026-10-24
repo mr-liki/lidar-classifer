@@ -50,3 +50,64 @@ def world_text_transform(project, x, y, height, rotation, cap_height):
     divisor = max(float(cap_height), 1.)
     return QTransform((bx-px)/divisor, (by-py)/divisor,
                       (dx-px)/divisor, (dy-py)/divisor, px, py)
+
+
+def native_draw_text_layout(project, anchor, entity, base_font=None):
+    """One font and one transform for painting AND hit-testing native Draw text.
+
+    A new native label has a positive CAD-world ``height`` frozen when it is
+    placed, so zoom changes its screen geometry exactly like nearby linework.
+    Older drawings without height retain their previous screen-sized behavior
+    until edited (or replaced).  Imported SNT text has its own rendering path.
+    """
+    from PySide6.QtGui import QFont, QFontMetricsF
+
+    font = QFont(base_font) if base_font is not None else QFont()
+    family = str(entity.get('font_family') or 'Arial')
+    font.setFamily(family)
+    font.setBold(bool(entity.get('bold', False)))
+    font.setItalic(bool(entity.get('italic', False)))
+    try:
+        points = max(1., min(999., float(entity.get('font_size') or 75.)))
+    except (ValueError, TypeError):
+        points = 75.
+    try:
+        height = float(entity.get('height') or 0.)
+    except (ValueError, TypeError):
+        height = 0.
+    rotation = float(entity.get('rotation', 0.) or 0.)
+    if math.isfinite(height) and height > 0.:
+        # The same reference-glyph size is used for all zooms.  Never use
+        # QFont.pointSize() after setPixelSize(): it is -1 by Qt convention.
+        font.setPixelSize(64)
+        cap_height = max(1., QFontMetricsF(font).capHeight())
+        transform = world_text_transform(project, anchor[0], anchor[1],
+                                         height, rotation, cap_height)
+    else:
+        # Backward compatibility: older native text stored font_size in pixels,
+        # not CAD-world height. Keep its appearance until the first edit.
+        font.setPixelSize(max(6, min(512, int(points))))
+        px, py = project(anchor[0], anchor[1])
+        transform = QTransform().translate(px, py).rotate(-rotation)
+    return font, transform
+
+
+def native_draw_text_height(entity, world_per_logical_pixel):
+    """Capture CAD letter height once at placement, independently of later zoom.
+
+    Font size is a typographic point size; QFontMetricsF provides the actual
+    cap height at current logical-DPI.  Existing labels are scaled by their
+    original height when subsequently edited, not by current zoom.
+    """
+    from PySide6.QtGui import QFont, QFontMetricsF
+
+    try:
+        font_size = max(1., min(999., float(entity.get('font_size') or 75.)))
+    except (TypeError, ValueError):
+        font_size = 75.
+    font = QFont(str(entity.get('font_family') or 'Arial'))
+    font.setPointSizeF(font_size)
+    font.setBold(bool(entity.get('bold', False)))
+    font.setItalic(bool(entity.get('italic', False)))
+    px = max(float(QFontMetricsF(font).capHeight()), 1.)
+    return px * max(float(world_per_logical_pixel), 1.e-12)

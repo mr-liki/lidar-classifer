@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_zoom.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_peaks.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
@@ -207,6 +207,7 @@ class NativeView:
         Main and section views share the engine's Vulkan device; each HWND
         has its own renderer handle."""
         err = create_string_buffer(512)
+        self.class_writes = 0            # class records written into the document
         self.h = lib().lnt_view_open_on_window(c_void_p(int(hwnd)), int(width), int(height),
                                                os.fsencode(lnt_path), os.fsencode(VULKAN_DLL),
                                                int(budget_mb), float(sse), err, 512)
@@ -301,6 +302,16 @@ class NativeView:
 
     def set_mode(self, mode):
         self._ok() and lib().lnt_view_set_mode(c_void_p(self.h), int(mode))
+
+    def set_lines(self, colors, visible):
+        import numpy as np
+        fn=getattr(lib(),'lnt_view_set_lines',None)
+        if fn is None: return False
+        fn.argtypes=[c_void_p,c_void_p,c_void_p]; fn.restype=c_int
+        colors=np.ascontiguousarray(colors,dtype=np.uint8)
+        visible=np.ascontiguousarray(visible,dtype=np.uint8)
+        if colors.shape!=(65536,3) or visible.shape!=(65536,): raise ValueError('Invalid flight-line palette')
+        return bool(fn(c_void_p(self.h),c_void_p(colors.ctypes.data),c_void_p(visible.ctypes.data)))
 
     def set_luts(self, class_rgb, elev_rgb, int_rgb):
         """Three (256,3) uint8 numpy tables: class palette, elevation ramp, intensity ramp."""
@@ -452,6 +463,11 @@ class NativeView:
                                    len(node), err, 256)
         if not ok:
             self.last_error = err.value.decode("utf-8", "replace") or "write failed"
+        else:
+            # How many class records this session wrote into the document. The
+            # backup uses it to tell "there is work to save" from "nothing was
+            # classified", so a close never writes a pointless full copy.
+            self.class_writes = int(getattr(self, "class_writes", 0) or 0) + len(node)
         if counts is not None:
             counts.after_write(token, bool(ok))
         return bool(ok)

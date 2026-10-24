@@ -112,6 +112,8 @@ def lnt_vector_backend(view):
     if proxy is None or getattr(proxy, "_handle", 0) != handle:
         proxy = copy.copy(base)
         proxy._handle = handle
+        import weakref
+        proxy._frame_overlays = weakref.WeakSet()
         for attr in ("_nkv_line_width_range", "_nkv_line_width_logged"):
             proxy.__dict__.pop(attr, None)
         proxy.request_render = lambda *a, **k: None   # the LNT view's timer presents
@@ -418,7 +420,7 @@ class _MvpScreenMapping:
             origin = np.asarray(backend.get_render_origin_xyz(), dtype=np.float64)
         except Exception:
             origin = np.zeros(3, dtype=np.float64)
-        return np.asarray(mvp, dtype=np.float64), origin
+        return np.array(mvp, dtype=np.float64, copy=True), origin.copy()
 
     def world_to_screen(self, x, y):
         """(px, py) in framebuffer pixels, or None before the first frame."""
@@ -440,7 +442,7 @@ class _MvpScreenMapping:
     def projection_snapshot(self, world_z=None):
         """One immutable frame projection shared by every label in a paint."""
         backend = self._backend()
-        frames = getattr(backend, 'render_count', None)
+        frames = getattr(backend, 'present_count', getattr(backend, 'render_count', None))
         size = self._size()
         token = (frames, size, world_z) if isinstance(frames, int) else None
         if token is not None and token == getattr(self, '_snapshot_token', None):

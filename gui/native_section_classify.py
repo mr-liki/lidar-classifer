@@ -18,7 +18,7 @@ import time
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import QWidget
 from gui.native_measure_geometry import measurement_labels, measurement_text
@@ -270,6 +270,8 @@ class CanvasOverlay(QWidget):
         super().__init__(canvas.window(), Qt.Tool | Qt.FramelessWindowHint |
                          Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.canvas = canvas
+        self._owner_window = canvas.window()
+        self._owner_window.installEventFilter(self)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -278,6 +280,7 @@ class CanvasOverlay(QWidget):
         self._content_revision = 0
         self._follow_state = None
         self._paint_projection = None
+        self._shutdown = False
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._follow)
@@ -290,14 +293,40 @@ class CanvasOverlay(QWidget):
             overlays.add(self)
 
     def set_shapes(self, shapes):
+        if self._shutdown:
+            return
         self.shapes = list(shapes)
         self._changed()
 
     def set_marks(self, marks):
+        if self._shutdown:
+            return
         self.marks = [list(m) for m in marks]
         self._changed()
 
+    def shutdown(self):
+        """Stop callbacks and retire this native tool window exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.shapes = []
+        self.marks = []
+        self._follow_state = None
+        self._paint_projection = None
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass
+        try:
+            self.hide()
+            self.close()
+            self.deleteLater()
+        except (RuntimeError, ReferenceError):
+            pass
+
     def _changed(self):
+        if self._shutdown:
+            return
         self._content_revision += 1
         if self.shapes or self.marks:
             self._follow()
@@ -317,15 +346,37 @@ class CanvasOverlay(QWidget):
             self._paint_projection = None
         self.update()
 
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, '_owner_window', None):
+            kind = event.type()
+            if (kind in (QEvent.Hide, QEvent.Close)
+                    or (kind == QEvent.WindowStateChange and watched.isMinimized())):
+                # Hide immediately, preserving shapes for the owner's restore.
+                self.hide()
+        return super().eventFilter(watched, event)
+
     def _follow(self, immediate=False):
+        if self._shutdown:
+            return
         canvas = self.canvas
         if not (self.shapes or self.marks) or not canvas.isVisible() or canvas._closed:
             self.hide()
             return
         top = canvas.window()
-        if self.parentWidget() is not top:
-            # The dock floats as its own window: stay owned by (and above) it.
-            self.setParent(top, self.windowFlags())
+        if self._owner_window is not top:
+            if self._owner_window is not None:
+                self._owner_window.removeEventFilter(self)
+            self._owner_window = top
+            top.installEventFilter(self)
+
+        # Do not reparent this native Qt.Tool window after creation.
+        # Global positioning below does not require reparenting.
+
+        # Qt keeps children logically visible while their window is minimized.
+        # Timer/present callbacks must not re-show the transparent tool window.
+        if not top.isVisible() or top.isMinimized():
+            self.hide()
+            return
         top_left = canvas.mapToGlobal(canvas.rect().topLeft())
         if self.pos() != top_left:
             self.move(top_left)
@@ -481,25 +532,32 @@ class CanvasOverlay(QWidget):
                     angle = -float(data.get('rotation', 0.) or 0.)
                     transform = QTransform().translate(qpts[0].x(), qpts[0].y()).rotate(angle)
                     font = QFont(painter.font())
-                    # Native Text uses the VTK text palette's font settings;
-                    # imported world-height SNT labels retain their own sizing.
-                    if data.get('source') != 'attachment':
-                        font.setFamily(str(data.get('font_family',font.family())))
-                        if data.get('font_size') is not None:
-                            font.setPixelSize(max(6, min(512, int(data['font_size']))))
-                        font.setBold(bool(data.get('bold',False)))
-                        font.setItalic(bool(data.get('italic',False)))
-                    world_sized = data.get('source') == 'attachment' and float(data.get('height', 0.) or 0.) > 0.
-                    if world_sized:
-                        from gui.native_label_layout import world_text_transform
-                        font = QFont(font)
-                        font.setPixelSize(64)
-                        metrics = QFontMetricsF(font)
-                        transform = world_text_transform(to_qt, *pts[0], float(data['height']),
-                                                         -angle, metrics.capHeight())
-                        screen_height = math.hypot(transform.m21(), transform.m22()) * metrics.capHeight()
-                        if screen_height < 2.:
-                            continue
+                    if data.get('source') not in ('attachment', 'snt_text_copy'):
+                        # Use EXACTLY the same world anchor, size and rotation
+                        # as the native text hit-test / edit route.
+                        from gui.native_label_layout import native_draw_text_layout
+                        font, transform = native_draw_text_layout(to_qt, pts[0], data, font)
+                    else:
+                        # Imported CAD labels keep the existing SNT world-height
+                        # behavior, without inheriting native Draw font settings.
+                        if data.get('source') != 'attachment':
+                            font.setFamily(str(data.get('font_family', font.family())))
+                            font.setBold(bool(data.get('bold', False)))
+                            font.setItalic(bool(data.get('italic', False)))
+                        world_sized = float(data.get('height', 0.) or 0.) > 0.
+                        if not world_sized and data.get('source') == 'snt_text_copy':
+                            if data.get('font_size') is not None:
+                                font.setPixelSize(max(6, min(512, int(data['font_size']))))
+                        if world_sized:
+                            from gui.native_label_layout import world_text_transform
+                            font.setPixelSize(64)
+                            metrics = QFontMetricsF(font)
+                            transform = world_text_transform(to_qt, *pts[0],
+                                                             float(data['height']), -angle,
+                                                             metrics.capHeight())
+                            screen_height = math.hypot(transform.m21(), transform.m22()) * metrics.capHeight()
+                            if screen_height < 2.:
+                                continue
                     if data.get('source') == 'attachment':
                         rect = transform.mapRect(QFontMetricsF(font).boundingRect(text))
                         if not rect.intersects(QRectF(self.rect())):
@@ -1282,6 +1340,11 @@ class SectionClassifier:
 
     def _begin_brush_transaction(self, first_point):
         """Begin speculative live painting; no disk write/history exists yet."""
+        # A newly opened native main view intentionally has no app.data yet.
+        # Create its empty region store before checking the transaction data;
+        # the first swept query will populate only the records it touches.
+        from gui.lnt_section_bridge import get_store
+        get_store(self.app)
         resolved = self._resolve_brush_transaction_classes()
         if resolved is None:
             return False
@@ -1800,4 +1863,4 @@ class SectionClassifier:
             )
         app.statusBar().showMessage(f"{indices.size:,} points -> class {to_code}", 3000)
         return int(indices.size)
-    
+

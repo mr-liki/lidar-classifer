@@ -157,9 +157,13 @@ class PremiumAIController:
         return last_percent
 
     def _build_command(self, input_path: Path, output_path: Path) -> list[str]:
+        # A frozen build has no python.exe: the app exe re-enters main.py with
+        # --run-python-script so the engine runs as a child instead of the GUI.
+        launcher = [sys.executable]
+        if getattr(sys, "frozen", False):
+            launcher.append("--run-python-script")
         # These are the frozen V4.2/V3.3 exact settings used by the validated path.
-        return [
-            sys.executable,
+        return launcher + [
             str(self.engine_path),
             "--input", str(input_path),
             "--output", str(output_path),

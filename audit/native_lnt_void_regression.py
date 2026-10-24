@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gui import lnt_native as nat
 from audit.lnt_surface_lod_view_test import View
 root = Path(__file__).resolve().parents[1]
-nat.LNT_DLL = os.environ.get('NAKSHA_TEST_LNT_DLL',str(root / 'native/lnt/main_display_modes.dll'))
+nat.LNT_DLL = os.environ.get('NAKSHA_TEST_LNT_DLL',nat.LNT_DLL)
 nat.VULKAN_DLL = str(root / 'native/naksha_vulkan/build_msvc/naksha_vulkan.dll')
 with tempfile.TemporaryDirectory(prefix='lnt_void_') as folder:
     path = Path(folder) / 'hollow.las'

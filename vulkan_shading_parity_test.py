@@ -38,8 +38,10 @@ Method
 Two parameter sets are exercised:
     A  defaults          azimuth 45,  sharpness  45, ambient 0.25
     B  overdrive rig     azimuth 120, sharpness 150, ambient 0.40
+    C  low-ambient rig   azimuth  70, sharpness  30, ambient 0.05
 so the legacy AND the overdrive (90..200) branches of sharpness, gain,
-effective elevation and key/fill are both validated.
+effective elevation and key/fill are both validated, and the ambient-below-floor
+(low-ambient) clamp is validated against the GPU.
 
 Usage:
     python vulkan_shading_parity_test.py [C:\\path\\file.las]  (default 123.las)
@@ -989,13 +991,14 @@ def evaluate(win, sd, cache, ctx, images, mvp, origin, kind, cands, depth_img):
 
 
 # --------------------------------------------------------------------------- #
-# Parameter sets: defaults + an overdrive rig (sharpness > 90) so the legacy
-# AND the 90..200 overdrive branches of sharpness/gain/elevation/key+fill are
-# both exercised against the GPU port.
+# Parameter sets: defaults, an overdrive rig (sharpness > 90), and a low-ambient
+# rig (ambient below the 0.08 anti-black floor) so the legacy, the 90..200
+# overdrive, and the ambient-floor branches are all exercised against the GPU.
 # --------------------------------------------------------------------------- #
 PARAM_SETS = (
-    ("A_defaults",   45.0,  45.0, 0.25),
-    ("B_overdrive", 120.0, 150.0, 0.40),
+    ("A_defaults",    45.0,  45.0, 0.25),
+    ("B_overdrive",  120.0, 150.0, 0.40),
+    ("C_low_ambient", 70.0,  30.0, 0.05),
 )
 
 
@@ -1219,8 +1222,10 @@ def main() -> int:
 
     # ---- dataset through the production loaders ---------------------------
     print(f"[parity] loading {os.path.basename(LAS_PATH)} ...", flush=True)
-    win.open_file(filenames=[LAS_PATH],
-                  import_options=dict(DEFAULT_IMPORT_OPTIONS), prompt_import=False)
+    from unittest.mock import patch
+    with patch.object(win, '_prompt_lidar_import_options_for_files',
+                      return_value=dict(DEFAULT_IMPORT_OPTIONS)):
+        win._load_single_lidar_file(LAS_PATH)
     if not wait_until(app_qt, lambda: (getattr(win, "data", None) is not None
                                        and win.data.get("xyz") is not None
                                        and getattr(win, "_file_loader_worker", None) is None),
@@ -1236,6 +1241,12 @@ def main() -> int:
         check("PTC palette applied", False, "class_palette stayed empty")
         return report()
     check("PTC palette applied", True, f"classes={len(win.class_palette)}")
+    # The production LAS loader hands the canvas back to VTK. Install after
+    # loading so this test measures native pixels rather than waiting on VTK.
+    installed = rb.install_as_main_viewport()
+    check("Vulkan viewport installed", installed)
+    if not installed:
+        return report()
 
     # ---- shaded class through the production path -------------------------
     print("[parity] display mode -> shaded_class ...", flush=True)

@@ -27,12 +27,19 @@ class NativeSelectRect:
         self.dragging = False
         self.vertices = []       # shape-mode world vertices
         self.selected_rows = np.empty(0, dtype=np.int64)
+        self._canvas_instance = None
         self._overlay = None
 
     # ---- lifecycle ----------------------------------------------------
     def _canvas(self):
         from gui.native_main_classify import MainCanvas  # noqa: PLC0415
-        return MainCanvas(self.view)
+        # MainCanvas is a lightweight Python adapter, but CanvasOverlay keeps
+        # it as a long-lived Qt callback target.  Recreating the adapter on
+        # every paint made _overlay_for replace the QWidget repeatedly and
+        # left stale Shiboken objects/timers parented to the main window.
+        if self._canvas_instance is None:
+            self._canvas_instance = MainCanvas(self.view)
+        return self._canvas_instance
 
     def _overlay_for(self, canvas):
         from gui.native_section_classify import CanvasOverlay  # noqa: PLC0415
@@ -69,6 +76,22 @@ class NativeSelectRect:
                 self._overlay.set_shapes([])
         except Exception:
             pass
+
+    def shutdown(self):
+        """Destroy Qt overlay state before its Vulkan view disappears."""
+        self.active = False
+        self.start = self.current = None
+        self.dragging = False
+        self.vertices = []
+        overlay, self._overlay = self._overlay, None
+        if overlay is not None:
+            try:
+                overlay.shutdown()
+            except (RuntimeError, ReferenceError, AttributeError):
+                pass
+        canvas, self._canvas_instance = self._canvas_instance, None
+        if canvas is not None:
+            canvas._closed = True
 
     def deactivate(self):
         self.active = False

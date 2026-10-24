@@ -3,6 +3,7 @@
 #include "../include/LNTInteractiveLoop.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -100,6 +101,29 @@ bool LntInteractiveLoop::render_frame(VulkanEngine& engine, LntScene& scene,
                                          cam_.near_clip, cam_.far_clip)) {
         err_ = std::string("set_camera_lookat failed: ") + engine.last_error();
         return false;
+    }
+
+    if (depth_enabled_ && !depth_samples_.empty()) {
+        // Use the SAME eye as SetOrthographicWorld, which centres its eye in
+        // the clip range rather than using the orbit controller's distance.
+        double eye[3] = {cam_.eye[0], cam_.eye[1], cam_.eye[2]};
+        if (cam_.ortho) {
+            double d[3] = {cam_.target[0]-eye[0], cam_.target[1]-eye[1], cam_.target[2]-eye[2]};
+            const double n = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+            const double standoff = std::max(1.0, .5*(cam_.near_clip+cam_.far_clip));
+            if (n > 1e-12) for (int k=0;k<3;++k) eye[k]=cam_.target[k]-d[k]/n*standoff;
+        }
+        depth_values_.clear();
+        for (const auto& p : depth_samples_) {
+            const double x=p[0]-eye[0], y=p[1]-eye[1], z=p[2]-eye[2];
+            depth_values_.push_back(std::sqrt(x*x+y*y+z*z));
+        }
+        std::sort(depth_values_.begin(), depth_values_.end());
+        const auto last = depth_values_.size()-1;
+        float lo = float(depth_values_[size_t(.01*last)]);
+        float hi = float(depth_values_[size_t(.99*last)]);
+        if (hi <= lo) { lo -= .5f; hi = lo+1.f; }
+        engine.set_point_depth_range(lo, hi, 1.f);
     }
 
     LNT_STAGE("render_frame: streamer.update_visible_nodes");

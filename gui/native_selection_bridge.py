@@ -81,6 +81,29 @@ class NativeSelectionManager(QObject):
     def count(self):
         return len(self._prune())
 
+    def _sync_fence_highlights(self):
+        """Canvas selection replaces old cyan classification-dialog outlines.
+
+        The manager already implements new/add/subtract/invert, so retain its
+        complete current group instead of just the most recently clicked ring.
+        """
+        draw = self.controller.draw
+        # VTK's/older Stage 1-5 test controllers deliberately do not have
+        # native Draw fence overlays. Their selection logic stays unchanged.
+        setter = getattr(draw, 'set_classification_fence_highlights', None)
+        native_coords = getattr(draw, '_native_coords', None)
+        if not callable(setter) or not callable(native_coords):
+            return
+        from gui.native_fence_selection import (
+            selected_fence_shapes, propagate_native_fence_selection,
+        )
+        chosen_drawings = [feature['drawing']
+                           for feature in self._selected.values()
+                           if feature.get('source') == 'native']
+        fences = selected_fence_shapes(chosen_drawings, native_draw=draw)
+        setter(self, fences, replace=True)
+        propagate_native_fence_selection(getattr(draw, 'app', None), fences)
+
     def _repaint(self):
         self.controller.draw._paint()
         # The Measure overlay is a different Qt window/layer. Trigger it as
@@ -89,6 +112,10 @@ class NativeSelectionManager(QObject):
 
     def clear(self, emit=True):
         self._selected.clear()
+        # Deactivation must not erase a DIFFERENT dialog's newer selection;
+        # explicit canvas selection (apply) always supersedes the old group.
+        if getattr(self.controller.draw, '_active_fence_highlight_owner', None) == id(self):
+            self._sync_fence_highlights()
         self._repaint()
         if emit:self.selection_changed.emit(0)
 
@@ -116,6 +143,7 @@ class NativeSelectionManager(QObject):
             self.controller.message(f'Selection capped at {self.MAX_BULK:,} elements for responsiveness')
             old=dict(list(old.items())[:self.MAX_BULK])
         self._selected=old
+        self._sync_fence_highlights()
         self._repaint()
         self.selection_changed.emit(len(old))
 
@@ -172,13 +200,15 @@ class NativeSelectionController(QObject):
         self._text_index=[]
         self._text_min_x=[]
         self._text_prefix_max_x=[]
+        self._snt_copy_sources=[]
 
     def message(self, msg, timeout=3500):
         bar=getattr(self.app,'statusBar',lambda:None)()
         if bar is not None:bar.showMessage(msg,timeout)
 
     def is_active(self):
-        return self._active and self.draw.tool=='select'
+        return (self._active and self.draw.tool == 'select' and
+                getattr(self.draw, '_selection_bridge', None) is self)
 
     def activate(self, method='individual'):
         if self.draw.tool!='select' and not self.draw.activate('select'):
@@ -195,6 +225,7 @@ class NativeSelectionController(QObject):
         self._active=False
         self._reset_gesture()
         self._move_mode=self._copy_mode=self._intersect_mode=False
+        self._snt_copy_sources=[]
         if self.draw._selection_bridge is self:
             self.draw._selection_bridge=None
         self.selection_manager.clear()
@@ -204,6 +235,8 @@ class NativeSelectionController(QObject):
         if self._intersect_mode:
             self.exit_intersect_mode(commit=True)
         self._method=method
+        self._copy_mode=self._move_mode=False
+        self._snt_copy_sources=[]
         self._reset_gesture()
         self.selection_manager.clear()
         self.message(f'Vulkan Select: {method.replace("_"," ")}')
@@ -308,12 +341,15 @@ class NativeSelectionController(QObject):
 
     def _select_area(self, method, vertices):
         if not vertices:return
+        if method == 'shape' and len(vertices) < 3:return
+        if method in ('block', 'cline') and len(vertices) < 2:return
         a,b=vertices[0],vertices[-1]
         if method=='shape':
             bounds=[(min(p[0] for p in vertices),min(p[1] for p in vertices)),
                     (max(p[0] for p in vertices),max(p[1] for p in vertices))]
         else:
-            bounds=[a,b]
+            bounds=[(min(a[0],b[0]), min(a[1],b[1])),
+                    (max(a[0],b[0]), max(a[1],b[1]))]
         tol=self.draw.canvas.world_per_pixel()*10. if method=='cline' else 0.
         bounds=[(bounds[0][0]-tol,bounds[0][1]-tol),
                 (bounds[1][0]+tol,bounds[1][1]+tol)]
@@ -324,8 +360,12 @@ class NativeSelectionController(QObject):
             if method=='block' and rect_selects(coords,a,b,inside):hits.append(feat)
             elif method=='shape' and polygon_selects(coords,vertices,inside):hits.append(feat)
             elif method=='cline' and line_selects(coords,a,b):hits.append(feat)
-        self.selection_manager.apply(hits,self._selection_modifier())
-        self.message(f'Selected {self.selection_manager.count()} element(s)')
+        modifier=self._selection_modifier()
+        self.selection_manager.apply(hits,modifier)
+        print(f'[Native Element Selection] {method}: hits={len(hits)} '
+              f'mode={modifier} selected={self.selection_manager.count()}', flush=True)
+        self.message(f'{method.title()}: {len(hits)} shape(s) hit; '
+                     f'{self.selection_manager.count()} element(s) selected')
         self._reset_gesture()
 
     def _ensure_text_index(self):
@@ -437,13 +477,23 @@ class NativeSelectionController(QObject):
                     self.message('Intersect: segment selected (red). Right-click to remove it')
             return True
         if button==Qt.RightButton:
+            if self._copy_mode and self._method=='snt_text':
+                self.exit_copy_mode()
+                self.message('SNT text placement cancelled; original labels unchanged')
+                return True
             if self._method=='shape' and len(self._gesture)>=3:
                 self._select_area('shape',list(self._gesture))
             else:self._reset_gesture()
             return True
         if button!=Qt.LeftButton:return False
+        if self._method in ('block','shape','cline','snt_text'):
+            print(f'[Native Element Selection] press method={self._method} '
+                  f'copy={self._copy_mode}', flush=True)
         try:p=self.draw.canvas.section_at(pos.x(),pos.y())
         except RuntimeError:return True
+        if self._copy_mode and self._method=='snt_text':
+            self._place_snt_copies(p)
+            return True
         if self._move_mode or self._copy_mode:
             if not self.selection_manager.count():
                 feat=(self._text_pick(p) if self._method=='snt_text'
@@ -453,11 +503,11 @@ class NativeSelectionController(QObject):
                 return True
             if self._offset_origin is None:
                 self._offset_origin=p
+                self._hover=p
+                self.draw._paint()
                 self.message('Click target point (or drag) to place geometry')
             else:
-                dx=p[0]-self._offset_origin[0];dy=p[1]-self._offset_origin[1]
-                self._transform_selected(lambda c:translate(c,dx,dy),copy=self._copy_mode)
-                self._offset_origin=None
+                self._place_transform(p)
             return True
         if self._method=='individual':
             hit=self._pick_editable(p)
@@ -472,7 +522,11 @@ class NativeSelectionController(QObject):
             self._start=p
         elif self._method=='shape':
             self._set_hover_feature(None)
-            self._gesture.append(p)
+            # Double-clicks generate duplicate click positions on some Qt
+            # input paths. Keep only distinct polygon corners.
+            if (not self._gesture or
+                    math.dist(self._gesture[-1],p)>max(self.draw.canvas.world_per_pixel(),1.e-10)):
+                self._gesture.append(p)
         elif self._method in ('block','cline'):
             self._set_hover_feature(None)
             if self._start is None:
@@ -493,7 +547,7 @@ class NativeSelectionController(QObject):
                     self._intersect_hovered_part=hovered
                     self.draw._paint()
             return True
-        if (self._method in ('individual', 'block', 'shape', 'cline')
+        if (self._method == 'individual'
                 and not (self._gesture or self._start is not None or
                          self._offset_origin is not None or self._move_mode or self._copy_mode)):
             # Hover picks target ONLY editable Draw + completed Measure objects,
@@ -504,7 +558,9 @@ class NativeSelectionController(QObject):
                 self._set_hover_feature(self._pick_editable(self._hover))
         elif self._hover_feature is not None:
             self._set_hover_feature(None)
-        if self._gesture or self._start is not None or self._offset_origin is not None:
+        if (self._gesture or self._start is not None or
+                self._offset_origin is not None or
+                (self._copy_mode and self._method=='snt_text')):
             self.draw._paint()
         return True
 
@@ -516,10 +572,15 @@ class NativeSelectionController(QObject):
             try:p=self.draw.canvas.section_at(pos.x(),pos.y())
             except RuntimeError:return True
             if math.dist(p,self._offset_origin)>self.draw.canvas.world_per_pixel()*3:
-                dx=p[0]-self._offset_origin[0];dy=p[1]-self._offset_origin[1]
-                self._transform_selected(lambda coords:translate(coords,dx,dy),
-                                         copy=self._copy_mode)
-                self._offset_origin=None
+                self._place_transform(p)
+            return True
+        if self._method == 'cline' and self._start is not None:
+            # Support VTK-style drawing the crossing line by either click-tap
+            # at both endpoints or press-drag-release.
+            try:p=self.draw.canvas.section_at(pos.x(),pos.y())
+            except RuntimeError:return True
+            if math.dist(self._start,p)>self.draw.canvas.world_per_pixel()*3.:
+                self._select_area('cline',[self._start,p])
             return True
         if self._method in ('block','snt_text') and self._start is not None:
             try:p=self.draw.canvas.section_at(pos.x(),pos.y())
@@ -565,6 +626,7 @@ class NativeSelectionController(QObject):
         if key==Qt.Key_Escape:
             self._reset_gesture()
             self._move_mode=self._copy_mode=False
+            self._snt_copy_sources=[]
             return True
         if key in (Qt.Key_Enter,Qt.Key_Return) and self._method=='shape':
             if len(self._gesture)>=3:self._select_area('shape',list(self._gesture))
@@ -597,14 +659,24 @@ class NativeSelectionController(QObject):
             dx=self._hover[0]-self._offset_origin[0]
             dy=self._hover[1]-self._offset_origin[1]
             for feat in self.selection_manager.get_features()[:100]:
+                # The preview is still smooth/render-sampled, but must not
+                # advertise its samples as new editable control vertices.
+                is_curve = feat.get('source') == 'native' and feat.get('type') == 'curve'
                 shapes.append(('drawing_preview',translate(feat['coords'],dx,dy),
-                               {'type':'polyline','color':'#79d6ff','width':2}))
+                               {'type':'polyline','color':'#79d6ff','width':2,
+                                'show_vertices': not is_curve}))
         if pts:
             if self._method in ('block','snt_text') and len(pts)>=2:
                 a,b=pts[0],pts[-1]
                 pts=[a,(b[0],a[1]),b,(a[0],b[1]),a]
             shapes.append(('drawing_preview',pts,
                            {'type':'polyline','color':'#ffd54f','width':2}))
+        if self._method=='snt_text' and self._copy_mode and self._hover is not None:
+            # Live in-viewport paste preview at the cursor, retaining the world
+            # spacing of all selected labels. This is not yet a Draw history edit.
+            from gui.native_snt_text_copy import copy_group
+            for label in copy_group(self._snt_copy_sources[:200],self._hover):
+                shapes.append(('drawing_preview',label['coords'],label))
         if self._method=='snt_text':
             # Outline true/approximated label bounds, so a selected label is
             # visibly highlighted even though imported SNT text stays read-only.
@@ -638,6 +710,33 @@ class NativeSelectionController(QObject):
         if self._intersect_mode:return []
         return self.selection_manager.get_features()[:500]
 
+    def transform_hidden_drawing_ids(self):
+        """Native sources temporarily replaced by the active transform ghost."""
+        if self._offset_origin is None or not (self._move_mode or self._copy_mode):
+            return set()
+        return {
+            id(feature['drawing'])
+            for feature in self.selection_manager.get_features()
+            if feature.get('source') == 'native' and feature.get('drawing') is not None
+        }
+
+    def _place_transform(self, target):
+        """Retire the ghost before any document/selection callback repaints.
+
+        Selection changes repaint synchronously inside _transform_selected.
+        Leaving the anchor live there applies the displacement a second time
+        to the newly selected result and leaves that wrong frame on screen.
+        """
+        origin = self._offset_origin
+        if origin is None:
+            return
+        dx, dy = target[0] - origin[0], target[1] - origin[1]
+        self._offset_origin = None
+        self._hover = target
+        self._transform_selected(lambda coords: translate(coords, dx, dy),
+                                 copy=self._copy_mode)
+        self.draw._paint()
+
     def _transform_selected(self,transform,copy=False):
         selected=self.selection_manager.get_features()
         if not selected:return self.message('Select at least one element')
@@ -653,7 +752,13 @@ class NativeSelectionController(QObject):
         before=list(self.draw.drawings)
         replaced=[];created=[];imported=0
         for feat in selected:
-            coords=feat['coords']
+            # `feat['coords']` is the *rendered*, 20-samples-per-span curve.
+            # It is valid for hit-testing, never for storing an editable copy.
+            # Use original control vertices for native curves instead.
+            if feat['source'] == 'native' and feat['drawing'].get('type') == 'curve':
+                coords = feat['drawing'].get('coords', ())
+            else:
+                coords = feat['coords']
             if not coords:continue
             result=transform(coords)
             if not result or any(not math.isfinite(v) for p in result for v in p[:2]):
@@ -661,12 +766,17 @@ class NativeSelectionController(QObject):
             if feat['source']=='native':
                 orig=feat['drawing']
                 new=dict(orig,coords=list(result))
-                # Circle/rectangle/hatch/curve have non-vertex source data.
-                # They must be stored as transformed polyline geometry, not
-                # left with a stale centre/radius, hatch scanlines or spline.
-                if orig.get('type') in ('circle','rectangle','hatch','curve'):
+                # Circle/rectangle/hatch store special non-vertex geometry.
+                # Preserve the old VTK-compatible polyline conversion there.
+                # A Curve, however, stores real control vertices in 'coords'.
+                # Keep type='curve' so the native renderer samples the same
+                # Catmull-Rom spline on the translated/rotated/mirrored copy.
+                if orig.get('type') in ('circle','rectangle','hatch'):
                     new['type']='polyline'
                     new.pop('hatch_segments',None)
+                elif orig.get('type') == 'curve':
+                    new.pop('interpolated', None)
+                    new.pop('control_points', None)
                 if not copy:replaced.append(orig)
             elif feat['source']=='measure':
                 # Copying a measurement yields an independent Draw overlay;
@@ -703,13 +813,49 @@ class NativeSelectionController(QObject):
         self._move_mode=False;self._offset_origin=None
 
     def enter_copy_mode(self):
-        if self._method=='snt_text':return self.copy_selected_snt_text_to_clipboard()
+        if self._method=='snt_text':
+            selected=[f for f in self.selection_manager.get_features()
+                      if f.get('source')=='snt']
+            if not selected:
+                return self.message('Select SNT text label(s) before Copy')
+            self.copy_selected_snt_text_to_clipboard()
+            self._snt_copy_sources=list(selected)
+            self._copy_mode=True;self._move_mode=False;self._offset_origin=None
+            self.message(f'Copy {len(selected)} SNT label(s): move to the target '
+                         'position and left-click to paste (Escape cancels)')
+            self.draw._paint()
+            return True
         if not self.selection_manager.count():return self.message('Select geometry before Copy')
         self._copy_mode=True;self._move_mode=False;self._offset_origin=None
         self.message('Copy: click anchor, then target; Escape cancels')
 
     def exit_copy_mode(self):
         self._copy_mode=False;self._offset_origin=None
+        self._snt_copy_sources=[]
+        self.draw._paint()
+
+    def _place_snt_copies(self, position):
+        """Commit one reversible Draw operation; never mutate an SNT file."""
+        from gui.native_snt_text_copy import copy_group
+        if (not self._snt_copy_sources or
+                self.draw._scene_token() != self._snt_copy_sources[0].get('scene_token')):
+            self.exit_copy_mode()
+            self.message('SNT source changed; copy cancelled safely')
+            return False
+        pasted = copy_group(self._snt_copy_sources, position)
+        if not pasted:
+            self.exit_copy_mode()
+            self.message('No valid SNT text geometry to paste')
+            return False
+        before = list(self.draw.drawings)
+        self.draw.drawings.extend(pasted)
+        self.draw.record_object_change(before)
+        self.exit_copy_mode()
+        self.message(f'Pasted {len(pasted)} new text label(s); originals preserved; '
+                     'Ctrl+Z undoes paste. Use Individual to select/edit copies')
+        print(f'[Native Element Selection] snt_text pasted={len(pasted)} '
+              f'undo_group=1', flush=True)
+        return True
 
     def _notify_intersect_button(self, active):
         popup=getattr(self.app,'_element_selection_dialog',None)

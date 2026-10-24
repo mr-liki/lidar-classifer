@@ -1110,9 +1110,35 @@ class DisplayModeDialog(QDialog):
             "Line",                   # idx 7 - LAS flight lines / Point Source ID
         ])
         controls_layout.addWidget(self.color_mode, stretch=2)
+        self.shading_quality_label = QLabel("Speed")
+        self.shading_quality_label.setToolTip(
+            "Shading density: Fast uses 1M representatives, Normal uses 3M, "
+            "and Slow triangulates every eligible point."
+        )
+        controls_layout.addWidget(self.shading_quality_label)
+        self.shading_quality = QComboBox()
+        self.shading_quality.setObjectName("displayShadingQuality")
+        self.shading_quality.addItem("Fast", "fast")
+        self.shading_quality.addItem("Normal", "normal")
+        self.shading_quality.addItem("Slow \u2013 all points", "slow")
+        self.shading_quality.setMinimumWidth(135)
+        self._shading_quality_value = str(
+            settings.value("global_shading_quality", "normal") or "normal"
+        ).lower()
+        self._surface_quality_value = str(
+            settings.value("global_surface_quality", "normal") or "normal"
+        ).lower()
+        self._quality_mode_context = int(self.color_mode.currentIndex())
+        quality_index = self.shading_quality.findData(self._shading_quality_value)
+        self.shading_quality.setCurrentIndex(quality_index if quality_index >= 0 else 1)
         if parent is not None:
-            parent.shading_quality = "normal"
-            parent.surface_quality = "normal"
+            parent.shading_quality = self._shading_quality_value
+            parent.surface_quality = self._surface_quality_value
+        self.shading_quality.setToolTip(
+            "Fast: up to 1,000,000 mesh points. Normal: up to 3,000,000. "
+            "Slow: every eligible finite point; may require very large RAM and several minutes."
+        )
+        controls_layout.addWidget(self.shading_quality)
         self.color_mode.currentIndexChanged.connect(self._sync_color_mode_state)
         self.color_mode.currentIndexChanged.connect(self._restore_class_mode_visibility)
 
@@ -1170,7 +1196,7 @@ class DisplayModeDialog(QDialog):
         self.border_setting_btn.setFixedWidth(26)
         self.border_setting_btn.setFocusPolicy(Qt.NoFocus)
 
-        self.border_setting_menu = QMenu(self)
+        self.border_setting_menu = QMenu(self.border_setting_btn)
         self.border_logic_point = QAction("Per-Point", self.border_setting_menu)
         self.border_logic_point.setCheckable(True)
         self.border_logic_point.setChecked(False)
@@ -1196,13 +1222,7 @@ class DisplayModeDialog(QDialog):
         self.border_logic_object.triggered.connect(lambda _=False: self._select_border_mode(1))
         self.border_logic_hybrid.triggered.connect(lambda _=False: self._select_border_mode(2))
 
-        self.border_setting_btn.clicked.connect(
-            lambda: self.border_setting_menu.exec(
-                self.border_setting_btn.mapToGlobal(
-                    self.border_setting_btn.rect().bottomLeft()
-                )
-            )
-        )
+        self.border_setting_btn.clicked.connect(self._show_border_menu)
 
         table_card = QFrame()
         table_card.setObjectName("displayTableCard")
@@ -1529,12 +1549,49 @@ class DisplayModeDialog(QDialog):
         try:
             if not hasattr(self, "color_mode") or self.color_mode is None:
                 return
+
+            # Save the outgoing mesh-quality choice before changing context.
+            previous = int(getattr(self, "_quality_mode_context", self.color_mode.currentIndex()))
+            if hasattr(self, "shading_quality"):
+                current_value = str(self.shading_quality.currentData() or "normal")
+                if previous == 1:
+                    self._shading_quality_value = current_value
+                elif previous == 6:
+                    self._surface_quality_value = current_value
+
             for mode in (6, 7):
                 item = self.color_mode.model().item(mode)
                 if item is not None:
                     item.setEnabled(True)
 
             self.color_mode.setVisible(True)
+            mode_idx = int(self.color_mode.currentIndex())
+            mesh_speed_visible = self.current_slot in (0, 1, 2, 3, 4) and mode_idx in (1, 6)
+
+            if hasattr(self, "shading_quality_label"):
+                self.shading_quality_label.setVisible(mesh_speed_visible)
+            if hasattr(self, "shading_quality"):
+                self.shading_quality.setVisible(mesh_speed_visible)
+                self.shading_quality.setEnabled(mesh_speed_visible)
+                if mesh_speed_visible:
+                    wanted = (
+                        getattr(self, "_shading_quality_value", "normal")
+                        if mode_idx == 1
+                        else getattr(self, "_surface_quality_value", "normal")
+                    )
+                    qidx = self.shading_quality.findData(str(wanted).lower())
+                    if qidx < 0:
+                        qidx = self.shading_quality.findData("normal")
+                    self.shading_quality.blockSignals(True)
+                    self.shading_quality.setCurrentIndex(qidx if qidx >= 0 else 1)
+                    self.shading_quality.blockSignals(False)
+                    self.shading_quality.setToolTip(
+                        ("Shading \u2013 " if mode_idx == 1 else "Surface \u2013 ")
+                        + "Fast: 1M representatives; Normal: 3M; Slow: all eligible points."
+                    )
+
+            self._quality_mode_context = mode_idx
+
             # Main, cross-section and cut slots all expose the full mode list.
             self.color_mode.setEnabled(getattr(self._get_app_window(), "_lnt_main_view", None) is not None or self.current_slot in range(0, 10))
             # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
@@ -1589,6 +1646,23 @@ class DisplayModeDialog(QDialog):
                 slot_pal.setdefault(code, {}).update({'show': show, 'weight': weight})
             except Exception:
                 continue
+
+    def _show_border_menu(self):
+        # popup() leaves the normal event loop in control. A blocking exec()
+        # could leave this menu alive while its independent dialog moved/hid.
+        from PySide6.QtCore import QPoint
+        button = self.border_setting_btn
+        if self.isVisible() and button.isVisible():
+            self.border_setting_menu.popup(button.mapToGlobal(QPoint(0, button.height())))
+
+    def _dismiss_border_menu(self):
+        menu = getattr(self, 'border_setting_menu', None)
+        if menu is not None:
+            menu.hide()
+
+    def resizeEvent(self, event):
+        self._dismiss_border_menu()
+        super().resizeEvent(event)
 
     def _select_border_mode(self, mode_val: int, push_gpu: bool = True) -> None:
         """
@@ -1658,7 +1732,7 @@ class DisplayModeDialog(QDialog):
 
                     wt_item = self.table.item(row, 6)
                     if wt_item:
-                        wt_item.setText(f"{info.get('weight', default_weight):.1f}")
+                        wt_item.setText(f"{info.get('weight', default_weight):.2f}")
                 except Exception:
                     continue
         finally:
@@ -2373,6 +2447,10 @@ class DisplayModeDialog(QDialog):
             return
         app = self._get_app_window()
         source_ids = None
+        main_native = getattr(app, '_lnt_main_view', None)
+        if int(getattr(self,'current_slot',0)) == 0 and main_native is not None:
+            flight = getattr(main_native,'flight_lines',None)
+            if flight is not None: source_ids=flight.unique()
         native_canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(int(getattr(self, 'current_slot', 0)))
         if native_canvas is not None:
             source_ids = native_canvas._source_ids
@@ -2440,6 +2518,16 @@ class DisplayModeDialog(QDialog):
             pass
 
     def _open_lines_dialog(self):
+        app = self._get_app_window()
+        view = getattr(app,'_lnt_main_view',None)
+        if int(getattr(self,'current_slot',0)) == 0 and view is not None and getattr(view,'flight_lines',None) is None:
+            from gui.native_flight_lines import open_existing, prepare
+            if open_existing(view) is None:
+                # Only old/missing sidecars require the potentially expensive
+                # LAS/LAZ recovery worker.  Its callback re-enters this method
+                # and opens the populated selector when preparation completes.
+                prepare(view,self._open_lines_dialog)
+                return
         """Open a persistent selector; changes commit only when OK is clicked."""
         app = self._get_app_window()
         canvas = getattr(getattr(app, '_native_sections', None), 'views', {}).get(self.current_slot)
@@ -2905,6 +2993,51 @@ class DisplayModeDialog(QDialog):
             if chk:
                 chk.setChecked(False)
 
+    def sync_applied_palette(self, slot_idx, palette, mode):
+        """Refresh shortcut results without saving stale widgets or re-applying."""
+        self.view_palettes[slot_idx] = clone_palette(palette)
+        self.slot_shows[slot_idx] = {
+            int(code): bool(info.get("show", True))
+            for code, info in palette.items()
+        }
+        if slot_idx == 0 and getattr(self, "_class_mode_vis_slot0", None) is not None:
+            self._class_mode_vis_slot0 = dict(self.slot_shows[0])
+        if not hasattr(self, "view_color_modes"):
+            self.view_color_modes = {}
+        mode_idx = {"class": 0, "shaded_class": 1, "shaded": 1, "depth": 2,
+                    "intensity": 3, "rgb": 4, "elevation": 5,
+                    "surface": 6, "line": 7}.get(mode, 0)
+        self.view_color_modes[slot_idx] = mode_idx
+        if self.current_slot != slot_idx:
+            return
+        blocked = self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                code_item = self.table.item(row, 1)
+                if code_item is None:
+                    continue
+                info = palette.get(int(code_item.text()))
+                if info is None:
+                    continue
+                check = self.table.cellWidget(row, 0)
+                if check is not None:
+                    check_blocked = check.blockSignals(True)
+                    try:
+                        check.setChecked(bool(info.get("show", True)))
+                    finally:
+                        check.blockSignals(check_blocked)
+                weight = self.table.item(row, 6)
+                if weight is not None:
+                    weight.setText(f"{float(info.get('weight', 1.0 if slot_idx == 0 else 0.5)):.2f}")
+        finally:
+            self.table.blockSignals(blocked)
+        blocked = self.color_mode.blockSignals(True)
+        try:
+            self.color_mode.setCurrentIndex(mode_idx)
+        finally:
+            self.color_mode.blockSignals(blocked)
+        self._sync_color_mode_state()
+
     def sync_with_app_state(self):
         """
         Synchronize the dialog's widgets with the application's actual current state
@@ -2926,6 +3059,7 @@ class DisplayModeDialog(QDialog):
         _MODE_TO_IDX = {
             "class":        0,
             "shaded_class": 1,
+            "shaded":       1,
             "depth":        2,
             "intensity":    3,
             "rgb":          4,
@@ -2934,6 +3068,12 @@ class DisplayModeDialog(QDialog):
             "line":         7,
         }
         target_idx = _MODE_TO_IDX.get(current_mode, 0)
+
+        # Remember Main View changes even while a different slot is selected.
+        # Otherwise returning to Main View restores its stale pre-switch mode.
+        if not hasattr(self, "view_color_modes"):
+            self.view_color_modes = {}
+        self.view_color_modes[0] = target_idx
 
         # Sync color_mode combo box index. app.display_mode is the Main View's
         # own mode flag — only apply it while Main View (slot 0) is selected,
@@ -3142,7 +3282,7 @@ class DisplayModeDialog(QDialog):
                 _enforce(class_map, self.current_slot)
             self._untick_import_blocked(self.current_slot)
 
-        quality_mode = "normal"
+        quality_mode = str(self.shading_quality.currentData() or "normal").lower()
         if self.current_slot == 0 and idx in (1, 6) and quality_mode == "slow":
             total_points = len(app.data.get("xyz", [])) if isinstance(getattr(app, "data", None), dict) else 0
             if total_points > 25_000_000:
@@ -3574,6 +3714,7 @@ class DisplayModeDialog(QDialog):
         self._weight_popup.show_at(global_pos)
 
     def moveEvent(self, event):
+        self._dismiss_border_menu()
         super().moveEvent(event)
         if hasattr(self, '_weight_popup') and self._weight_popup.isVisible():
             delta = event.pos() - event.oldPos()
@@ -3592,6 +3733,7 @@ class DisplayModeDialog(QDialog):
         self.hide()
 
     def hideEvent(self, event):
+        self._dismiss_border_menu()
         self.save_global_settings()
         super().hideEvent(event)
 
@@ -3712,6 +3854,10 @@ class DisplayModeDialog(QDialog):
         try:
             for child in self.findChildren(QWidget):
                 if not child.isWindow() or not child.isVisible():
+                    continue
+                # Qt owns transient popup focus/stacking. Raising these after
+                # owner activation could resurrect a detached border menu.
+                if child.windowType() in (Qt.Popup, Qt.ToolTip):
                     continue
                 if child.windowState() & Qt.WindowMinimized:
                     continue
@@ -3917,8 +4063,17 @@ class DisplayModeDialog(QDialog):
             if self.current_ptc_path and os.path.exists(self.current_ptc_path):
                 settings.setValue("global_last_ptc_path", self.current_ptc_path)
 
-            # 6. Save color mode & structured border mode
+            # 6. Save color mode, mesh Speed & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
+            # Persist Shading and Surface Speed independently even though they share one UI combo.
+            mode_idx = int(self.color_mode.currentIndex())
+            current_quality = str(self.shading_quality.currentData() or "normal")
+            if mode_idx == 1:
+                self._shading_quality_value = current_quality
+            elif mode_idx == 6:
+                self._surface_quality_value = current_quality
+            settings.setValue("global_shading_quality", getattr(self, "_shading_quality_value", "normal"))
+            settings.setValue("global_surface_quality", getattr(self, "_surface_quality_value", "normal"))
             if self.border_logic_hybrid.isChecked():
                 mode_val = 2
             elif self.border_logic_object.isChecked():

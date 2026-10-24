@@ -98,6 +98,8 @@ struct View {
     double init_sse = 8.0;
     uint32_t w = 1, h = 1;
     bool surface_requested = false;
+    bool line_mode = false;
+    std::vector<std::array<double, 3>> depth_samples;
     std::string surface_error;
     bool surface_urgent = false; // first entry to Shading must not wait for pan debounce
     int surface_method = 0;
@@ -222,6 +224,9 @@ struct View {
     }
     // Geometry parameters and colours; a palette/light change recolours, never rebuilds.
     void lod_sync() {
+        // Tiled surfaces use the same crisp shader as cut-based surfaces, but
+        // never set surface_shading_upload. Seed its lighting on entry too.
+        push_crisp_shading_params();
         SurfaceParams p = make_surface_params();
         lod->set_params(p);
         uint8_t lut[768];
@@ -392,6 +397,12 @@ struct View {
             params.azimuth_deg = surface_shading.azimuth_deg;
             params.elevation_deg = surface_shading.light_elevation_deg;
             params.ambient = surface_shading.ambient;
+            // The CPU bake needs the whole derivation (Sharpness gain, over-90 elevation,
+            // ambient floor), not just the three raw numbers: see SurfaceParams::crisp_shade.
+            params.surface = surface_shading;
+            // The class count decides between VTK's crisp cell shade (multi-class) and its
+            // plain hillshade (one visible class); build_surface_job narrows this below.
+            params.crisp_shade = true;
         }
         params.single_elevation_deg = surface_single_elevation;
         params.compact_crisp = (!surface_elev || surface_gpu_elev) && eng.has_compact_shaded_class_surface();
@@ -605,6 +616,9 @@ struct View {
             job.class_count = unsigned(classes.count());
             job.method = params.method = job.class_count >= 2
                 ? SurfaceMethod::Barycentric : SurfaceMethod::Facet;
+            // Multi-class Shading bakes VTK's crisp cell shade; one visible class keeps
+            // VTK's plain hillshade (its own branch, selected by single_elevation_deg).
+            params.crisp_shade = params.crisp_shade && job.class_count >= 2;
             // The compact crisp engine path colours and lights the mesh itself: skip the
             // per-face colours, the mixed-face list and the per-vertex barycentric bake.
             if (params.compact_crisp && job.class_count >= 2 &&
@@ -1147,6 +1161,24 @@ __declspec(dllexport) int lnt_view_set_class_weights(void* h, const float* weigh
 }
 __declspec(dllexport) void lnt_view_set_mode(void* h, int mode) {
     if (View* v = static_cast<View*>(h)) {
+        if(v->line_mode) { v->scene.set_lines(nullptr,nullptr,nullptr); v->line_mode=false; v->streamer.set_merge_draw_ranges(true); }
+        v->loop.set_depth_enabled(mode == kEngineDepth);
+        v->frame_sig_valid = false;
+        if (mode == kEngineDepth && v->depth_samples.empty()) {
+            size_t roots = 0;
+            for (const auto& n : v->rd.nodes()) if (v->rd.is_root_node(n)) ++roots;
+            const size_t per_root = std::max<size_t>(1, 8192/std::max<size_t>(1,roots));
+            for (const auto& n : v->rd.nodes()) if (v->rd.is_root_node(n)) {
+                std::vector<RawPoint> points;
+                if (!v->rd.read_node_points(n, points)) continue;
+                const size_t take = std::min(per_root, points.size());
+                for (size_t i=0; i<take; ++i) {
+                    const auto& p = points[i*points.size()/take];
+                    v->depth_samples.push_back({p.x,p.y,p.z});
+                }
+            }
+            v->loop.set_depth_samples(v->depth_samples);
+        }
         // Point presentation modes (including native view-space Depth) must
         // take ownership back from a previously selected surface/shading mesh.
         v->surface_requested = false;
@@ -1159,6 +1191,16 @@ __declspec(dllexport) void lnt_view_set_mode(void* h, int mode) {
 // distance: what the 2D mode uses when the user switches back from 3D orbit.
 __declspec(dllexport) void lnt_view_plan_view(void* h) {
     if (View* v = static_cast<View*>(h)) v->ctl.set_angles(0.0, 0.0);
+}
+__declspec(dllexport) int lnt_view_set_lines(void* h, const uint8_t* rgb, const uint8_t* visible) {
+    View* v=static_cast<View*>(h);
+    if(!v || !rgb || !visible) return 0;
+    v->scene.set_lines(&v->rd,rgb,visible);
+    v->line_mode=true; v->surface_requested=false;
+    v->loop.set_depth_enabled(false);
+    v->eng.show_surface(false); v->eng.set_display_mode(0);
+    v->streamer.set_merge_draw_ranges(true); v->frame_sig_valid=false;
+    return 1;
 }
 // 1 = 2D plan (orthographic, orbit locked; the default), 0 = 3D perspective orbit.
 __declspec(dllexport) void lnt_view_set_2d(void* h, int on) {
@@ -1179,6 +1221,8 @@ __declspec(dllexport) void lnt_view_reset(void* h) {
 __declspec(dllexport) int lnt_view_set_shading(void* h, const ShadingUniforms* config) {
     View* v = static_cast<View*>(h);
     if (!v || !config || !v->eng.set_shading_mode(*config)) return 0;
+    if(v->line_mode) { v->scene.set_lines(nullptr,nullptr,nullptr); v->line_mode=false; v->streamer.set_merge_draw_ranges(true); }
+    v->loop.set_depth_enabled(false);
     const bool request_surface = config->display_mode == uint32_t(LNTDisplayMode::NormalShading);
     const bool needs_new_surface = request_surface &&
         (!v->has_surface_light || (v->surface_elev && !v->surface_gpu_elev) ||
@@ -1244,9 +1288,14 @@ __declspec(dllexport) int lnt_view_set_surface_shading(void* h, double azimuth_d
     v->surface_shading.ambient = float(ambient);
     if (light_elevation_deg > 0.0) v->surface_shading.light_elevation_deg = float(light_elevation_deg);
     v->has_surface_shading = true;
+    v->frame_sig_valid = false;
+    if (v->lod_mode_last) {
+        // The tiled arena is already resident: update shader push constants,
+        // not the cut-builder's CPU colours or its geometry generation.
+        return v->push_crisp_shading_params() ? 1 : 0;
+    }
     if (v->surface_shading_upload) {          // engine-lit mesh: relight in place
-        v->push_crisp_shading_params();
-        return 1;
+        return v->push_crisp_shading_params() ? 1 : 0;
     }
     // Legacy CPU-baked path: the shade is baked into the vertex colours, so re-light by
     // rebuilding. Same TIN, so the node source cache is still valid.

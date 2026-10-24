@@ -10,6 +10,27 @@ class ReferenceSurfaceError(ValueError):
     """Raised when a usable reference TIN cannot be constructed."""
 
 
+def has_tin_xy_support(reference_xyz):
+    """True only with >=3 spatially non-collinear XY reference points.
+
+    A small fence can contain 1-2 class-ground samples; those cannot define a
+    TIN and should trigger the original Height global-reference fallback.
+    """
+    ref = np.asarray(reference_xyz, dtype=np.float64)
+    if ref.ndim != 2 or ref.shape[0] < 3 or ref.shape[1] < 2:
+        return False
+    if not np.isfinite(ref[:, :2]).all():
+        return False
+    xy = ref[:, :2] - np.mean(ref[:, :2], axis=0)
+    xx = float(np.dot(xy[:, 0], xy[:, 0]))
+    yy = float(np.dot(xy[:, 1], xy[:, 1]))
+    xy_cross = float(np.dot(xy[:, 0], xy[:, 1]))
+    trace = xx + yy
+    if trace <= 1e-20:
+        return False
+    return xx * yy - xy_cross * xy_cross > 1e-12 * trace * trace
+
+
 def heights_above_reference_tin(reference_xyz, query_xyz, max_triangle,
                                 batch_size=500_000):
     """Return height above a temporary XY Delaunay TIN and validity mask.

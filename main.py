@@ -11,12 +11,19 @@ from pathlib import Path
 # launcher is on PATH, which is NOT the interpreter this project is built and
 # tested against. Re-exec ONCE under the project venv so every fix in this
 # tree is the code that actually runs.
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+FROZEN = bool(getattr(sys, "frozen", False))
+# In a PyInstaller build the entry script lives inside _MEIPASS (the onedir
+# `_internal` folder), which is where every bundled data/binary folder sits.
+PROJECT_ROOT = (getattr(sys, "_MEIPASS", None)
+                or os.path.dirname(os.path.abspath(__file__)))
 VENV_PYTHON = os.path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe")
 
 
 def _ensure_project_runtime():
     """Re-exec under the project venv, exactly once. Returns never (it execs)."""
+    if FROZEN:
+        # A frozen build has no project venv and must not relaunch itself.
+        return False
     try:
         current = os.path.normcase(os.path.abspath(sys.executable))
         wanted = os.path.normcase(os.path.abspath(VENV_PYTHON))
@@ -70,6 +77,15 @@ def _runtime_self_check(win):
     import importlib
     import os as _os
     import sys as _sys
+
+    # A packaged build usually has stdout redirected to a log. Without line
+    # buffering this diagnostic block is held in an 8 KB buffer that a healthy
+    # long-running GUI never fills, so the block silently never reaches the log.
+    for _stream in (_sys.stdout, _sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
 
     failures = []
 
@@ -199,6 +215,42 @@ def _runtime_self_check(win):
             + "\n  - ".join(failures))
  
  
+def _run_python_script_command() -> int | None:
+    """Run a bundled .py engine as a child of this exe (`--run-python-script`).
+
+    Premium AI and the vehicle post-filter run as separate processes. A frozen
+    build has no `python.exe` beside the app, so `sys.executable` is the GUI
+    executable: the controllers prefix that script path with this flag, and the
+    active interpreter here becomes the child instead of a second GUI launch.
+    """
+    argv = sys.argv[1:]
+    if "--run-python-script" not in argv:
+        return None
+    rest = argv[argv.index("--run-python-script") + 1:]
+    if not rest:
+        print("[NAKSHA RUNTIME] --run-python-script needs a script path")
+        return 2
+    script = os.path.abspath(rest[0])
+    if not os.path.isfile(script):
+        print(f"[NAKSHA RUNTIME] script not found: {script}")
+        return 2
+
+    script_dir = os.path.dirname(script)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    sys.argv = [script] + rest[1:]
+
+    import runpy
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            return 0
+        return code if isinstance(code, int) else 1
+    return 0
+
+
 def _configure_console_utf8():
     """Force UTF-8 console output on Windows to avoid mojibake in logs."""
     if os.name != "nt":
@@ -271,6 +323,9 @@ _configure_gdal_proj_env()
 
 def _run_maintenance_command() -> int | None:
     """Handle installer maintenance commands before importing the GUI stack."""
+    script_exit = _run_python_script_command()
+    if script_exit is not None:
+        return script_exit
     if "--unregister-snt" not in sys.argv[1:]:
         return None
 
@@ -295,9 +350,27 @@ def _run_maintenance_command() -> int | None:
 
 
 if __name__ == "__main__":
+    # Frozen child processes (Premium PCA workers use the spawn context) are
+    # re-launched as this exe with `--multiprocessing-fork`; freeze_support()
+    # must see those arguments before anything else runs.
+    if FROZEN:
+        try:
+            import multiprocessing
+            multiprocessing.freeze_support()
+        except Exception:
+            pass
+
     _maintenance_exit_code = _run_maintenance_command()
     if _maintenance_exit_code is not None:
         raise SystemExit(_maintenance_exit_code)
+
+    # A frozen build keeps plugins in %LOCALAPPDATA%; copy the bundled set in
+    # before the window asks PluginManager to discover them.
+    try:
+        from gui.plugin_seed import seed_bundled_plugins
+        seed_bundled_plugins()
+    except Exception:
+        traceback.print_exc()
  
 import open3d as o3d
 from PySide6.QtCore import qInstallMessageHandler, QTimer
