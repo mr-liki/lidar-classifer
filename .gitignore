@@ -77,6 +77,7 @@ cloth_nodes.txt
 .cwj_uploads/
 tests/*
 !tests/test_native_point_deletion.py
+!tests/test_lnt_open_progress.py
 patch_backups/
 .commandcode/
 .workbuddy-ai/

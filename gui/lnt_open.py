@@ -1250,6 +1250,8 @@ class _BuildUi(QObject):
     every widget / engine call below runs on the GUI thread (the engine's window
     must be created on a thread with a message loop)."""
 
+    LOAD_PROGRESS_START = 85
+
     def __init__(self, main_window, source, dlg, thread, worker):
         super().__init__(main_window)
         self.mw, self.source, self.dlg = main_window, source, dlg
@@ -1259,7 +1261,8 @@ class _BuildUi(QObject):
     @Slot(float, str)
     def on_progress(self, p, text):
         self.dlg.setLabelText(text)
-        self.dlg.setValue(int(p))
+        percent = int(max(0, min(100, p)) * self.LOAD_PROGRESS_START / 100)
+        self.dlg.setValue(max(self.dlg.value(), percent))
 
     @Slot(str, str)
     def on_finished(self, lnt, error):
@@ -1269,9 +1272,11 @@ class _BuildUi(QObject):
             self.dlg.canceled.disconnect()
         except Exception:   # noqa: BLE001
             pass
-        self.dlg.close()
         self.mw._lnt_build = None
+        if not error and self.dlg.wasCanceled():
+            error = "cancelled"
         if error:
+            self.dlg.close()
             self.mw._lnt_import_class_filter = None   # never leak into a later reopen
         if error == "cancelled":
             print("[LNT] build cancelled")
@@ -1284,7 +1289,8 @@ class _BuildUi(QObject):
             self.mw._lnt_source_path = self.worker.render_source
             self.mw._lnt_source_paths = list(self.worker.sources)
             self.mw._lnt_render_crs_wkt = self.worker.target_crs_wkt
-            _show(self.mw, lnt, self.name)
+            _show(self.mw, lnt, self.name, progress_dialog=self.dlg,
+                  progress_start=self.LOAD_PROGRESS_START)
 
     @Slot()
     def on_cancel(self):
@@ -1547,7 +1553,7 @@ def _refresh_total_points(app):
             print(f"[LNT] total points label update failed: {exc}")
 
 
-def _show(app, lnt_path, name):
+def _show(app, lnt_path, name, *, progress_dialog=None, progress_start=0):
     # Saving a native document may change the source identity and therefore
     # reopen it from a newly built local .lnt.  Preserve presentation state
     # across that renderer handoff: start() intentionally installs a neutral
@@ -1582,18 +1588,24 @@ def _show(app, lnt_path, name):
             print(f"[LNT] could not prepare the session PTC for the new cloud: {exc}")
     close_lnt_view(app, reopening=True)
     original_lnt = os.path.realpath(os.fspath(lnt_path))
-    load_dialog = QProgressDialog(
-        f"Loading {os.path.basename(original_lnt)}...", "Cancel", 0, 100, app
-    )
-    load_dialog.setWindowTitle("Loading point cloud")
-    load_dialog.setWindowModality(Qt.WindowModal)
-    load_dialog.setMinimumDuration(0)
-    load_dialog.setAutoClose(False)
-    load_dialog.setAutoReset(False)
-    load_dialog.setValue(0)
+    # First-open builds continue into loading in their existing dialog. Cached
+    # opens still own a standalone loading dialog, with their full 0..100 range.
+    load_dialog = progress_dialog
+    if load_dialog is None:
+        load_dialog = QProgressDialog(
+            f"Loading {os.path.basename(original_lnt)}...", "Cancel", 0, 100, app
+        )
+        load_dialog.setWindowTitle("Loading point cloud")
+        load_dialog.setWindowModality(Qt.WindowModal)
+        load_dialog.setMinimumDuration(0)
+        load_dialog.setAutoClose(False)
+        load_dialog.setAutoReset(False)
+    load_dialog.setValue(progress_start)
 
     def report_copy(percent):
-        load_dialog.setValue(int(percent))
+        # Leave the last percent for opening the native viewer itself.
+        value = progress_start + int(percent * (99 - progress_start) / 100)
+        load_dialog.setValue(max(load_dialog.value(), value))
         load_dialog.setLabelText(
             f"Loading {os.path.basename(original_lnt)}... {int(percent)}%"
         )
@@ -1617,8 +1629,12 @@ def _show(app, lnt_path, name):
         )
         return
     load_dialog.setLabelText(f"Opening {os.path.basename(original_lnt)}...")
-    load_dialog.setValue(100)
+    load_dialog.setValue(99)
     QApplication.processEvents()
+    if load_dialog.wasCanceled():
+        shutil.rmtree(session_dir, ignore_errors=True)
+        load_dialog.close()
+        return
     view = LntMainView(app, working_lnt, name)
     view._session_lnt_dir = session_dir
     view.original_lnt_path = original_lnt
@@ -1631,6 +1647,7 @@ def _show(app, lnt_path, name):
         print(f"[LNT] cannot show {lnt_path}: {exc}")
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
+    load_dialog.setValue(100)
     load_dialog.close()
     app._lnt_main_view = view
     reset_history = getattr(app, "_reset_main_view_history_baseline", None)
