@@ -15932,7 +15932,10 @@ class NakshaApp(QMainWindow):
                 if activate_native_draw(self, tool_name):
                     self.digitizer.active_tool = None
                     self.digitizer.enabled = False
-                    self.statusBar().showMessage(f'Native Vulkan Draw: {tool_name}', 3000)
+                    from gui.native_draw import get_native_draw
+                    native = get_native_draw(self)
+                    if native is not None and native.active():  # not a cancelled Text dialog
+                        self.statusBar().showMessage(f'Native Vulkan Draw: {tool_name}', 3000)
                     return
 
                 if hasattr(self, "digitizer"):
