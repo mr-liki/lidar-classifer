@@ -1,10 +1,10 @@
 {
-  "created": "2026-10-22 15:38:13",
+  "created": "2026-10-24 12:06:20",
   "dll": "native/naksha_vulkan/build_msvc/naksha_vulkan.dll",
   "dll_exports": 143,
-  "dll_sha256": "b97e1c073a5b322431bd03815915750816ac3ebbbfe9fc0a38f7d040738df4ca",
+  "dll_sha256": "4605214f5331730e562144fc707638c4efb729cb9bda686935300e5b3aefc3fd",
   "missing_exports": [],
-  "source_digest": "98ba8b28c58da05e5071227f9c875dd38269f07d9beea8d6e9c7576859249aba",
+  "source_digest": "8e081266b116c24cce8a296bcaae6f7258adbbcc141ffed22ecc6109047dffc8",
   "source_files": 73,
-  "source_newest": "shaders/surface.frag"
+  "source_newest": "src/PointCloudRenderer.cpp"
 }

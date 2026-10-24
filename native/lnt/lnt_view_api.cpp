@@ -1665,6 +1665,11 @@ __declspec(dllexport) int lnt_view_surface_point_counts(void* h, uint64_t* out3)
     return 1;
 }
 
+// Style-only engine updates need the next GUI tick, without the 100 ms idle wait.
+__declspec(dllexport) void lnt_view_request_redraw(void* h) {
+    if (h) static_cast<View*>(h)->frame_sig_valid = false;
+}
+
 __declspec(dllexport) int lnt_view_frame(void* h, float dt, LntViewStats* out) {
     View* v = static_cast<View*>(h);
     if (!v) return 0;

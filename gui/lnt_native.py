@@ -74,6 +74,9 @@ def lib():
     d.lnt_view_attach.argtypes = [c_uint64, c_int, c_int, c_char_p, c_char_p,
                                   c_uint32, c_double, c_char_p, c_int]
     d.lnt_view_attach.restype = c_void_p
+    if hasattr(d, "lnt_view_request_redraw"):
+        d.lnt_view_request_redraw.argtypes = [c_void_p]
+        d.lnt_view_request_redraw.restype = None
     d.lnt_view_close.argtypes = [c_void_p]
     d.lnt_view_resize.argtypes = [c_void_p, c_int, c_int]
     d.lnt_view_resize.restype = c_int
@@ -662,6 +665,11 @@ class NativeView:
 
     def reset(self):
         self._ok() and lib().lnt_view_reset(c_void_p(self.h))
+
+    def request_redraw(self):
+        fn = getattr(lib(), "lnt_view_request_redraw", None)
+        if self._ok() and fn is not None:
+            fn(c_void_p(self.h))
 
     def frame(self, dt):
         return self._ok() and bool(lib().lnt_view_frame(c_void_p(self.h), float(dt),
