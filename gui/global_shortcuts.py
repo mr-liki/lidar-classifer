@@ -990,6 +990,7 @@ class GlobalShortcutFilter(QObject):
                 elif event.key() == Qt.Key_Escape and (
                         getattr(self.app_window, 'cross_section_active', False)
                         or getattr(self.app_window, 'cut_section_mode_on', False)
+                        or getattr(self.app_window, '_native_xs_active', False)
                         or (measurement is not None and measurement.active)
                         or getattr(self.app_window, 'active_classify_tool', None)):
                     return execute_native_shortcut(self.app_window, 'Escape', key_label=key_label)
