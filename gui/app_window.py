@@ -1194,6 +1194,9 @@ class NakshaApp(QMainWindow):
        
 
         super().__init__()
+        # Destroy the widget tree while QApplication is alive, before
+        # Python/PySide finalization after the event loop exits.
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setObjectName("NakshaMainWindow")
         self.setContextMenuPolicy(Qt.NoContextMenu)
         try:
@@ -15705,8 +15708,10 @@ class NakshaApp(QMainWindow):
         super().closeEvent(event)
 
         # Keep shutdown flag true while windows are actually closing.
-        # Reset if close was aborted or the main window stayed visible.
-        if (not event.isAccepted()) or self.isVisible():
+        # Qt hides the window AFTER closeEvent returns, so isVisible() is
+        # still true here even for an accepted close. Deferred callbacks must
+        # continue to see the shutdown guard until the widget is destroyed.
+        if not event.isAccepted():
             self._shutdown_in_progress = False
 
     def deactivate_all_tools(self):

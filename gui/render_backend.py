@@ -3941,7 +3941,19 @@ class _GeometryMirror(_QObject):
             except Exception:
                 pass
 
+    def detach(self):
+        """Stop layout callbacks before either viewport starts destruction."""
+        for source in self._sources:
+            try:
+                source.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._sources = []
+        self._target = None
+
     def eventFilter(self, obj, event):
+        if getattr(self, "_target", None) is None:
+            return False
         try:
             if event.type() in (_QEvent.Resize, _QEvent.Move, _QEvent.LayoutRequest):
                 geom = self._sources[0].geometry()
@@ -7833,6 +7845,21 @@ class AppRenderBackendOwner:
                 self._log.exception("Vulkan resize failed (ignored)")
 
     def shutdown(self) -> None:
+        # Disable queued paint/resize/camera work before destroying native
+        # resources. Closing must not expose the legacy viewport underneath.
+        self.active = False
+        self._viewport_installed = False
+        mirror = self._geometry_mirror
+        self._geometry_mirror = None
+        if mirror is not None:
+            mirror.detach()
+            mirror.deleteLater()
+        if self.vulkan_widget is not None:
+            self.vulkan_widget._owner = None
+            try:
+                self.vulkan_widget.hide()
+            except RuntimeError:
+                pass  # Qt may already have destroyed the surface.
         # The ordinary SNT/LAZ Draw overlay is a Qt tool window. Close it
         # before destroying the Vulkan widget and native render backend.
         plan_view = getattr(self, '_plan_draw_view', None)
@@ -7846,10 +7873,6 @@ class AppRenderBackendOwner:
             self._plan_draw_view = None
         try:
             self._remove_camera_sync()
-        except Exception:
-            pass
-        try:
-            self.toggle_visible(False)
         except Exception:
             pass
         if self.vulkan_backend is not None:
