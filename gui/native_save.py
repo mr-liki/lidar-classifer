@@ -40,6 +40,74 @@ def _publish(files, stage_dir):
         raise
 
 
+def _class_digest(slots, mapping, drawings):
+    """Hash native classes without building another tens-of-megabytes bytes object."""
+    digest = hashlib.sha256()
+    digest.update(memoryview(slots))
+    digest.update(json.dumps(mapping, sort_keys=True).encode('utf-8'))
+    digest.update(drawings or b'')
+    return digest.digest()
+
+
+def _compatible_point_scaling(source_header, destination_header):
+    """A source record is reusable only with identical physical XYZ scaling."""
+    return (np.array_equal(source_header.scales, destination_header.scales)
+            and np.array_equal(source_header.offsets, destination_header.offsets))
+
+
+def _binary_prefix_compatible(source_dtype, destination_dtype):
+    """Permit raw field copies ONLY for a byte-identical prefix layout.
+
+    A new Naksha user-class extra dimension is sometimes appended to an
+    existing LAS point format. The old bytes can be copied directly into a
+    larger record only when *every* original field has the identical offset
+    and dtype, and every additional output field begins AFTER the original
+    record. Never apply this optimization to LAS 1.2 -> 1.4 format upgrades.
+    """
+    if (source_dtype.names is None or destination_dtype.names is None
+            or source_dtype.hasobject or destination_dtype.hasobject
+            or source_dtype.itemsize > destination_dtype.itemsize):
+        return False
+    for name in source_dtype.names:
+        src = source_dtype.fields[name]
+        dst = destination_dtype.fields.get(name)
+        if dst is None or src[0] != dst[0] or src[1] != dst[1]:
+            return False
+    for name in destination_dtype.names:
+        if name not in source_dtype.fields:
+            if destination_dtype.fields[name][1] < source_dtype.itemsize:
+                return False
+    return True
+
+
+def _full_source_record(chunk, header, laspy, *, allow_fast):
+    """Build output with no lost LAS fields; avoid per-dimension copies.
+
+    Reuse the decompressed chunk in-place if its point format matches exactly.
+    For identical base formats with one appended extra field, copy raw bytes
+    into the pre-zeroed wider record. Otherwise use laspy's existing safe
+    dimension conversion logic, including LAS 1.2 -> 1.4 scan-angle handling.
+    Filters and attribute selection run after this faithful record copy, so
+    Save As retains its existing filtering and dimension-selection behavior.
+    """
+    if allow_fast and _compatible_point_scaling(chunk, header):
+        if chunk.point_format == header.point_format:
+            return chunk, 'direct'
+        if chunk.point_format.id == header.point_format.id:
+            pts = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=header)
+            if (chunk.array.flags.c_contiguous and pts.array.flags.c_contiguous
+                    and _binary_prefix_compatible(chunk.array.dtype, pts.array.dtype)):
+                input_size = chunk.array.dtype.itemsize
+                pts.array.view(np.uint8).reshape(len(chunk), -1)[:, :input_size] = (
+                    chunk.array.view(np.uint8).reshape(len(chunk), input_size))
+                return pts, 'prefix'
+    pts = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=header)
+    pts.copy_fields_from(chunk)
+    if chunk.point_format.id < 6 <= header.point_format.id:
+        pts.scan_angle = np.rint(np.asarray(chunk.scan_angle_rank) / .006).astype(np.int16)
+    return pts, 'converted'
+
+
 def native_active(app):
     view = getattr(app, '_lnt_main_view', None)
     return view is not None and getattr(view, 'native', None) is not None
@@ -252,6 +320,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     source it was built from) are never replaced.
     """
     import laspy
+    total_started = time.perf_counter()
     cache = cache if cache is not None else {}
     mapping = mapping or {}
     destination = str(Path(destination).resolve())
@@ -269,6 +338,19 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     if subset and same_lnt:
         raise ValueError('Save a filtered subset to a new filename to keep the open document intact.')
     same_source = source and os.path.normcase(os.path.abspath(source)) == os.path.normcase(destination)
+    digest = _class_digest(slots, mapping, drawings)
+    # A repeated unchanged Save needs neither source-order matching nor LAZ
+    # recompression. The only trusted shortcut is an earlier successful Save
+    # to this very destination, with unchanged source metadata and companion.
+    if (same_source and companion and not subset and attributes is None and version is None
+            and cache.get('saved_path') == os.path.normcase(os.path.abspath(destination))
+            and cache.get('saved_digest') == digest and os.path.isfile(target_lnt)
+            and cache.get('saved_stat') == os.stat(source).st_mtime_ns):
+        progress(100, 'Both files are already saved.')
+        print(f'[NATIVE-SAVE-PERF] unchanged=True total={time.perf_counter() - total_started:.2f}s '
+              'no LAZ recompression', flush=True)
+        return {'path': destination, 'lnt': target_lnt, 'count': len(slots), 'unchanged': True}
+    mapping_started = time.perf_counter()
     if source:
         order = source_mapping(source, lnt, entries, leaves, starts, cache, progress)
         source_slots = np.empty_like(slots)
@@ -307,12 +389,8 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     if has_user_classes and USER_CLASS not in header.point_format.dimension_names:
         header.add_extra_dim(laspy.ExtraBytesParams(name=USER_CLASS, type=np.uint64,
                                                   description='Naksha user class number'))
-    # Repeated unchanged Save is a histogram-sized comparison, with no LAZ recompression.
-    digest = hashlib.sha256(slots.tobytes() + json.dumps(mapping, sort_keys=True).encode() + (drawings or b'')).digest()
-    if (same_source and not subset and attributes is None and version is None and
-            cache.get('saved_digest') == digest and cache.get('saved_stat') == os.stat(source).st_mtime_ns):
-        progress(100, 'Both files are already saved.')
-        return {'path': destination, 'lnt': target_lnt, 'count': len(slots), 'unchanged': True}
+
+    map_seconds = time.perf_counter() - mapping_started
     folder = str(Path(destination).parent)
     # A private staging directory gives the builder normal .las/.laz extensions.
     # mkdir uses normal inherited Windows permissions (unlike Python 3.14 mkdtemp).
@@ -322,6 +400,8 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     staged = str(stage_dir / ('points' + ext))
     staged_lnt = str(stage_dir / 'points.lnt')
     count = 0
+    source_record_modes = {'direct': 0, 'prefix': 0, 'converted': 0}
+    export_started = time.perf_counter()
     try:
         fast_las = False
         if source and Path(source).suffix.lower() == '.las' and ext == '.las' and not subset and attributes is None:
@@ -347,10 +427,11 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                     for chunk in chunks:
                         if reader:
                             n = len(chunk)
-                            pts = laspy.ScaleAwarePointRecord.zeros(n, header=header)
-                            pts.copy_fields_from(chunk)
-                            if chunk.point_format.id < 6 <= header.point_format.id:
-                                pts.scan_angle = np.rint(np.asarray(chunk.scan_angle_rank) / .006).astype(np.int16)
+                            pts, record_mode = _full_source_record(
+                                chunk, header, laspy,
+                                allow_fast=True,  # only succeeds for proven matching layouts
+                            )
+                            source_record_modes[record_mode] += 1
                             xyz = None
                         else:
                             xyz, raw = chunk
@@ -361,19 +442,23 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                             pts.intensity = raw['intensity'].astype(np.uint16) * 257
                         current = source_slots[at:at + n]
                         pts.classification = current
-                        user_codes = lut[current]
+                        # Allocate user-code/selection masks only when needed.
+                        # Filtered Save As semantics remain exactly as before.
+                        if has_user_classes or classes is not None:
+                            user_codes = lut[current]
                         if has_user_classes:
                             pts[USER_CLASS] = user_codes
-                        keep = np.ones(n, dtype=bool)
-                        if classes is not None:
-                            keep &= np.isin(user_codes, classes)
-                        if lines is not None:
-                            keep &= np.isin(np.asarray(pts.point_source_id), lines)
-                        if fences:
-                            from gui.save_points_dialog import fence_inside_mask
-                            if xyz is None:
-                                xyz = np.column_stack((pts.x, pts.y, pts.z))
-                            keep &= fence_inside_mask(xyz, fences)
+                        if subset:
+                            keep = np.ones(n, dtype=bool)
+                            if classes is not None:
+                                keep &= np.isin(user_codes, classes)
+                            if lines is not None:
+                                keep &= np.isin(np.asarray(pts.point_source_id), lines)
+                            if fences:
+                                from gui.save_points_dialog import fence_inside_mask
+                                if xyz is None:
+                                    xyz = np.column_stack((pts.x, pts.y, pts.z))
+                                keep &= fence_inside_mask(xyz, fences)
                         if attributes is not None:
                             from gui.save_pointcloud import _apply_attribute_selection
                             _apply_attribute_selection(pts, attributes)
@@ -389,14 +474,17 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                 finally:
                     if reader:
                         reader.close()
+        encode_seconds = time.perf_counter() - export_started
         if count == 0:
             raise ValueError('No points match the Save As selection.')
+        companion_started = time.perf_counter()
         if subset or attributes is not None:
             from gui.lnt_open import build_lnt
             build_lnt(staged, lambda n, text: progress(80 + int(n * .15), text), lambda: False)
         elif companion and not same_lnt:
             progress(85, 'Copying the native document…')
             shutil.copyfile(lnt, staged_lnt)
+        companion_seconds = time.perf_counter() - companion_started
         # Every output is staged before publication; replacement failures roll back.
         files = []
         if companion and os.path.isfile(staged_lnt):
@@ -423,7 +511,9 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                 shutil.copyfile(original, temp)
                 files.append((temp, target))
         files.append((staged, destination))
+        publish_started = time.perf_counter()
         _publish(files, stage_dir)
+        publish_seconds = time.perf_counter() - publish_started
         # A source save must not invalidate the edited native cache on next open.
         if companion and os.path.isfile(target_lnt):
             stamp = max(time.time_ns(), os.stat(destination).st_mtime_ns + 1_000_000)
@@ -433,18 +523,45 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                 stamp_source_cache(destination, target_lnt)
         if same_source and not subset and attributes is None:
             cache['saved_digest'] = digest
+            cache['saved_path'] = os.path.normcase(os.path.abspath(destination))
             cache['saved_stat'] = os.stat(destination).st_mtime_ns
             # Content changed but point order did not; retain the verified permutation.
             stat = os.stat(destination)
             cache['signature'] = (str(Path(source).resolve()), stat.st_size, stat.st_mtime_ns,
                                   hashlib.sha256(entries.tobytes()).digest())
         progress(100, 'Saved LAS/LAZ and native document.')
+        print(f'[NATIVE-SAVE-PERF] mapping={map_seconds:.2f}s '
+              f'encode={encode_seconds:.2f}s companion={companion_seconds:.2f}s '
+              f'publish={publish_seconds:.2f}s '
+              f'total={time.perf_counter() - total_started:.2f}s '
+              f'chunks={source_record_modes} points={count:,} '
+              f'companion={companion} output={ext}', flush=True)
         return {'path': destination, 'lnt': target_lnt, 'count': count, 'unchanged': False}
     finally:
         shutil.rmtree(stage_dir)
 
 
-def save_native(app, path=None, *, show_dialog=False, reopen=True, version=None):
+def _same_save_path(left, right):
+    """Compare on-disk destinations without confusing a session LNT with its companion."""
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(os.path.abspath(os.fspath(right)))
+
+
+def _should_reopen_after_save(source, destination, *, show_dialog, version, reopen):
+    """Keep an already loaded Vulkan/LNT session for ordinary in-place Save.
+
+    The private session's .lnt path necessarily differs from its published
+    companion's path. That difference is *not* evidence that the document needs
+    reloading. Explicit Save As, a new output path, a format change, or an
+    explicit caller override retain their original reopen behavior.
+    """
+    if reopen is not None:
+        return bool(reopen)
+    return bool(show_dialog or version is not None or not _same_save_path(source, destination))
+
+
+def save_native(app, path=None, *, show_dialog=False, reopen=None, version=None):
     """Shared ribbon, shortcut and close/save entry point. Returns actual completion."""
     from PySide6.QtCore import QThread, Signal, Qt
     from PySide6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
@@ -497,6 +614,14 @@ def save_native(app, path=None, *, show_dialog=False, reopen=True, version=None)
                                     f'Also replace the existing native file?\n{target_lnt}',
                                     QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
                 return False
+    # Ordinary Save writes back to the loaded LAS/LAZ without discarding the
+    # active private LNT session, Vulkan buffers, section stores or camera.
+    # Save As and explicit version/new-path exports retain the old reopen path.
+    reopen_after_save = _should_reopen_after_save(
+        source if source_exists else None, destination,
+        show_dialog=show_dialog, version=version, reopen=reopen,
+    )
+    prepare_started = time.perf_counter()
     try:
         flush_edits(app)
         from gui.class_slots import _state
@@ -506,6 +631,7 @@ def save_native(app, path=None, *, show_dialog=False, reopen=True, version=None)
     except Exception as exc:
         QMessageBox.critical(app, 'Save failed', str(exc))
         return False
+    prepare_seconds = time.perf_counter() - prepare_started
     cache = getattr(view, '_save_mapping_cache', None)
     if cache is None:
         view._save_mapping_cache = cache = {}
@@ -555,17 +681,48 @@ def save_native(app, path=None, *, show_dialog=False, reopen=True, version=None)
         dialog.deleteLater()
         worker.deleteLater()
     if worker.error:
+        print(f'[NATIVE-SAVE-PERF] FAILED after={time.perf_counter() - started:.2f}s '
+              f'gui_prepare={prepare_seconds:.2f}s', flush=True)
         QMessageBox.critical(app, 'Save failed', worker.error)
         return False
-    if os.path.normcase(os.path.abspath(worker.result['lnt'])) == os.path.normcase(os.path.abspath(view.lnt_path)):
+    print(f'[NATIVE-SAVE-PERF] gui_prepare={prepare_seconds:.2f}s '
+          f'worker_wall={time.perf_counter() - started:.2f}s', flush=True)
+    # The active LNT is a *private writable session*; its filename almost
+    # always differs from the companion saved next to the LAZ. When the whole
+    # source file was saved in place, the in-memory classifications are now a
+    # committed checkpoint even though those two LNT paths differ. This keeps
+    # Clear Project -> Don't Save from accidentally undoing a successful Save.
+    full_source_save = (
+        source_exists and _same_save_path(source, destination)
+        and classes is None and lines is None and not fences and attributes is None
+    )
+    checkpoint_needed = (
+        _same_save_path(worker.result['lnt'], view.lnt_path) or full_source_save
+    )
+    if checkpoint_needed:
         store = getattr(app, '_lnt_section_store', None)
         if store is not None and store.view is view:
-            store.mark_saved()
+            try:
+                store.mark_saved()
+            except Exception as exc:
+                # The on-disk export already committed; never report it as a
+                # failed export or initiate another reload to mask this issue.
+                print(f'[NATIVE-SAVE] WARNING: session checkpoint failed: {exc}', flush=True)
+                QMessageBox.warning(
+                    app, 'Save checkpoint warning',
+                    'The LAS/LAZ was saved, but the in-memory section checkpoint '
+                    f'could not be updated: {exc}\n'
+                    'Do not discard further edits until this is resolved.',
+                )
     app.last_save_path = destination
     app.last_save_format = Path(destination).suffix[1:]
     app.statusBar().showMessage(f'Saved {worker.result["count"]:,} points — LAS/LAZ + LNT '
                                 f'({time.perf_counter() - started:.2f} s)', 6000)
-    if reopen and os.path.normcase(os.path.abspath(worker.result['lnt'])) != os.path.normcase(os.path.abspath(view.lnt_path)):
+    if reopen_after_save and not _same_save_path(worker.result['lnt'], view.lnt_path):
         from gui.lnt_open import open_with_lnt
+        print(f'[NATIVE-SAVE] reopening exported document: {destination}', flush=True)
         open_with_lnt(app, destination)
+    else:
+        print('[NATIVE-SAVE] kept current Vulkan/LNT session; '
+              'no close/reopen or tile/cache rebuild', flush=True)
     return True

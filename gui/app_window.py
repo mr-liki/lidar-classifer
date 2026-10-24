@@ -14266,6 +14266,12 @@ class NakshaApp(QMainWindow):
         the loaded document or the file it was built from.
         """
         from gui import native_backup, native_save
+        # Native manual saves run in a worker while QProgressDialog processes
+        # timer events. Do not launch a simultaneous full LAZ recompression:
+        # the next timer/exit backup may run normally after Save completes.
+        if getattr(self, '_native_save_running', False):
+            print('⏭️ Auto-backup deferred — native Save is already running')
+            return
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
             return
