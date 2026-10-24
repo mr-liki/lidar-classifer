@@ -191,7 +191,10 @@ def backup_path(app, source=None, *, timestamp=None):
 def _protected_paths(app):
     """Files the backup must never be written over."""
     paths = set()
-    for candidate in (source_for(app), document(app), getattr(app, "loaded_file", None)):
+    view = getattr(app, "_lnt_main_view", None)
+    original_document = getattr(view, "original_lnt_path", None) if view else None
+    for candidate in (source_for(app), document(app), original_document,
+                      getattr(app, "loaded_file", None)):
         if candidate:
             paths.add(os.path.normcase(os.path.abspath(os.fspath(candidate))))
     return paths

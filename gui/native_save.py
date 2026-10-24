@@ -454,7 +454,8 @@ def save_native(app, path=None, *, show_dialog=False, reopen=True, version=None)
     source = _source_for(app)
     source_exists = source and Path(source).suffix.lower() in ('.las', '.laz') and os.path.isfile(source)
     classes = lines = fences = attributes = None
-    destination = path or (source if source_exists else str(Path(view.lnt_path).with_suffix('.las')))
+    original_document = getattr(view, 'original_lnt_path', None) or view.lnt_path
+    destination = path or (source if source_exists else str(Path(original_document).with_suffix('.las')))
     if show_dialog:
         from gui.save_points_dialog import SavePointsDialog, collect_save_fences, _fence_ring
         import laspy

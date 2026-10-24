@@ -2324,9 +2324,17 @@ class NativeDraw:
                        and hovered.get('source') == 'native' else
                        getattr(self, '_hover_selected_native_ref', None)
                        if bridge is None and self.tool == 'select' else None)
+        transform_hidden = (
+            bridge.transform_hidden_drawing_ids()
+            if bridge is not None and hasattr(bridge, 'transform_hidden_drawing_ids')
+            else set()
+        )
         for i, drawing in enumerate(self.drawings):
-            if drawing is self._moving_text_ref and self._moving_text_hover is not None:
+            if (drawing is getattr(self, '_moving_text_ref', None)
+                    and getattr(self, '_moving_text_hover', None) is not None):
                 continue  # The live preview replaces the original, not duplicates it.
+            if id(drawing) in transform_hidden:
+                continue  # Transform preview replaces its committed sources this frame.
             if id(drawing) in hidden_in_intersect:
                 continue  # VTK-style overlay replaces original with split pieces.
             if gpu_blocks and drawing.get('source') == 'block_creation':
@@ -2353,7 +2361,8 @@ class NativeDraw:
                 data['control_points'] = list(coords)
                 coords = _catmull_rom(coords)
             shapes.append(('drawing', coords, data))
-        if self._moving_text_ref is not None and self._moving_text_hover is not None:
+        if (getattr(self, '_moving_text_ref', None) is not None
+                and getattr(self, '_moving_text_hover', None) is not None):
             # Only the placement preview moves; original world coordinates and
             # every font/style field remain immutable until the left-click.
             label = self._moving_text_ref
