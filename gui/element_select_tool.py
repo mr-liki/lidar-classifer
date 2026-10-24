@@ -22,12 +22,19 @@ listening to clicks at the same time.
 """
 
 import time
+import math
 
 import vtk
-from PySide6.QtCore import QObject, QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtWidgets import QApplication, QInputDialog
 
 from gui.selection_manager import SelectionMode
+from gui.extend_vertex_geometry import (
+    open_vertices, nearest_vertex, adjacent_sides,
+    extension_from_vertex, extension_by_distance,
+    extend_candidates, extend_target_live, extend_replacements,
+    extended_edge_length_meters,
+)
 
 
 class PickMethod:
@@ -55,6 +62,7 @@ class ElementSelectTool(QObject):
     HOVER_COLOR = (1.0, 0.85, 0.2)   # warm yellow preview
     HOVER_WIDTH_BOOST = 1.5
     INTERSECT_HISTORY_RENDER_DELAY_MS = 20
+    extend_measurement_changed = Signal(object, bool)  # metres (or None), final?
 
     def __init__(self, app, digitizer):
         super().__init__()
@@ -155,11 +163,222 @@ class ElementSelectTool(QObject):
         self._copy_centroid = None    # (cx, cy) world-space anchor
         self._copy_preview_actors = []
 
+        # One-shot Extend attached to the same Element Selection panel.
+        self._extend_mode = None
+        self._extend_anchor = None
+        self._extend_side = None
+        self._extend_hover = None
+        self._extend_overlay_actor = None
+
         # Reusable picker — created once, not on every mouse move
         self._world_picker = vtk.vtkWorldPointPicker()
         self._overlay_cell_picker = vtk.vtkCellPicker()
         self._overlay_cell_picker.SetTolerance(0.005)
         self._overlay_prop_picker = vtk.vtkPropPicker()
+
+    def begin_vertex_extend(self, mode):
+        """Arm one vertex reshape of an EXISTING open Draw polyline."""
+        if mode not in ('free', 'fixed', 'distance_vertex'):
+            return False
+        if self._move_mode or self._copy_mode or self._intersect_mode:
+            self._status('Finish Move/Copy/Intersect before Extend')
+            return False
+        if not self._active:
+            self.activate(PickMethod.INDIVIDUAL)
+        self._extend_mode = mode
+        self._extend_anchor = None
+        self._extend_side = None
+        self._extend_hover = None
+        messages = {
+            'free': 'Extend 360: choose ANY control vertex, then its new position',
+            'fixed': 'Extend Fixed: choose ANY vertex; select its incident edge if needed',
+            'distance_vertex': 'Extend Distance: choose ANY vertex, edge and length',
+        }
+        self.extend_measurement_changed.emit(0.0, False)
+        self._status(messages[mode] + ' (Esc cancels)')
+        return True
+
+    def _cancel_vertex_extend(self):
+        if self._extend_mode is not None:
+            self.extend_measurement_changed.emit(None, False)
+        self._extend_mode = None
+        self._extend_anchor = None
+        self._extend_side = None
+        self._extend_hover = None
+        self._remove_overlay('_extend_overlay_actor')
+
+    def _choose_extend_side(self, drawing, index):
+        available = adjacent_sides(drawing, index)
+        if len(available) == 1:
+            return available[0]
+        if len(available) != 2:
+            return None
+        choices = [f'Previous edge: vertex {index} to {index + 1}',
+                   f'Next edge: vertex {index + 1} to {index + 2}']
+        parent = getattr(self.app, '_element_selection_dialog', None) or self.app
+        choice, ok = QInputDialog.getItem(
+            parent, 'Extend - Choose Existing Edge',
+            'Which edge sets the direction for this middle vertex?',
+            choices, 0, False)
+        if not ok:
+            return None
+        return ('previous' if choice == choices[0] else 'next'
+                if choice == choices[1] else None)
+
+    def _commit_vertex_extend(self, drawing, new_coords):
+        changes = extend_replacements(self.digitizer.drawings, drawing, new_coords)
+        if not changes:
+            self._cancel_vertex_extend()
+            self.deactivate()
+            self._status('Extend cancelled: stale or invalid source geometry')
+            return
+        # Display the full FINAL edge length from adjacent vertex to edited
+        # vertex, matching Measure -> Line; not the dragged-vertex displacement.
+        index = self._extend_anchor[1] if self._extend_anchor else None
+        metres = (extended_edge_length_meters(
+            drawing, index, new_coords, self._extend_side)
+            if index is not None else None)
+        try:
+            self.digitizer._save_state()  # one VTK drawing Undo snapshot
+            affected = []
+            for original, coords in changes:
+                self.digitizer._set_transformed_coords(original, coords)
+                original.pop('bounds', None)
+                self.digitizer._rebuild_transformed_drawing(original)
+                affected.append(original)
+            self.digitizer._finish_transform_refresh(affected)
+            manager = self.selection
+            if manager is not None:
+                manager.clear()
+            previous_highlights = list(affected)
+            selected_drawing = getattr(self.digitizer, 'selected_drawing', None)
+            if isinstance(selected_drawing, dict) and all(
+                    selected_drawing is not d for d in affected):
+                previous_highlights.append(selected_drawing)
+            previous_highlights.extend(getattr(self.digitizer, 'multi_selected', ()) or ())
+            self.digitizer.selected_drawing = None
+            self.digitizer.selected = None
+            self.digitizer.multi_selected = []
+            self.digitizer.selected_vertex_idx = None
+            unhighlight = getattr(self.digitizer, '_unhighlight_line', None)
+            if callable(unhighlight):
+                seen = set()
+                for item in previous_highlights:
+                    if isinstance(item, dict) and id(item) not in seen:
+                        seen.add(id(item))
+                        unhighlight(item)
+            self.digitizer._pending_transform_deselect_on_right_click = False
+            clear_labels = getattr(self.digitizer, 'clear_coordinate_labels', None)
+            if callable(clear_labels):
+                clear_labels()
+        except Exception as exc:
+            try:
+                self.digitizer.undo()
+            except Exception:
+                pass
+            self._status(f'Extend could not complete: {exc}')
+            return
+        self._cancel_vertex_extend()
+        self.deactivate()
+        if metres is not None:
+            self.extend_measurement_changed.emit(metres, True)
+        self._render()
+        self._status(f'Extend complete: {len(changes)} existing segment(s) reshaped; '
+                     'original color restored')
+        print(f'[Extend VTK] updated_existing={len(changes)} undo=1', flush=True)
+
+    def _vertex_extend_press(self, x, y):
+        point = self._screen_to_world(x, y)
+        if self._extend_anchor is None:
+            other = self._screen_to_world(x + 12, y)
+            tolerance = max(math.hypot(other[0]-point[0],other[1]-point[1]), 1e-9)
+            selected = list(self.selection.get() or []) if self.selection is not None else []
+            drawings = list(getattr(self.digitizer, 'drawings', []) or [])
+            preferred = [d for d in selected if isinstance(d, dict)
+                         and self._drawing_in_edit_scope(d)]
+            picked = nearest_vertex(tuple(extend_candidates(drawings, preferred)),
+                                    point, max(tolerance, 1e-9) * 20 / 12)
+            if picked is None:
+                nearby = [d for d in drawings if self._drawing_in_edit_scope(d)]
+                picked = nearest_vertex(tuple(extend_candidates(drawings, nearby)),
+                                        point, max(tolerance, 1e-9) * 20 / 12)
+            if picked is None:
+                self._status('Extend: click an actual vertex of an editable OPEN line')
+                return
+            drawing, index = picked
+            self._extend_side = None
+            if self._extend_mode in ('fixed', 'distance_vertex'):
+                self._extend_side = self._choose_extend_side(drawing, index)
+                if self._extend_side is None:
+                    self._cancel_vertex_extend()
+                    self.deactivate()
+                    self._status('Extend cancelled; no direction chosen')
+                    return
+            self._extend_anchor = picked
+            self._extend_hover = point
+            if self._extend_mode == 'distance_vertex':
+                parent = getattr(self.app, '_element_selection_dialog', None) or self.app
+                distance, ok = QInputDialog.getDouble(
+                    parent, 'Extend Existing Vertex by Distance',
+                    'Add length to selected existing edge (world units):',
+                    1.0, 0.000001, 1.e9, 6)
+                if not ok:
+                    self._cancel_vertex_extend()
+                    self.deactivate()
+                    self._status('Extend cancelled; no drawing changed')
+                    return
+                proposal = extension_by_distance(drawing, index, distance,
+                                                 self._extend_side)
+                if proposal is None:
+                    self._cancel_vertex_extend()
+                    self.deactivate()
+                    self._status('Extend rejected: invalid length or protected vertex')
+                    return
+                self._commit_vertex_extend(drawing, proposal[1])
+                return
+            self._status('Move mouse to preview SAME N-line, then click to reshape')
+            return
+        drawing, index = self._extend_anchor
+        if not extend_target_live(self.digitizer.drawings, drawing):
+            self._cancel_vertex_extend()
+            self.deactivate()
+            self._status('Extend cancelled: drawing no longer exists')
+            return
+        proposal = extension_from_vertex(drawing, index, point,
+                                         self._extend_mode, self._extend_side)
+        if proposal is None:
+            self._status('Choose a valid position (incident edges cannot collapse)')
+            return
+        self._commit_vertex_extend(drawing, proposal[1])
+
+    def _vertex_extend_preview(self, x, y):
+        self._extend_hover = self._screen_to_world(x, y)
+        self._remove_overlay('_extend_overlay_actor')
+        if self._extend_anchor is None or self._extend_mode == 'distance_vertex':
+            return
+        drawing, index = self._extend_anchor
+        proposal = extension_from_vertex(drawing, index, self._extend_hover,
+                                         self._extend_mode, self._extend_side)
+        if proposal is None:
+            return
+        # Live feedback is the length of the affected final edge (A -> C).
+        metres = extended_edge_length_meters(
+            drawing, index, proposal[1], self._extend_side)
+        if metres is not None:
+            self.extend_measurement_changed.emit(metres, False)
+        # Draw whole proposed N as a temporary preview overlay. No new Draw
+        # entity is created; this actor is removed on commit/cancel.
+        screen = []
+        for p in proposal[1]:
+            pt = self._world_to_screen(p[0], p[1], p[2] if len(p)>2 else 0.)
+            if pt is None:
+                return
+            screen.append(pt)
+        self._extend_overlay_actor = self._make_screen_polyline(
+            screen, color=(1.0, 0.8, 0.25), width=3.0, dashed=True)
+        if self._extend_overlay_actor is not None:
+            self.renderer.AddActor2D(self._extend_overlay_actor)
+            self._render()
 
     # ------------------------------------------------------------------
     # Public API
@@ -793,6 +1012,8 @@ class ElementSelectTool(QObject):
             self._status(f"Element Select active — {method} (Overlap mode)")
 
     def deactivate(self):
+        if self._extend_mode is not None:
+            self._cancel_vertex_extend()
         if not self._active:
             self._restore_left_click_pan()
             return
@@ -911,6 +1132,12 @@ class ElementSelectTool(QObject):
         if not self._active:
             return
         x, y = self.interactor.GetEventPosition()
+        if self._extend_mode is not None:
+            self._vertex_extend_press(x,y)
+            try:
+                if obj is not None: obj.AbortFlagOn()
+            except Exception: pass
+            return
 
         # ── Intersect mode: left-click selects a bisected part ────────
         if self._intersect_mode:
@@ -990,6 +1217,11 @@ class ElementSelectTool(QObject):
     def _on_left_release(self, obj, evt):
         if not self._active:
             return
+        if self._extend_mode is not None:
+            try:
+                if obj is not None: obj.AbortFlagOn()
+            except Exception: pass
+            return
 
         # ── Interactive drag-move release ─────────────────────────────
         if self._move_mode and self._drag_active:
@@ -1030,6 +1262,9 @@ class ElementSelectTool(QObject):
         except Exception:
             pass
         x, y = self.interactor.GetEventPosition()
+        if self._extend_mode is not None:
+            self._vertex_extend_preview(x,y)
+            return
 
         # ── Intersect mode: highlight whichever half the cursor is over ──
         if self._intersect_mode:
@@ -1071,6 +1306,14 @@ class ElementSelectTool(QObject):
     def _on_right_press(self, obj, evt):
         if not self._active:
             return
+        if self._extend_mode is not None:
+            self._cancel_vertex_extend()
+            self.deactivate()
+            self._status('Extend cancelled; drawing unchanged')
+            try:
+                if obj is not None: obj.AbortFlagOn()
+            except Exception:pass
+            return True
         handled = False
 
         # COPY MODE — right-click exits.
@@ -1153,7 +1396,11 @@ class ElementSelectTool(QObject):
             shift = False
 
         if key in ("Escape", "escape"):
-            if self._intersect_mode:
+            if self._extend_mode is not None:
+                self._cancel_vertex_extend()
+                self.deactivate()
+                self._status('Extend cancelled; drawing unchanged')
+            elif self._intersect_mode:
                 self._cancel_intersect_mode()
                 self._status("Intersect: cancelled.")
             elif self._move_mode:
@@ -2200,6 +2447,8 @@ class ElementSelectTool(QObject):
     # Cancel / cleanup helpers
     # ------------------------------------------------------------------
     def _cancel_in_progress_pick(self):
+        if self._extend_mode is not None:
+            self._cancel_vertex_extend()
         # Clear copy mode
         if self._copy_mode:
             for actor in self._copy_preview_actors:

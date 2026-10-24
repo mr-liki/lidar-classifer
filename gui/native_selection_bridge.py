@@ -20,6 +20,12 @@ from gui.native_selection_geometry import (
     rect_selects, polygon_selects, line_selects, translate, rotate, mirror,
 )
 from gui.native_vector_pick import nearest_segment
+from gui.extend_vertex_geometry import (
+    open_vertices, nearest_vertex, adjacent_sides,
+    extension_from_vertex, extension_by_distance,
+    extend_candidates, extend_target_live, extend_replacements,
+    extended_edge_length_meters,
+)
 from gui.native_intersect_geometry import split_selected_features
 
 
@@ -170,6 +176,8 @@ class NativeSelectionManager(QObject):
 
 class NativeSelectionController(QObject):
     """Vulkan interaction half of the existing SelectionModeDialog."""
+    pick_completed = Signal()  # A whole selection gesture, not an interim click.
+    extend_measurement_changed = Signal(object, bool)  # metres (or None), final?
     def __init__(self, draw):
         super().__init__()
         self.draw=draw
@@ -201,6 +209,13 @@ class NativeSelectionController(QObject):
         self._text_min_x=[]
         self._text_prefix_max_x=[]
         self._snt_copy_sources=[]
+        # Extend uses the existing Select canvas only while its own two-click
+        # transaction is armed; ordinary picking and all other tools unchanged.
+        self._extend_mode=None
+        self._extend_anchor=None  # (native drawing object, control vertex index)
+        self._extend_side=None  # interior: previous or next existing segment
+        self._extend_hover=None
+        self._extend_scene_token=None
 
     def message(self, msg, timeout=3500):
         bar=getattr(self.app,'statusBar',lambda:None)()
@@ -220,6 +235,7 @@ class NativeSelectionController(QObject):
         return True
 
     def deactivate(self):
+        self._cancel_extend(disarm=False)
         if self._intersect_mode:
             self.exit_intersect_mode(commit=True)
         self._active=False
@@ -231,7 +247,24 @@ class NativeSelectionController(QObject):
         self.selection_manager.clear()
         if self.draw.tool=='select':self.draw.cancel()
 
+    def finish_pick_once(self):
+        """Disarm canvas picking without clearing the selected features.
+
+        Normal deactivate() intentionally clears selections and is used for
+        explicit teardown. A completed one-shot pick must not use it.
+        """
+        if not self.is_active() or self._move_mode or self._copy_mode or self._intersect_mode:
+            return
+        self._active = False
+        self._reset_gesture()
+        self._set_hover_feature(None)
+        # Keep _selection_bridge installed: native Draw paints cyan selection
+        # from it. Clearing this link would make the selection disappear.
+        if self.draw.tool == 'select':
+            self.draw.cancel()
+
     def set_method(self, method):
+        self._cancel_extend(disarm=False)
         if self._intersect_mode:
             self.exit_intersect_mode(commit=True)
         self._method=method
@@ -240,6 +273,211 @@ class NativeSelectionController(QObject):
         self._reset_gesture()
         self.selection_manager.clear()
         self.message(f'Vulkan Select: {method.replace("_"," ")}')
+
+    def begin_vertex_extend(self, mode):
+        """Use the *existing* Element Selection -> Extend button (one-shot)."""
+        if mode not in ('free', 'fixed', 'distance_vertex'):
+            return False
+        if self._intersect_mode or self._copy_mode or self._move_mode:
+            self.message('Finish Move/Copy/Intersect before using Extend')
+            return False
+        if not self.is_active() and not self.activate('individual'):
+            return False
+        self._reset_gesture()
+        self._set_hover_feature(None)
+        self._extend_mode=mode
+        self._extend_anchor=None
+        self._extend_side=None
+        self._extend_hover=None
+        self._extend_scene_token=self.draw._scene_token()
+        instructions = {
+            'free': 'Extend 360: click ANY control vertex, move and click to reshape that same line',
+            'fixed': 'Extend Fixed: click ANY control vertex; choose adjacent edge if needed',
+            'distance_vertex': 'Extend Distance: click ANY control vertex and enter extension length',
+        }
+        self.extend_measurement_changed.emit(0.0, False)
+        self.message(instructions[mode] + '; right-click/Esc cancels',0)
+        return True
+
+    def _cancel_extend(self, disarm=True):
+        active=self._extend_mode is not None
+        self._extend_mode=None
+        self._extend_anchor=None
+        self._extend_side=None
+        self._extend_hover=None
+        self._extend_scene_token=None
+        if active:
+            self.extend_measurement_changed.emit(None, False)
+            self.draw._paint()
+            if disarm:
+                self.finish_pick_once()
+        return active
+
+    def _choose_extend_side(self, drawing, index):
+        """Middle vertices need an explicit direction edge, never a guess."""
+        available = adjacent_sides(drawing, index)
+        if len(available) == 1:
+            return available[0]
+        if len(available) != 2:
+            return None
+        choices = [f'Previous edge: vertex {index} to {index + 1}',
+                   f'Next edge: vertex {index + 1} to {index + 2}']
+        parent = getattr(self.app, '_element_selection_dialog', None) or self.app
+        selection, ok = QInputDialog.getItem(
+            parent, 'Extend - Choose Existing Edge',
+            'Which edge sets the direction for this middle vertex?',
+            choices, 0, False)
+        if not ok:
+            return None
+        return ('previous' if selection == choices[0] else 'next'
+                if selection == choices[1] else None)
+
+    def _commit_vertex_extend(self, original, new_coords):
+        """One atomic in-place Extend, including BOTH sides of Line joints."""
+        changes = extend_replacements(self.draw.drawings, original, new_coords)
+        if not changes:
+            self._cancel_extend()
+            self.message('Extend rejected: shape changed or no valid edit; no drawing changed')
+            return True
+        # Report the FINAL complete edited edge length (A -> C), NOT the
+        # movement of the vertex (B -> C). Match the unchanged Measure -> Line
+        # world-coordinate distance convention for identical endpoints.
+        anchor_idx = self._extend_anchor[1] if self._extend_anchor else None
+        metres = (extended_edge_length_meters(
+            original, anchor_idx, new_coords, self._extend_side)
+            if anchor_idx is not None else None)
+        before = list(self.draw.drawings)
+        affected_ids = {id(d) for d, _ in changes}
+        replacements = {}
+        for drawing, coords in changes:
+            revised = dict(drawing, coords=[tuple(p) for p in coords])
+            revised.pop('bounds', None)
+            replacements[id(drawing)] = revised
+        # Replace only affected records. The N remains exactly the same number
+        # of Draw entities. For Line chains, a middle vertex updates both
+        # incident LINE segments, not one endpoint in isolation.
+        self.draw.drawings[:] = [replacements.get(id(d), d) for d in before]
+        self.draw.record_object_change(before)
+
+        # EXTEND-ONLY cleanup: cyan disappears after a successful commit, and
+        # the stored drawing color is shown. Ordinary Select remains unchanged.
+        self.selection_manager.clear()
+        if getattr(self.draw, '_selected_native_ref', None) is not None and \
+                id(self.draw._selected_native_ref) in affected_ids:
+            self.draw._store_selection(None)
+        # Retire any stale selected fence/highlight object references. This
+        # does NOT undo or revert classified point-cloud data.
+        cleanup = getattr(self.draw, '_prune_deleted_native_refs', None)
+        if callable(cleanup):
+            cleanup(affected_ids)
+        completed_mode = self._extend_mode
+        self._cancel_extend()
+        if metres is not None:
+            self.extend_measurement_changed.emit(metres, True)
+        self.message(f'Extend complete: {len(changes)} existing segment(s) reshaped; '
+                     'original color restored. Click Extend to edit again')
+        print(f'[Extend] mode={completed_mode} '
+              f'updated_existing={len(changes)} undo=1 selection_cleared=True', flush=True)
+        return True
+
+    def _extend_press(self, pos, button):
+        """Vertex click + mouse destination, or vertex click + typed distance."""
+        if button == Qt.RightButton:
+            self._cancel_extend()
+            self.message('Extend cancelled; drawing unchanged')
+            return True
+        if button != Qt.LeftButton:
+            return False
+        if self._extend_scene_token != self.draw._scene_token():
+            self._cancel_extend()
+            self.message('Extend cancelled: attachment/scene changed')
+            return True
+        try:
+            point = self.draw.canvas.section_at(pos.x(), pos.y())
+        except (RuntimeError, ValueError):
+            return True
+        if self._extend_anchor is None:
+            # 20px target radius, independent of zoom level. The original
+            # 12px per-record picker missed shared corners of Line chains.
+            tol = max(self.draw.canvas.world_per_pixel() * 20., 1e-9)
+            selection = self.selection_manager.get_features()
+            preferred = [f['drawing'] for f in selection if f['source'] == 'native']
+            candidates = tuple(extend_candidates(self.draw.drawings, preferred))
+            target = nearest_vertex(candidates, point, tol)
+            if target is None:
+                a, b = (point[0]-tol, point[1]-tol), (point[0]+tol, point[1]+tol)
+                nearby = [f['drawing'] for f in self._features_bbox(a,b)
+                          if f['source'] == 'native']
+                target = nearest_vertex(tuple(extend_candidates(self.draw.drawings, nearby)),
+                                        point, tol)
+            if target is None:
+                self.message('Extend: click a drawn ENDPOINT or connected CORNER '
+                             '(within 20 pixels); no changes made', 5500)
+                print(f'[Extend] no vertex at xy={point[:2]} tolerance={tol:.6f}', flush=True)
+                return True
+            drawing, index = target
+            print(f'[Extend] picked vertex={index + 1}/{len(open_vertices(drawing))} '
+                  f'chain_segments={len(drawing.get("_extend_chain_records", (drawing,)))} '
+                  f'mode={self._extend_mode}', flush=True)
+            self._extend_side = None
+            if self._extend_mode in ('fixed', 'distance_vertex'):
+                self._extend_side = self._choose_extend_side(drawing, index)
+                if self._extend_side is None:
+                    self._cancel_extend()
+                    self.message('Extend cancelled: no direction chosen; original drawing unchanged')
+                    return True
+            self._extend_anchor = target
+            self._extend_hover = point
+            if self._extend_mode == 'distance_vertex':
+                parent = getattr(self.app, '_element_selection_dialog', None) or self.app
+                distance, ok = QInputDialog.getDouble(
+                    parent, 'Extend Existing Vertex by Distance',
+                    'Add length to selected existing edge (world units):',
+                    1.0, 0.000001, 1.e9, 6)
+                if not ok:
+                    self._cancel_extend()
+                    self.message('Extend cancelled; drawing unchanged')
+                    return True
+                proposal = extension_by_distance(drawing, index, distance,
+                                                 self._extend_side)
+                if proposal is None:
+                    self._cancel_extend()
+                    self.message('Extend rejected: invalid length or protected vertex')
+                    return True
+                return self._commit_vertex_extend(drawing, proposal[1])
+            self.draw._paint()
+            self.message('Move cursor to preview the SAME N-line; click to commit',0)
+            return True
+        original, index = self._extend_anchor
+        if not extend_target_live(self.draw.drawings, original):
+            self._cancel_extend()
+            self.message('Extend cancelled: original drawing/chain no longer exists')
+            return True
+        proposal = extension_from_vertex(original, index, point, self._extend_mode,
+                                         self._extend_side)
+        if proposal is None:
+            self.message('Move vertex to a valid position (existing vertices cannot collapse)')
+            return True
+        return self._commit_vertex_extend(original, proposal[1])
+
+    def _extend_move(self, pos):
+        try:
+            self._extend_hover=self.draw.canvas.section_at(pos.x(),pos.y())
+        except (RuntimeError,ValueError):
+            return True
+        if self._extend_anchor is not None:
+            drawing, index = self._extend_anchor
+            proposal = extension_from_vertex(
+                drawing, index, self._extend_hover, self._extend_mode,
+                self._extend_side)
+            if proposal is not None:
+                # Live preview uses the SAME final-edge formula as commit.
+                metres = extended_edge_length_meters(
+                    drawing, index, proposal[1], self._extend_side)
+                if metres is not None:
+                    self.extend_measurement_changed.emit(metres, False)
+            self.draw._paint()
+        return True
 
     def set_enclose_mode(self, mode):
         self._enclose_mode=mode
@@ -367,6 +605,7 @@ class NativeSelectionController(QObject):
         self.message(f'{method.title()}: {len(hits)} shape(s) hit; '
                      f'{self.selection_manager.count()} element(s) selected')
         self._reset_gesture()
+        self.pick_completed.emit()
 
     def _ensure_text_index(self):
         """Cache world-space SNT text bounds, not legacy VTK actors.
@@ -438,6 +677,7 @@ class NativeSelectionController(QObject):
         self.message(f'SNT Text: {len(hits)} label(s) matched; '
                      f'{self.selection_manager.count()} selected')
         self._reset_gesture()
+        self.pick_completed.emit()
 
     def _visible_text_features(self):
         self._ensure_text_index()
@@ -462,6 +702,8 @@ class NativeSelectionController(QObject):
 
     def press(self,pos,button):
         if not self.is_active():return False
+        if self._extend_mode is not None:
+            return self._extend_press(pos,button)
         if self._intersect_mode:
             if button==Qt.RightButton:
                 self._intersect_delete_part()
@@ -515,6 +757,7 @@ class NativeSelectionController(QObject):
             mode=self._selection_modifier()
             if self._intersect_mode and mode=='new':mode='add'
             self.selection_manager.apply([hit] if hit else [],mode)
+            self.pick_completed.emit()
         elif self._method=='snt_text':
             self._set_hover_feature(None)
             # VTK SNT Text uses a *dragged rectangle*. A click without a
@@ -538,6 +781,8 @@ class NativeSelectionController(QObject):
 
     def move(self,pos,buttons):
         if not self.is_active():return False
+        if self._extend_mode is not None:
+            return self._extend_move(pos)
         try:self._hover=self.draw.canvas.section_at(pos.x(),pos.y())
         except RuntimeError:return True
         if self._intersect_mode:
@@ -566,6 +811,7 @@ class NativeSelectionController(QObject):
 
     def release(self,pos,button):
         if not self.is_active():return False
+        if self._extend_mode is not None:return True
         if self._intersect_mode:return True
         if button!=Qt.LeftButton:return False
         if (self._move_mode or self._copy_mode) and self._offset_origin is not None:
@@ -594,6 +840,7 @@ class NativeSelectionController(QObject):
                                                  self._selection_modifier())
                     self.message(f'SNT Text: {self.selection_manager.count()} selected')
                     self._reset_gesture()
+                    self.pick_completed.emit()
                 return True
             if math.dist(self._start,p)>self.draw.canvas.world_per_pixel()*3.:
                 self._select_area('block',[self._start,p])
@@ -602,6 +849,7 @@ class NativeSelectionController(QObject):
         return True
 
     def double_click(self,pos,button):
+        if self._extend_mode is not None:return True
         if self._intersect_mode:return True
         if not self.is_active() or button!=Qt.LeftButton:return False
         if self._method=='shape' and len(self._gesture)>=3:
@@ -616,6 +864,10 @@ class NativeSelectionController(QObject):
 
     def key(self,key):
         if not self.is_active():return False
+        if self._extend_mode is not None and key==Qt.Key_Escape:
+            self._cancel_extend()
+            self.message('Extend cancelled; drawing unchanged')
+            return True
         if self._intersect_mode and key==Qt.Key_Escape:
             self.exit_intersect_mode(commit=False)
             self.message('Intersect cancelled; no drawings changed')
@@ -634,6 +886,25 @@ class NativeSelectionController(QObject):
         return False
 
     def preview_shapes(self):
+        if self._extend_mode is not None:
+            if self._extend_anchor is None or self._extend_mode == 'distance_vertex':
+                return []
+            drawing, index = self._extend_anchor
+            if not extend_target_live(self.draw.drawings, drawing):
+                return []
+            proposal = extension_from_vertex(
+                drawing, index, self._extend_hover or open_vertices(drawing)[index],
+                self._extend_mode, self._extend_side)
+            if proposal is None:
+                return []
+            new_coords = proposal[1]
+            moved = new_coords[index]
+            # Show the WHOLE proposed N-line: never a detached line/branch.
+            return [('drawing_preview', [(p[0], p[1]) for p in new_coords],
+                     {'type': 'polyline', 'color': '#ffd54f', 'width': 3,
+                      'show_vertices': True}),
+                    ('drawing_preview', [(moved[0], moved[1])],
+                     {'type': 'point', 'color': '#00dcff', 'width': 4})]
         if self._intersect_mode:
             shapes=[]
             for idx,part in enumerate(self._intersect_parts):
@@ -1000,6 +1271,8 @@ class NativeSelectionController(QObject):
         return True
 
     def extend(self):
+        if self._extend_mode is not None:
+            return self.message('Finish/cancel the current vertex extension first')
         if self._method=='snt_text':
             return self.message('Imported SNT Text is read-only')
         selected=self.selection_manager.get_features()

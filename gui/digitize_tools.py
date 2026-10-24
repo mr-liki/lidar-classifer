@@ -3770,34 +3770,12 @@ class DigitizeManager:
                     self._force_render()
                 # 0 points: nothing was placed, nothing to clean up
                 return
-            # ✅ BULLETPROOF FREEHAND FINALIZATION
+            # Freehand ordinarily finishes on mouse-up. Right-click remains
+            # an optional fallback only if a drag release was missed.
             if self.active_tool == "freehand":
                 self.left_down = False
                 self.is_drawing_freehand = False
-                
-                if hasattr(self, "temp_points") and len(self.temp_points) > 1:
-                    # Auto-close loop if the start and end points aren't exactly the same
-                    start_pt = np.array(self.temp_points[0])
-                    end_pt = np.array(self.temp_points[-1])
-                    
-                    if np.linalg.norm(end_pt - start_pt) > 0.01:
-                        self.temp_points.append(tuple(start_pt))
-                        print("🔗 Freehand auto-closed on Right-Click")
-                        
-                    self._finalize_freehand()
-                else:
-                    print("❌ Freehand cancelled (not enough points)")
-                    self._hide_snap_marker_now()
-                    if hasattr(self, "_preview_actor") and self._preview_actor:
-                        try: self.renderer.RemoveViewProp(self._preview_actor)
-                        except Exception:
-                            pass
-                        self._preview_actor = None
-                                
-                self.temp_points = []
-                if not getattr(self, 'freehand_permanent_mode', True):
-                    self.active_tool = None
-                self._force_render()
+                self._finalize_freehand()
                 return
                 
             if self.active_tool in ("smartline", "line"):
@@ -7054,12 +7032,20 @@ class DigitizeManager:
         # Reset left mouse button state
         self.left_down = False
 
-        # 3. FREEHAND: PAUSE LOGIC (Replaced the old Finalization logic)
-        # ======================= FREEHAND PAUSE (DO NOT FINISH) =======================
+        # FREEHAND ONLY: mouse-up is the finish gesture; no right-click needed.
         if self.active_tool == "freehand" and getattr(self, "is_drawing_freehand", False):
-            # Just pause recording. Do NOT clear points. Do NOT finalize.
+            try:
+                release_pos = self._get_mouse_world_no_snap()
+                if (not self.temp_points or
+                        self._world_to_screen_distance(
+                            release_pos, self.temp_points[-1]) > 2.0):
+                    self.temp_points.append(release_pos)
+            except (RuntimeError, TypeError, ValueError):
+                pass  # Keep sampled stroke if viewport became unavailable.
             self.is_drawing_freehand = False
-            print("⏸️ Freehand PAUSED. (Left-drag to continue, Right-click to finish)")
+            finished = self._finalize_freehand()
+            print("✅ Freehand finished on left-button release" if finished
+                  else "ℹ️ Freehand stroke too short; nothing saved")
             return
 
         # -------------------- Other Tools (unchanged) --------------------
@@ -10953,27 +10939,27 @@ class DigitizeManager:
         ✅ FIX: Commit freehand drawing using overlay renderer (consistent with all other tools).
         Previously used self.renderer.AddActor2D() which bypassed overlay_renderer.
         """
-        self._hide_snap_marker_now()
-        self._save_state()
+        from gui.freehand_release_geometry import close_freehand_to_start
 
+        self._hide_snap_marker_now()
         self._remove_preview_actor_2d('_preview_actor')
         self._remove_preview_actor_2d('_freehand_preview_actor_2d')
 
         if len(self.temp_points) < 2:
             self.temp_points = []
-            return
+            self.is_drawing_freehand = False
+            return False
 
-        # 2. FORCE AUTO-CLOSE
-        start_pt = self.temp_points[0]
-        end_pt = self.temp_points[-1]
-        
-        dist = np.linalg.norm(np.array(start_pt) - np.array(end_pt))
-        
-        if dist > 0.001:
-            self.temp_points.append(start_pt)
-            print("🔗 Freehand loop Auto-Closed (Forced)")
-        else:
-            print("🔗 Freehand loop already closed")
+        # Freehand ONLY: preserve the actual release sample and append the
+        # stroke's OWN starting point. A distant release still closes exactly.
+        # The closing edge belongs to this one drawing, not a second entity.
+        trace, closed = close_freehand_to_start(self.temp_points)
+        if not closed:
+            self.temp_points = []
+            self.is_drawing_freehand = False
+            return False
+        self.temp_points = trace
+        self._save_state()
 
         # 3. Create Final Actor — use 3D polyline actor like all other tools
         fh_style = self._get_draw_style('freehand')
@@ -10997,7 +10983,10 @@ class DigitizeManager:
             "original_style": fh_lstyle,
         }
 
-        if fh_style.get("fill_enabled", False):
+        # Fill the closed Freehand region only if the user enabled filling.
+        closed = (len(self.temp_points) >= 4 and
+                  tuple(self.temp_points[0]) == tuple(self.temp_points[-1]))
+        if closed and fh_style.get("fill_enabled", False):
             fill_color = fh_style.get("fill_color", fh_color)
             fill_opacity = fh_style.get("fill_opacity", 0.3)
             fill_actor = self._make_fill_actor(list(self.temp_points), fill_color, fill_opacity)
@@ -11019,6 +11008,7 @@ class DigitizeManager:
             self.active_tool = None
         self.renderer.Modified()
         self.app.vtk_widget.render()
+        return True
 
     # Drawing types that form a closed area and can be hatched
     _HATCHABLE_TYPES = frozenset({
