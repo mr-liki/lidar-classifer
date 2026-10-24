@@ -1027,10 +1027,14 @@ static void* open_impl(void* parent_hwnd, uint64_t attach_handle, void* on_windo
     // holes while detail loads), and the GPU upload is time-sliced so a camera move
     // never stalls a frame on tile uploads. NAKSHA_LNT_POINT_BUDGET overrides the budget.
     {
+        const char* progressive = std::getenv("NAKSHA_LNT_PROGRESSIVE_TILES");
+        const bool hold = !(progressive && std::strcmp(progressive, "1") == 0);
         LntLodParams lp = v->streamer.params();
         lp.max_nodes = 20000;
         lp.point_budget = 6000000;
-        lp.gate_split_on_residency = true;     // parent retention: a parent stays until its children land
+        // A held cut must target the final LOD independently of CPU residency.
+        // Otherwise each arriving sibling group publishes an intermediate cut.
+        lp.gate_split_on_residency = !hold;
         if (const char* env = std::getenv("NAKSHA_LNT_POINT_BUDGET"))
             if (unsigned long long b = std::strtoull(env, nullptr, 10)) lp.point_budget = b;
         v->streamer.set_params(lp);
@@ -1038,6 +1042,10 @@ static void* open_impl(void* parent_hwnd, uint64_t attach_handle, void* on_windo
         v->streamer.set_upload_budget_ms(5.0);
         v->streamer.set_prefetch_ahead(4.0);
         v->streamer.set_merge_draw_ranges(true);
+        // Refinement happens out of sight: the last complete picture stays on screen
+        // until every tile of the new cut is uploaded. NAKSHA_LNT_PROGRESSIVE_TILES=1
+        // restores progressive (stand-in) drawing.
+        v->streamer.set_hold_incomplete_cut(hold);
     }
     v->reset();
     v->loop.attach(&v->ctl, &v->cache, v->origin);

@@ -6117,6 +6117,125 @@ static void section_surface(const std::string& path) {
 
 #include "surface_barycentric_checks.h"
 
+
+// Delayed CPU loads and sliced GPU uploads must never publish a partial new cut.
+static void section_background_refine(const std::string& out) {
+    std::printf("\n=== X. ATOMIC BACKGROUND REFINEMENT (VULKAN) ===\n");
+    Reader rd;
+    std::string used = out + ".large", err;
+    if (!rd.open(used)) {
+        used = out;
+        if (!rd.open(used)) { check("background: dataset opens", false, rd.error()); return; }
+    }
+    const std::string dll = VulkanEngine::find_dll();
+    VulkanEngine eng;
+    if (dll.empty() || !eng.load(dll, err) || !eng.is_available() ||
+        !eng.open(960, 720, true, false, err)) {
+        skip("background refinement", "Vulkan unavailable: " + err);
+        return;
+    }
+    const BoundingBox box = rd.get_bounds();
+    const double side = std::max(box.extent(0), box.extent(1));
+    const double origin[3] = {rd.origin(0), rd.origin(1), rd.origin(2)};
+    eng.set_render_origin(origin[0], origin[1], origin[2]);
+    uint64_t payload = 0;
+    for (const auto& e : rd.nodes()) payload += uint64_t(e.point_count) * sizeof(RawPoint);
+    auto camera = [&](double distance, LNTCamera& cam) {
+        double eye[3] = {box.mid(0), box.mid(1), box.mid(2) + side * distance};
+        eng.set_camera_lookat(eye[0], eye[1], eye[2],
+                             box.mid(0), box.mid(1), box.mid(2),
+                             45.0, 0.1, side * 40.0);
+        EngineFrame frame;
+        float m[16] = {};
+        if (!capture_with_mvp(eng, frame, m) ||
+            !cam.set_from_engine_mvp(m, origin, eye)) return false;
+        cam.screen_height_px = frame.height;
+        return true;
+    };
+    for (bool hold : {true, false}) {
+        const std::string label = hold ? "hold ON: " : "hold OFF: ";
+        eng.clear_point_draw_ranges();
+        LntScene scene;
+        if (!scene.plan(rd, err) || !scene.reserve(eng, err)) {
+            check(label + "arena reserved", false, err); return;
+        }
+        LntCacheManager cache(std::max<uint64_t>(2 * payload, 1024 * 1024));
+        LntStreamer streamer;
+        if (!cache.open(used, err) || !streamer.attach(rd, &cache, err)) {
+            check(label + "streamer attaches", false, err); return;
+        }
+        streamer.set_hold_incomplete_cut(hold);
+        streamer.set_base_levels(1);
+        streamer.set_merge_draw_ranges(true);
+        LntLodParams params;
+        params.sse_threshold = 90.0;
+        streamer.set_params(params);
+        LNTCamera far_cam, near_cam;
+        if (!camera(8.0, far_cam)) {
+            check(label + "engine camera available", false); return;
+        }
+        bool warm = false;
+        for (int i = 0; i < 50; ++i) {
+            streamer.update_visible_nodes(eng, scene, far_cam, err);
+            cache.drain(15000);
+            streamer.update_visible_nodes(eng, scene, far_cam, err);
+            const auto& st = streamer.stats();
+            if (!st.holding && !st.stand_in_ranges && !st.uncovered_cells &&
+                st.wanted_points > 0 && eng.draw_range_points() == st.wanted_points) {
+                warm = true; break;
+            }
+        }
+        check(label + "far cut warms completely", warm, err);
+        if (!warm) return;
+        const uint64_t far_points = eng.draw_range_points();
+        cache.set_load_delay_ms(5);
+        streamer.set_upload_budget_ms(1.0);
+        // Match idle refinement: request all visible original points.
+        params.sse_threshold = 0.0;
+        streamer.set_params(params);
+        if (!camera(0.65, near_cam)) {
+            check(label + "near camera available", false); return;
+        }
+        uint64_t held = 0, partial = 0;
+        bool stable = true, no_push = true, complete = false, healthy = true;
+        const uint64_t pushes_before = streamer.stats().range_pushes;
+        for (int frame = 0; frame < 400; ++frame) {
+            err.clear();
+            streamer.update_visible_nodes(eng, scene, near_cam, err);
+            if (!err.empty()) { healthy = false; break; }
+            const auto& st = streamer.stats();
+            if (st.holding) {
+                ++held;
+                stable = stable && eng.draw_range_points() == far_points;
+                no_push = no_push && st.range_pushes == pushes_before;
+            } else {
+                if (st.stand_in_ranges || st.uncovered_cells) ++partial;
+                if (!st.stand_in_ranges && !st.uncovered_cells &&
+                    st.wanted_points > far_points &&
+                    eng.draw_range_points() == st.wanted_points) {
+                    complete = true; break;
+                }
+            }
+            eng.render();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const std::string detail = std::to_string(held) + " held, " +
+            std::to_string(partial) + " partial; " + std::to_string(far_points) +
+            " -> " + std::to_string(eng.draw_range_points()) + " points; wanted " + std::to_string(streamer.stats().wanted_points) +
+            ", cut nodes " + std::to_string(streamer.stats().cut_nodes);
+        check(label + "uploads succeed", healthy, err);
+        check(label + "eventually swaps to the complete near cut", complete, detail);
+        if (hold) {
+            check(label + "delayed refinement actually holds frames", held > 0, detail);
+            check(label + "held frames retain the far point count and push no ranges",
+                  stable && no_push, detail);
+            check(label + "no incomplete cut reaches the display", partial == 0, detail);
+        } else {
+            check(label + "control exposes incomplete frames", partial > 0 && held == 0, detail);
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     // Unbuffered stdout: a harness that can crash must still show which check it
     // reached. With full buffering on a pipe, a fault discards every line.
@@ -6155,6 +6274,7 @@ int main(int argc, char** argv) {
         section_shading(out);                    // U: shading modes
         section_surface(out);                    // V: triangulated shaded surface
         section_surface_barycentric();           // W: indexed vertex colours
+        section_background_refine(out);          // X: whole-cut GPU swap
     }
 
     std::printf("\n%s\n", std::string(62, '=').c_str());

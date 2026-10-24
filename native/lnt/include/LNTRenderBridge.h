@@ -145,12 +145,14 @@ public:
     bool planned() const { return planned_; }
     uint64_t planned_points() const { return planned_points_; }
     bool bounded_arena() const { return bounded_arena_; }
-    void prepare_bounded_frame(uint64_t incoming_points) {
-        if (!bounded_arena_ || next_gpu_point_ + incoming_points <= gpu_capacity_points_) return;
+    // True when the arena wrapped: every tile is marked not uploaded again.
+    bool prepare_bounded_frame(uint64_t incoming_points) {
+        if (!bounded_arena_ || next_gpu_point_ + incoming_points <= gpu_capacity_points_) return false;
         for (LntTile& tile : tiles_) tile.uploaded = false;
         next_gpu_point_ = 0;
         uploaded_tiles_ = 0;
         arena_points_ = 0;
+        return true;
     }
     bool reserve(VulkanEngine& engine, std::string& err);
     // Writes one tile's payload at its planned offset. Idempotent, so a payload
