@@ -838,10 +838,16 @@ class NativeVectorLayer(NativeAttachmentLayer):
     remove_file, shutdown) is inherited.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, gpu_only=False):
         # The view may be an .lnt session's, or the promoted-viewport view an
         # SNT-only attach gets (§5); NativeAttachmentLayer takes it either way.
-        super().__init__(app, view=_view_for(app))
+        if gpu_only:
+            self.app = app
+            self.view = _view_for(app)
+            self.overlay = None
+            self.documents = {}
+        else:
+            super().__init__(app, view=_view_for(app))
         self._backend = _backend(app)
         self._v_used = 0
         self._i_used = 0
@@ -1129,7 +1135,11 @@ class NativeVectorLayer(NativeAttachmentLayer):
     def refresh(self) -> None:
         # Base class: feeds the Qt overlay from documents[*]['groups'] (now TEXT
         # only) honouring handle._visible, and drives the transparent window.
-        super().refresh()
+        if self.overlay is None and any(d.get('groups') for d in self.documents.values()):
+            from gui.native_attachments import CanvasOverlay, ensure_classifier
+            self.overlay = CanvasOverlay(ensure_classifier(self.view).canvas)
+        if self.overlay is not None:
+            super().refresh()
         self._push_draw_ranges()
 
     def _push_draw_ranges(self) -> None:
@@ -1190,11 +1200,12 @@ class NativeVectorLayer(NativeAttachmentLayer):
                 self.overlay.close()
             except Exception:
                 pass
-            classifier = ensure_classifier(view)
-            if classifier is None:
-                return False
+            if self.overlay is not None:
+                classifier = ensure_classifier(view)
+                if classifier is None:
+                    return False
+                self.overlay = CanvasOverlay(classifier.canvas)
             self.view = view
-            self.overlay = CanvasOverlay(classifier.canvas)
         self._backend = backend
         self._v_used = 0
         self._i_used = 0
@@ -1221,13 +1232,16 @@ class NativeVectorLayer(NativeAttachmentLayer):
                 self._backend.vector_clear()
             except Exception:
                 pass
-        super().shutdown()
+        if self.overlay is not None:
+            super().shutdown()
+        else:
+            self.documents.clear()
         # Nothing resident any more: an SNT-only session gives the canvas back.
         # (An .lnt session is untouched inside demote_snt_viewport.)
         self._demote_if_empty()
 
 
-def vector_layer_for(app) -> Optional[NativeVectorLayer]:
+def vector_layer_for(app, *, gpu_only=False) -> Optional[NativeVectorLayer]:
     """The app's NativeVectorLayer, created on first use, or None if unusable.
 
     Rebuilt when the view changes (a new canvas means a new overlay layer) and
@@ -1249,7 +1263,7 @@ def vector_layer_for(app) -> Optional[NativeVectorLayer]:
         if not layer.rebind():
             return None
     elif layer is None:
-        layer = app._native_vector_layer = NativeVectorLayer(app)
+        layer = app._native_vector_layer = NativeVectorLayer(app, gpu_only=gpu_only)
     return layer
 
 

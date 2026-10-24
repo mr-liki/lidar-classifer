@@ -25,6 +25,7 @@ answers=iter((QMessageBox.No,QMessageBox.Yes))
 QMessageBox.question=lambda *a,**k:next(answers,QMessageBox.Yes)
 QMessageBox.information=lambda *a,**k:QMessageBox.Ok
 QMessageBox.warning=lambda *a,**k:QMessageBox.Ok
+QMessageBox.critical=lambda *a,**k:QMessageBox.Ok
 win=NakshaApp()
 win.show()
 owner=win.render_backend
@@ -85,6 +86,7 @@ def test_main_window_shutdown_process(tmp_path,scenario,exit_path):
     script=tmp_path/"shutdown.py"
     script.write_text(SCRIPT,encoding="utf-8")
     env=dict(os.environ,PYTHONIOENCODING="utf-8",QT_QPA_PLATFORM="windows",
+             LOCALAPPDATA=str(tmp_path/"localappdata"),
              NAKSHA_RENDER_BACKEND="vulkan",NAKSHA_VULKAN_MAIN_VIEWPORT="1",
              NAKSHA_VULKAN_PREVIEW="0",NAKSHA_VULKAN_DISABLE_VTK_LIDAR="1")
     result=subprocess.run([sys.executable,"-u",str(script),scenario,str(document),str(tmp_path/"settings"),exit_path],

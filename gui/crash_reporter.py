@@ -517,8 +517,14 @@ class CrashReporter:
             return
 
         original_notify = app.notify
+        from shiboken6 import isValid
 
         def safe_notify(receiver, event):
+            # Deferred Qt deletes can invalidate a Python wrapper while tool
+            # transitions pump nested events. Never dispatch back into C++
+            # with an already deleted receiver, including during normal use.
+            if receiver is None or not isValid(receiver):
+                return False
             if os.getenv("NAKSHA_NOTIFY_TRACE"):
                 _notify_trace(receiver, event)
 

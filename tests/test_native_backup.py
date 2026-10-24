@@ -17,6 +17,7 @@ import pytest
 from PySide6.QtCore import QSettings
 
 from gui import native_backup, native_save
+from gui import lnt_open
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE_LNT = os.path.join(ROOT, "native", "lnt", "test.lnt")
@@ -165,6 +166,43 @@ def test_backup_never_targets_the_loaded_file(document):
     app = _FakeApp(document)
     path = native_backup.backup_path(app)
     assert os.path.normcase(path) != os.path.normcase(document)
+
+
+def test_native_session_writes_only_a_private_document(tmp_path, monkeypatch):
+    """A crash cannot alter the original because the renderer never opens it."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    document = str(tmp_path / "original.lnt")
+    with open(document, "wb") as handle:
+        handle.write(b"LNT-safe-original" * 1024)
+    before = open(document, "rb").read()
+    progress = []
+    working, session_dir = lnt_open._session_lnt_copy(document, progress.append)
+    try:
+        assert os.path.normcase(os.path.abspath(working)) != os.path.normcase(
+            os.path.abspath(document)
+        )
+        with open(working, "r+b") as handle:
+            handle.seek(0)
+            handle.write(b"WORK")
+        assert open(document, "rb").read() == before
+        assert progress and progress[-1] == 100
+    finally:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def test_cached_load_progress_uses_module_qapplication():
+    """A later local import must not break the progress callback's closure."""
+    assert "QApplication" not in lnt_open._show.__code__.co_varnames
+
+
+def test_backup_protects_original_and_private_native_documents(document):
+    app = _FakeApp(document, writes=1)
+    original = os.path.join(os.path.dirname(document), "original.lnt")
+    shutil.copyfile(document, original)
+    app._lnt_main_view.original_lnt_path = original
+    protected = native_backup._protected_paths(app)
+    assert os.path.normcase(os.path.abspath(document)) in protected
+    assert os.path.normcase(os.path.abspath(original)) in protected
 
 
 # --------------------------------------------------------------------------- #

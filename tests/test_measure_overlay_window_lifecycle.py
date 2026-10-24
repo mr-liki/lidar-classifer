@@ -62,6 +62,29 @@ def test_minimize_hides_measurements_until_restore(scene, tool):
     assert (overlay.shapes, overlay.marks) == before
 
 
+@pytest.mark.parametrize('tool_name', ['NativeSelectRect'])
+def test_identify_gestures_reuse_one_overlay_and_shutdown_callbacks(scene, tool_name, monkeypatch):
+    from unittest.mock import Mock
+    from gui.native_zoom_rect import NativeZoomRect
+    from gui.native_select_rect import NativeSelectRect
+    qt, owner, widget, canvas, _ = scene
+    cls = {'NativeZoomRect': NativeZoomRect, 'NativeSelectRect': NativeSelectRect}[tool_name]
+    tool = cls(canvas.view)
+    gpu_preview = Mock()
+    monkeypatch.setattr('gui.native_zoom_preview.VulkanSelectionPreview',
+                        lambda view: gpu_preview)
+    first_canvas = tool._canvas()
+    overlay = tool._overlay_for(first_canvas)
+    for _ in range(100):
+        assert tool._canvas() is first_canvas
+        assert tool._overlay_for(tool._canvas()) is overlay
+        tool.cancel()
+    tool.shutdown()
+    gpu_preview.shutdown.assert_called_once()
+    assert first_canvas._closed
+    tool.shutdown()
+
+
 @pytest.mark.parametrize("action", ["hide", "close"])
 def test_owner_hide_or_close_preserves_hidden_measurements(scene, action):
     qt, owner, _, _, overlay = scene

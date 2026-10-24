@@ -2,8 +2,7 @@
 
 Drag (or two clicks) a rectangle in world coordinates, then frame it with
 the native ``frame_region(cx, cy, width)`` camera call.  Rubber band is
-drawn on the click-through ``CanvasOverlay`` (Qt cannot paint over the
-native Vulkan child window).
+drawn by the Vulkan vector pass in the point cloud's render frame.
 """
 from __future__ import annotations
 
@@ -20,19 +19,33 @@ class NativeZoomRect:
         self.current = None    # world XY of drag current end
         self.dragging = False
         self._overlay = None
+        self._canvas_instance = None
+        self._shutdown = False
 
     # ---- lifecycle ----------------------------------------------------
     def _canvas(self):
         from gui.native_main_classify import MainCanvas  # noqa: PLC0415
-        return MainCanvas(self.view)
+        if self._canvas_instance is None:
+            self._canvas_instance = MainCanvas(self.view)
+        return self._canvas_instance
 
     def _overlay_for(self, canvas):
-        from gui.native_section_classify import CanvasOverlay  # noqa: PLC0415
-        if self._overlay is None or getattr(self._overlay, "canvas", None) is not canvas:
-            self._overlay = CanvasOverlay(canvas)
+        from gui.native_zoom_preview import VulkanZoomPreview
+        if self._overlay is None:
+            self._overlay = VulkanZoomPreview(self.view)
         return self._overlay
 
     def activate(self):
+        # Bind to the current LNT renderer; no Qt preview window is created.
+        self._shutdown = False
+        canvas = self._canvas()
+        self._overlay_for(canvas)
+        drawing = getattr(self.view, 'drawing', None)
+        if drawing is not None and drawing.active():
+            drawing.cancel()
+        measurement = getattr(self.view, 'measurement', None)
+        if measurement is not None and measurement.active:
+            measurement.cancel()
         self.active = True
         self.start = self.current = None
         self.dragging = False
@@ -50,12 +63,25 @@ class NativeZoomRect:
         self.dragging = False
         try:
             if self._overlay is not None:
-                self._overlay.set_shapes([])
+                self._overlay.clear()
         except Exception:
             pass
 
     def deactivate(self):
         self.cancel()
+
+    def shutdown(self):
+        """Release overlay callbacks before the native viewport is destroyed."""
+        self._shutdown = True
+        self.active = False
+        self.start = self.current = None
+        self.dragging = False
+        overlay, self._overlay = self._overlay, None
+        if overlay is not None:
+            overlay.shutdown()
+        canvas, self._canvas_instance = self._canvas_instance, None
+        if canvas is not None:
+            canvas._closed = True
 
     # ---- events (called from the native input filter) ------------------
     def press(self, pos, button):
@@ -110,29 +136,26 @@ class NativeZoomRect:
 
     # ---- internals ------------------------------------------------------
     def _paint(self):
+        if self._shutdown:
+            return
         try:
             canvas = self._canvas()
             ov = self._overlay_for(canvas)
-            if self.start is not None and self.current is not None:
-                ov.set_shapes([("rect", [self.start, self.current], None)])
-            else:
-                ov.set_shapes([])
-        except Exception:
-            pass
+            ov.set_rectangle(self.start, self.current)
+        except Exception as exc:
+            self.cancel()
+            self.app.statusBar().showMessage(f'Zoom preview failed: {exc}', 5000)
 
     def _finish(self):
         self.dragging = False
-        try:
-            if self._overlay is not None:
-                self._overlay.set_shapes([])
-        except Exception:
-            pass
         if self.start is None or self.current is None:
             self.start = self.current = None
+            self._paint()
             return
         x0, y0 = float(self.start[0]), float(self.start[1])
         x1, y1 = float(self.current[0]), float(self.current[1])
         self.start = self.current = None
+        self._paint()
         w, h = abs(x1 - x0), abs(y1 - y0)
         if w < 1e-9 or h < 1e-9:
             return
@@ -142,7 +165,7 @@ class NativeZoomRect:
             aspect = float(widget.width()) / max(1.0, float(widget.height()))
         except Exception:
             aspect = 1.0
-        width_m = max(w, h / max(aspect, 1e-9)) * 1.05
+        width_m = max(w, h * max(aspect, 1e-9)) * 1.05
         try:
             self.view.native.frame_region(cx, cy, float(width_m))
         except Exception as exc:

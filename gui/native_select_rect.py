@@ -1,7 +1,6 @@
 """Rectangle / polygon selection + count/delete for the native plan view.
 
-No VTK: Block and Shape gestures are drawn on the click-through
-``CanvasOverlay`` in world coordinates; the candidate records come from the
+Block and Shape gestures are drawn by the Vulkan vector pass; candidate records come from the
 section store (exact leaf records with class + XYZ).  Selection is a set of
 store rows (file identities), counted into the Identify ribbon.
 
@@ -33,21 +32,25 @@ class NativeSelectRect:
     # ---- lifecycle ----------------------------------------------------
     def _canvas(self):
         from gui.native_main_classify import MainCanvas  # noqa: PLC0415
-        # MainCanvas is a lightweight Python adapter, but CanvasOverlay keeps
-        # it as a long-lived Qt callback target.  Recreating the adapter on
-        # every paint made _overlay_for replace the QWidget repeatedly and
-        # left stale Shiboken objects/timers parented to the main window.
+        # Reuse the native screen/world adapter for the whole tool session.
         if self._canvas_instance is None:
             self._canvas_instance = MainCanvas(self.view)
         return self._canvas_instance
 
     def _overlay_for(self, canvas):
-        from gui.native_section_classify import CanvasOverlay  # noqa: PLC0415
-        if self._overlay is None or getattr(self._overlay, "canvas", None) is not canvas:
-            self._overlay = CanvasOverlay(canvas)
+        from gui.native_zoom_preview import VulkanSelectionPreview
+        if self._overlay is None:
+            self._overlay = VulkanSelectionPreview(self.view)
         return self._overlay
 
     def activate(self):
+        self._overlay_for(self._canvas())
+        drawing = getattr(self.view, 'drawing', None)
+        if drawing is not None and drawing.active():
+            drawing.cancel()
+        measurement = getattr(self.view, 'measurement', None)
+        if measurement is not None and measurement.active:
+            measurement.cancel()
         self.active = True
         self.start = self.current = None
         self.dragging = False
@@ -73,12 +76,12 @@ class NativeSelectRect:
         self.deactivate_selection()
         try:
             if self._overlay is not None:
-                self._overlay.set_shapes([])
+                self._overlay.clear()
         except Exception:
             pass
 
     def shutdown(self):
-        """Destroy Qt overlay state before its Vulkan view disappears."""
+        """Hide the GPU preview before its Vulkan view disappears."""
         self.active = False
         self.start = self.current = None
         self.dragging = False
@@ -100,7 +103,7 @@ class NativeSelectRect:
         self.vertices = []
         try:
             if self._overlay is not None:
-                self._overlay.set_shapes([])
+                self._overlay.clear()
         except Exception:
             pass
 
@@ -122,6 +125,7 @@ class NativeSelectRect:
             return False
         if self.pick_method == "Shape":
             self.vertices.append(w)
+            self.current = w
             self._paint()
             return True
         if self.dragging and self.start is not None:
@@ -133,9 +137,16 @@ class NativeSelectRect:
         return True
 
     def move(self, pos):
-        if not self.active or self.pick_method != "Block":
+        if not self.active:
             return False
-        if not self.dragging or self.start is None:
+        if self.pick_method == 'Shape' and self.vertices:
+            try:
+                self.current = self._canvas().section_at(pos.x(), pos.y())
+            except Exception:
+                return False
+            self._paint()
+            return True
+        if self.pick_method != 'Block' or not self.dragging or self.start is None:
             return False
         try:
             self.current = self._canvas().section_at(pos.x(), pos.y())
@@ -189,13 +200,14 @@ class NativeSelectRect:
         try:
             ov = self._overlay_for(self._canvas())
             if self.pick_method == "Shape" and self.vertices:
-                ov.set_shapes([("polygon", list(self.vertices), None)])
+                ov.set_polygon(self.vertices, self.current)
             elif self.start is not None and self.current is not None:
-                ov.set_shapes([("rect", [self.start, self.current], None)])
+                ov.set_rectangle(self.start, self.current)
             else:
-                ov.set_shapes([])
-        except Exception:
-            pass
+                ov.clear()
+        except Exception as exc:
+            self.deactivate()
+            self.app.statusBar().showMessage(f'Selection preview failed: {exc}', 5000)
 
     def _status(self):
         try:
@@ -212,6 +224,7 @@ class NativeSelectRect:
         self.dragging = False
         a, b = self.start, self.current
         self.start = self.current = None
+        self._paint()
         if a is None or b is None:
             return
         x0, x1 = sorted((float(a[0]), float(b[0])))
@@ -233,6 +246,9 @@ class NativeSelectRect:
                         polygon=p)
 
     def _query_box(self, x0, x1, y0, y1, polygon=None):
+        # A failed/new query must never leave an older deletion target armed.
+        self.selected_rows = np.empty(0, dtype=np.int64)
+        self._update_count()
         from gui.lnt_section_bridge import get_store  # noqa: PLC0415
         store = get_store(self.app)
         if store is None:
@@ -262,8 +278,11 @@ class NativeSelectRect:
                 from gui.native_tiled_runner import _points_in_polygons  # noqa: PLC0415
                 keep &= _points_in_polygons(
                     pts[:, :2], np.asarray(polygon, dtype=np.float64))
-            except Exception:
-                pass
+            except Exception as exc:
+                self.selected_rows = np.empty(0, dtype=np.int64)
+                self._update_count()
+                self.app.statusBar().showMessage(f'Shape selection failed: {exc}', 5000)
+                return
         try:
             palette = getattr(self.app, "class_palette", None)
             if isinstance(palette, dict) and palette:

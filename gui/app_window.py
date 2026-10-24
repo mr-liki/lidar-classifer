@@ -14269,6 +14269,12 @@ class NakshaApp(QMainWindow):
         the loaded document or the file it was built from.
         """
         from gui import native_backup, native_save
+        # Native manual saves run in a worker while QProgressDialog processes
+        # timer events. Do not launch a simultaneous full LAZ recompression:
+        # the next timer/exit backup may run normally after Save completes.
+        if getattr(self, '_native_save_running', False):
+            print('⏭️ Auto-backup deferred — native Save is already running')
+            return
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
             return
@@ -14449,8 +14455,11 @@ class NakshaApp(QMainWindow):
                         f"Classified point cloud saved to {os.path.basename(destination)}", 8000)
                 except Exception:
                     pass
-            if cfg["keep_original"]:
-                native_backup.restore_loaded_document(self)
+            # The renderer works on a private session document, so the loaded
+            # original is already unchanged even after a crash.  This call is
+            # retained only to reset the in-memory section snapshot cleanly;
+            # the old preference must never permit writes to the original.
+            native_backup.restore_loaded_document(self)
         except Exception as exc:  # noqa: BLE001 - a failed backup must not block the exit
             print(f"⚠️ Exit backup failed: {exc}")
 

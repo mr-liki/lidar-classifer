@@ -503,11 +503,11 @@ class NativeSelectionController(QObject):
                 return True
             if self._offset_origin is None:
                 self._offset_origin=p
+                self._hover=p
+                self.draw._paint()
                 self.message('Click target point (or drag) to place geometry')
             else:
-                dx=p[0]-self._offset_origin[0];dy=p[1]-self._offset_origin[1]
-                self._transform_selected(lambda c:translate(c,dx,dy),copy=self._copy_mode)
-                self._offset_origin=None
+                self._place_transform(p)
             return True
         if self._method=='individual':
             hit=self._pick_editable(p)
@@ -572,10 +572,7 @@ class NativeSelectionController(QObject):
             try:p=self.draw.canvas.section_at(pos.x(),pos.y())
             except RuntimeError:return True
             if math.dist(p,self._offset_origin)>self.draw.canvas.world_per_pixel()*3:
-                dx=p[0]-self._offset_origin[0];dy=p[1]-self._offset_origin[1]
-                self._transform_selected(lambda coords:translate(coords,dx,dy),
-                                         copy=self._copy_mode)
-                self._offset_origin=None
+                self._place_transform(p)
             return True
         if self._method == 'cline' and self._start is not None:
             # Support VTK-style drawing the crossing line by either click-tap
@@ -712,6 +709,33 @@ class NativeSelectionController(QObject):
         # The Intersect preview replaces its sources with selectable pieces.
         if self._intersect_mode:return []
         return self.selection_manager.get_features()[:500]
+
+    def transform_hidden_drawing_ids(self):
+        """Native sources temporarily replaced by the active transform ghost."""
+        if self._offset_origin is None or not (self._move_mode or self._copy_mode):
+            return set()
+        return {
+            id(feature['drawing'])
+            for feature in self.selection_manager.get_features()
+            if feature.get('source') == 'native' and feature.get('drawing') is not None
+        }
+
+    def _place_transform(self, target):
+        """Retire the ghost before any document/selection callback repaints.
+
+        Selection changes repaint synchronously inside _transform_selected.
+        Leaving the anchor live there applies the displacement a second time
+        to the newly selected result and leaves that wrong frame on screen.
+        """
+        origin = self._offset_origin
+        if origin is None:
+            return
+        dx, dy = target[0] - origin[0], target[1] - origin[1]
+        self._offset_origin = None
+        self._hover = target
+        self._transform_selected(lambda coords: translate(coords, dx, dy),
+                                 copy=self._copy_mode)
+        self.draw._paint()
 
     def _transform_selected(self,transform,copy=False):
         selected=self.selection_manager.get_features()

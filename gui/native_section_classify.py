@@ -271,7 +271,6 @@ class CanvasOverlay(QWidget):
                          Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.canvas = canvas
         self._owner_window = canvas.window()
-        self._owner_window.installEventFilter(self)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -284,6 +283,9 @@ class CanvasOverlay(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._follow)
+        # Installing a filter can immediately deliver window events. All
+        # Python and Qt members must exist before the object becomes callable.
+        self._owner_window.installEventFilter(self)
         backend = getattr(canvas, 'frame_backend', None)
         if backend is not None:
             import weakref
@@ -309,6 +311,19 @@ class CanvasOverlay(QWidget):
         if self._shutdown:
             return
         self._shutdown = True
+        # Remove both callback registrations while the QObject is still alive.
+        # deleteLater alone leaves this tool in the renderer's frame callbacks
+        # and installed as the main window's event filter until deferred delete.
+        owner, self._owner_window = self._owner_window, None
+        if owner is not None:
+            try:
+                owner.removeEventFilter(self)
+            except (RuntimeError, ReferenceError):
+                pass
+        backend = getattr(self.canvas, 'frame_backend', None)
+        overlays = getattr(backend, '_frame_overlays', None)
+        if overlays is not None:
+            overlays.discard(self)
         self.shapes = []
         self.marks = []
         self._follow_state = None

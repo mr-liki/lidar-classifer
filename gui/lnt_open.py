@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from PySide6.QtCore import QEvent, QObject, QThread, Qt, QTimer, Slot, Signal
-from PySide6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from gui import lnt_native as nat
 from gui.laspy_compat import install_opaque_extra_bytes_fix
@@ -54,6 +54,71 @@ def lnt_path_for(source):
 
 LNT_FORMAT_VERSION = 2      # points carry a classification byte (11 B/pt)
 LNT_CLASS_SEMANTICS = "legacy-packed-class-v1"
+
+
+def _copy_session_file(source, destination, progress=None, copied=0, total=1):
+    """Copy one session file in bounded chunks and report byte progress."""
+    chunk = 8 * 1024**2
+    with open(source, "rb") as src, open(destination, "wb") as dst:
+        while True:
+            block = src.read(chunk)
+            if not block:
+                break
+            dst.write(block)
+            copied += len(block)
+            if progress is not None:
+                progress(min(99, int(copied * 100 / max(1, total))))
+    shutil.copystat(source, destination)
+    return copied
+
+
+def _session_lnt_copy(lnt_path, progress=None):
+    """Return a private writable copy of an LNT for this process.
+
+    The native renderer updates classification bytes in its open document.  It
+    must therefore never be pointed at the user's cache/source document: an
+    abnormal process termination cannot run rollback code.  A session copy is
+    the only crash-safe boundary; explicit Save still publishes through
+    ``native_save.write_pair``.
+    """
+    source = os.path.realpath(os.fspath(lnt_path))
+    if not os.path.isfile(source):
+        raise FileNotFoundError(source)
+    root = os.path.join(
+        os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+        "NakshaAI", "lnt_sessions",
+    )
+    os.makedirs(root, exist_ok=True)
+    companions = [source + ".lines"] if os.path.isfile(source + ".lines") else []
+    total = os.path.getsize(source) + sum(os.path.getsize(path) for path in companions)
+    required = total + 8 * 1024**2
+    if shutil.disk_usage(root).free < required:
+        raise OSError(
+            "Not enough free space for the crash-safe working copy of "
+            f"{os.path.basename(source)} (need about {required / 1024**3:.2f} GiB)."
+        )
+    session_dir = tempfile.mkdtemp(prefix=f"{os.getpid()}_", dir=root)
+    working = os.path.join(session_dir, os.path.basename(source))
+    try:
+        copied = _copy_session_file(source, working, progress, total=total)
+        # Flight-line identity is part of the native document's presentation.
+        if companions:
+            _copy_session_file(companions[0], working + ".lines", progress,
+                               copied=copied, total=total)
+        if progress is not None:
+            progress(100)
+        return working, session_dir
+    except Exception:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise
+
+
+def _discard_session_lnt(view):
+    """Best-effort removal after the renderer has released its private file."""
+    session_dir = getattr(view, "_session_lnt_dir", None)
+    if session_dir:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        view._session_lnt_dir = None
 
 
 def lnt_file_version(path):
@@ -824,6 +889,7 @@ class LntMainView(QObject):
             except Exception as exc:   # noqa: BLE001
                 print(f"[LNT] could not restore Naksha's renderer cleanly: {exc}")
         self.owner = None
+        _discard_session_lnt(self)
 
     # -- colour ----------------------------------------------------------
     def _luts_for(self, source):
@@ -1515,15 +1581,57 @@ def _show(app, lnt_path, name):
         except Exception as exc:  # noqa: BLE001
             print(f"[LNT] could not prepare the session PTC for the new cloud: {exc}")
     close_lnt_view(app, reopening=True)
-    view = LntMainView(app, lnt_path, name)
+    original_lnt = os.path.realpath(os.fspath(lnt_path))
+    load_dialog = QProgressDialog(
+        f"Loading {os.path.basename(original_lnt)}...", "Cancel", 0, 100, app
+    )
+    load_dialog.setWindowTitle("Loading point cloud")
+    load_dialog.setWindowModality(Qt.WindowModal)
+    load_dialog.setMinimumDuration(0)
+    load_dialog.setAutoClose(False)
+    load_dialog.setAutoReset(False)
+    load_dialog.setValue(0)
+
+    def report_copy(percent):
+        load_dialog.setValue(int(percent))
+        load_dialog.setLabelText(
+            f"Loading {os.path.basename(original_lnt)}... {int(percent)}%"
+        )
+        QApplication.processEvents()
+        if load_dialog.wasCanceled():
+            raise Cancelled()
+
+    try:
+        working_lnt, session_dir = _session_lnt_copy(original_lnt, report_copy)
+    except Cancelled:
+        load_dialog.close()
+        print(f"[LNT] loading cancelled: {original_lnt}")
+        return
+    except Exception as exc:  # noqa: BLE001 - fail closed, never open original writable
+        load_dialog.close()
+        print(f"[LNT] cannot create crash-safe working document: {exc}")
+        QMessageBox.critical(
+            app, "Open point cloud",
+            "Could not create the private working copy required to protect the "
+            f"original file:\n\n{exc}",
+        )
+        return
+    load_dialog.setLabelText(f"Opening {os.path.basename(original_lnt)}...")
+    load_dialog.setValue(100)
+    QApplication.processEvents()
+    view = LntMainView(app, working_lnt, name)
+    view._session_lnt_dir = session_dir
+    view.original_lnt_path = original_lnt
     try:
         view.start()
     except Exception as exc:   # noqa: BLE001 - surfaced to the user
         view.stop()
+        load_dialog.close()
         _keep_vector_overlay(app)
         print(f"[LNT] cannot show {lnt_path}: {exc}")
         QMessageBox.critical(app, "Open point cloud", f"Could not show the point cloud:\n\n{exc}")
         return
+    load_dialog.close()
     app._lnt_main_view = view
     reset_history = getattr(app, "_reset_main_view_history_baseline", None)
     if callable(reset_history):
@@ -1566,7 +1674,6 @@ def _show(app, lnt_path, name):
     _refresh_total_points(app)
     if not getattr(app, "_lnt_quit_hook", False):
         app._lnt_quit_hook = True
-        from PySide6.QtWidgets import QApplication
         # Free the LNT renderer before Qt tears the window down at exit.
         QApplication.instance().aboutToQuit.connect(
             lambda: getattr(app, "_lnt_main_view", None)

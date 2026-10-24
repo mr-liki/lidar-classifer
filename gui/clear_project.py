@@ -1490,6 +1490,50 @@ def _save_display_settings_before_clear(app):
         traceback.print_exc()
 
 
+
+def _save_project_before_clear(app) -> bool:
+    """Commit classification edits before releasing the native LNT document.
+
+    Clear Data already saves through save_pointcloud_quick while the LNT view is
+    alive.  Use that same entrypoint here: it dispatches to native_save.save_native
+    for the Vulkan/LNT backend, which flushes pending section/AI edits and
+    transactionally writes the LAS/LAZ plus its LNT companion.  Never infer
+    saveability from app.data: the native loader intentionally sets it to None.
+    """
+    from .save_pointcloud import has_fenced_parent_writeback, save_pointcloud_quick
+    from .native_save import native_active, save_native
+
+    is_native = bool(native_active(app))
+    # Legacy buffered-grid sessions have multiple authoritative parent files.
+    if not is_native and has_fenced_parent_writeback(app):
+        save_path = "__fenced_parent_writeback__"
+    else:
+        # Match the working Clear Data save destination.  The LNT source-path
+        # fallback is needed if an import bypassed the legacy loaded_file field.
+        save_path = (getattr(app, "last_save_path", None)
+                     or getattr(app, "loaded_file", None)
+                     or (getattr(app, "_lnt_source_path", None) if is_native else None))
+
+    if not save_path and is_native:
+        # Standalone native .lnt files can be exported even without a LAS
+        # loaded_file; let the existing native writer choose the destination.
+        print("[PROJECT-CLEAR-SAVE] Native document without source path: using native save default")
+        return bool(save_native(app, path=None, reopen=False))
+    if not save_path:
+        print("[PROJECT-CLEAR-SAVE] No safe output destination; retaining project")
+        return False
+    if is_native and os.path.splitext(os.fspath(save_path))[1].lower() not in (".las", ".laz"):
+        # Never silently overwrite a non-LAS file using a stale last_save_path.
+        print("[PROJECT-CLEAR-SAVE] Non-LAS native destination; using native writer default")
+        return bool(save_native(app, path=None, reopen=False))
+
+    backend = "VULKAN-LNT" if is_native else "IN-MEMORY"
+    print(f"[PROJECT-CLEAR-SAVE] START backend={backend} target={os.path.basename(os.fspath(save_path))}")
+    success = bool(save_pointcloud_quick(app, save_path))
+    print(f"[PROJECT-CLEAR-SAVE] {'COMMITTED' if success else 'FAILED'} backend={backend}")
+    return success
+
+
 def clear_project(app):
     """
     Clear all loaded files and reset state, with confirmation.
@@ -1502,22 +1546,16 @@ def clear_project(app):
     if not _has_point_cloud(app):
         print("ℹ️ Clear Project: no point cloud data loaded — nothing to clear.")
         return
-    # ✅ FIX: Explicitly clear the shading cache to prevent stale data between projects
-    clear_shading_cache(reason="project_clear")
-    from .shading_large_cloud import clear_large_shading_preset_cache
-    clear_large_shading_preset_cache(app)
-    # Also null out the rendered-cache-key and stale mesh actors so that
-    app._rendered_shading_cache_key = None
-    app._shaded_mesh_actor = None
-    app._shaded_mesh_polydata = None
+    # Do not invalidate live shading or native state before the user chooses,
+    # and never before the Save transaction has actually succeeded.
 
     # ============================================================================
     # ✅ CHECK IF PROJECT HAS UNSAVED DATA
     # ============================================================================
     should_save = False
     
-    if hasattr(app, 'data') and app.data is not None:
-        # Create custom message box with Save/Don't Save/Cancel options
+    if getattr(app, 'data', None) is not None or getattr(getattr(app, '_lnt_main_view', None), 'native', None) is not None:
+        # Native LNT has app.data=None; it STILL needs a Save/Don't Save/Cancel prompt.
         msg_box = QMessageBox(app)
         msg_box.setStyleSheet(get_dialog_stylesheet())
         msg_box.setIcon(QMessageBox.Question)
@@ -1543,9 +1581,13 @@ def clear_project(app):
         elif clicked_button == save_button:
             should_save = True
             print("✅ User chose to save before clearing")
-        else:  # don't_save_button
+        elif clicked_button == dont_save_button:
             should_save = False
             print("⚠️ User chose NOT to save before clearing")
+        else:
+            # An OS close/dismiss must not silently turn into Don't Save.
+            print("❌ Clear project dialog dismissed - keeping current project")
+            return
     else:
         # No data loaded, just confirm clear
         reply = QMessageBox.question(
@@ -1559,66 +1601,53 @@ def clear_project(app):
             return
 
     try:
+        # A native session owns the complete point cloud in its .lnt file;
+        # close_lnt_view() destroys the owner/section store and resets app.data.
+        # Save FIRST, while both the Vulkan document and source mapping exist.
+        # A failed, cancelled, or unavailable save MUST NOT delete any state.
+        if should_save:
+            try:
+                saved = _save_project_before_clear(app)
+            except Exception as save_error:
+                saved = False
+                print(f"[PROJECT-CLEAR-SAVE] ERROR: {save_error}")
+            if not saved:
+                print("[PROJECT-CLEAR-SAVE] ABORT: no project resources were cleared")
+                QMessageBox.warning(
+                    app, "Clear Project Cancelled",
+                    "The classified point cloud could not be saved.\n\n"
+                    "Clear Project was cancelled; the loaded data, drawings, "
+                    "sections, and undo history are still available."
+                )
+                return
+            print("✅ Project classification data saved successfully before clearing")
+
         print("\n" + "="*60)
         if should_save:
-            print("🧹 CLEARING PROJECT (SAVING PROJECT & DISPLAY SETTINGS)")
+            print("🧹 CLEARING PROJECT (SAVED PROJECT & DISPLAY SETTINGS)")
         else:
             print("🧹 CLEARING PROJECT (NOT SAVING - DISPLAY SETTINGS WILL BE PRESERVED)")
             _discard_lnt_edits_on_dont_save(app)
         print("="*60)
+
+        # Cache reset belongs to teardown, NEVER to the pre-save phase.  In
+        # particular it must not run if the user presses Cancel or Save fails.
+        clear_shading_cache(reason="project_clear")
+        from .shading_large_cloud import clear_large_shading_preset_cache
+        clear_large_shading_preset_cache(app)
+        app._rendered_shading_cache_key = None
+        app._shaded_mesh_actor = None
+        app._shaded_mesh_polydata = None
+
         if getattr(app, "_lnt_main_view", None) is not None:
             from .lnt_open import close_lnt_view
             # Don't Save already reverted the file: the teardown must not flush.
-            # keep_native_viewport: clearing must not bounce the canvas to VTK -
-            # the empty native viewport stays so tools keep routing to Vulkan.
+            # Keep the empty promoted Vulkan viewport installed for native tools.
             try:
                 close_lnt_view(app, flush_pending=bool(should_save),
                                keep_native_viewport=True)
             except TypeError:
                 close_lnt_view(app, keep_native_viewport=True)
-
-        # ============================================================================
-        # ✅ SAVE THE PROJECT IF USER CHOSE TO SAVE
-        # ============================================================================
-        if should_save and hasattr(app, 'data') and app.data is not None:
-            save_path = None
-
-            # A buffered/fenced dataset has multiple owning source files and
-            # intentionally no single loaded_file. The quick-save routine
-            # recognizes its ownership metadata before examining this marker.
-            from .save_pointcloud import has_fenced_parent_writeback
-            if has_fenced_parent_writeback(app):
-                save_path = "__fenced_parent_writeback__"
-            
-            # Determine save path
-            if save_path is None and hasattr(app, 'last_save_path') and app.last_save_path:
-                save_path = app.last_save_path
-            elif save_path is None and hasattr(app, 'loaded_file') and app.loaded_file:
-                save_path = app.loaded_file
-            
-            if save_path:
-                try:
-                    print(f"\n💾 Saving project to: {os.path.basename(save_path)}")
-                    
-                    from .save_pointcloud import save_pointcloud_quick
-                    
-                    # Save without showing dialog
-                    save_ok = save_pointcloud_quick(app, save_path)
-                    if save_ok:
-                        print(f"✅ Project saved successfully before clearing")
-                        if hasattr(app, "statusBar"):
-                            app.statusBar().showMessage(f"✅ Saved: {os.path.basename(save_path)}", 3000)
-                    else:
-                        print("⚠️ Project save failed before clearing")
-                        if hasattr(app, "statusBar"):
-                            app.statusBar().showMessage(f"⚠️ Save failed: {os.path.basename(save_path)}", 5000)
-                    
-                except Exception as save_error:
-                    print(f"⚠️ Error saving: {save_error}")
-                    if hasattr(app, "statusBar"):
-                        app.statusBar().showMessage(f"⚠️ Save failed: {save_error}", 5000)
-            else:
-                print("⚠️ No save path available - skipping save")
 
         # ============================================================================
         # ✅ SAVE DISPLAY SETTINGS BEFORE CLEARING

@@ -2324,9 +2324,17 @@ class NativeDraw:
                        and hovered.get('source') == 'native' else
                        getattr(self, '_hover_selected_native_ref', None)
                        if bridge is None and self.tool == 'select' else None)
+        transform_hidden = (
+            bridge.transform_hidden_drawing_ids()
+            if bridge is not None and hasattr(bridge, 'transform_hidden_drawing_ids')
+            else set()
+        )
         for i, drawing in enumerate(self.drawings):
-            if drawing is self._moving_text_ref and self._moving_text_hover is not None:
+            if (drawing is getattr(self, '_moving_text_ref', None)
+                    and getattr(self, '_moving_text_hover', None) is not None):
                 continue  # The live preview replaces the original, not duplicates it.
+            if id(drawing) in transform_hidden:
+                continue  # Transform preview replaces its committed sources this frame.
             if id(drawing) in hidden_in_intersect:
                 continue  # VTK-style overlay replaces original with split pieces.
             if gpu_blocks and drawing.get('source') == 'block_creation':
@@ -2353,7 +2361,8 @@ class NativeDraw:
                 data['control_points'] = list(coords)
                 coords = _catmull_rom(coords)
             shapes.append(('drawing', coords, data))
-        if self._moving_text_ref is not None and self._moving_text_hover is not None:
+        if (getattr(self, '_moving_text_ref', None) is not None
+                and getattr(self, '_moving_text_hover', None) is not None):
             # Only the placement preview moves; original world coordinates and
             # every font/style field remain immutable until the left-click.
             label = self._moving_text_ref
@@ -2592,8 +2601,34 @@ def get_native_draw(app, create=False, allow_snt=False):
     return draw
 
 
+def _return_to_plan_view_for_draw(app):
+    """Draw places plan XY only. A 3D orbit (D / Shift+P / View ribbon) must
+    not make activation fall through to the VTK digitizer hidden under the
+    Vulkan surface, so a Draw tool brings the main view back to Top."""
+    view = getattr(app, '_lnt_main_view', None)
+    if view is not None:
+        if getattr(view, 'native', None) is None or getattr(view, 'mode_2d', False):
+            return
+    elif getattr(app, 'data', None) or not (
+            getattr(app, 'is_3d_mode', False) or
+            getattr(app, '_main_view_3d_user_enabled', False)):
+        return  # 2D already, or a VTK-rendered cloud keeps the legacy path
+    change = getattr(app, 'handle_view_change', None)
+    if callable(change) and change('top') is not False:
+        if view is None or getattr(view, 'mode_2d', False):
+            return
+    if view is not None:
+        # Renderer without view presets: same as the native TopView shortcut.
+        view.set_2d(True)
+        view.native.plan_view()
+        app.current_view = 'top'
+    app.is_3d_mode = False
+    app._main_view_3d_user_enabled = False
+
+
 def activate_native_draw(app, tool):
     if str(tool or '').lower().replace(' ', '_') not in TOOL_MAP:
         return False
+    _return_to_plan_view_for_draw(app)
     draw = get_native_draw(app, create=True)
     return bool(draw and draw.activate(tool))
