@@ -117,6 +117,9 @@ def lib():
         d.lnt_set_classes.argtypes = [c_void_p, c_void_p, c_void_p, c_void_p, c_uint64,
                                       c_char_p, c_int]
         d.lnt_set_classes.restype = c_int
+    if hasattr(d, "lnt_view_set_deleted"):
+        d.lnt_view_set_deleted.argtypes = [c_void_p] * 4 + [c_uint64]
+        d.lnt_view_set_deleted.restype = c_int
     if hasattr(d, "lnt_preview_classes"):        # instant class display before the write
         d.lnt_preview_classes.argtypes = [c_void_p] * 6 + [c_uint64, c_void_p]
         d.lnt_preview_classes.restype = c_int
@@ -477,6 +480,19 @@ class NativeView:
         if counts is not None:
             counts.after_write(token, bool(ok))
         return bool(ok)
+
+    def set_deleted(self, node, local, classes):
+        """Replace session exclusions by exact native record identities."""
+        import numpy as np
+        if not (self._ok() and hasattr(lib(), 'lnt_view_set_deleted')):
+            raise RuntimeError('Rebuild the native viewer to enable point deletion.')
+        node = np.ascontiguousarray(node, dtype=np.uint32)
+        local = np.ascontiguousarray(local, dtype=np.uint32)
+        classes = np.ascontiguousarray(classes, dtype=np.uint8)
+        if not len(node) == len(local) == len(classes):
+            raise ValueError('Deletion identity length mismatch')
+        return bool(lib().lnt_view_set_deleted(c_void_p(self.h), c_void_p(node.ctypes.data),
+                    c_void_p(local.ctypes.data), c_void_p(classes.ctypes.data), len(node)))
 
     def preview_classes(self, node, local, xyz, old_class, new_class):
         """Show class edits at once, before set_classes() writes them: the resident surface

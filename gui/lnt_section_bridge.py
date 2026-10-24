@@ -145,6 +145,9 @@ class LntSectionStore:
         self._synced = np.empty(0, dtype=np.uint8)       # classes as last written to the file
         # A timer flush is not a user Save. Keep a separate checkpoint so
         # Don't Save cannot undo classifications already explicitly saved.
+        self.deleted = np.empty(0, dtype=bool)
+        self._saved_deleted = np.empty(0, dtype=bool)
+        self.deletion_revision = 0
         self._saved_classes = np.empty(0, dtype=np.uint8)
         self.rgb8 = np.empty((0, 3), dtype=np.uint8)     # file colours as uploaded to section views
         self.generation = 0                              # bumps whenever flush finds class edits
@@ -152,6 +155,7 @@ class LntSectionStore:
         # against the store in O(m log n), not an np.isin over the whole store
         self._node_rows = {}                             # leaf node -> (local -> store row)
         self._buffers = {}                               # column name -> backing array with spare rows
+        self.last_region_all_indices = np.empty(0, dtype=np.int64)
         self.last_region_indices = np.empty(0, dtype=np.int64)  # store rows of the last query box
         self.data = {
             "xyz": np.empty((0, 3), dtype=np.float64),
@@ -207,6 +211,7 @@ class LntSectionStore:
         """Make sure every point inside the world box [mn, mx] is in app.data.
         Returns True on success; on failure last_error says why."""
         self.last_error = ""
+        self.last_region_all_indices = np.empty(0, dtype=np.int64)
         self.last_region_indices = np.empty(0, dtype=np.int64)
         remaining = MAX_STORE_POINTS - len(self)
         res = self.view.native.query_points(mn, mx, max_points=max(remaining, 1) + len(self))
@@ -216,6 +221,7 @@ class LntSectionStore:
         """Make sure every point a plan-view brush stroke covers is in app.data; on success
         last_region_indices holds exactly those store rows (no bounding-box surplus)."""
         self.last_error = ""
+        self.last_region_all_indices = np.empty(0, dtype=np.int64)
         self.last_region_indices = np.empty(0, dtype=np.int64)
         remaining = MAX_STORE_POINTS - len(self)
         res = self.view.native.query_stroke(path, radius, square,
@@ -251,7 +257,8 @@ class LntSectionStore:
         fresh = rows < 0
         m = int(np.count_nonzero(fresh))
         if m == 0:
-            self.last_region_indices = rows
+            self.last_region_all_indices = rows.copy()
+            self.last_region_indices = self.live_rows(rows)
             return True
         if base + m > MAX_STORE_POINTS:
             self.last_error = (f"the section holds {base + m:,} points (limit "
@@ -275,6 +282,8 @@ class LntSectionStore:
         self.local = self._append("local", self.local, new_local)
         self._synced = self._append("synced", self._synced, cls_new)
         self._saved_classes = self._append("saved_classes", self._saved_classes, cls_new)
+        self.deleted = self._append('deleted', self.deleted, np.zeros(m, dtype=bool))
+        self._saved_deleted = self._append('saved_deleted', self._saved_deleted, np.zeros(m, dtype=bool))
         rows[fresh] = np.arange(base, base + m, dtype=np.int64)
         for s0, s1 in zip(bounds[:-1], bounds[1:]):
             nd, loc = int(node[s0]), local[s0:s1]
@@ -286,8 +295,42 @@ class LntSectionStore:
                     grown[:tbl.shape[0]] = tbl
                 tables[nd] = tbl = grown
             tbl[loc] = rows[s0:s1]
-        self.last_region_indices = rows
+        self.last_region_all_indices = rows.copy()
+        self.last_region_indices = self.live_rows(rows)
         return True
+
+    def live_rows(self, rows):
+        rows = np.asarray(rows, dtype=np.int64)
+        return rows[~self.deleted[rows]]
+
+    def deletion_identities(self):
+        rows = np.flatnonzero(self.deleted)
+        return self.node[rows].copy(), self.local[rows].copy()
+
+    def set_deleted(self, rows, deleted=True):
+        """Publish a new native exclusion mask before changing canonical state."""
+        rows = np.unique(np.asarray(rows, dtype=np.int64))
+        candidate = self.deleted.copy()
+        candidate[rows] = deleted
+        active = np.flatnonzero(candidate)
+        if not self.view.native.set_deleted(self.node[active], self.local[active],
+                                            self.data['classification'][active]):
+            raise RuntimeError('Native point deletion failed; the working cloud was unchanged.')
+        self.deleted[:] = candidate
+        self.deletion_revision += 1
+        self.generation += 1
+        self.last_region_indices = self.live_rows(self.last_region_all_indices)
+        self.app.classification_revision = int(getattr(self.app, 'classification_revision', 0)) + 1
+        classifier = getattr(self.view, 'classifier', None)
+        canvas = getattr(classifier, 'canvas', None)
+        if canvas is not None:
+            canvas._region = None
+        sections = getattr(self.app, '_native_sections', None)
+        if sections is not None:
+            try:
+                sections.refresh_deletions()
+            except Exception as exc:
+                self.app.statusBar().showMessage(f'Point deletion applied; section refresh failed: {exc}', 5000)
 
     def ensure_for_section(self, P1, P2, half_width, buffer):
         """Load the corridor of a cross section (same box finalize_section pre-filters on)."""
@@ -491,6 +534,7 @@ class LntSectionStore:
         if current.shape != self._saved_classes.shape:
             raise RuntimeError('Native save checkpoint does not match the section store.')
         self._saved_classes[:] = current
+        self._saved_deleted[:] = self.deleted
         self._discarded = False
 
     def discard_unflushed_edits(self, stop_timer=True):
@@ -531,6 +575,12 @@ class LntSectionStore:
                     raise OSError(getattr(nv, 'last_error', '') or 'Could not restore saved native classes.')
                 print(f"[LNT-SECTION] reverted {rows.size:,} class edits on Don't Save")
             # Only acknowledge the rollback after its native write succeeded.
+            deleted = getattr(self, 'deleted', np.empty(0, dtype=bool))
+            saved_deleted = getattr(self, '_saved_deleted', np.zeros(len(deleted), dtype=bool))
+            deletion_rows = np.flatnonzero(deleted != saved_deleted)
+            if deletion_rows.size:
+                self.set_deleted(deletion_rows, saved_deleted[deletion_rows])
+                reverted += int(deletion_rows.size)
             cur[:] = saved
             self._synced[:] = saved
             self._preview_pending = False

@@ -305,10 +305,18 @@ def _native_chunks(lnt, entries, progress):
                 yield xyz, points
 
 
+def pending_deletions(app):
+    store = getattr(app, '_lnt_section_store', None)
+    if store is None or not hasattr(store, 'deletion_identities'):
+        return None
+    node, local = store.deletion_identities()
+    return (node, local) if len(node) else None
+
+
 def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                classes=None, fences=None, attributes=None, version=None,
                lines=None, progress=lambda n, text: None, drawings=None,
-               companion=True):
+               companion=True, deleted=None):
     """Stage both outputs before replacing either. All heavy work stays off Qt's thread.
 
     Source LAS dimensions, CRS, VLRs and EVLRs are preserved. Class numbers above
@@ -333,7 +341,18 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     lut = np.arange(256, dtype=np.uint64)
     for code, slot in mapping.items():
         lut[int(slot)] = int(code)
+    excluded = np.zeros(len(slots), dtype=bool)
+    if deleted is not None:
+        node, local = (np.asarray(a, dtype=np.int64) for a in deleted)
+        positions = np.searchsorted(leaves, node)
+        if (node.shape != local.shape or np.any(positions >= len(leaves))
+                or np.any(leaves[positions] != node) or np.any(local < 0)
+                or np.any(local >= entries['point_count'][node])):
+            raise ValueError('Invalid deleted native record identity.')
+        excluded[starts[positions] + local] = True
+    deleting = bool(excluded.any())
     subset = classes is not None or bool(fences) or lines is not None
+    filtering = subset or deleting
     same_lnt = os.path.normcase(os.path.abspath(lnt)) == os.path.normcase(target_lnt)
     if subset and same_lnt:
         raise ValueError('Save a filtered subset to a new filename to keep the open document intact.')
@@ -342,7 +361,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     # A repeated unchanged Save needs neither source-order matching nor LAZ
     # recompression. The only trusted shortcut is an earlier successful Save
     # to this very destination, with unchanged source metadata and companion.
-    if (same_source and companion and not subset and attributes is None and version is None
+    if (same_source and companion and not filtering and attributes is None and version is None
             and cache.get('saved_path') == os.path.normcase(os.path.abspath(destination))
             and cache.get('saved_digest') == digest and os.path.isfile(target_lnt)
             and cache.get('saved_stat') == os.stat(source).st_mtime_ns):
@@ -355,6 +374,8 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         order = source_mapping(source, lnt, entries, leaves, starts, cache, progress)
         source_slots = np.empty_like(slots)
         source_slots[order] = slots
+        source_excluded = np.empty_like(excluded)
+        source_excluded[order] = excluded
         with laspy.open(source) as reader:
             header = copy.deepcopy(reader.header)
         # Legacy point formats only hold 0..31. Upgrade without abusing LAS flags.
@@ -378,6 +399,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         header.set_version_and_point_format(laspy.header.Version.from_str(wanted_version), point_format)
     else:
         source_slots = slots
+        source_excluded = excluded
         header = laspy.LasHeader(point_format=7, version='1.4')
         from gui.lnt_ai_bridge import _lnt_bounds
         low, high_bounds = _lnt_bounds(lnt)
@@ -404,7 +426,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
     export_started = time.perf_counter()
     try:
         fast_las = False
-        if source and Path(source).suffix.lower() == '.las' and ext == '.las' and not subset and attributes is None:
+        if source and Path(source).suffix.lower() == '.las' and ext == '.las' and not filtering and attributes is None:
             with laspy.open(source) as original:
                 fast_las = (original.header.point_format == header.point_format and
                             original.header.version == header.version)
@@ -448,8 +470,8 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                             user_codes = lut[current]
                         if has_user_classes:
                             pts[USER_CLASS] = user_codes
-                        if subset:
-                            keep = np.ones(n, dtype=bool)
+                        if filtering:
+                            keep = ~source_excluded[at:at + n].copy()
                             if classes is not None:
                                 keep &= np.isin(user_codes, classes)
                             if lines is not None:
@@ -464,7 +486,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                             _apply_attribute_selection(pts, attributes)
                             if 'Class' not in attributes and USER_CLASS in pts.point_format.dimension_names:
                                 pts[USER_CLASS] = np.zeros(n, dtype=np.uint64)
-                        out = pts[keep] if subset else pts
+                        out = pts[keep] if filtering else pts
                         writer.write_points(out)
                         count += len(out)
                         at += n
@@ -475,10 +497,18 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
                     if reader:
                         reader.close()
         encode_seconds = time.perf_counter() - export_started
-        if count == 0:
+        if count == 0 and not deleting and (len(slots) or subset):
             raise ValueError('No points match the Save As selection.')
         companion_started = time.perf_counter()
-        if subset or attributes is not None:
+        if count == 0 and companion:
+            # A valid empty v2 document replaces any old companion, atomically.
+            import struct
+            with open(lnt, 'rb') as native_file:
+                header_bytes = bytearray(native_file.read(64))
+            struct.pack_into('<Q', header_bytes, 8, 64)
+            Path(staged_lnt).write_bytes(header_bytes + struct.pack('<QQ', 0, 0))
+            Path(staged_lnt + '.lines').write_bytes(b'LNTLINE1' + struct.pack('<Q', 0))
+        elif companion and (filtering or attributes is not None):
             from gui.lnt_open import build_lnt
             build_lnt(staged, lambda n, text: progress(80 + int(n * .15), text), lambda: False)
         elif companion and not same_lnt:
@@ -489,6 +519,9 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
         files = []
         if companion and os.path.isfile(staged_lnt):
             files.append((staged_lnt, target_lnt))
+            if deleting or count == 0:
+                lines_file = staged_lnt + '.lines'
+                files.append((lines_file if os.path.isfile(lines_file) else None, target_lnt + '.lines'))
         classmap_targets = [target_lnt + '.classmap.json'] if companion else []
         classmap_targets.append(destination + '.classmap.json')
         for i, target in enumerate(classmap_targets):
@@ -521,7 +554,7 @@ def write_pair(source, lnt, destination, *, mapping=None, cache=None,
             if Path(destination).suffix.lower() in ('.las', '.laz'):
                 from gui.lnt_open import stamp_source_cache
                 stamp_source_cache(destination, target_lnt)
-        if same_source and not subset and attributes is None:
+        if same_source and not filtering and attributes is None:
             cache['saved_digest'] = digest
             cache['saved_path'] = os.path.normcase(os.path.abspath(destination))
             cache['saved_stat'] = os.stat(destination).st_mtime_ns
@@ -621,6 +654,9 @@ def save_native(app, path=None, *, show_dialog=False, reopen=None, version=None)
         source if source_exists else None, destination,
         show_dialog=show_dialog, version=version, reopen=reopen,
     )
+    deleted = pending_deletions(app)
+    if deleted is not None:
+        reopen_after_save = True
     prepare_started = time.perf_counter()
     try:
         flush_edits(app)
@@ -643,7 +679,7 @@ def save_native(app, path=None, *, show_dialog=False, reopen=None, version=None)
             self.result, self.error = None, ''
             try:
                 self.result = write_pair(source, view.lnt_path, destination, mapping=mapping,
-                                         cache=cache, classes=classes, lines=lines, fences=fences,
+                                         cache=cache, classes=classes, lines=lines, fences=fences, deleted=deleted,
                                          attributes=attributes, version=version, drawings=drawings,
                                          progress=lambda n, text: self.progress.emit(n, text))
             except Exception as exc:
@@ -699,7 +735,7 @@ def save_native(app, path=None, *, show_dialog=False, reopen=None, version=None)
     checkpoint_needed = (
         _same_save_path(worker.result['lnt'], view.lnt_path) or full_source_save
     )
-    if checkpoint_needed:
+    if checkpoint_needed and deleted is None:
         store = getattr(app, '_lnt_section_store', None)
         if store is not None and store.view is view:
             try:
@@ -714,11 +750,17 @@ def save_native(app, path=None, *, show_dialog=False, reopen=None, version=None)
                     f'could not be updated: {exc}\n'
                     'Do not discard further edits until this is resolved.',
                 )
+    if deleted is not None:
+        # Compaction assigns new node/local identities. Old row history cannot
+        # be replayed against the replacement document.
+        app.undo_stack.clear()
+        app.redo_stack.clear()
+        cache.clear()
     app.last_save_path = destination
     app.last_save_format = Path(destination).suffix[1:]
     app.statusBar().showMessage(f'Saved {worker.result["count"]:,} points — LAS/LAZ + LNT '
                                 f'({time.perf_counter() - started:.2f} s)', 6000)
-    if reopen_after_save and not _same_save_path(worker.result['lnt'], view.lnt_path):
+    if reopen_after_save and (deleted is not None or not _same_save_path(worker.result['lnt'], view.lnt_path)):
         from gui.lnt_open import open_with_lnt
         print(f'[NATIVE-SAVE] reopening exported document: {destination}', flush=True)
         open_with_lnt(app, destination)

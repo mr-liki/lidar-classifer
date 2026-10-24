@@ -28,6 +28,7 @@
 // `tau_px` pixels. A refinement is shown only when every visible child is resident on
 // the GPU (otherwise the parent stays): coverage never has holes while finer data
 // arrives. Requests go to a worker pool, coarse levels first.
+#include "LNTDeletionMask.h"
 #include "LNTCamera.h"
 #include "LNTReader.h"
 #include "LNTSurfaceArchive.h"
@@ -283,6 +284,7 @@ struct ClassEdit {
 // ---------------------------------------------------------------------------------
 class NodePoints {
 public:
+    SharedDeletionMask deleted_records;
     using Ptr = std::shared_ptr<const std::vector<SurfacePoint>>;
     explicit NodePoints(uint64_t budget) : budget_(budget) {}
     void clear(uint64_t generation) {
@@ -618,6 +620,7 @@ inline bool gather_tile(const BuildIo& io, uint64_t k, SurfaceTile& out, KeptNod
         auto v = io.points->get(i, *io.rd, nodes, io.generation, io.io_lock, error);
         if (!v) return false;
         for (const auto& p : *v) {
+            if (record_deleted(io.points->deleted_records, nodes[i].node_id, uint32_t(&p - v->data()))) continue;
             if (io.rd->is_collection()) {
                 uint32_t cx,cy;qt.record_cell(i,p.x,p.y,d,cx,cy);
                 if(cx!=key_x(k)||cy!=key_y(k))continue;
@@ -630,6 +633,7 @@ inline bool gather_tile(const BuildIo& io, uint64_t k, SurfaceTile& out, KeptNod
         auto v = io.points->get(i, *io.rd, nodes, io.generation, io.io_lock, error);
         if (!v) return false;
         for (const auto& p : *v) {
+            if (record_deleted(io.points->deleted_records, nodes[i].node_id, uint32_t(&p - v->data()))) continue;
             uint32_t cx, cy;
             qt.record_cell(i, p.x, p.y, d, cx, cy);
             if (cx == key_x(k) && cy == key_y(k)) {
@@ -832,6 +836,7 @@ public:
     ~Manager() { shutdown(); }
 
     LodConfig config;
+    SharedDeletionMask deleted_records;
 
     // `io_lock` serialises payload reads against in-place class edits (may be null).
     bool open(const Reader& rd, const std::string& path, std::shared_mutex* io_lock, std::string* err) {
@@ -842,8 +847,9 @@ public:
         total_points_ = rd.directory().total_points;
         if (!qt_.build(rd)) { if (err) *err = "surface LOD: empty or degenerate directory"; return false; }
         points_ = std::make_unique<NodePoints>(config.node_bytes);
+        points_->deleted_records = deleted_records;
         points_->clear(source_gen_);
-        if (rd.is_collection()) { config.persist = false; w_disabled_ = true; }
+        if (rd.is_collection() || (deleted_records && !deleted_records->empty())) { config.persist = false; w_disabled_ = true; }
         else read_archive();
         const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
         const unsigned n = config.workers ? config.workers : std::min(6u, std::max(2u, hw / 2));
@@ -914,6 +920,7 @@ public:
             ++source_gen_;
             queue_.clear();
         }
+        points_->deleted_records = deleted_records;
         points_->clear(source_gen_);
         {
             std::lock_guard<std::mutex> lk(a_mu_);

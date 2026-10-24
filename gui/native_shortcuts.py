@@ -147,6 +147,17 @@ def native_classification_history(app, redo=False):
         app.statusBar().showMessage('Nothing to redo' if redo else 'Nothing to undo', 2500)
         return True
     entry = source[-1]
+    if isinstance(entry, dict) and 'deleted_rows' in entry:
+        try:
+            store.set_deleted(entry['deleted_rows'], redo)
+        except Exception as exc:
+            app.statusBar().showMessage(str(exc), 5000)
+            return True
+        destination.append(source.pop())
+        selector = getattr(view, 'native_select', None)
+        if selector is not None:
+            selector.deactivate_selection()
+        return True
     if not isinstance(entry, dict) or not all(k in entry for k in ('indices', 'old_classes', 'new_classes')):
         app.statusBar().showMessage('This history entry is not a native point-cloud edit.', 3000)
         return True

@@ -96,6 +96,44 @@ class VulkanSelectionPreview(VulkanZoomPreview):
             xyz = np.vstack([xyz, np.repeat(xyz[-1:], capacity - len(xyz), axis=0)])
         self._set_points(xyz)
 
+    def set_selected_points(self, points):
+        """Exact XY highlights, bounded uploads through the shared Vulkan arena."""
+        name = self.NAME + '_points'
+        self.layer.remove_file(self.KIND, name)
+        points = np.asarray(points, dtype=np.float64)
+        if not len(points):
+            return
+        bounds = _cloud_z_bounds(self.view.app)
+        z = bounds[1] + max(50., bounds[1] - bounds[0]) if bounds else 0.
+        from gui.native_main_classify import MainCanvas
+        canvas = MainCanvas(self.view)
+        x0, x1, y0, y1 = canvas.visible_extent()
+        radius = max(x1 - x0, y1 - y0) / 600.
+        chunks = []
+        for at in range(0, len(points), 65536):
+            p = points[at:at + 65536]
+            xyz = np.repeat(p, 4, axis=0)
+            xyz[:, 2] = z
+            xyz[0::4, 0] -= radius
+            xyz[1::4, 0] += radius
+            xyz[2::4, 1] -= radius
+            xyz[3::4, 1] += radius
+            indices = np.empty((len(p) * 2, 3), dtype=np.uint32)
+            indices[:, :2] = np.arange(len(p) * 4, dtype=np.uint32).reshape(-1, 2)
+            indices[:, 2] = RESTART_INDEX
+            chunks.append({'xyz': xyz, 'rgb': np.tile(np.array([255, 255, 0], dtype=np.uint8), (len(xyz), 1)),
+                           'indices': indices.ravel(), 'v_count': len(xyz),
+                           'i_count': indices.size, 'lineweight': 2})
+        if not self.layer.put_entities(self.KIND, name, [], prepared_groups={self.LAYER: chunks}):
+            raise RuntimeError('Vulkan selection highlight upload failed')
+
+    def clear(self):
+        super().clear()
+        self.layer.remove_file(self.KIND, self.NAME + '_points')
+
+    def shutdown(self):
+        self.clear()
+        self.layer.remove_file(self.KIND, self.NAME)
 
 class VulkanTempFencePreview(VulkanSelectionPreview):
     """Yellow temporary-classification fence on the native Vulkan canvas."""

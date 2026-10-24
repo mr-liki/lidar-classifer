@@ -58,6 +58,7 @@
 #ifndef LNT_STREAMER_H
 #define LNT_STREAMER_H
 
+#include "LNTDeletionMask.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -606,7 +607,8 @@ public:
     // isolation). No payload is read here.
     inline bool attach(const Reader& reader, LntCacheManager* cache, std::string& err) {
         if (!reader.ok()) { err = "reader is not open: " + reader.error(); return false; }
-        if (!tree_.build(reader.nodes(), err)) return false;
+        if (reader.nodes().empty() && reader.get_total_points() == 0) tree_ = LntNodeTree{};
+        else if (!tree_.build(reader.nodes(), err)) return false;
         entries_ = &reader.nodes();
         for (int i = 0; i < 3; ++i) origin_[i] = reader.header().bounds_min[i];
         dataset_points_ = reader.get_total_points();
@@ -662,6 +664,12 @@ public:
     // Coalesce contiguous (first, count) draw windows into one range before pushing, so
     // a cut made of many neighbouring tiles costs one draw call per run, not one per
     // tile. Off by default (it changes the engine's range count).
+    SharedDeletionMask deleted_records;
+    void set_deleted_records(SharedDeletionMask mask) {
+        deleted_records = std::move(mask);
+        draw_ranges_valid_ = false;
+        last_cut_complete_ = false;
+    }
     void set_merge_draw_ranges(bool on) { merge_ranges_ = on; draw_ranges_valid_ = false; }
     // BACKGROUND REFINEMENT. While the new cut still has cells whose tiles are not
     // on the GPU (drawn by a coarser ancestor stand-in, or blank), keep drawing the
@@ -1240,11 +1248,25 @@ private:
     // for a stand-in.
     inline void add_window(const LntTile& tile, uint64_t owner_id, uint64_t covers_id,
                            bool stand_in) {
-        draw_list_.firsts.push_back(tile.first);
-        draw_list_.counts.push_back(tile.count);
-        draw_list_.ids.push_back(owner_id);
-        draw_list_.covers.push_back(covers_id);
-        draw_list_.points += tile.count;
+        auto append = [&](uint32_t first, uint32_t count) {
+            if (!count) return;
+            draw_list_.firsts.push_back(first);
+            draw_list_.counts.push_back(count);
+            draw_list_.ids.push_back(owner_id);
+            draw_list_.covers.push_back(covers_id);
+            draw_list_.points += count;
+        };
+        auto it = deleted_records ? deleted_records->find(owner_id) : DeletionMask::const_iterator{};
+        if (!deleted_records || it == deleted_records->end()) append(tile.first, tile.count);
+        else {
+            uint32_t begin = 0;
+            for (uint32_t local : it->second) {
+                if (local >= tile.count) break;
+                append(tile.first + begin, local - begin);
+                begin = local + 1;
+            }
+            append(tile.first + begin, tile.count - begin);
+        }
         if (stand_in) {
             ++draw_list_.stand_ins;
             draw_list_.stand_in_points += tile.count;

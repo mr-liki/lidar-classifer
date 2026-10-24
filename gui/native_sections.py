@@ -290,6 +290,14 @@ class SectionCanvas(QWidget):
         super().resizeEvent(event)
 
     def set_points(self, local, indices, axis=0, fit=True, bounds=None):
+        # Keep source rows for undo, including an entirely deleted section.
+        if local is self.local and indices is self.indices and hasattr(self, '_deletion_source'):
+            local, indices = self._deletion_source
+        self._deletion_source = (local, indices)
+        store = get_store(self.owner.app)
+        if store is not None and hasattr(store, 'deleted'):
+            keep = ~store.deleted[np.asarray(indices, dtype=np.int64)]
+            local, indices = np.asarray(local)[keep], np.asarray(indices)[keep]
         if not np.array_equal(self.indices, indices):
             self._source_ids = None
         # New records/axis: any cached triangulation is no longer valid, and a
@@ -1256,7 +1264,7 @@ class NativeSections:
             raise RuntimeError(store.last_error if store else 'Native section query API unavailable')
         # Only the rows of the queried box can be in the corridor; testing them
         # (not the whole accumulated store) keeps a section's cost its own size.
-        rows = getattr(store, 'last_region_indices', None)
+        rows = getattr(store, 'last_region_all_indices', getattr(store, 'last_region_indices', None))
         if rows is None:
             indices, local, core, lo, hi = section_geometry(store.data['xyz'], p1, p2, half_width, buffer, True)
         else:
@@ -1377,7 +1385,8 @@ class NativeSections:
                 # its own class colors/visibility whether linked or not.
                 if data or target.axis != source.axis:
                     target.classifier.cancel()
-                    target.set_points(source.local, source.indices, source.axis, fit=False,
+                    source_local, source_rows = getattr(source, '_deletion_source', (source.local, source.indices))
+                    target.set_points(source_local, source_rows, source.axis, fit=False,
                                       bounds=(source._lo, source._hi))
                     self._classes[peer] = self._classes.get(slot, np.empty(0, dtype=np.uint8)).copy()
                 elif display:
@@ -1594,7 +1603,8 @@ class NativeSections:
             return
         # Snapshot the source when taking a nested cut; replacing the cut slot
         # must not change the input of subsequent depth adjustments.
-        self._cut_recipe = (source.slot, source.local.copy(), source.indices.copy(),
+        source_local, source_rows = getattr(source, '_deletion_source', (source.local, source.indices))
+        self._cut_recipe = (source.slot, source_local.copy(), source_rows.copy(),
                             source.axis, centre)
         self._cut_recipe_nested = nested
         self.cancel_cut()
@@ -1636,6 +1646,13 @@ class NativeSections:
             controller.cut_points = canvas.local
             controller.is_cut_view_active = True
         self.app.statusBar().showMessage(f'Cut: {selected.sum():,} records, depth {depth:.3f} m', 5000)
+
+    def refresh_deletions(self):
+        for slot, canvas in self.views.items():
+            if hasattr(canvas, '_deletion_source'):
+                local, rows = canvas._deletion_source
+                canvas.set_points(local, rows, canvas.axis, fit=False)
+                self._classes.pop(slot, None)
 
     def refresh_edits(self, force=False, changed=None, show_main=True):
         store = get_store(self.app)
