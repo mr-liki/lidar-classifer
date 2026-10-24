@@ -2592,8 +2592,34 @@ def get_native_draw(app, create=False, allow_snt=False):
     return draw
 
 
+def _return_to_plan_view_for_draw(app):
+    """Draw places plan XY only. A 3D orbit (D / Shift+P / View ribbon) must
+    not make activation fall through to the VTK digitizer hidden under the
+    Vulkan surface, so a Draw tool brings the main view back to Top."""
+    view = getattr(app, '_lnt_main_view', None)
+    if view is not None:
+        if getattr(view, 'native', None) is None or getattr(view, 'mode_2d', False):
+            return
+    elif getattr(app, 'data', None) or not (
+            getattr(app, 'is_3d_mode', False) or
+            getattr(app, '_main_view_3d_user_enabled', False)):
+        return  # 2D already, or a VTK-rendered cloud keeps the legacy path
+    change = getattr(app, 'handle_view_change', None)
+    if callable(change) and change('top') is not False:
+        if view is None or getattr(view, 'mode_2d', False):
+            return
+    if view is not None:
+        # Renderer without view presets: same as the native TopView shortcut.
+        view.set_2d(True)
+        view.native.plan_view()
+        app.current_view = 'top'
+    app.is_3d_mode = False
+    app._main_view_3d_user_enabled = False
+
+
 def activate_native_draw(app, tool):
     if str(tool or '').lower().replace(' ', '_') not in TOOL_MAP:
         return False
+    _return_to_plan_view_for_draw(app)
     draw = get_native_draw(app, create=True)
     return bool(draw and draw.activate(tool))

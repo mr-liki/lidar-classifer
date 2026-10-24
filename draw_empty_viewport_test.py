@@ -102,3 +102,41 @@ def test_engine_without_vector_support_is_not_promoted(app):
 def test_unknown_tool_does_not_promote_canvas(app):
     assert not activate_native_draw(app, 'unknown-tool')
     assert app.render_backend.install_count == 0
+
+
+def test_draw_after_3d_orbit_returns_empty_canvas_to_plan(app):
+    # A 3D flag kept across Clear Project made owns_main_camera() refuse the
+    # native canvas, so Draw fell to the VTK digitizer hidden under Vulkan.
+    def to_top(mode):
+        app.is_3d_mode = False
+        app._main_view_3d_user_enabled = False
+    app.is_3d_mode = True
+    app.handle_view_change = Mock(side_effect=to_top)
+    assert activate_native_draw(app, 'SmartLine')
+    app.handle_view_change.assert_called_once_with('top')
+
+
+def test_draw_in_3d_lnt_view_returns_to_plan_view():
+    from gui.native_draw import _return_to_plan_view_for_draw
+    native = SimpleNamespace(plan_view=Mock())
+    view = SimpleNamespace(native=native, mode_2d=False)
+    view.set_2d = lambda on: setattr(view, 'mode_2d', on)
+    app = SimpleNamespace(_lnt_main_view=view, is_3d_mode=True,
+                          _main_view_3d_user_enabled=True,
+                          handle_view_change=Mock(return_value=False))
+    _return_to_plan_view_for_draw(app)
+    app.handle_view_change.assert_called_once_with('top')
+    assert view.mode_2d and native.plan_view.called
+    assert not app.is_3d_mode and not app._main_view_3d_user_enabled
+
+
+def test_draw_keeps_plan_lnt_view_and_vtk_cloud_camera_untouched():
+    from gui.native_draw import _return_to_plan_view_for_draw
+    plan = SimpleNamespace(_lnt_main_view=SimpleNamespace(native=object(), mode_2d=True),
+                           handle_view_change=Mock())
+    _return_to_plan_view_for_draw(plan)
+    vtk_cloud = SimpleNamespace(_lnt_main_view=None, data={'xyz': 1}, is_3d_mode=True,
+                                handle_view_change=Mock())
+    _return_to_plan_view_for_draw(vtk_cloud)
+    plan.handle_view_change.assert_not_called()
+    vtk_cloud.handle_view_change.assert_not_called()
