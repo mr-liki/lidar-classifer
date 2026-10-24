@@ -512,13 +512,18 @@ class NativeDraw:
                                     current_font='Arial', current_bold=True,
                                     current_italic=False, current_color=(1, 0, 0),
                                     parent=self.app)
-            if dialog.exec() != QDialog.Accepted:
+            values = dialog.get_values() if dialog.exec() == QDialog.Accepted else None
+            if values is None or not str(values.get('text', '')).strip():
+                # Cancelled (Esc / Cancel / empty text): the Text tool stands
+                # down here. Still report the activation as handled, otherwise
+                # the ribbon falls back to the VTK digitizer, whose own Text
+                # dialog would reopen behind this one.
                 self.cancel()
-                return False
-            values = dialog.get_values()
-            if not str(values.get('text', '')).strip():
-                self.cancel()
-                return False
+                clear_buttons = getattr(self.app, '_clear_ribbon_active_buttons', None)
+                if callable(clear_buttons):
+                    clear_buttons('draw')
+                self.app.statusBar().showMessage('Text tool deactivated', 2500)
+                return True
             self._text_options = values
         self.canvas.setFocus()
         self.app.statusBar().showMessage(self._instruction(), 5000)

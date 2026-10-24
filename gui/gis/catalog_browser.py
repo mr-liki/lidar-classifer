@@ -854,11 +854,13 @@ def show_catalog_panel(app, folder: str | None = None):
             if folder and os.path.isdir(folder):
                 _dock.set_folder(folder)
             _dock.show(); _dock.raise_(); _dock.activateWindow()
+            _dock.tree.setFocus(Qt.OtherFocusReason)
 
         QTimer.singleShot(0, _deferred_dock)
         return dock
     if folder and os.path.isdir(folder): dock.set_folder(folder)
     dock.show(); dock.raise_(); dock.activateWindow()
+    dock.tree.setFocus(Qt.OtherFocusReason)
     return dock
 
 

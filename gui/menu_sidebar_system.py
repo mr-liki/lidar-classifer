@@ -27,20 +27,7 @@ from gui.undo_context_manager import get_undo_context_manager
 
 
 # ── SNT dialog button highlight ─────────────────────────────────────────
-# Keeps the File ▸ Attachments ▸ SNT ribbon button in a "medium bright white"
-# highlighted state while the Attach SNT window is visible, so users can see
-# the feature is still open / in use. Cleared when the dialog is hidden.
-_SNT_HIGHLIGHT_QSS = """
-QPushButton#ribbonButton[sntOpen="true"] {
-    background-color: #9aa0a6;
-    border: 1px solid #c8cdd2;
-    border-radius: 10px;
-}
-QPushButton#ribbonButton[sntOpen="true"]:hover {
-    background-color: #a8adb3;
-    border: 1px solid #d5dade;
-}
-"""
+# Use the normal ribbon checked state while the Attach SNT window is visible.
 
 
 def _find_snt_ribbon_button(app):
@@ -63,35 +50,29 @@ def _find_snt_ribbon_button(app):
 
 
 def _set_snt_button_highlight(app, on: bool) -> None:
-    """Toggle the SNT ribbon button highlight on/off (safe no-op on failure)."""
+    """Use the normal ribbon highlight while the SNT dialog is open."""
     try:
         btn = _find_snt_ribbon_button(app)
         if btn is None:
             return
-        btn.setProperty("sntOpen", True if on else False)
-        if on:
-            # Prepend our highlight QSS so it wins over the theme's inline style
-            # without wiping it (theme refresh reapplies via setStyleSheet).
-            existing = str(btn.styleSheet() or "")
-            if "sntOpen" not in existing:
-                btn.setStyleSheet(_SNT_HIGHLIGHT_QSS + existing)
-        else:
-            existing = str(btn.styleSheet() or "")
-            if "sntOpen" in existing:
-                btn.setStyleSheet(existing.replace(_SNT_HIGHLIGHT_QSS, ""))
-        # Force QSS re-evaluation of the dynamic property
-        try:
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-        except Exception:
-            pass
-        btn.update()
+        # Dialog visibility owns this state, so other tools and tab switches
+        # must not clear it through the section's active-button tracking.
+        section = btn.parentWidget()
+        while section is not None:
+            if getattr(section, "active_button", None) is btn:
+                section.active_button = None
+                break
+            section = section.parentWidget()
+        if btn.isChecked() != on:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(on)
+            btn.blockSignals(blocked)
     except Exception:
         pass
 
 
 class _SntDialogVisibilityFilter(QObject):
-    """Clears the SNT button highlight when the dialog is hidden/destroyed."""
+    """Syncs the SNT button highlight when the dialog is shown or hidden."""
 
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
@@ -120,13 +101,13 @@ def _track_snt_dialog_visibility(app, dlg) -> None:
     """Install the visibility filter (once) and light the SNT button."""
     try:
         if getattr(dlg, "_snt_btn_filter_installed", False):
-            _set_snt_button_highlight(app, True)
+            _set_snt_button_highlight(app, dlg.isVisible())
             return
         filt = _SntDialogVisibilityFilter(app, parent=dlg)
         dlg.installEventFilter(filt)
         dlg._snt_btn_filter = filt
         dlg._snt_btn_filter_installed = True
-        _set_snt_button_highlight(app, True)
+        _set_snt_button_highlight(app, dlg.isVisible())
     except Exception:
         pass
 
@@ -1044,7 +1025,8 @@ class FileRibbon(QWidget):
         attachments = RibbonSection("Attachments", self)
         attachments.add_button(" DXF", "📎", self._attach_dxf)
         attachments.add_button("DWG", "📐", self._attach_dwg, toggleable=False)
-        attachments.add_button("SNT", "🗂️", self._attach_snt, toggleable=False)
+        self.snt_btn = attachments.add_button("SNT", "🗂️", self._attach_snt, toggleable=False)
+        self.snt_btn.setCheckable(True)
         attachments.add_button("PRJ", "📋", self._identify_blocks)
         attachments.add_button("Verify", "🔍", self._verify_grid_labels)
 
@@ -3701,26 +3683,65 @@ class BlockRibbon(QWidget):
         layout.setSpacing(2)
 
         create_section = RibbonSection("Create", self)
-        create_section.add_button(
+        self._create_section = create_section
+        self.create_block_btn = create_section.add_button(
             "Create Block",
             "▦",
             self._show_block_creation_settings,
             toggleable=False,
         )
-        create_section.add_button(
+        # Highlighted like Measure > Line, but the state belongs to the tool:
+        # checked exactly while the native Create Block dialog is open.
+        self.create_block_btn.setCheckable(True)
+        self.create_cell_btn = create_section.add_button(
             "Create Cell",
             "◯",
             self._show_cell_creation_settings,
             toggleable=False,
         )
+        self.create_cell_btn.setCheckable(True)
         layout.addWidget(create_section)
         layout.addStretch()
+
+    def sync_create_block_button(self):
+        """Create Block stays highlighted exactly while its native dialog is
+        open - whether it was opened here, closed with X / Esc, or hidden."""
+        btn = self.create_block_btn
+        if self._create_section.active_button is btn:
+            self._create_section.active_button = None   # owned by the dialog, not the section toggle
+        app = getattr(self, "app", None) or self.window()
+        dialog = getattr(app, "native_block_creation_dialog", None)
+        try:
+            active = dialog is not None and dialog.isVisible()
+        except RuntimeError:                            # dialog already deleted
+            active = False
+        if btn.isChecked() != active:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(blocked)
+
+    def sync_create_cell_button(self):
+        """Keep Create Cell highlighted while its native dialog is visible."""
+        btn = self.create_cell_btn
+        if self._create_section.active_button is btn:
+            self._create_section.active_button = None
+        app = getattr(self, "app", None) or self.window()
+        dialog = getattr(app, "native_cell_creation_dialog", None)
+        try:
+            active = dialog is not None and dialog.isVisible()
+        except RuntimeError:
+            active = False
+        if btn.isChecked() != active:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(blocked)
 
     def _show_block_creation_settings(self):
         try:
             app = getattr(self, "app", None) or self.window()
             from gui.native_create import show_native_block_dialog
             if show_native_block_dialog(app):
+                self.sync_create_block_button()
                 return
             existing = getattr(app, "block_creation_settings_dialog", None)
             
@@ -3762,6 +3783,7 @@ class BlockRibbon(QWidget):
             app = getattr(self, "app", None) or self.window()
             from gui.native_create import show_native_cell_dialog
             if show_native_cell_dialog(app):
+                self.sync_create_cell_button()
                 return
             existing = getattr(app, "cell_creation_settings_dialog", None)
 

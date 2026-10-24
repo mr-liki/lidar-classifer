@@ -273,6 +273,14 @@ class NativeMeasure:
         if not self.active:
             return False
         if key == Qt.Key_Escape:
+            if getattr(self, 'style_key', None) == 'cross_section':
+                # XS is one tool across every section window: stand it down
+                # through its button, not just this window's line.
+                from gui.native_shortcuts import set_xs
+                set_xs(self.app, False)
+                self.cancel()
+                self._status('Cross-section measurement disabled', 2500)
+                return True
             self.cancel()
             self._status('Measurement tool deactivated', 2500)
             return True

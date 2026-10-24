@@ -11285,6 +11285,12 @@ class NakshaApp(QMainWindow):
        
         # Clear tool
         self.active_classify_tool = None
+
+        # Global Escape consumes the key before the native canvas can cancel
+        # its gesture. Reset all main/cross/cut classifiers now, including their
+        # Qt overlays, rather than waiting for another mouse event to repaint.
+        from gui.native_section_classify import notify_native_classification_activation
+        native_classification = notify_native_classification_activation(self, None)
        
         # ✅ CRITICAL: Unlock main view
         self.skip_main_view_refresh = False
@@ -11295,6 +11301,16 @@ class NakshaApp(QMainWindow):
             self._hide_class_picker_safely()
             print("   ✅ Class picker closed")
        
+        if native_classification:
+            # Native Vulkan canvases own their input and overlays. Do not restore
+            # VTK interactors or render a legacy viewport during native teardown.
+            if hasattr(self, "_gpu_sync_done"):
+                self._gpu_sync_done = False
+            if hasattr(self, "_section_visibility_refresh_required"):
+                self._section_visibility_refresh_required = False
+            self.statusBar().showMessage("Classification tool deactivated", 2000)
+            return
+
         # Restore section view interactors
         if hasattr(self, "section_controller"):
             try:
@@ -15932,7 +15948,10 @@ class NakshaApp(QMainWindow):
                 if activate_native_draw(self, tool_name):
                     self.digitizer.active_tool = None
                     self.digitizer.enabled = False
-                    self.statusBar().showMessage(f'Native Vulkan Draw: {tool_name}', 3000)
+                    from gui.native_draw import get_native_draw
+                    native = get_native_draw(self)
+                    if native is not None and native.active():  # not a cancelled Text dialog
+                        self.statusBar().showMessage(f'Native Vulkan Draw: {tool_name}', 3000)
                     return
 
                 if hasattr(self, "digitizer"):

@@ -233,6 +233,11 @@ class SectionCanvas(QWidget):
         # armed Pan tool must be disarmed here too.
         self.pan_gesture.finish()
         disarm_pan(self.owner.app)
+        # Same for an armed measurement (XS): its Escape stands the whole XS
+        # tool down, which keyPressEvent would never get to do here.
+        measurement = getattr(self, 'measurement', None)
+        if measurement is not None and measurement.key(Qt.Key_Escape):
+            return
         # QShortcut activation bypasses keyPressEvent and the global KeyPress
         # filter. Route classification through its full Escape handler here as
         # well, including when the armed tool has no unfinished gesture.
