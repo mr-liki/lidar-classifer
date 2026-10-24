@@ -3711,12 +3711,13 @@ class BlockRibbon(QWidget):
         # Highlighted like Measure > Line, but the state belongs to the tool:
         # checked exactly while the native Create Block dialog is open.
         self.create_block_btn.setCheckable(True)
-        create_section.add_button(
+        self.create_cell_btn = create_section.add_button(
             "Create Cell",
             "◯",
             self._show_cell_creation_settings,
             toggleable=False,
         )
+        self.create_cell_btn.setCheckable(True)
         layout.addWidget(create_section)
         layout.addStretch()
 
@@ -3731,6 +3732,22 @@ class BlockRibbon(QWidget):
         try:
             active = dialog is not None and dialog.isVisible()
         except RuntimeError:                            # dialog already deleted
+            active = False
+        if btn.isChecked() != active:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(blocked)
+
+    def sync_create_cell_button(self):
+        """Keep Create Cell highlighted while its native dialog is visible."""
+        btn = self.create_cell_btn
+        if self._create_section.active_button is btn:
+            self._create_section.active_button = None
+        app = getattr(self, "app", None) or self.window()
+        dialog = getattr(app, "native_cell_creation_dialog", None)
+        try:
+            active = dialog is not None and dialog.isVisible()
+        except RuntimeError:
             active = False
         if btn.isChecked() != active:
             blocked = btn.blockSignals(True)
@@ -3784,6 +3801,7 @@ class BlockRibbon(QWidget):
             app = getattr(self, "app", None) or self.window()
             from gui.native_create import show_native_cell_dialog
             if show_native_cell_dialog(app):
+                self.sync_create_cell_button()
                 return
             existing = getattr(app, "cell_creation_settings_dialog", None)
 

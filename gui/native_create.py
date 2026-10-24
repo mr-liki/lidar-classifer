@@ -648,6 +648,20 @@ class NativeCellDialog(_BaseDialog):
         count = self.controller.create_cells(self.diameter.value(), self.color.name(), self.width.value())
         self.app.statusBar().showMessage(f'Created {count} native Vulkan cell(s)', 4000)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_ribbon_button()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._sync_ribbon_button()
+
+    def _sync_ribbon_button(self):
+        ribbon = getattr(getattr(self.app, 'ribbon_manager', None), 'ribbons', {}).get('block')
+        sync = getattr(ribbon, 'sync_create_cell_button', None)
+        if callable(sync):
+            sync()
+
     def reset(self):
         self.diameter.setValue(3000.); self.width.setValue(2); self.color = QColor('#2979ff'); self._color_style()
 
