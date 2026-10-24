@@ -1,0 +1,85 @@
+Naksha Ground PTD V2 - testing and rollback
+Feature branch: feature/ground-ptd-performance-20261023
+Validation date: 2026-10-24 (Asia/Calcutta)
+
+V2 is an opt-in candidate. The measured 360-second target has failed.
+The broader regression suite is not clean. Do not package for production.
+
+Launch for controlled manual testing, using a disposable dataset copy:
+
+  Set-Location 'E:\NAKSHA_LIDAR_10_23_26\lidar-classifer-BRUSH'
+  $env:NAKSHA_GROUND_ENGINE_V2 = '1'
+  $env:NAKSHA_GROUND_LOCATOR = '0'
+  $env:NAKSHA_GROUND_GPU = '0'
+  $env:NAKSHA_GROUND_WORKERS = '2'
+  .\venv\Scripts\python.exe main.py
+
+The existing streamed dispatch and 8-million-record Undo/snapshot guards remain.
+The project ENEL PTC files identify Ground as class 1 and source/default as 0.
+Select the actual project classes in the dialog; do not assume LAS class 2.
+
+For complete-query simplex auditing during a controlled run, additionally set:
+
+  $env:NAKSHA_GROUND_V2_AUDIT = '1'
+
+Audit mode compares every compiled lookup ID with the original complete SciPy
+query. A mismatch returns the complete SciPy result and disables the compiled
+locator for that PTD invocation. Auditing adds work and has no 360-second claim.
+The old nearest-vertex/subset locator is quarantined, including legacy opt-in.
+
+Disable V2 without removing other integrations:
+
+  $env:NAKSHA_GROUND_ENGINE_V2 = '0'
+  $env:NAKSHA_GROUND_LOCATOR = '0'
+  $env:NAKSHA_GROUND_GPU = '0'
+
+Restart the application after changing its launch environment. Absent an
+explicit V2 flag, the current SciPy route remains the default. Ground worker
+preferences, existing UI settings, Vulkan/VTK code and other classifiers are
+preserved. V2 also falls back when its optional runtime or operation fails.
+
+Repeat the differential tests:
+
+  .\venv\Scripts\python.exe -m pytest -q tests/test_ground_ptd_engine_v2.py
+
+Repeat the real-data copy/fence/history/save validation:
+
+  .\venv\Scripts\python.exe scripts/validate_ground_ptd_v2_real_io.py `
+    --source 'E:\TEST FOLDER VULKAN\NT-298\DX2033391 MARCENA\MARCENA000018.lnt' `
+    --baseline-source '..\Naksha_Ground_V2_Backup_20261023\gui\lidar_classification_tools.py' `
+    --output audit/ground_ptd_v2/real_native_repeat --export
+
+For a fresh full-operation measurement, run validate_ground_ptd_v2_full.py with
+--engine 1 (or --engine 0 plus --baseline-source), --workers 2, --source pointing
+to the original LNT, and a NEW --output directory inside the repository. Each
+command copies the source and commits only that copy. Source SHA-256, exact
+readback, plan arrays, stage measurements and progress are saved in that output.
+Do not run concurrent validators for an isolated performance comparison.
+
+--resume-checkpoints can finish interrupted accuracy validation. A resumed run
+is explicitly excluded from cold full-runtime acceptance. Checkpoints use exact
+ordered inputs and source/code hashes; newly written checkpoints are not reused
+within a cold run. Full timings use the cached LNT, not a fresh LAZ-to-LNT build.
+
+Backups and source removal:
+
+  E:\NAKSHA_LIDAR_10_23_26\Naksha_Ground_V2_Backup_20261023
+  E:\NAKSHA_LIDAR_10_23_26\Naksha_Ground_V2_Resume_20261024
+
+The first contains the initial Git patch, source copies and baseline hashes.
+The second preserves the state at the continuation boundary. The V2-only source
+patch is audit/ground_ptd_v2/ground_ptd_v2.patch; modified_sources.json lists it.
+It excludes the user's pre-existing unrelated changes and benchmark data.
+
+Before considering source removal, check the reverse patch without applying it:
+
+  git apply --reverse --check audit/ground_ptd_v2/ground_ptd_v2.patch
+
+Only apply a reverse patch if no later edits conflict. Prefer disabling V2.
+Reversing the whole patch restores the legacy locator source, so its environment
+flag must remain 0. Never use reset/clean or restore whole files from Git HEAD:
+those operations would discard pre-existing uncommitted integrations.
+
+No commit, push, branch replacement, production executable or Setup.exe was made.
+The new test file is covered by the V2-only patch even though the repository's
+existing ignore rules hide new tests from ordinary git status output.

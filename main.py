@@ -364,6 +364,23 @@ if __name__ == "__main__":
     if _maintenance_exit_code is not None:
         raise SystemExit(_maintenance_exit_code)
 
+    # Apply saved Ground performance settings before classification modules load.
+    # Works identically from python main.py and a PyInstaller/Inno Setup EXE.
+    # Preserve developer process overrides; never modify Windows user/system env.
+    try:
+        from gui.ground_performance_settings import configure_ground_runtime
+        _ground_perf = configure_ground_runtime()
+        print("[Ground performance] workers={} GPU={} ({})".format(
+            _ground_perf["workers"],
+            _ground_perf.get("gpu_backend", "cpu").upper() if _ground_perf["gpu_active"] else "CPU",
+            _ground_perf["cuda_status"]), flush=True)
+    except Exception as _ground_perf_err:
+        # Startup should never fail because of an optional performance setting.
+        os.environ.setdefault("NAKSHA_GROUND_WORKERS", "2")
+        os.environ["NAKSHA_GROUND_GPU"] = "0"
+        print("[Ground performance] settings unavailable; safe CPU fallback: {}".format(
+            type(_ground_perf_err).__name__), flush=True)
+
     # A frozen build keeps plugins in %LOCALAPPDATA%; copy the bundled set in
     # before the window asks PluginManager to discover them.
     try:

@@ -4,6 +4,7 @@ import sys
 from flask import views
 from .execute_tool import execute_tool
 from .shading_preset_quality import normalize_shading_preset_quality, shading_quality_label
+from .shortcut_key_state import qt_event_modifier_names, native_virtual_key_modifier_names
 # ✅ ADD this class in the same file as GlobalShortcutFilter, BEFORE it
 
 try:
@@ -92,33 +93,56 @@ class _CtrlAltNativeEventFilter(QAbstractNativeEventFilter):
         if msg.message not in (0x0100, 0x0104):  # WM_KEYDOWN / WM_SYSKEYDOWN
             return False, 0
 
-        user32 = ctypes.windll.user32
-        ctrl_down = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
-        alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
-        if not (ctrl_down and alt_down):
-            return False, 0
-
         keyname = self._keyname_from_virtual_key(int(msg.wParam))
         if keyname is None:
             return False, 0
 
-        shift_down = bool(user32.GetAsyncKeyState(0x10) & 0x8000)
-        modifier = "ctrl+alt+shift" if shift_down else "ctrl+alt"
+        modifier = native_virtual_key_modifier_names(
+            keyname, syskey_alt=(msg.message == 0x0104)
+        )
         combo = (modifier, keyname)
+
+        # Shortcut Manager's "Capture Keys" field must still be able to learn
+        # Alt+F4 / RightAlt+F4. Windows would otherwise close its parentless
+        # manager window before QLineEdit receives the F4 keypress.
+        if keyname == "F4" and "alt" in modifier.split("+"):
+            if self.shortcut_filter._is_shortcut_editor_active():
+                from PySide6.QtWidgets import QApplication
+                focus = QApplication.focusWidget()
+                if focus is not None and getattr(focus, "capture_mode", False):
+                    from PySide6.QtGui import QKeyEvent
+                    from PySide6.QtCore import QCoreApplication
+                    flags = Qt.NoModifier
+                    if "ctrl" in modifier.split("+"):
+                        flags |= Qt.ControlModifier
+                    if "alt" in modifier.split("+"):
+                        flags |= Qt.AltModifier
+                    if "shift" in modifier.split("+"):
+                        flags |= Qt.ShiftModifier
+                    QCoreApplication.postEvent(
+                        focus, QKeyEvent(QEvent.KeyPress, Qt.Key_F4, flags, "")
+                    )
+                    return True, 0
+
         shortcuts = getattr(self.shortcut_filter.app_window, "shortcuts", {})
         if combo not in shortcuts:
             return False, 0
 
-        if (
-            self.shortcut_filter._is_runtime_shortcut_suspended()
-            or self.shortcut_filter._is_input_popup_open()
-            or self.shortcut_filter._is_prj_dialog_active()
-            or self.shortcut_filter._is_display_mode_dialog_active()
-            or self.shortcut_filter._is_shortcut_editor_active()
-        ):
+        # Alt+F4 must be caught *before* Windows issues SC_CLOSE, including
+        # when a child / section HWND, rather than the main window, has focus.
+        # Preserve the established Ctrl+Alt native fallback for Win32 children.
+        if combo != ("alt", "F4") and "ctrl+alt" not in modifier:
             return False, 0
 
-        print(f"Native Ctrl+Alt shortcut match: {combo}")
+        if not self.shortcut_filter._runtime_shortcut_allowed_from_native():
+            return False, 0
+
+        # WM_*KEYDOWN bit 30 means a held key's autorepeat. Do not reapply a
+        # display preset repeatedly or enqueue multiple Qt callbacks.
+        if int(msg.lParam) & (1 << 30):
+            return True, 0
+
+        print(f"[SHORTCUT-ROUTE] native {combo}")
         QTimer.singleShot(
             0,
             lambda combo=combo: self.shortcut_filter._activate_registered_combo(combo),
@@ -137,10 +161,13 @@ class GlobalShortcutFilter(QObject):
 
     @staticmethod
     def _modifier_for_key(key):
+        # Some Windows keyboard layouts expose the right Alt as Qt.Key_AltGr.
+        # It still acts as the user's configured Alt for shortcut F-keys.
         return {
             Qt.Key_Control: "ctrl",
             Qt.Key_Alt: "alt",
             Qt.Key_Shift: "shift",
+            Qt.Key_AltGr: "alt",
         }.get(key)
 
     def _track_modifier_event(self, event):
@@ -153,7 +180,13 @@ class GlobalShortcutFilter(QObject):
             self._pressed_modifiers.discard(modifier)
 
     def rebuild_ctrl_alt_shortcuts(self):
-        """Register a Qt fallback and the native Windows listener."""
+        """Rebuild application-scoped modifier shortcuts after settings change.
+
+        The historical method name is retained for ShortcutManager callers.
+        Register Alt, Ctrl and Shift combinations on *all* active NAKSHA Qt
+        windows, not just the current Vulkan/VTK interactor with keyboard focus.
+        No OS-wide hotkeys or hooks are installed.
+        """
         for shortcut in self._registered_ctrl_alt_shortcuts:
             shortcut.setEnabled(False)
             shortcut.deleteLater()
@@ -167,26 +200,59 @@ class GlobalShortcutFilter(QObject):
                 self._native_ctrl_alt_filter = _CtrlAltNativeEventFilter(self)
                 qt_app.installNativeEventFilter(self._native_ctrl_alt_filter)
 
+        registered = 0
         for combo in getattr(self.app_window, "shortcuts", {}):
             modifier, keyname = combo
             modifier_parts = modifier.split("+")
-            if "ctrl" not in modifier_parts or "alt" not in modifier_parts:
+            if modifier in ("none", ""):
+                # Plain shortcuts remain in the existing gesture/undo pipeline.
+                continue
+            if not set(modifier_parts).issubset({"ctrl", "alt", "shift"}):
                 continue
             sequence = "+".join(
                 [part.capitalize() for part in modifier_parts] + [keyname]
             )
             shortcut = QShortcut(QKeySequence(sequence), self.app_window)
             shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.setAutoRepeat(False)
             shortcut.activated.connect(
                 lambda combo=combo: self._activate_registered_combo(combo)
             )
-            shortcut.activatedAmbiguously.connect(
-                lambda combo=combo: self._activate_registered_combo(combo)
-            )
+            # Ambiguous matches are not executed: another Qt shortcut owns the
+            # same key, so running either action would be unpredictable.
             self._registered_ctrl_alt_shortcuts.append(shortcut)
+            registered += 1
+        print(f"[SHORTCUT-ROUTE] registered={registered} scope=application")
+
+    def _runtime_shortcut_allowed_from_native(self):
+        """Keep native fallback away from text entry and configuration UI."""
+        if (
+            self._is_runtime_shortcut_suspended()
+            or self._is_input_popup_open()
+            or self._is_prj_dialog_active()
+            or self._is_display_mode_dialog_active()
+            or self._is_shortcut_editor_active()
+        ):
+            return False
+        try:
+            from PySide6.QtWidgets import (
+                QApplication, QLineEdit, QTextEdit, QPlainTextEdit,
+                QAbstractSpinBox, QComboBox,
+            )
+            focus = QApplication.focusWidget()
+            if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit,
+                                  QAbstractSpinBox)):
+                return False
+            if isinstance(focus, QComboBox) and focus.isEditable():
+                return False
+        except (RuntimeError, ReferenceError):
+            return False
+        return True
 
     def _activate_registered_combo(self, combo):
         if combo not in getattr(self.app_window, "shortcuts", {}):
+            return
+        if not self._runtime_shortcut_allowed_from_native():
             return
         modifier, keyname = combo
         key = getattr(Qt, f"Key_{keyname}", None)
@@ -549,16 +615,7 @@ class GlobalShortcutFilter(QObject):
     @staticmethod
     def _event_combo(event, pressed_modifiers=None):
         """Return the canonical shortcut key used by ShortcutManager storage."""
-        mods = event.modifiers()
-        pressed_modifiers = pressed_modifiers or set()
-        parts = []
-        if mods & Qt.ControlModifier or "ctrl" in pressed_modifiers:
-            parts.append("ctrl")
-        if mods & Qt.AltModifier or "alt" in pressed_modifiers:
-            parts.append("alt")
-        if mods & Qt.ShiftModifier or "shift" in pressed_modifiers:
-            parts.append("shift")
-        modifier = "+".join(parts) if parts else "none"
+        modifier = qt_event_modifier_names(event, Qt, pressed_modifiers)
 
         key = event.key()
         if Qt.Key_F1 <= key <= Qt.Key_F12:
@@ -649,6 +706,15 @@ class GlobalShortcutFilter(QObject):
 
     def eventFilter(self, obj, event):
         _QTimer = QTimer  # noqa — intentional alias
+
+        # Qt.ApplicationShortcut registrations are resolved via ShortcutOverride
+        # *before* the normal KeyPress. Let capture/search/text inputs and modal
+        # dialogs own their keys, or the new app-wide QShortcuts would swallow
+        # events even when _activate_registered_combo() safely declines them.
+        if event.type() == QEvent.ShortcutOverride:
+            if not self._runtime_shortcut_allowed_from_native():
+                event.accept()
+            return False
 
         if event.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
             self._pressed_modifiers.clear()

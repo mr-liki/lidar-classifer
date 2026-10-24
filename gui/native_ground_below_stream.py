@@ -8,6 +8,10 @@ one atomic Undo operation after preflight and source-file revision verification.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from queue import Empty, Full, Queue
+from threading import Event
+from time import monotonic
 import math
 import os
 from pathlib import Path
@@ -191,8 +195,123 @@ def _split_rect(bounds):
     return (x0, y0, x1, mid), (x0, mid, x1, y1)
 
 
+# Full-cloud density preflight is opt-in. It verifies every read window before
+# starting expensive PTD and selects a RAM-bounded full-halo alternative for
+# crowded regions. It never changes LNT bytes, classes, anchors or the halo.
+def _preflight_ground_windows(path, info, regions, allowed, halo, max_context,
+                              prepared, workers, cancelled, params_sources,
+                              params_target, trace=False):
+    if os.environ.get('NAKSHA_GROUND_PREFLIGHT', '0').strip().lower() not in (
+            '1', 'true', 'yes', 'on'):
+        return None, None
+    from gui.ground_ptd_density_preflight import (
+        DensityIndex, DensityPreflightError, plan_windows,
+        ram_budgeted_extended_limit)
+    from gui.ground_ptd_profiler import log as _trace_log
+    adaptive = os.environ.get('NAKSHA_GROUND_DENSE_ADAPTIVE', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    prefer_dense = os.environ.get('NAKSHA_GROUND_DENSE_PREFER_LARGE', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    started = monotonic()
+    try:
+        if adaptive:
+            requested = int(os.environ.get('NAKSHA_GROUND_DENSE_MAX_CONTEXT', '6000000'))
+            dense_limit, free_ram = ram_budgeted_extended_limit(
+                max_context, workers, requested)
+        else:
+            dense_limit, free_ram = max_context, 0
+        eligible_classes = (set(range(256)) if params_sources is None else
+                            set(params_sources))
+        eligible_classes.discard(int(params_target))
+        index = DensityIndex(
+            path, info, allowed, POINT, _exactly,
+            eligible_classes=eligible_classes, cancelled=cancelled)
+        # Validate file revision both before starting and after completing
+        # density preflight. Never rely on a stale class histogram.
+        _check_file(path, info)
+        plans, stats = plan_windows(
+            regions, index, halo=halo, base_limit=max_context,
+            dense_limit=dense_limit, adaptive=adaptive,
+            prefer_dense=prefer_dense, cancelled=cancelled,
+            intersects=lambda box: _intersects_poly_bbox(box, prepared))
+        _check_file(path, info)
+    except DensityPreflightError as exc:
+        raise ScopedPlanningError(f'Ground density preflight: {exc}') from exc
+    stats.update(extended_limit=dense_limit, base_limit=max_context,
+                 memory_available=free_ram, adaptive=adaptive,
+                 prefer_dense=prefer_dense,
+                 seconds=round(monotonic()-started, 3))
+    message = ('[GROUND PREFLIGHT] PASS region_roots={} planned_cells={} '
+               'split_nodes={} dense_cells={} empty_core_skips={} prefer_dense={} normal_cap={:,} dense_cap={:,} '
+               'free_ram_gib={:.1f} elapsed={:.2f}s exact_window_counts={} '
+               'NO_LNT_WRITES').format(
+                   len(regions), stats['total_cells'], stats['splits'],
+                   stats['dense_cells'], stats['skipped_ineligible_cells'],
+                   prefer_dense, max_context, dense_limit,
+                   free_ram/(1024**3), stats['seconds'],
+                   stats['fallback_exact_counts'])
+    print(message, flush=True)
+    if trace:
+        _trace_log(message)
+    return plans, stats
+
+
+class _ContextSlots:
+    """A large context exclusively owns RAM slots; small ones may parallelize.
+
+    Holding the acquisition mutex while waiting for free slots avoids the
+    classic deadlock where two large tasks each hold half their permits.
+    """
+    def __init__(self, workers):
+        from threading import Lock, BoundedSemaphore
+        self._slots = BoundedSemaphore(workers)
+        self._lock = Lock()
+        self.workers = workers
+
+    def acquire(self, large):
+        count = self.workers if large else 1
+        with self._lock:
+            for _ in range(count):
+                self._slots.acquire()
+        return count
+
+    def release(self, count):
+        for _ in range(count):
+            self._slots.release()
+
+
+class _ChangeChunks:
+    """Planned (identity, old, new) records kept as NumPy chunks, in order."""
+
+    def __init__(self):
+        self.ids, self.old, self.new = [], [], []
+        self.count = 0
+
+    def add(self, ids, old, new):
+        if len(ids):
+            self.ids.append(np.asarray(ids, np.uint64))
+            self.old.append(np.asarray(old, np.uint8))
+            self.new.append(np.asarray(new, np.uint8))
+            self.count += len(ids)
+
+    def extend(self, other):
+        self.ids += other.ids; self.old += other.old; self.new += other.new
+        self.count += other.count
+
+    def __len__(self):
+        return self.count
+
+
 def _plan_result(records, info, stats):
-    if records:
+    if isinstance(records, _ChangeChunks) and len(records):
+        ids = np.concatenate(records.ids)
+        if len(np.unique(ids)) != len(ids):
+            raise ScopedPlanningError('Duplicate planned point identity; no changes written.')
+        nodes = (ids >> np.uint64(32)).astype(np.uint32)
+        local = (ids & np.uint64(0xffffffff)).astype(np.uint32)
+        old = np.concatenate(records.old)
+        new = np.concatenate(records.new)
+    elif records and not isinstance(records, _ChangeChunks):
         # The same underlying node/local can never be planned twice, even
         # when selected user fences overlap or tile context overlaps.
         ids = np.asarray([entry[0] for entry in records], np.uint64)
@@ -222,6 +341,20 @@ def plan_streamed_ground(path, polygons, params, *, expected_total=None,
     and all writes remain exact and fence-scoped. A conservative halo is based
     on the actual configured seed-search cell size and TIN thresholds.
     """
+    # Explicit opt-in: the default remains the original single-worker route.
+    # Each worker reads its own LNT handle and produces a read-only plan. The
+    # GUI callback/cancellation state is accessed only on the caller thread.
+    try:
+        workers = int(os.environ.get("NAKSHA_GROUND_WORKERS", "2"))
+    except ValueError as exc:
+        raise ScopedPlanningError('NAKSHA_GROUND_WORKERS must be an integer.') from exc
+    if workers > 1:
+        if workers > 4:
+            raise ScopedPlanningError('Ground worker count must be 1-4 to bound memory usage.')
+        return _plan_streamed_ground_parallel(
+            path, polygons, params, expected_total=expected_total,
+            max_changes=max_changes, progress=progress, cancelled=cancelled,
+            tile_size=tile_size, max_context=max_context, workers=workers)
     from gui.lidar_classification_tools import classify_ground_ptd
     path = Path(path)
     info = inspect_directory(path, max_points=2**63-1)
@@ -247,23 +380,48 @@ def plan_streamed_ground(path, polygons, params, *, expected_total=None,
     else:
         allowed = sources | (trusted if params.get('seed_method') != 'lowest_only' else set())
     regions = _regions(info, prepared, tile_size)
-    all_changes = []
+    from gui.ground_ptd_profiler import enabled as _trace_enabled, log as _trace_log
+    trace = _trace_enabled()
+    if trace:
+        _trace_log('[GROUND STREAM] mode={} workers=1 regions={} halo={:.2f}m '
+                   'read_limit={:,} trace=ON'.format(
+                       'FENCE' if prepared else 'FULL', len(regions), halo, max_context))
+    all_changes = _ChangeChunks()
     nregions, processed, eligible_count, skipped = 0, 0, 0, 0
-    tasks = [(rect, 0) for rect in reversed(regions)]
+    read_seconds, ptd_seconds, started_all = 0., 0., monotonic()
+    if progress is not None and os.environ.get('NAKSHA_GROUND_PREFLIGHT', '0') == '1':
+        progress(3, 'Checking all LNT Ground terrain windows before classification')
+    preplanned, _density = _preflight_ground_windows(
+        path, info, regions, allowed, halo, max_context, prepared,
+        workers=1, cancelled=cancelled,
+        params_sources=sources, params_target=target, trace=trace)
+    tasks = ([(rect, 0) for rect in reversed(regions)] if preplanned is None else
+             [(core, limit) for group in reversed(preplanned)
+              for core, limit in reversed(group)])
     while tasks:
         _check_cancel(cancelled)
         core, depth = tasks.pop()
+        context_limit = max_context if preplanned is None else depth
         if not _intersects_poly_bbox(core, prepared):
             continue
         pad = (core[0]-halo, core[1]-halo, core[2]+halo, core[3]+halo)
+        started_read = monotonic()
         try:
             tile = _read_window(path, info, pad, allowed_classes=allowed,
-                                max_context=max_context, cancelled=cancelled)
+                                max_context=context_limit, cancelled=cancelled)
         except ScopedPlanningError as exc:
+            read_seconds += monotonic() - started_read
+            # A preflight-accepted window MUST still fit exactly. If it does
+            # not, fail without writes rather than silently changing tiling.
+            if preplanned is not None:
+                raise ScopedPlanningError(
+                    'Ground density preflight count disagreed with the exact LNT reader; '
+                    'no classifications were changed.') from exc
             if 'Context window contains over' not in str(exc) or depth >= 12:
                 raise
             tasks.extend([(sub, depth+1) for sub in reversed(_split_rect(core))])
             continue
+        read_seconds += monotonic() - started_read
         nregions += 1
         xyz, original = tile['xyz'], tile['classification']
         if not len(xyz):
@@ -295,9 +453,16 @@ def plan_streamed_ground(path, polygons, params, *, expected_total=None,
         # read-only terrain support; never turn all outside-fence source
         # points into eligible seed/candidate inputs by omitting this mask.
         fence_in_context = _inside(xyz[:, :2], prepared) if prepared else None
+        started_ptd = monotonic()
         result = classify_ground_ptd(xyz=xyz, classification=updated,
                                      fence_mask=fence_in_context, progress_cb=_emit,
                                      abort_check=cancelled, **params) or {}
+        _current_ptd_seconds = monotonic() - started_ptd
+        ptd_seconds += _current_ptd_seconds
+        if trace:
+            _trace_log('[GROUND REGION] cell={} context_pts={:,} source_candidates={:,} '
+                       'PTD={:.3f}s'.format(nregions, len(xyz), count,
+                                            _current_ptd_seconds))
         reason = str(result.get('stop_reason', '')).strip().lower()
         if reason in ('cancelled', 'canceled', 'aborted'):
             raise ScopedPlanningError('Ground PTD cancelled before write.')
@@ -309,9 +474,8 @@ def plan_streamed_ground(path, polygons, params, *, expected_total=None,
             raise ScopedPlanningError(f'Ground PTD terrain analysis failed: {reason}.')
         changed = np.flatnonzero(eligible & (updated != original))
         if len(changed):
-            ids = _identity(tile['node'][changed], tile['local'][changed])
-            all_changes.extend((int(key), int(before), int(after)) for key, before, after
-                               in zip(ids, original[changed], updated[changed]))
+            all_changes.add(_identity(tile['node'][changed], tile['local'][changed]),
+                            original[changed], updated[changed])
         processed += 1
         if len(all_changes) > max_changes:
             raise ScopedPlanningError(f'Ground changes exceed reversible {max_changes:,}-record Undo budget.')
@@ -322,9 +486,248 @@ def plan_streamed_ground(path, polygons, params, *, expected_total=None,
     _check_file(path, info)
     plan = _plan_result(all_changes, info, {'areas': nregions,
                  'source_candidates': eligible_count, 'planned_changes': len(all_changes),
-                 'method': 'local PTD with overlapping terrain context'})
+                 'method': 'local PTD with overlapping terrain context',
+                 'workers': 1,
+                 'density_preflight': _density,
+                 'wall_seconds': round(monotonic() - started_all, 3),
+                 'cumulative_read_seconds': round(read_seconds, 3),
+                 'cumulative_ptd_seconds': round(ptd_seconds, 3)})
     return plan, info
 
+
+
+def _plan_streamed_ground_parallel(path, polygons, params, *, expected_total,
+                                   max_changes, progress, cancelled, tile_size,
+                                   max_context, workers):
+    """Opt-in multicore planning; no LNT edits or Qt calls on worker threads.
+
+    Each original processing cell, including its deterministic recursive
+    splits, is a self-contained read-only task. Return its records in the
+    original depth-first cell order so Undo/change identities match exactly.
+    All results are verified before the caller can commit a single write.
+    """
+    from gui.lidar_classification_tools import classify_ground_ptd
+    path = Path(path)
+    info = inspect_directory(path, max_points=2**63-1)
+    if expected_total is not None and info['total'] != int(expected_total):
+        raise ScopedPlanningError('Active cloud count differs from LNT directory.')
+    if info['leaf_sum'] != info['total']:
+        raise ScopedPlanningError('LNT leaf count differs from header.')
+    prepared = _prepare_area(polygons)
+    sources = _class_set(params['from_classes'])
+    trusted = _class_set(params.get('current_ground'))
+    target = int(params['to_class'])
+    if not 0 <= target <= 255:
+        raise ScopedPlanningError('Invalid Ground target classification.')
+    if sources is not None and trusted is not None and (sources & trusted) and params.get('seed_method') != 'lowest_only':
+        raise ScopedPlanningError('Current Ground class must not overlap source classes.')
+    halo = max(65.0, float(params.get('max_building_size', 60.0))*1.5,
+               float(params.get('iteration_distance', 1.4))*6.0,
+               float(params.get('edge_length_threshold', 5.0))*3.0)
+    if not np.isfinite(halo) or halo <= 0:
+        raise ScopedPlanningError('Invalid Ground search extent.')
+    allowed = (None if sources is None or trusted is None else
+               sources | (trusted if params.get('seed_method') != 'lowest_only' else set()))
+    regions = _regions(info, prepared, tile_size)
+    from gui.ground_ptd_profiler import enabled as _trace_enabled, log as _trace_log
+    trace = _trace_enabled()
+    if trace:
+        _trace_log('[GROUND STREAM] mode={} workers={} regions={} halo={:.2f}m '
+                   'read_limit={:,} trace=ON'.format(
+                       'FENCE' if prepared else 'FULL', workers, len(regions),
+                       halo, max_context))
+    if not regions:
+        _check_cancel(cancelled)
+        _check_file(path, info)
+        return _plan_result([], info, {'areas': 0, 'source_candidates': 0,
+                     'planned_changes': 0,
+                     'method': 'local PTD with overlapping terrain context',
+                     'workers': workers}), info
+
+    if progress is not None and os.environ.get('NAKSHA_GROUND_PREFLIGHT', '0') == '1':
+        progress(3, 'Checking all LNT Ground terrain windows before classification')
+    preplanned, _density = _preflight_ground_windows(
+        path, info, regions, allowed, halo, max_context, prepared,
+        workers=workers, cancelled=cancelled,
+        params_sources=sources, params_target=target, trace=trace)
+    # Conservatively reserve RAM for an entire oversized context while
+    # ordinary base-sized contexts may still use both worker threads.
+    slots = _ContextSlots(workers) if preplanned is not None else None
+    stopped = Event()
+    notifications = Queue(maxsize=max(16, workers*16))
+
+    def calculate_region(index, top_core):
+        """Called on worker thread; never touches Qt progress objects."""
+        tasks = ([(top_core, 0)] if preplanned is None else
+                 [(core, limit) for core, limit in reversed(preplanned[index])])
+        records = _ChangeChunks()
+        cells = 0
+        eligible_count = 0
+        processed = 0
+        time_read = 0.0
+        time_ptd = 0.0
+        while tasks:
+            _check_cancel(stopped.is_set)
+            core, depth = tasks.pop()
+            if not _intersects_poly_bbox(core, prepared):
+                continue
+            context_limit = max_context if preplanned is None else depth
+            pad = (core[0]-halo, core[1]-halo, core[2]+halo, core[3]+halo)
+            acquired = slots.acquire(context_limit > max_context) if slots else 0
+            try:
+                started = monotonic()
+                try:
+                    tile = _read_window(path, info, pad, allowed_classes=allowed,
+                                        max_context=context_limit, cancelled=stopped.is_set)
+                except ScopedPlanningError as exc:
+                    time_read += monotonic() - started
+                    if preplanned is not None:
+                        raise ScopedPlanningError(
+                            'Ground density preflight count disagreed with the LNT reader; no edits were committed.') from exc
+                    if 'Context window contains over' not in str(exc) or depth >= 12:
+                        raise
+                    tasks.extend([(sub, depth+1) for sub in reversed(_split_rect(core))])
+                    continue
+                time_read += monotonic() - started
+                cells += 1
+                xyz, original = tile['xyz'], tile['classification']
+                if not len(xyz):
+                    continue
+                inside = ((xyz[:, 0] >= core[0]) & (xyz[:, 0] < core[2]) &
+                          (xyz[:, 1] >= core[1]) & (xyz[:, 1] < core[3]))
+                if prepared:
+                    inside &= _inside(xyz[:, :2], prepared)
+                eligible = inside & (original != target)
+                if sources is not None:
+                    eligible &= np.isin(original, list(sources))
+                count = int(np.count_nonzero(eligible))
+                if not count:
+                    continue
+                eligible_count += count
+                updated = original.copy()
+                def emit(pct, msg=''):
+                    _check_cancel(stopped.is_set)
+                    try:
+                        notifications.put_nowait((index, pct, str(msg)[:95]))
+                    except Full:
+                        pass
+                fence_in_context = _inside(xyz[:, :2], prepared) if prepared else None
+                started = monotonic()
+                result = classify_ground_ptd(xyz=xyz, classification=updated,
+                                             fence_mask=fence_in_context,
+                                             progress_cb=emit,
+                                             abort_check=stopped.is_set,
+                                             **params) or {}
+                time_ptd += monotonic() - started
+                reason = str(result.get('stop_reason', '')).strip().lower()
+                if reason in ('cancelled', 'canceled', 'aborted'):
+                    raise ScopedPlanningError('Ground PTD cancelled before write.')
+                unsafe = ('tin construction failed', 'non-finite tin coordinates',
+                          'degenerate tin extent')
+                if reason in unsafe:
+                    raise ScopedPlanningError(f'Ground PTD terrain analysis failed: {reason}.')
+                changed = np.flatnonzero(eligible & (updated != original))
+                if len(changed):
+                    records.add(_identity(tile['node'][changed], tile['local'][changed]),
+                                original[changed], updated[changed])
+                processed += 1
+                if len(records) > max_changes:
+                    raise ScopedPlanningError(f'Ground changes exceed reversible {max_changes:,}-record Undo budget.')
+            finally:
+                if slots:
+                    slots.release(acquired)
+        return {'records': records, 'cells': cells, 'eligible': eligible_count,
+                'processed': processed, 'read_seconds': time_read,
+                'ptd_seconds': time_ptd}
+
+    results = [None] * len(regions)
+    completed = 0
+    submitted = 0
+    pending = {}
+    started_all = monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix='naksha-ground') as pool:
+            while completed < len(regions):
+                if cancelled is not None and cancelled():
+                    stopped.set()
+                    raise ScopedPlanningError('Ground PTD cancelled before write.')
+                # Limit queued futures as well as executing tasks; dense
+                # regions may contain millions of points in each tile.
+                while submitted < len(regions) and len(pending) < workers*2:
+                    fut = pool.submit(calculate_region, submitted, regions[submitted])
+                    pending[fut] = submitted
+                    submitted += 1
+                done, _ = wait(tuple(pending), timeout=0.15,
+                               return_when=FIRST_COMPLETED)
+                # The only place callbacks touch Qt is this caller thread.
+                last_message = None
+                while True:
+                    try:
+                        last_message = notifications.get_nowait()
+                    except Empty:
+                        break
+                if progress is not None and last_message is not None:
+                    idx, pct, msg = last_message
+                    advance = (completed + max(0., min(float(pct), 100.))/100.) / len(regions)
+                    progress(min(91, 6 + int(85*advance)),
+                             f'Ground PTD cell {idx+1}/{len(regions)}: {msg}')
+                for fut in done:
+                    idx = pending.pop(fut)
+                    try:
+                        results[idx] = fut.result()
+                    except Exception:
+                        stopped.set()
+                        raise
+                    completed += 1
+                    if trace:
+                        output = results[idx]
+                        elapsed = monotonic() - started_all
+                        _trace_log('[GROUND REGION] {}/{} cells={} candidate={:,} '
+                                   'PTD={:.3f}s read={:.3f}s finished={}/{} '
+                                   'elapsed={:.3f}s'.format(
+                                       idx + 1, len(regions), output['cells'],
+                                       output['eligible'], output['ptd_seconds'],
+                                       output['read_seconds'], completed, len(regions),
+                                       elapsed))
+                    if progress is not None:
+                        progress(6 + int(85*completed/len(regions)),
+                                 f'Ground PTD: {completed:,}/{len(regions):,} cells finished')
+    except Exception:
+        stopped.set()
+        raise
+    _check_cancel(cancelled)
+    records = _ChangeChunks()
+    for output in results:
+        records.extend(output['records'])
+        if len(records) > max_changes:
+            raise ScopedPlanningError(f'Ground changes exceed reversible {max_changes:,}-record Undo budget.')
+    _check_file(path, info)
+    if trace:
+        slowest = sorted(enumerate(results),
+                         key=lambda item: item[1]['ptd_seconds'], reverse=True)[:5]
+        _trace_log('[GROUND STREAM SLOWEST] ' + '; '.join(
+            'region{}={:.3f}s ({} cells)'.format(
+                i + 1, row['ptd_seconds'], row['cells'])
+            for i, row in slowest))
+        _trace_log('[GROUND STREAM FINISH] wall={:.3f}s '
+                   'CPU_worker_PTD={:.3f}s read={:.3f}s; '
+                   'C++/Numba/GPU specifics in [GROUND BACKENDS]'.format(
+                       monotonic() - started_all,
+                       sum(row['ptd_seconds'] for row in results),
+                       sum(row['read_seconds'] for row in results)))
+    plan = _plan_result(records, info, {
+        'areas': sum(x['cells'] for x in results),
+        'source_candidates': sum(x['eligible'] for x in results),
+        'planned_changes': len(records),
+        'method': 'local PTD with overlapping terrain context',
+        'workers': workers,
+        'density_preflight': _density,
+        'wall_seconds': round(monotonic() - started_all, 3),
+        'cumulative_read_seconds': round(sum(x['read_seconds'] for x in results), 3),
+        'cumulative_ptd_seconds': round(sum(x['ptd_seconds'] for x in results), 3),
+    })
+    return plan, info
 
 def _fit_flags(query, neighbor_points, surface_type, limit, z_tolerance):
     """Match classify_below_surface's planar/curved residual tests per query batch."""

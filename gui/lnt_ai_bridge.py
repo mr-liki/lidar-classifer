@@ -272,6 +272,13 @@ class LntAiBridge(QObject):
         """Hand app.data back once every AI dialog has closed (any exit path)."""
         if not self.active:
             return
+        # Keep the source-order LNT identity map and the working point data alive
+        # until the model worker has finished *and* its result was committed.
+        # During long AI3 jobs the mapping/fence windows are hidden; visibility
+        # alone is not a reliable indicator of an idle AI session.
+        if bool(getattr(self.app, "_ai_run_active", False)):
+            self._idle_ticks = 0
+            return
         from PySide6.QtWidgets import QApplication
         busy = QApplication.activeModalWidget() is not None   # a prompt between AI steps
         for name in _AI_DIALOGS:

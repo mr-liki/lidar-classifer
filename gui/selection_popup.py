@@ -496,9 +496,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             "Click empty space or press Esc to finish."
         )
         self.btn_copy.setToolTip(
-            "Copy: ghost preview follows your cursor.\n"
-            "Left-click to place a copy — click again to place another.\n"
-            "Right-click or Esc to exit copy mode."
+            "For SNT Text: copy the selected original label text to the "
+            "clipboard; selection stays highlighted, no placement preview.\n"
+            "For native drawings: copy geometry using its normal placement "
+            "workflow. Right-click or Esc cancels drawing placement."
         )
         self.btn_intersect.setToolTip(
             "Intersect: finds where the selected element is crossed by another line, "
@@ -677,7 +678,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             "block":      "Drag a rectangle to pick touched elements.",
             "shape":      "Click polygon vertices, right-click to close.",
             "cline":      "Click two points to draw a line; crossed elements pick.",
-            "snt_text":   "Pick SNT label(s), click Copy, then click the canvas to place editable copies.",
+            "snt_text":   "Select and highlight original SNT labels; Copy copies text to the clipboard only.",
         }.get(key, "")
 
     # ------------------------------------------------------------------

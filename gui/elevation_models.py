@@ -23,6 +23,7 @@ DEFAULT_RESOLUTION = 0.5
 DEFAULT_COVERAGE_BUFFER = 1.5
 MAX_RASTER_CELLS = 30_000_000
 _CHUNK_POINTS = 2_000_000
+MAX_VULKAN_PREVIEW_VERTICES = 750_000
 # Native .lnt tile size for streamed elevation builds: bounds memory per query
 # (~2 M points × ~45 B) while keeping the number of native round-trips low.
 _LNT_STREAM_TILE = 2_000_000
@@ -483,6 +484,88 @@ def render_elevation_relief_rgba(
     return rgba
 
 
+def build_elevation_vulkan_mesh(
+    model: ElevationModel,
+    max_vertices: int = MAX_VULKAN_PREVIEW_VERTICES,
+):
+    """Convert a north-up elevation grid to a bounded indexed Vulkan mesh."""
+    elevation = np.asarray(model.elevation, dtype=np.float32)
+    if elevation.ndim != 2 or not np.any(np.isfinite(elevation)):
+        raise ElevationModelError("The elevation model has no cells to display.")
+    limit = max(4, int(max_vertices))
+    stride = max(1, int(np.ceil(np.sqrt(elevation.size / float(limit)))))
+    rows = np.arange(0, elevation.shape[0], stride, dtype=np.int64)
+    cols = np.arange(0, elevation.shape[1], stride, dtype=np.int64)
+    if rows[-1] != elevation.shape[0] - 1:
+        rows = np.append(rows, elevation.shape[0] - 1)
+    if cols[-1] != elevation.shape[1] - 1:
+        cols = np.append(cols, elevation.shape[1] - 1)
+    sampled = elevation[np.ix_(rows, cols)]
+    valid = np.isfinite(sampled)
+
+    vertex_ids = np.full(sampled.shape, -1, dtype=np.int32)
+    vertex_ids[valid] = np.arange(np.count_nonzero(valid), dtype=np.int32)
+    rr, cc = np.nonzero(valid)
+    positions = np.empty((len(rr), 3), dtype=np.float64)
+    positions[:, 0] = model.left + (cols[cc] + 0.5) * model.resolution
+    positions[:, 1] = model.top - (rows[rr] + 0.5) * model.resolution
+    positions[:, 2] = sampled[rr, cc]
+
+    quads = valid[:-1, :-1] & valid[1:, :-1] & valid[:-1, 1:] & valid[1:, 1:]
+    qr, qc = np.nonzero(quads)
+    if not len(qr):
+        raise ElevationModelError(
+            "The elevation model is too sparse to form a preview surface."
+        )
+    tl = vertex_ids[qr, qc]
+    tr = vertex_ids[qr, qc + 1]
+    bl = vertex_ids[qr + 1, qc]
+    br = vertex_ids[qr + 1, qc + 1]
+    faces = np.empty((len(qr) * 2, 3), dtype=np.int32)
+    faces[0::2] = np.column_stack((tl, bl, br))
+    faces[1::2] = np.column_stack((tl, br, tr))
+
+    rgba = render_elevation_relief_rgba(
+        sampled, valid, pixel_size=model.resolution * stride
+    )
+    rgb = rgba[..., :3].astype(np.uint16, copy=False)
+    colors = np.empty((len(faces), 3), dtype=np.uint8)
+    colors[0::2] = ((rgb[qr, qc] + rgb[qr + 1, qc] + rgb[qr + 1, qc + 1]) // 3)
+    colors[1::2] = ((rgb[qr, qc] + rgb[qr + 1, qc + 1] + rgb[qr, qc + 1]) // 3)
+    return positions, faces, colors, stride
+
+
+def display_elevation_model_vulkan(app, model: ElevationModel, mesh=None) -> bool:
+    """Display a generated model in the renderer that owns the native viewport."""
+    view = getattr(app, "_lnt_main_view", None)
+    native = getattr(view, "native", None) if view is not None else None
+    if native is None:
+        return False
+    from gui.native_vector_overlay import lnt_vector_backend
+
+    backend = lnt_vector_backend(view)
+    if backend is None:
+        raise ElevationModelError("The active Vulkan renderer is unavailable.")
+    positions, faces, colors, stride = mesh or build_elevation_vulkan_mesh(model)
+    if not backend.set_surface(positions, faces, colors):
+        raise ElevationModelError(
+            f"The Vulkan renderer could not upload the {model.surface_type} surface."
+        )
+    show = getattr(native, "show_external_surface", None)
+    if not callable(show) or not show():
+        backend.clear_surface()
+        raise ElevationModelError(
+            "The loaded LNT viewer does not support generated Vulkan surfaces; rebuild its DLL."
+        )
+    app._elevation_vulkan_surface = {
+        "kind": model.surface_type,
+        "stride": int(stride),
+        "vertices": int(len(positions)),
+        "triangles": int(len(faces)),
+    }
+    return True
+
+
 def write_elevation_geotiff(model: ElevationModel, output_path) -> str:
     """Write a single-band Float32, north-up elevation GeoTIFF."""
 
@@ -918,6 +1001,9 @@ def create_elevation_model(app, surface_type: str) -> None:
                 )
                 self.progressed.emit(92, f"Writing {kind} preview GeoTIFF…")
                 model.preview_path = write_elevation_geotiff(model, preview_path)
+                if _native_view(app) is not None and options["add_preview"]:
+                    self.progressed.emit(96, f"Preparing {kind} Vulkan surface")
+                    model._vulkan_preview_mesh = build_elevation_vulkan_mesh(model)
                 self.progressed.emit(100, f"{kind} complete")
                 self.succeeded.emit(model)
             except ElevationModelCancelled:
@@ -948,19 +1034,23 @@ def create_elevation_model(app, surface_type: str) -> None:
         progress_dialog.close()
         if options["add_preview"]:
             try:
-                from gui.gis.gis_layers import _import_raster_layer
-
-                _import_raster_layer(
-                    app,
-                    model.preview_path,
-                    f"{kind} {model.resolution:g} m",
-                )
+                preview_mesh = getattr(model, "_vulkan_preview_mesh", None)
+                if _native_view(app) is not None:
+                    display_elevation_model_vulkan(app, model, preview_mesh)
+                else:
+                    from gui.gis.gis_layers import _import_raster_layer
+                    _import_raster_layer(
+                        app, model.preview_path, f"{kind} {model.resolution:g} m"
+                    )
             except Exception as exc:
                 QMessageBox.warning(
                     app,
                     f"{kind} Created",
                     f"The {kind} was created, but its preview could not be added:\n{exc}",
                 )
+            finally:
+                if hasattr(model, "_vulkan_preview_mesh"):
+                    del model._vulkan_preview_mesh
         left, bottom, right, top = model.bounds
         QMessageBox.information(
             app,

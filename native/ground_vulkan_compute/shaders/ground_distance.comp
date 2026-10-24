@@ -1,0 +1,35 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+
+// GPU executes necessary plane-distance screening only. The authoritative
+// CPU Ground PTD decision and a full CPU check of every rejection stay intact.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer PackedInputs {
+    double xyz_anchor_normal[];
+} input_data;
+layout(set = 0, binding = 1, std430) writeonly buffer KeepFlags {
+    uint keep[];
+} output_data;
+layout(push_constant) uniform Params {
+    uint count;
+    uint upward_only;
+    double distance_limit;
+    double guard;
+} pc;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.count) return;
+    uint base = index * 9u;
+    double dx = input_data.xyz_anchor_normal[base + 0u] - input_data.xyz_anchor_normal[base + 3u];
+    double dy = input_data.xyz_anchor_normal[base + 1u] - input_data.xyz_anchor_normal[base + 4u];
+    double dz = input_data.xyz_anchor_normal[base + 2u] - input_data.xyz_anchor_normal[base + 5u];
+    double d = dx * input_data.xyz_anchor_normal[base + 6u];
+    d += dy * input_data.xyz_anchor_normal[base + 7u];
+    d += dz * input_data.xyz_anchor_normal[base + 8u];
+    // Nonfinite distances are never rejected on the device.
+    bool reject = !(isnan(d) || isinf(d)) &&
+        (abs(d) > pc.distance_limit + pc.guard ||
+         (pc.upward_only != 0u && d < -pc.guard));
+    output_data.keep[index] = reject ? 0u : 1u;
+}

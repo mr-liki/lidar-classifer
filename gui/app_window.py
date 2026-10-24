@@ -10903,7 +10903,12 @@ class NakshaApp(QMainWindow):
             # standalone: never touches the digitizer or classification
             # interactors.
             if tool_name == "temp_fence":
-                if self.data is None:
+                native_view = getattr(self, "_lnt_main_view", None)
+                native_loaded = (
+                    native_view is not None
+                    and getattr(native_view, "native", None) is not None
+                )
+                if self.data is None and not native_loaded:
                     QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
                     return
                 # Stand down any active classification tool first so its

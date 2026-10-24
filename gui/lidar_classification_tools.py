@@ -3461,6 +3461,22 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
                         terrascan_compatible_densification=False,
                         complete_ground_from_final_tin=True,
                         progress_cb=None, abort_check=None):
+    # Performance tracing is observational and opt-in. The early-rejection
+    # branch is separately opt-in and must pass exact V1/V2 class parity.
+    import os as _ground_os
+    from time import perf_counter as _ground_clock
+    _trace = _ground_os.environ.get('NAKSHA_GROUND_PROFILE', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    _early_reject = _ground_os.environ.get('NAKSHA_GROUND_EARLY_REJECT', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    _trace_start = _ground_clock() if _trace else 0.0
+    _trace_tin_seconds = 0.0
+    _trace_lookup_seconds = 0.0
+    _trace_candidates_seconds = 0.0
+    _trace_ranking_seconds = 0.0
+    _trace_lookup_queries = 0
+    _trace_iteration_slow = []
+    _trace_cuda_failures = 0
     xyz = np.asarray(xyz)
     classification = np.asarray(classification)
     if xyz.ndim != 2 or xyz.shape[1] < 3:
@@ -3767,246 +3783,530 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
             f"({len(seed_local):,} anchors, {source_candidate_count:,} candidates)",
         )
 
-    for iteration in range(max_iterations):
-        if abort_check and abort_check():
-            stop_reason = "cancelled"
-            break
-        ga=np.array(sorted(ground_set),dtype=np.intp)
-        if len(ga)<3:
-            stop_reason = "fewer than 3 TIN points"
-            break
-        if progress_cb:
-            progress_cb(
-                12 + int(iteration / max_iterations * 80),
-                f"Iter {iteration+1}/{max_iterations}: {len(ga):,} anchors …",
-            )
-        # Cap seed triangulation size to prevent Qhull memory spikes on huge seed sets.
-        ga_tri, tri_points = _subsample_ground_tin_points(pts, ga)
-        if len(tri_points) < 3:
-            stop_reason = "fewer than 3 sampled TIN points"
-            break
-        xy_tri = tri_points[:, :2]
-        if not np.isfinite(xy_tri).all():
-            stop_reason = "non-finite TIN coordinates"
-            break
-        if np.ptp(xy_tri[:,0]) <= 1e-12 or np.ptp(xy_tri[:,1]) <= 1e-12:
-            stop_reason = "degenerate TIN extent"
-            break
-        try:
-            tri = Delaunay(xy_tri)
-        except Exception:
-            stop_reason = "TIN construction failed"
-            break
-        finally:
-            # Release the numpy slice used for triangulation immediately;
-            # Delaunay has already copied what it needs into C memory.
-            del xy_tri
-        # Existing ground guides the TIN but is never a source candidate. Only
-        # a bounded anchor subset is triangulated; mark every trusted-ground
-        # point processed so millions of unsampled class-2 points do not enter
-        # the expensive candidate query.
-        in_ground[:] = is_cg_local | is_context_local
-        in_ground[ga] = True
-        ng=np.where(~in_ground)[0]
-        if not len(ng):
-            stop_reason = "all candidates processed"
-            del tri
-            break
-        sids=tri.find_simplex(pts[ng,:2]); valid=sids!=-1
-        if not valid.any():
-            stop_reason = "no candidates inside TIN"
-            del tri
-            break
-        vng=ng[valid]; vsids=sids[valid]
-        usids,inv=np.unique(vsids,return_inverse=True)
-        sv=tri.simplices[usids]
-        # Delaunay simplex indices refer to the possibly subsampled tri_points,
-        # never to the full ground array.  Mixing these arrays creates invalid
-        # triangle planes and can accept most or all source points.
-        A3=tri_points[sv[:,0]]; B3=tri_points[sv[:,1]]; C3=tri_points[sv[:,2]]
-        me=np.maximum(np.maximum(np.linalg.norm(B3-A3,axis=1),np.linalg.norm(C3-B3,axis=1)),np.linalg.norm(A3-C3,axis=1))
-        nor=np.cross(B3-A3,C3-A3); nl=np.linalg.norm(nor,axis=1,keepdims=True)
-        good=nl[:,0]>1e-12; nor=nor/np.where(nl>0,nl,1.0); nor[nor[:,2]<0]*=-1
-        sl=np.arccos(np.clip(nor[:,2],-1,1)); tok=good&(sl<=terrain_rad)
-        pn=nor[inv]; pme=me[inv]; pto=tok[inv]; pA=A3[inv]; pa=pts[vng]
-        act=pto.copy()
-        if stop_triangulation: act&=pme>=stop_edge_length
-        d=np.einsum('ij,ij->i',pn,pa-pA); pd=np.abs(d)
-        act&=pd<=iteration_distance
-        if add_only_upward: act&=d>=0
-        pp=pa-d[:,np.newaxis]*pn; psv=sv[inv]
-        nr=np.minimum(np.minimum(np.linalg.norm(tri_points[psv[:,0]]-pp,axis=1),np.linalg.norm(tri_points[psv[:,1]]-pp,axis=1)),np.linalg.norm(tri_points[psv[:,2]]-pp,axis=1))
-        alpha=np.where(nr<1e-12,90.0,np.degrees(np.arctan2(pd,nr)))
-        ea=np.full(len(vng),iteration_angle,dtype=float)
-        if reduce_angle_edge:
-            sm=pme<edge_length_threshold; ea[sm]=iteration_angle*pme[sm]/edge_length_threshold
-        if use_distance_as_rating:
-            w=distance_weight/100.0
-            act&=(1-w)*np.where(ea>0,alpha/ea,1.0)+w*(pd/iteration_distance if iteration_distance>0 else np.ones_like(pd))<=1.0
-        else:
-            act&=alpha<=ea
-        # TerraScan/Axelsson-style progressive densification is deliberately
-        # conservative inside each current TIN facet.  The legacy Naksha path
-        # accepted every passing point in the same facet at once, which can
-        # over-densify flat areas and makes a later percentage-based Class-0
-        # holdout look like random peppering.  In compatibility mode select at
-        # most ONE best passing candidate per simplex for this iteration.  The
-        # primary rank is iteration angle (TerraScan documents this as the main
-        # density control), then point-to-plane distance, then stable point id.
-        pass_pos = np.flatnonzero(act)
-        if terrascan_compatible_densification and len(pass_pos):
-            pass_sid = vsids[pass_pos]
-            order = np.lexsort((
-                vng[pass_pos],
-                pd[pass_pos],
-                alpha[pass_pos],
-                pass_sid,
-            ))
-            ordered_sid = pass_sid[order]
-            first = np.empty(len(order), dtype=bool)
-            first[0] = True
-            first[1:] = ordered_sid[1:] != ordered_sid[:-1]
-            chosen_pos = pass_pos[order[first]]
-            np_ = vng[chosen_pos]
-        else:
-            np_ = vng[pass_pos]
-        if not len(np_):
-            stop_reason = "thresholds reached"
-            del tri
-            break
-        ground_set.update(np_.tolist())
-        iterations_completed = iteration + 1
-        del tri
-
-    # ------------------------------------------------------------------
-    # Final surface-completion pass
-    # ------------------------------------------------------------------
-    # ``one best point per facet`` is intentionally kept as the TIN-anchor
-    # growth rule because it prevents a low object cluster from changing the
-    # surface too aggressively in a single iteration.  It must NOT, however,
-    # become a rule that only those sparse anchor points receive the Ground
-    # class.  That was the reason Ground appeared as isolated patches: on the
-    # user's 376k-point fence only 710 points became anchors.
-    #
-    # Once the TIN has converged, perform one classification-only sweep against
-    # that final surface.  Every remaining source point that passes the exact
-    # same slope, plane-distance and iteration-angle tests is labelled Ground,
-    # but it is NOT inserted back into the TIN.  Therefore classification
-    # coverage improves without changing the stable topology/seed logic or
-    # allowing powerlines/vegetation to steer the surface.
-    surface_completion_local = np.array([], dtype=np.intp)
-    surface_completion_examined = 0
-    surface_completion_outside_tin = 0
-    if (
-        terrascan_compatible_densification
-        and complete_ground_from_final_tin
-        and stop_reason != "cancelled"
-        and len(ground_set) >= 3
+    # GPU is a conservative rejection gate only. The original CPU code stays
+    # authoritative for all accepted points, angles, ties and TIN growth.
+    _ground_gpu_requested = (
+        _ground_os.environ.get('NAKSHA_GROUND_GPU', '0').lower() in ('1', 'true', 'yes', 'on')
+        or _ground_os.environ.get('NAKSHA_GROUND_VULKAN_COMPUTE', '').lower() in ('1', 'true', 'yes', 'on')
+    )
+    # The previous adjacency/subset locator failed adversarial parity tests.
+    # Its environment flag must no longer select an approximate search.
+    # V2 stays local to this call, preserving the streamed dispatch identity.
+    _ground_v2 = None
+    # Dense-existing-ground one-iteration work previously bypassed V2 and
+    # therefore the native C++ locator even on million-point query tiles.
+    # Explicit opt-in ONLY: keep unchanged CPU/SciPy as default, and use
+    # NAKSHA_GROUND_V2_AUDIT=1 for complete simplex-ID parity during testing.
+    _v2_dense_opt_in = _ground_os.environ.get('NAKSHA_GROUND_V2_DENSE', '0').strip().lower() in (
+        '1', 'true', 'yes', 'on'
+    )
+    if (not dense_ground_fast_path or _v2_dense_opt_in) and _ground_os.environ.get('NAKSHA_GROUND_ENGINE_V2', '0').lower() in (
+        '1', 'true', 'yes', 'on'
     ):
-        if progress_cb:
-            progress_cb(93, "Final ground-surface completion sweep …")
-        ga_final = np.asarray(sorted(ground_set), dtype=np.intp)
-        _, final_tri_points = _subsample_ground_tin_points(pts, ga_final)
-        if len(final_tri_points) >= 3:
-            xy_final = final_tri_points[:, :2]
-            if (
-                np.isfinite(xy_final).all()
-                and np.ptp(xy_final[:, 0]) > 1e-12
-                and np.ptp(xy_final[:, 1]) > 1e-12
-            ):
-                try:
-                    final_tri = Delaunay(xy_final)
-                    is_anchor = np.zeros(n, dtype=bool)
-                    is_anchor[ga_final] = True
-                    remain = np.flatnonzero(is_from_local & ~is_anchor)
-                    surface_completion_examined = int(len(remain))
-                    if len(remain):
-                        sids = final_tri.find_simplex(pts[remain, :2])
-                        valid = sids != -1
-                        surface_completion_outside_tin = int(
-                            np.count_nonzero(~valid)
-                        )
-                        if np.any(valid):
-                            vng = remain[valid]
-                            vsids = sids[valid]
-                            usids, inv = np.unique(vsids, return_inverse=True)
-                            sv = final_tri.simplices[usids]
-                            A3 = final_tri_points[sv[:, 0]]
-                            B3 = final_tri_points[sv[:, 1]]
-                            C3 = final_tri_points[sv[:, 2]]
-                            me = np.maximum(
-                                np.maximum(
-                                    np.linalg.norm(B3 - A3, axis=1),
-                                    np.linalg.norm(C3 - B3, axis=1),
-                                ),
-                                np.linalg.norm(A3 - C3, axis=1),
-                            )
-                            nor = np.cross(B3 - A3, C3 - A3)
-                            nl = np.linalg.norm(nor, axis=1, keepdims=True)
-                            good = nl[:, 0] > 1e-12
-                            nor = nor / np.where(nl > 0, nl, 1.0)
-                            nor[nor[:, 2] < 0] *= -1
-                            sl = np.arccos(np.clip(nor[:, 2], -1, 1))
-                            tok = good & (sl <= terrain_rad)
-                            pn = nor[inv]
-                            pme = me[inv]
-                            pto = tok[inv]
-                            pA = A3[inv]
-                            pa = pts[vng]
-                            act = pto.copy()
-                            if stop_triangulation:
-                                act &= pme >= stop_edge_length
-                            d = np.einsum('ij,ij->i', pn, pa - pA)
-                            pd = np.abs(d)
-                            act &= pd <= iteration_distance
-                            if add_only_upward:
-                                act &= d >= 0
-                            pp = pa - d[:, np.newaxis] * pn
-                            psv = sv[inv]
-                            nr = np.minimum(
-                                np.minimum(
-                                    np.linalg.norm(final_tri_points[psv[:, 0]] - pp, axis=1),
-                                    np.linalg.norm(final_tri_points[psv[:, 1]] - pp, axis=1),
-                                ),
-                                np.linalg.norm(final_tri_points[psv[:, 2]] - pp, axis=1),
-                            )
-                            alpha = np.where(
-                                nr < 1e-12,
-                                90.0,
-                                np.degrees(np.arctan2(pd, nr)),
-                            )
-                            ea = np.full(len(vng), iteration_angle, dtype=float)
-                            if reduce_angle_edge:
-                                sm = pme < edge_length_threshold
-                                ea[sm] = (
-                                    iteration_angle
-                                    * pme[sm]
-                                    / edge_length_threshold
-                                )
-                            if use_distance_as_rating:
-                                w = distance_weight / 100.0
-                                act &= (
-                                    (1 - w) * np.where(ea > 0, alpha / ea, 1.0)
-                                    + w * (
-                                        pd / iteration_distance
-                                        if iteration_distance > 0
-                                        else np.ones_like(pd)
-                                    )
-                                ) <= 1.0
-                            else:
-                                act &= alpha <= ea
-                            surface_completion_local = vng[act]
-                except Exception:
-                    # Completion is an additive classification stage only.  If
-                    # it cannot be built, retain the already-valid conservative
-                    # PTD result rather than failing the whole Ground run.
-                    surface_completion_local = np.array([], dtype=np.intp)
-                finally:
-                    try:
-                        del final_tri
-                    except Exception:
-                        pass
+        try:
+            from gui.ground_ptd_engine_v2 import GroundEngineV2, choose_per_simplex
+            _ground_v2 = GroundEngineV2(factory=Delaunay)
+        except Exception:
+            pass  # unavailable optional optimization: original SciPy path
 
+    # SciPy's barycentric transform (computed inside find_simplex) runs one
+    # tiny LAPACK call per triangle; with OpenBLAS's thread pool each call
+    # costs ~17 us instead of ~1 us. One BLAS thread gives identical bits.
+    try:
+        from gui.ground_ptd_incremental import blas_single_thread as _ground_blas_single
+    except Exception:
+        from contextlib import nullcontext as _ground_blas_single
+    # Qhull is deterministic: a bit-identical TIN input (for example the final
+    # completion sweep after "thresholds reached") reuses the previous TIN.
+    _ground_tin_reuse = _ground_os.environ.get('NAKSHA_GROUND_TIN_REUSE', '1').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    _ground_tin_cache = [None, None]
+
+    def _ground_tin(xy):
+        nonlocal _ground_v2, _trace_tin_seconds
+        tic = _ground_clock() if _trace else 0.0
+        try:
+            if _ground_v2 is not None:
+                try:
+                    return _ground_v2.triangulate(xy)
+                except Exception:
+                    _ground_v2 = None
+            if not _ground_tin_reuse:
+                return Delaunay(xy)
+            key = np.ascontiguousarray(xy, dtype=np.float64)
+            cached = _ground_tin_cache[0]
+            if (cached is not None and cached.shape == key.shape
+                    and np.array_equal(cached.view(np.uint64), key.view(np.uint64))):
+                return _ground_tin_cache[1]
+            _ground_tin_cache[0] = _ground_tin_cache[1] = None
+            built = Delaunay(xy)
+            _ground_tin_cache[0], _ground_tin_cache[1] = key.copy(), built
+            return built
+        finally:
+            if _trace:
+                _trace_tin_seconds += _ground_clock() - tic
+
+    def _ground_locate(triangulation, xy):
+        nonlocal _ground_v2, _trace_lookup_seconds, _trace_lookup_queries
+        tic = _ground_clock() if _trace else 0.0
+        try:
+            with _ground_blas_single():
+                if _ground_v2 is not None:
+                    try:
+                        return _ground_v2.locate(triangulation, xy)
+                    except Exception:
+                        _ground_v2 = None
+                return triangulation.find_simplex(xy)
+        finally:
+            if _trace:
+                _trace_lookup_seconds += _ground_clock() - tic
+                _trace_lookup_queries += len(xy)
+    _ground_gpu_calls = 0
+    _ground_gpu_candidates = 0
+    _ground_gpu_rejected = 0
+    _ground_gpu_seconds = 0.0
+    _ground_gpu_backend = {'vulkan': 0, 'cuda': 0}
+
+    def _ground_gpu_gate(pa, pA, pn):
+        nonlocal _ground_gpu_calls, _ground_gpu_candidates
+        nonlocal _ground_gpu_rejected, _ground_gpu_seconds, _trace_cuda_failures
+        if not _ground_gpu_requested or len(pa) < 4096:
+            return None
+        # Prefer REAL native Vulkan compute; optional CUDA, then unchanged CPU.
+        # The same unconditional CPU shadow audit below checks every reject.
+        result = None
+        from gui.ground_ptd_vulkan import conservative_vulkan_prefilter
+        if _ground_os.environ.get('NAKSHA_GROUND_VULKAN_COMPUTE', '1').lower() not in ('0', 'false', 'no', 'off'):
+            result = conservative_vulkan_prefilter(
+                pa, pA, pn, iteration_distance,
+                add_only_upward=add_only_upward,
+            )
+        if result is None and _ground_os.environ.get('NAKSHA_GROUND_GPU', '0').lower() in ('1', 'true', 'yes', 'on'):
+            from gui.ground_ptd_gpu import conservative_cuda_prefilter
+            result = conservative_cuda_prefilter(
+                pa, pA, pn, iteration_distance,
+                add_only_upward=add_only_upward,
+            )
+        if result is None:
+            if _trace:
+                _trace_cuda_failures += 1
+            return None
+        # Mandatory CPU audit of *every* proposed GPU reject. This is cheap
+        # (one plane dot product), and guarantees GPU floating-point behavior
+        # cannot discard any point that passes the authoritative CPU distance
+        # and upward gates. No approximate GPU decision is ever final.
+        keep = np.asarray(result['keep'], dtype=bool).copy()
+        if keep.shape != (len(pa),):
+            return None  # malformed accelerator output: full CPU fallback
+        rejected = np.flatnonzero(~keep)
+        if len(rejected):
+            d_cpu = np.einsum('ij,ij->i', pn[rejected], pa[rejected] - pA[rejected])
+            cpu_might_pass = np.abs(d_cpu) <= iteration_distance
+            if add_only_upward:
+                cpu_might_pass &= d_cpu >= 0
+            # Re-check any GPU rejection that the *original* CPU plane test
+            # would have kept. The remaining rejected points provably fail a
+            # necessary Ground criterion, regardless of GPU arithmetic.
+            keep[rejected[cpu_might_pass]] = True
+        _ground_gpu_calls += 1
+        _ground_gpu_candidates += result['candidates']
+        _ground_gpu_rejected += int(np.count_nonzero(~keep))
+        _ground_gpu_seconds += result['seconds']
+        _gpu_name = str(result.get('backend', '')).lower()
+        if 'vulkan' in _gpu_name:
+            _ground_gpu_backend['vulkan'] += 1
+        elif 'cuda' in _gpu_name:
+            _ground_gpu_backend['cuda'] += 1
+        return keep
+
+    # Opt-in stateful native evaluation (not persistent TIN insertion). Changed
+    # vertex sets still use the reference SciPy/Qhull rebuild. The native lookup
+    # preserves the complete ordered walk; cached/grid certificates are disabled.
+    # The original NumPy/SciPy code takes over on any refusal or failure.
+    _ground_inc = None
+    if not _early_reject and pts.dtype == np.float64 and pts.shape[1] == 3:
+        try:
+            from gui.ground_ptd_incremental import create_engine as _ground_inc_create
+            _ground_inc = _ground_inc_create(
+                pts, terrain_rad=terrain_rad, iteration_angle=iteration_angle,
+                iteration_distance=iteration_distance,
+                reduce_angle_edge=reduce_angle_edge,
+                edge_length_threshold=edge_length_threshold,
+                stop_triangulation=stop_triangulation,
+                stop_edge_length=stop_edge_length,
+                use_distance_as_rating=use_distance_as_rating,
+                distance_weight=distance_weight,
+                add_only_upward=add_only_upward,
+                one_per_simplex=terrascan_compatible_densification)
+        except Exception:
+            _ground_inc = None
+    _ground_inc_stats = None
+
+    def _ground_inc_run(triangulation, tin_ids, queries, mode):
+        """Engine result, or None after disabling it for the rest of this call."""
+        nonlocal _ground_inc, _ground_inc_stats, _trace_lookup_seconds, _trace_lookup_queries
+        if _ground_inc is None:
+            return None
+        tic = _ground_clock() if _trace else 0.0
+        try:
+            result = _ground_inc.run(triangulation, tin_ids, queries, mode)
+        except Exception:
+            result = None
+        finally:
+            if _trace:
+                _trace_lookup_seconds += _ground_clock() - tic
+                _trace_lookup_queries += len(queries)
+        _ground_inc_stats = dict(_ground_inc.stats)
+        if result is None:
+            _ground_inc.close()
+            _ground_inc = None
+        return result
+
+    # Worker cancellation can raise from a progress callback. Close native
+    # state even while the exception traceback retains this function frame.
+    try:
+        _trace_setup_seconds = _ground_clock() - _trace_start if _trace else 0.0
+        for iteration in range(max_iterations):
+            _iteration_start = _ground_clock() if _trace else 0.0
+            if _trace:
+                _iteration_tin_before = _trace_tin_seconds
+                _iteration_lookup_before = _trace_lookup_seconds
+            if abort_check and abort_check():
+                stop_reason = "cancelled"
+                break
+            ga=np.array(sorted(ground_set),dtype=np.intp)
+            if len(ga)<3:
+                stop_reason = "fewer than 3 TIN points"
+                break
+            if progress_cb:
+                progress_cb(
+                    12 + int(iteration / max_iterations * 80),
+                    f"Iter {iteration+1}/{max_iterations}: {len(ga):,} anchors …",
+                )
+            # Cap seed triangulation size to prevent Qhull memory spikes on huge seed sets.
+            ga_tri, tri_points = _subsample_ground_tin_points(pts, ga)
+            if len(tri_points) < 3:
+                stop_reason = "fewer than 3 sampled TIN points"
+                break
+            xy_tri = tri_points[:, :2]
+            if not np.isfinite(xy_tri).all():
+                stop_reason = "non-finite TIN coordinates"
+                break
+            if np.ptp(xy_tri[:,0]) <= 1e-12 or np.ptp(xy_tri[:,1]) <= 1e-12:
+                stop_reason = "degenerate TIN extent"
+                break
+            try:
+                tri = _ground_tin(xy_tri)
+            except Exception:
+                stop_reason = "TIN construction failed"
+                break
+            finally:
+                # Release the numpy slice used for triangulation immediately;
+                # Delaunay has already copied what it needs into C memory.
+                del xy_tri
+            # Existing ground guides the TIN but is never a source candidate. Only
+            # a bounded anchor subset is triangulated; mark every trusted-ground
+            # point processed so millions of unsampled class-2 points do not enter
+            # the expensive candidate query.
+            in_ground[:] = is_cg_local | is_context_local
+            in_ground[ga] = True
+            ng=np.where(~in_ground)[0]
+            if not len(ng):
+                stop_reason = "all candidates processed"
+                del tri
+                break
+            _inc = _ground_inc_run(tri, ga_tri, ng, 0)
+            if _inc is not None:
+                if _inc[0] == 'none_inside':
+                    stop_reason = "no candidates inside TIN"
+                    del tri
+                    break
+                np_ = _inc[1]
+                _rank_start = _ground_clock() if _trace else 0.0
+            else:
+                _xy_query = pts[ng, :2]
+                sids = _ground_locate(tri, _xy_query)
+                valid=sids!=-1
+                if not valid.any():
+                    stop_reason = "no candidates inside TIN"
+                    del tri
+                    break
+                vng=ng[valid]; vsids=sids[valid]
+                usids,inv=np.unique(vsids,return_inverse=True)
+                sv=tri.simplices[usids]
+                # Delaunay simplex indices refer to the possibly subsampled tri_points,
+                # never to the full ground array.  Mixing these arrays creates invalid
+                # triangle planes and can accept most or all source points.
+                _candidate_start = _ground_clock() if _trace else 0.0
+                A3=tri_points[sv[:,0]]; B3=tri_points[sv[:,1]]; C3=tri_points[sv[:,2]]
+                # GPU-assembled TIN facets (experimental). Each Vulkan FP64 value is
+                # bit-checked against the unchanged CPU formula; any mismatch restores
+                # the CPU value. SciPy still owns Delaunay triangle connectivity.
+                from gui.ground_ptd_vulkan_tin import exact_facet_geometry as _tin_geometry
+                me, nor, good = _tin_geometry(A3, B3, C3)
+                sl=np.arccos(np.clip(nor[:,2],-1,1)); tok=good&(sl<=terrain_rad)
+                pn=nor[inv]; pme=me[inv]; pto=tok[inv]; pA=A3[inv]; pa=pts[vng]
+                _gpu_keep = _ground_gpu_gate(pa, pA, pn)
+                if _gpu_keep is not None and not np.all(_gpu_keep):
+                    # Stable boolean subsequence: preserves original point ordering,
+                    # simplex IDs and the authoritative CPU per-facet tie-breaking.
+                    vng = vng[_gpu_keep]
+                    vsids = vsids[_gpu_keep]
+                    inv = inv[_gpu_keep]
+                    pn = pn[_gpu_keep]
+                    pme = pme[_gpu_keep]
+                    pto = pto[_gpu_keep]
+                    pA = pA[_gpu_keep]
+                    pa = pa[_gpu_keep]
+                act=pto.copy()
+                if stop_triangulation: act&=pme>=stop_edge_length
+                d=np.einsum('ij,ij->i',pn,pa-pA); pd=np.abs(d)
+                act&=pd<=iteration_distance
+                if add_only_upward: act&=d>=0
+                if _early_reject:
+                    from gui.ground_ptd_fast_eval import sparse_angle_filter
+                    act, alpha = sparse_angle_filter(
+                        tri_points, sv, inv, pa, pn, pme, d, pd, act,
+                        iteration_angle=iteration_angle,
+                        reduce_angle_edge=reduce_angle_edge,
+                        edge_length_threshold=edge_length_threshold,
+                        use_distance_as_rating=use_distance_as_rating,
+                        distance_weight=distance_weight,
+                        iteration_distance=iteration_distance)
+                else:
+                    pp=pa-d[:,np.newaxis]*pn; psv=sv[inv]
+                    nr=np.minimum(np.minimum(np.linalg.norm(tri_points[psv[:,0]]-pp,axis=1),np.linalg.norm(tri_points[psv[:,1]]-pp,axis=1)),np.linalg.norm(tri_points[psv[:,2]]-pp,axis=1))
+                    alpha=np.where(nr<1e-12,90.0,np.degrees(np.arctan2(pd,nr)))
+                    ea=np.full(len(vng),iteration_angle,dtype=float)
+                    if reduce_angle_edge:
+                        sm=pme<edge_length_threshold; ea[sm]=iteration_angle*pme[sm]/edge_length_threshold
+                    if use_distance_as_rating:
+                        w=distance_weight/100.0
+                        act&=(1-w)*np.where(ea>0,alpha/ea,1.0)+w*(pd/iteration_distance if iteration_distance>0 else np.ones_like(pd))<=1.0
+                    else:
+                        act&=alpha<=ea
+                if _trace:
+                    _trace_candidates_seconds += _ground_clock() - _candidate_start
+                _rank_start = _ground_clock() if _trace else 0.0
+                # TerraScan/Axelsson-style progressive densification is deliberately
+                # conservative inside each current TIN facet.  The legacy Naksha path
+                # accepted every passing point in the same facet at once, which can
+                # over-densify flat areas and makes a later percentage-based Class-0
+                # holdout look like random peppering.  In compatibility mode select at
+                # most ONE best passing candidate per simplex for this iteration.  The
+                # primary rank is iteration angle (TerraScan documents this as the main
+                # density control), then point-to-plane distance, then stable point id.
+                pass_pos = np.flatnonzero(act)
+                if terrascan_compatible_densification and len(pass_pos) and _ground_v2 is not None:
+                    chosen_pos = choose_per_simplex(
+                        vng, vsids, pd, alpha, pass_pos, len(tri.simplices)
+                    )
+                    np_ = vng[chosen_pos]
+                elif terrascan_compatible_densification and len(pass_pos):
+                    pass_sid = vsids[pass_pos]
+                    order = np.lexsort((
+                        vng[pass_pos],
+                        pd[pass_pos],
+                        alpha[pass_pos],
+                        pass_sid,
+                    ))
+                    ordered_sid = pass_sid[order]
+                    first = np.empty(len(order), dtype=bool)
+                    first[0] = True
+                    first[1:] = ordered_sid[1:] != ordered_sid[:-1]
+                    chosen_pos = pass_pos[order[first]]
+                    np_ = vng[chosen_pos]
+                else:
+                    np_ = vng[pass_pos]
+            if not len(np_):
+                stop_reason = "thresholds reached"
+                del tri
+                break
+            ground_set.update(np_.tolist())
+            iterations_completed = iteration + 1
+            if _trace:
+                _trace_ranking_seconds += _ground_clock() - _rank_start
+                _iteration_seconds = _ground_clock() - _iteration_start
+                _trace_iteration_slow.append((_iteration_seconds,
+                                              iteration + 1, int(len(ga))))
+                try:
+                    _every = max(1, min(100, int(
+                        _ground_os.environ.get('NAKSHA_GROUND_PROFILE_EVERY', '10'))))
+                except (ValueError, TypeError):
+                    _every = 10
+                if iteration == 0 or (iteration + 1) % _every == 0 or iteration + 1 == max_iterations:
+                    from gui.ground_ptd_profiler import log as _ground_trace_log
+                    _ground_trace_log(
+                        '[GROUND ITER] {}/{} anchors={:,} accepted={:,} '
+                        'wall={:.3f}s TIN={:.3f}s simplex={:.3f}s '
+                        'GroundCUDA_calls={}'.format(
+                            iteration + 1, max_iterations, len(ga), len(np_),
+                            _iteration_seconds,
+                            _trace_tin_seconds - _iteration_tin_before,
+                            _trace_lookup_seconds - _iteration_lookup_before,
+                            _ground_gpu_calls))
+            del tri
+
+        # ------------------------------------------------------------------
+        # Final surface-completion pass
+        # ------------------------------------------------------------------
+        # ``one best point per facet`` is intentionally kept as the TIN-anchor
+        # growth rule because it prevents a low object cluster from changing the
+        # surface too aggressively in a single iteration.  It must NOT, however,
+        # become a rule that only those sparse anchor points receive the Ground
+        # class.  That was the reason Ground appeared as isolated patches: on the
+        # user's 376k-point fence only 710 points became anchors.
+        #
+        # Once the TIN has converged, perform one classification-only sweep against
+        # that final surface.  Every remaining source point that passes the exact
+        # same slope, plane-distance and iteration-angle tests is labelled Ground,
+        # but it is NOT inserted back into the TIN.  Therefore classification
+        # coverage improves without changing the stable topology/seed logic or
+        # allowing powerlines/vegetation to steer the surface.
+        _trace_final_start = _ground_clock() if _trace else 0.0
+        _trace_final_tin_before = _trace_tin_seconds
+        _trace_final_lookup_before = _trace_lookup_seconds
+        surface_completion_local = np.array([], dtype=np.intp)
+        surface_completion_examined = 0
+        surface_completion_outside_tin = 0
+        if (
+            terrascan_compatible_densification
+            and complete_ground_from_final_tin
+            and stop_reason != "cancelled"
+            and len(ground_set) >= 3
+        ):
+            if progress_cb:
+                progress_cb(93, "Final ground-surface completion sweep …")
+            ga_final = np.asarray(sorted(ground_set), dtype=np.intp)
+            _ga_final_tri, final_tri_points = _subsample_ground_tin_points(pts, ga_final)
+            if len(final_tri_points) >= 3:
+                xy_final = final_tri_points[:, :2]
+                if (
+                    np.isfinite(xy_final).all()
+                    and np.ptp(xy_final[:, 0]) > 1e-12
+                    and np.ptp(xy_final[:, 1]) > 1e-12
+                ):
+                    try:
+                        final_tri = _ground_tin(xy_final)
+                        is_anchor = np.zeros(n, dtype=bool)
+                        is_anchor[ga_final] = True
+                        remain = np.flatnonzero(is_from_local & ~is_anchor)
+                        surface_completion_examined = int(len(remain))
+                        _inc = (_ground_inc_run(final_tri, _ga_final_tri, remain, 1)
+                                if len(remain) else None)
+                        if _inc is not None:
+                            surface_completion_outside_tin = int(_inc[2])
+                            if _inc[0] == 'ok':
+                                surface_completion_local = _inc[1]
+                        elif len(remain):
+                            _xy_query = pts[remain, :2]
+                            sids = _ground_locate(final_tri, _xy_query)
+                            valid = sids != -1
+                            surface_completion_outside_tin = int(
+                                np.count_nonzero(~valid)
+                            )
+                            if np.any(valid):
+                                vng = remain[valid]
+                                vsids = sids[valid]
+                                usids, inv = np.unique(vsids, return_inverse=True)
+                                sv = final_tri.simplices[usids]
+                                A3 = final_tri_points[sv[:, 0]]
+                                B3 = final_tri_points[sv[:, 1]]
+                                C3 = final_tri_points[sv[:, 2]]
+                                from gui.ground_ptd_vulkan_tin import exact_facet_geometry as _tin_geometry
+                                me, nor, good = _tin_geometry(A3, B3, C3)
+                                sl = np.arccos(np.clip(nor[:, 2], -1, 1))
+                                tok = good & (sl <= terrain_rad)
+                                pn = nor[inv]
+                                pme = me[inv]
+                                pto = tok[inv]
+                                pA = A3[inv]
+                                pa = pts[vng]
+                                _gpu_keep = _ground_gpu_gate(pa, pA, pn)
+                                if _gpu_keep is not None and not np.all(_gpu_keep):
+                                    vng = vng[_gpu_keep]
+                                    inv = inv[_gpu_keep]
+                                    pn = pn[_gpu_keep]
+                                    pme = pme[_gpu_keep]
+                                    pto = pto[_gpu_keep]
+                                    pA = pA[_gpu_keep]
+                                    pa = pa[_gpu_keep]
+                                act = pto.copy()
+                                if stop_triangulation:
+                                    act &= pme >= stop_edge_length
+                                d = np.einsum('ij,ij->i', pn, pa - pA)
+                                pd = np.abs(d)
+                                act &= pd <= iteration_distance
+                                if add_only_upward:
+                                    act &= d >= 0
+                                if _early_reject:
+                                    from gui.ground_ptd_fast_eval import sparse_angle_filter
+                                    act, alpha = sparse_angle_filter(
+                                        final_tri_points, sv, inv, pa, pn, pme, d, pd, act,
+                                        iteration_angle=iteration_angle,
+                                        reduce_angle_edge=reduce_angle_edge,
+                                        edge_length_threshold=edge_length_threshold,
+                                        use_distance_as_rating=use_distance_as_rating,
+                                        distance_weight=distance_weight,
+                                        iteration_distance=iteration_distance)
+                                else:
+                                    pp = pa - d[:, np.newaxis] * pn
+                                    psv = sv[inv]
+                                    nr = np.minimum(
+                                        np.minimum(
+                                            np.linalg.norm(final_tri_points[psv[:, 0]] - pp, axis=1),
+                                            np.linalg.norm(final_tri_points[psv[:, 1]] - pp, axis=1),
+                                        ),
+                                        np.linalg.norm(final_tri_points[psv[:, 2]] - pp, axis=1),
+                                    )
+                                    alpha = np.where(
+                                        nr < 1e-12,
+                                        90.0,
+                                        np.degrees(np.arctan2(pd, nr)),
+                                    )
+                                    ea = np.full(len(vng), iteration_angle, dtype=float)
+                                    if reduce_angle_edge:
+                                        sm = pme < edge_length_threshold
+                                        ea[sm] = (
+                                            iteration_angle
+                                            * pme[sm]
+                                            / edge_length_threshold
+                                        )
+                                    if use_distance_as_rating:
+                                        w = distance_weight / 100.0
+                                        act &= (
+                                            (1 - w) * np.where(ea > 0, alpha / ea, 1.0)
+                                            + w * (
+                                                pd / iteration_distance
+                                                if iteration_distance > 0
+                                                else np.ones_like(pd)
+                                            )
+                                        ) <= 1.0
+                                    else:
+                                        act &= alpha <= ea
+                                surface_completion_local = vng[act]
+                    except Exception:
+                        # Completion is an additive classification stage only.  If
+                        # it cannot be built, retain the already-valid conservative
+                        # PTD result rather than failing the whole Ground run.
+                        surface_completion_local = np.array([], dtype=np.intp)
+                    finally:
+                        try:
+                            del final_tri
+                        except Exception:
+                            pass
+
+    finally:
+        if _ground_inc is not None:
+            _ground_inc_stats = dict(_ground_inc.stats)
+            _ground_inc.close()
+            _ground_inc = None
+    _ground_tin_cache[0] = _ground_tin_cache[1] = None
+    _trace_final_elapsed = _ground_clock() - _trace_final_start if _trace else 0.0
+    _trace_final_other = max(
+        0.0, _trace_final_elapsed - (_trace_tin_seconds - _trace_final_tin_before)
+        - (_trace_lookup_seconds - _trace_final_lookup_before)
+    ) if _trace else 0.0
     gl=np.array(sorted(ground_set),dtype=np.intp)
     classification_local = (
         np.union1d(gl, surface_completion_local)
@@ -4048,6 +4348,76 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
             100,
             f"Done — {ground_count:,} ground, {class0_count:,} reserved in class 0",
         )
+    if _ground_gpu_calls:
+        print(
+            f"[Ground GPU] Vulkan compute={_ground_gpu_backend['vulkan']} calls, "
+            f"CUDA={_ground_gpu_backend['cuda']} calls; "
+            f"{_ground_gpu_rejected:,}/{_ground_gpu_candidates:,} "
+            f"CPU-audited rejects over {_ground_gpu_calls} calls, "
+            f"GPU dispatch+transfer {_ground_gpu_seconds:.3f}s; CPU retained all final decisions",
+            flush=True,
+        )
+    if _trace:
+        from gui.ground_ptd_profiler import report_ptd
+        total_seconds = _ground_clock() - _trace_start
+        active_stats = _ground_v2.stats if _ground_v2 is not None else {}
+        other_seconds = max(0.0, total_seconds - _trace_setup_seconds
+                            - _trace_tin_seconds - _trace_lookup_seconds
+                            - _trace_candidates_seconds - _trace_ranking_seconds
+                            - _trace_final_other)
+        report_ptd({
+            'working_points': int(n),
+            'source_candidates': source_candidate_count,
+            'iterations': iterations_completed,
+            'stop_reason': stop_reason,
+            'total_seconds': round(total_seconds, 6),
+            'early_reject': bool(_early_reject),
+            'final_sweep_wall_seconds': round(_trace_final_elapsed, 6),
+            'stages_seconds': {
+                'preparation_and_seeding': round(_trace_setup_seconds, 6),
+                'tin': round(_trace_tin_seconds, 6),
+                'simplex': round(_trace_lookup_seconds, 6),
+                'candidate_geometry': round(_trace_candidates_seconds, 6),
+                'facet_ranking': round(_trace_ranking_seconds, 6),
+                'final_sweep_other': round(_trace_final_other, 6),
+                'iteration_and_output_misc': round(other_seconds, 6),
+            },
+            'queries': int(_trace_lookup_queries),
+            'slowest_iterations': [
+                {'seconds': round(seconds, 6), 'iteration': iteration,
+                 'anchors': anchors}
+                for seconds, iteration, anchors in sorted(
+                    _trace_iteration_slow, reverse=True)[:3]
+            ],
+            'backend': {
+                'cpp_requested': _ground_os.environ.get('NAKSHA_GROUND_CPP', '0'),
+                'cpp_queries': int(active_stats.get('native_cpp_queries', 0)),
+                'grid_queries': int(active_stats.get('grid_queries', 0)),
+                'grid_fast_hits': int(active_stats.get('grid_fast_hits', 0)),
+                'grid_ordered_fallbacks': int(active_stats.get('grid_ordered_fallbacks', 0)),
+                'grid_fallback': active_stats.get('grid_fallback'),
+                'numba_queries': int(active_stats.get('compiled_queries', 0)),
+                'scipy_queries': int(active_stats.get('scipy_queries', 0)),
+                'audited_queries': int(active_stats.get('audited_queries', 0)),
+                'cpp_fallback': active_stats.get('native_cpp_fallback'),
+                'fallback': active_stats.get('fallback'),
+                'v2_active': _ground_v2 is not None,
+                'incremental': _ground_inc_stats,
+            },
+            'gpu': {
+                'requested': bool(_ground_gpu_requested),
+                'calls': _ground_gpu_calls,
+                'candidates': _ground_gpu_candidates,
+                'rejected': _ground_gpu_rejected,
+                'seconds': round(_ground_gpu_seconds, 6),
+                'failed_calls': _trace_cuda_failures,
+                'vulkan_calls': _ground_gpu_backend['vulkan'],
+                'cuda_calls': _ground_gpu_backend['cuda'],
+                'backend': ('vulkan_fp64_compute' if _ground_gpu_backend['vulkan'] else
+                            'cuda_fp64_torch' if _ground_gpu_backend['cuda'] else 'cpu'),
+                'cpu_shadow_verified': True,
+            },
+        })
     return {
         "changed": len(changed_indices),
         "indices": changed_indices,

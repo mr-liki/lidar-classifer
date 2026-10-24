@@ -1,0 +1,79 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+
+// An indexed, parallel GPU proposal for STRICTLY INTERIOR 2-D Delaunay
+// simplices. CPU SciPy/Qhull still constructs the connectivity. Any point
+// near a simplex edge, invalid triangle, ambiguity, outside the index, or
+// candidate-list overload reports -2 for exact CPU ordered-walk fallback.
+// The shader NEVER modifies classes, anchors, LAS, LAZ or LNT data.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(set=0,binding=0,std430) readonly buffer TransformData { double transform[]; } triangles;
+layout(set=0,binding=1,std430) readonly buffer GridOffsets { uint offsets[]; } grid;
+layout(set=0,binding=2,std430) readonly buffer GridTriangleIDs { uint IDs[]; } entries;
+layout(set=0,binding=3,std430) readonly buffer QueryXY { double xy[]; } queries;
+layout(set=0,binding=4,std430) writeonly buffer ResultIDs { int ids[]; } results;
+layout(push_constant) uniform Params {
+    uint count;
+    uint reserved;
+    double origin_x;
+    double origin_y;
+    double inverse_dx;
+    double inverse_dy;
+} pc;
+
+bool valid(double x) { return !isnan(x) && !isinf(x); }
+
+void main() {
+    uint qid = gl_GlobalInvocationID.x;
+    if (qid >= pc.count) return;
+    double x = queries.xy[2u*qid];
+    double y = queries.xy[2u*qid+1u];
+    results.ids[qid] = -2;
+    if (!valid(x) || !valid(y)) return;
+    double gx = (x - pc.origin_x) * pc.inverse_dx;
+    double gy = (y - pc.origin_y) * pc.inverse_dy;
+    // Safe outside-global-bounds fallback. No forced clamp of out-of-range
+    // query coordinates that could falsely certify a triangle.
+    if (!valid(gx) || !valid(gy) || gx < 0.0 || gy < 0.0 || gx >= 64.0 || gy >= 64.0)
+        return;
+    uint cell = 64u*uint(floor(gy)) + uint(floor(gx));
+    uint lo = grid.offsets[cell];
+    uint hi = grid.offsets[cell + 1u];
+    if (hi < lo || hi - lo > 512u) return;
+
+    int unique_id = -2;
+    uint possible = 0u;
+    for (uint j = lo; j < hi; ++j) {
+        uint sid = entries.IDs[j];
+        uint base = 6u*sid;
+        double dx = x - triangles.transform[base+4u];
+        double dy = y - triangles.transform[base+5u];
+        double a = triangles.transform[base];
+        double b = triangles.transform[base+1u];
+        double c = triangles.transform[base+2u];
+        double d = triangles.transform[base+3u];
+        if (!valid(a) || !valid(b) || !valid(c) || !valid(d) ||
+            !valid(dx) || !valid(dy)) return;
+
+        // Conservative floating-point envelope: if any other triangle
+        // COULD contain the query, report ambiguity. Never select an
+        // arbitrary triangle simply because it appears first in the CSR.
+        precise double z0 = dx*a + dy*b;
+        precise double z1 = dx*c + dy*d;
+        precise double z2 = 1.0 - z0 - z1;
+        double bound0 = 1e-12 + 128.0*2.220446049250313e-16*(abs(dx*a)+abs(dy*b)+1.0);
+        double bound1 = 1e-12 + 128.0*2.220446049250313e-16*(abs(dx*c)+abs(dy*d)+1.0);
+        double bound2 = 1e-12 + bound0 + bound1;
+        double tol = max(bound0,max(bound1,bound2));
+        if (!valid(z0) || !valid(z1) || !valid(z2) || !valid(tol)) return;
+        if (z0 >= -tol && z1 >= -tol && z2 >= -tol &&
+            z0 <= 1.0+tol && z1 <= 1.0+tol && z2 <= 1.0+tol) {
+            ++possible;
+            if (possible > 1u) return;  // near shared edge or overlapping facets
+            if (z0 > tol && z1 > tol && z2 > tol &&
+                z0 < 1.0-tol && z1 < 1.0-tol && z2 < 1.0-tol)
+                unique_id = int(sid);
+        }
+    }
+    if (possible == 1u) results.ids[qid] = unique_id;
+}

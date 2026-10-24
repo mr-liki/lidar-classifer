@@ -13,7 +13,7 @@ _LNT_DIR = os.path.join(ROOT, "native", "lnt")
 # Use the camera-preset build. Keeping a distinct deployed filename also lets a
 # corrected renderer be installed while an older main_shading.dll is still
 # mapped by a running Windows process.
-LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_peaks.dll")
+LNT_DLL = os.path.join(_LNT_DIR, "main_display_modes_elevation.dll")
 _VULKAN_DIR = os.path.join(ROOT, "native", "naksha_vulkan", "build_msvc")
 # Main and section renderers share the same engine module/device pool.
 VULKAN_DLL = os.path.join(_VULKAN_DIR, "naksha_vulkan.dll")
@@ -162,6 +162,9 @@ def lib():
     if hasattr(d, "lnt_view_set_surface_single_elevation"):
         d.lnt_view_set_surface_single_elevation.argtypes = [c_void_p, c_double]
         d.lnt_view_set_surface_single_elevation.restype = c_int
+    if hasattr(d, "lnt_view_show_external_surface"):
+        d.lnt_view_show_external_surface.argtypes = [c_void_p]
+        d.lnt_view_show_external_surface.restype = c_int
     if hasattr(d, "lnt_view_capture"):
         d.lnt_view_capture.argtypes = [c_void_p, c_void_p, c_uint64,
                                        POINTER(c_uint32), POINTER(c_uint32)]
@@ -623,6 +626,12 @@ class NativeView:
             return False
         return bool(lib().lnt_view_set_surface_single_elevation(
             c_void_p(self.h), float(elevation_deg)))
+
+    def show_external_surface(self):
+        """Present a mesh uploaded through the shared Vulkan renderer handle."""
+        if not (self._ok() and hasattr(lib(), "lnt_view_show_external_surface")):
+            return False
+        return bool(lib().lnt_view_show_external_surface(c_void_p(self.h)))
 
     def capture(self):
         """The engine's current frame as an (h, w, 4) uint8 array, or None."""

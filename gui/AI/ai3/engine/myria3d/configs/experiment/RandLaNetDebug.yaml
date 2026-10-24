@@ -1,0 +1,24 @@
+# @package _global_
+
+# Nota : may need to call
+#   python myria3d/pctl/dataset/toy_dataset.py
+# to create a toy dataset before running this.
+
+logger:
+  comet:
+    experiment_name: "RandLaNetDebug"
+    disabled: true
+
+trainer:
+  limit_train_batches: 1
+  limit_val_batches: 1
+  limit_test_batches: 1
+  max_epochs: 1
+  num_sanity_val_steps: 0
+
+datamodule:
+  batch_size: 2
+  num_workers: 1
+  # runtime.cwd is where application is run from e.g. where run.py is.
+  hdf5_file_path: "${hydra:runtime.cwd}/tests/data/toy_dataset.hdf5"
+

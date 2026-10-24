@@ -502,8 +502,8 @@ class _InputFilter(QObject):
                 self._last = None
                 _armed_picker.on_press(ev.position())
                 return True
-        for _attr in ("native_identify", "native_zoom", "native_select",
-                      "native_layer_pick"):
+        for _attr in ("native_temp_fence", "native_identify", "native_zoom",
+                      "native_select", "native_layer_pick"):
             _tool = getattr(self.view, _attr, None)
             if _tool is None or not getattr(_tool, "active", False):
                 continue
@@ -515,6 +515,11 @@ class _InputFilter(QObject):
                     return True
             elif t == E.MouseMove and not _middle_drag:
                 if _tool.move(ev.position()):
+                    return True
+            elif t == E.MouseButtonDblClick and ev.button() != Qt.MiddleButton:
+                _double = getattr(_tool, "double_click", None)
+                if callable(_double) and _double(ev.position(), ev.button()):
+                    self._last = None
                     return True
             elif t == E.MouseButtonRelease and ev.button() != Qt.MiddleButton:
                 _release = getattr(_tool, "release", None)
