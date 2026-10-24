@@ -1027,10 +1027,14 @@ static void* open_impl(void* parent_hwnd, uint64_t attach_handle, void* on_windo
     // holes while detail loads), and the GPU upload is time-sliced so a camera move
     // never stalls a frame on tile uploads. NAKSHA_LNT_POINT_BUDGET overrides the budget.
     {
+        const char* progressive = std::getenv("NAKSHA_LNT_PROGRESSIVE_TILES");
+        const bool hold = !(progressive && std::strcmp(progressive, "1") == 0);
         LntLodParams lp = v->streamer.params();
         lp.max_nodes = 20000;
         lp.point_budget = 6000000;
-        lp.gate_split_on_residency = true;     // parent retention: a parent stays until its children land
+        // A held cut must target the final LOD independently of CPU residency.
+        // Otherwise each arriving sibling group publishes an intermediate cut.
+        lp.gate_split_on_residency = !hold;
         if (const char* env = std::getenv("NAKSHA_LNT_POINT_BUDGET"))
             if (unsigned long long b = std::strtoull(env, nullptr, 10)) lp.point_budget = b;
         v->streamer.set_params(lp);
@@ -1038,6 +1042,10 @@ static void* open_impl(void* parent_hwnd, uint64_t attach_handle, void* on_windo
         v->streamer.set_upload_budget_ms(5.0);
         v->streamer.set_prefetch_ahead(4.0);
         v->streamer.set_merge_draw_ranges(true);
+        // Refinement happens out of sight: the last complete picture stays on screen
+        // until every tile of the new cut is uploaded. NAKSHA_LNT_PROGRESSIVE_TILES=1
+        // restores progressive (stand-in) drawing.
+        v->streamer.set_hold_incomplete_cut(hold);
     }
     v->reset();
     v->loop.attach(&v->ctl, &v->cache, v->origin);
@@ -1351,6 +1359,14 @@ __declspec(dllexport) void lnt_view_set_point_budget(void* h, uint64_t points) {
     }
 }
 
+// Per-frame GPU upload time slice (0 = unlimited). The interactive loop applies its
+// own slice to the streamer every frame (1 ms by default), so it is set there. Small
+// while navigating so a move never stalls on uploads; larger while the camera is still
+// so a full-detail cut fills in quickly.
+__declspec(dllexport) void lnt_view_set_upload_budget_ms(void* h, double ms) {
+    if (View* v = static_cast<View*>(h)) v->loop.set_upload_budget_ms(ms);
+}
+
 // ---- section tools: point query, classification write-back, screen <-> world ---------
 // Collects every leaf point inside the closed world box [mn, mx]; returns the count, -1 on
 // error, -2 when it exceeds max_points (0 = unlimited). Fetch them with lnt_query_fetch.
@@ -1647,6 +1663,11 @@ __declspec(dllexport) int lnt_view_surface_point_counts(void* h, uint64_t* out3)
     if(!h||!out3) return 0;
     std::memcpy(out3,static_cast<View*>(h)->surface_point_counts,sizeof(uint64_t)*3);
     return 1;
+}
+
+// Style-only engine updates need the next GUI tick, without the 100 ms idle wait.
+__declspec(dllexport) void lnt_view_request_redraw(void* h) {
+    if (h) static_cast<View*>(h)->frame_sig_valid = false;
 }
 
 __declspec(dllexport) int lnt_view_frame(void* h, float dt, LntViewStats* out) {

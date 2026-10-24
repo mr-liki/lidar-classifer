@@ -704,11 +704,20 @@ void PointCloudRenderer::updateBoundaryFlags() {
             ++boundaryPublishes_;
         }
     }
-    if (!boundaryJob_.valid() && structuralBoundary_.dirty()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (boundaryObservedRevision_ != structuralBoundary_.revision()) {
+        boundaryObservedRevision_ = structuralBoundary_.revision();
+        boundaryChangedAt_ = now;
+    }
+    // Prepare Structured flags before the user enables borders. Wait for a
+    // quiet cut so navigation/streaming does not launch a grid for every frame.
+    if (!boundaryJob_.valid() && structuralBoundary_.dirty() &&
+        now - boundaryChangedAt_ >= std::chrono::milliseconds(200)) {
         auto snapshot = structuralBoundary_;
-        snapshot.restrictToRanges(drawRanges_);
+        auto selected = drawRanges_;
         const auto count = pointCount_;
-        boundaryJob_ = std::async(std::launch::async, [snapshot=std::move(snapshot),count]() mutable {
+        boundaryJob_ = std::async(std::launch::async, [snapshot=std::move(snapshot),selected=std::move(selected),count]() mutable {
+            snapshot.restrictToRanges(selected);
             auto ranges = snapshot.ranges();
             return BoundaryResult{snapshot.compute(count,true),std::move(ranges)};
         });
@@ -720,7 +729,9 @@ void PointCloudRenderer::updateBoundaryFlags() {
 void PointCloudRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
     if (!initialized_ || pointCount_ == 0 || !visible_) return;
     if (arenaMode_ && drawRanges_.empty()) return;
-    if (borderPercent_ > 0.0f && borderMode_ == 1 && displayMode_ != 4)
+    // Arena boundary work is asynchronous and independent of border style.
+    // Width/mode changes then only update shader push constants.
+    if (displayMode_ != 4 && (arenaMode_ || (borderPercent_ > 0.0f && borderMode_ == 1)))
         updateBoundaryFlags();
     VkExtent2D ext = renderer_->GetExtent();
     VkViewport vp{0.0f, 0.0f, static_cast<float>(ext.width),

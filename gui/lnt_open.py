@@ -665,6 +665,15 @@ class LntMainView(QObject):
     that widget over as the main viewport (the app's own install_as_main_viewport),
     attaches the native streamer to the same renderer, and pumps frames."""
 
+    # Idle refinement. While the camera moves, the interactive cut (the SSE dial and
+    # the DLL's point budget) keeps navigation smooth. Interior LOD nodes are strided
+    # samples, so thin classes (wires, towers) break up in them; once the camera is
+    # still, every visible ORIGINAL point is drawn within a larger budget.
+    MOTION_POINT_BUDGET = int(os.environ.get("NAKSHA_LNT_POINT_BUDGET") or 6_000_000)
+    IDLE_POINT_BUDGET = int(os.environ.get("NAKSHA_LNT_IDLE_POINT_BUDGET") or 40_000_000)
+    IDLE_AFTER_S = 0.3
+    MOTION_UPLOAD_MS, IDLE_UPLOAD_MS = 1.0, 30.0   # per-frame GPU upload slice (loop default 1 ms)
+
     def __init__(self, app, lnt_path, name):
         super().__init__(app)
         self.app, self.lnt_path, self.name = app, lnt_path, name
@@ -701,6 +710,9 @@ class LntMainView(QObject):
         self._size = (0, 0)
         self._fails = 0
         self._n = 0
+        self._idle_detail = False
+        self._camera_probe = None
+        self._moved_at = self._t
         self._timer = QTimer(self)
         self._timer.setInterval(8)
         self._timer.timeout.connect(self._tick)
@@ -1111,8 +1123,32 @@ class LntMainView(QObject):
     def adjust_sse(self, delta):
         self.sse = max(0.0, min(50.0, self.sse + delta))
         if self.native is not None:
-            self.native.set_sse(self.sse)
+            self._set_idle_detail(False)       # show the new dial value; refine again when still
+            self._moved_at = time.perf_counter()
         self._status(f"LNT detail (SSE) = {self.sse:.0f} px  (0 = full resolution)")
+
+    def _set_idle_detail(self, on):
+        self._idle_detail = on
+        self.native.set_point_budget(self.IDLE_POINT_BUDGET if on else self.MOTION_POINT_BUDGET)
+        self.native.set_sse(0.0 if on else self.sse)
+        self.native.set_upload_budget_ms(self.IDLE_UPLOAD_MS if on else self.MOTION_UPLOAD_MS)
+
+    def _update_idle_detail(self, now):
+        """Interactive cut while the camera moves, full detail once it is still.
+        Any camera change (pan, zoom, orbit, fit, a programmatic move) shows up in
+        the world->screen mapping, so that is the motion probe. Shaded/Surface draw
+        surface tiles, not points, and keep the interactive point cut."""
+        nv = self.native
+        probe = (nv.world_to_screen(0.0, 0.0), nv.world_to_screen(1000.0, 1000.0))
+        if probe != self._camera_probe:
+            self._camera_probe, self._moved_at = probe, now
+            if self._idle_detail:
+                self._set_idle_detail(False)
+        elif self.shading_name in ("shaded", "shaded_class", "surface"):
+            if self._idle_detail:
+                self._set_idle_detail(False)
+        elif not self._idle_detail and now - self._moved_at >= self.IDLE_AFTER_S:
+            self._set_idle_detail(True)
 
     def _status(self, text):
         try:
@@ -1153,6 +1189,7 @@ class LntMainView(QObject):
             nv.resize(*size)
         now = time.perf_counter()
         dt, self._t = now - self._t, now
+        self._update_idle_detail(now)
         if nv.frame(dt):
             # Native LNT frames bypass VulkanRenderBackend.request_render.
             # Advance its projection cache and refresh overlays here too.

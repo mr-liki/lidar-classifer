@@ -42,6 +42,7 @@ class StructuralBoundary {
     std::map<std::size_t, std::shared_ptr<Chunk>> chunks_;
     uint64_t nextVersion_ = 0;
     bool dirty_ = true;
+    uint64_t revision_ = 0;
 public:
     struct Range { std::size_t first, count; uint64_t version; };
     std::vector<Range> ranges() const {
@@ -55,7 +56,8 @@ public:
         --it;
         return r.first >= it->first && r.first+r.count <= it->first+it->second->size() && it->second->version == r.version;
     }
-    void invalidate() { dirty_ = true; }
+    uint64_t revision() const { return revision_; }
+    void invalidate() { dirty_ = true; ++revision_; }
     // Resident parents and fine descendants may overlap in XY. Only the
     // selected draw cut belongs in a boundary grid; hidden LODs corrupt cell
     // heights/classes and flag flat building interiors as structural edges.
@@ -82,7 +84,7 @@ public:
         chunks_ = std::move(selected);
     }
     bool dirty() const { return dirty_; }
-    void clear() { chunks_.clear(); dirty_ = true; }
+    void clear() { chunks_.clear(); invalidate(); }
     void positions(std::size_t first, const float* xyz, std::size_t count) {
         // Arena slots may be reused or partially replaced. Retain only the
         // unaffected portions of an old tile, never stale overlapping points.
@@ -108,7 +110,7 @@ public:
         c.classes.assign(count, -1);
         c.version = ++nextVersion_;
         chunks_[first] = std::make_shared<Chunk>(std::move(c));
-        dirty_ = true;
+        invalidate();
     }
     void classification(std::size_t first, const uint8_t* cls, std::size_t count) {
         const auto end = first + count;
@@ -123,7 +125,7 @@ public:
             it->second->version = ++nextVersion_;
             for (auto i = lo; i < hi; ++i) it->second->classes[i-it->first] = cls[i-first];
         }
-        dirty_ = true;
+        invalidate();
     }
     std::vector<uint8_t> compute(std::size_t pointCount, bool streamedCut = false) const {
         std::vector<uint8_t> flags(pointCount, 0);

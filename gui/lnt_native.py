@@ -74,6 +74,9 @@ def lib():
     d.lnt_view_attach.argtypes = [c_uint64, c_int, c_int, c_char_p, c_char_p,
                                   c_uint32, c_double, c_char_p, c_int]
     d.lnt_view_attach.restype = c_void_p
+    if hasattr(d, "lnt_view_request_redraw"):
+        d.lnt_view_request_redraw.argtypes = [c_void_p]
+        d.lnt_view_request_redraw.restype = None
     d.lnt_view_close.argtypes = [c_void_p]
     d.lnt_view_resize.argtypes = [c_void_p, c_int, c_int]
     d.lnt_view_resize.restype = c_int
@@ -633,6 +636,11 @@ class NativeView:
         if self._ok() and hasattr(lib(), "lnt_view_set_point_budget"):
             lib().lnt_view_set_point_budget(c_void_p(self.h), int(points))
 
+    def set_upload_budget_ms(self, ms):
+        """Per-frame GPU upload time slice in ms (0 = unlimited; the view loop defaults to 1 ms)."""
+        if self._ok() and hasattr(lib(), "lnt_view_set_upload_budget_ms"):
+            lib().lnt_view_set_upload_budget_ms(c_void_p(self.h), c_double(ms))
+
     def set_clip_planes(self, planes):
         """GPU cross-section clip volume: up to 4 world-space (A, B, C, D) planes; a point
         is kept where A*x + B*y + C*z + D >= 0. None / empty switches clipping off.
@@ -657,6 +665,11 @@ class NativeView:
 
     def reset(self):
         self._ok() and lib().lnt_view_reset(c_void_p(self.h))
+
+    def request_redraw(self):
+        fn = getattr(lib(), "lnt_view_request_redraw", None)
+        if self._ok() and fn is not None:
+            fn(c_void_p(self.h))
 
     def frame(self, dt):
         return self._ok() and bool(lib().lnt_view_frame(c_void_p(self.h), float(dt),

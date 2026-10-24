@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -227,6 +228,8 @@ private:
     };
     std::future<BoundaryResult> boundaryJob_;
     uint64_t boundaryBuilds_ = 0, boundaryPublishes_ = 0;
+    uint64_t boundaryObservedRevision_ = ~uint64_t(0);
+    std::chrono::steady_clock::time_point boundaryChangedAt_{};
     void updateBoundaryFlags();
     // Packed oct16x2 normal stream (4 bytes/point), bound as vertex location 4.
     // Separate from positions_: no duplication, and the two streams must use an

@@ -583,6 +583,8 @@ struct LntStreamStats {
     uint64_t stand_in_ranges = 0;    // last frame
     uint64_t stand_in_points = 0;    // last frame
     uint64_t stand_in_frames = 0;    // frames that used the fallback at least once
+    bool     holding = false;        // this frame kept the previous complete draw list
+    uint64_t held_frames = 0;        // frames that did so (cumulative)
     uint64_t uncovered_cells = 0;    // last frame: cut cells with nothing on the GPU
     uint64_t uncovered_cells_total = 0;   // cumulative, including the cold start
     uint64_t max_uncovered_cells = 0;     // worst frame, so a single bad frame cannot hide
@@ -615,6 +617,9 @@ public:
         draw_ranges_valid_ = false;
         last_firsts_.clear();
         last_counts_.clear();
+        last_cut_complete_ = false;
+        stalled_holds_ = 0;
+        stats_.holding = false;
         err.clear();
         return true;
     }
@@ -658,6 +663,14 @@ public:
     // a cut made of many neighbouring tiles costs one draw call per run, not one per
     // tile. Off by default (it changes the engine's range count).
     void set_merge_draw_ranges(bool on) { merge_ranges_ = on; draw_ranges_valid_ = false; }
+    // BACKGROUND REFINEMENT. While the new cut still has cells whose tiles are not
+    // on the GPU (drawn by a coarser ancestor stand-in, or blank), keep drawing the
+    // previous COMPLETE draw list and swap to the new one in a single frame once
+    // every cell is uploaded. Uploads continue underneath, so the patchwork of
+    // mixed densities is never shown. A cold start (nothing complete yet) and a
+    // bounded-arena wrap (which overwrites the old slots) still draw progressively.
+    void set_hold_incomplete_cut(bool on) { hold_incomplete_ = on; }
+    bool hold_incomplete_cut() const { return hold_incomplete_; }
     uint64_t prefetch_requested() const { return prefetch_requested_; }
     static void merge_contiguous(const std::vector<uint32_t>& firsts,
                                  const std::vector<uint32_t>& counts,
@@ -997,7 +1010,9 @@ public:
                     cache_->residency(id) == LntResidency::Resident)
                     incoming_points += tile->count;
             }
-            scene.prepare_bounded_frame(incoming_points);
+            // A wrap rewrites every slot from 0: the held list would point at
+            // other tiles' points, so there is nothing safe to keep drawing.
+            if (scene.prepare_bounded_frame(incoming_points)) draw_ranges_valid_ = false;
         }
         uint64_t uploaded_now = 0;
         // The base layer goes first (it is pinned, so peek() is safe): coarse cover
@@ -1040,6 +1055,21 @@ public:
         //    nearest ancestor that does, so a cell whose payload is on its way is
         //    drawn at LOD density instead of going blank. See LntDrawList.
         const LntDrawList& list = resolve_draw_list(scene);
+        stats_.holding = false;
+        // A cut that stops making progress (nothing uploaded, nothing loading: a tile
+        // that cannot be read) is shown as it is after kMaxStalledHolds frames rather
+        // than held forever.
+        constexpr int kMaxStalledHolds = 120;
+        const bool incomplete = list.empty() || list.stand_ins > 0 || list.uncovered_nodes > 0;
+        const bool progressing = uploaded_now > 0 || (cache_ != nullptr && cache_->pending() > 0);
+        stalled_holds_ = (!incomplete || progressing) ? 0 : stalled_holds_ + 1;
+        if (hold_incomplete_ && incomplete && draw_ranges_valid_ && last_cut_complete_ && !last_firsts_.empty() &&
+            stalled_holds_ <= kMaxStalledHolds) {
+            stats_.holding = true;
+            ++stats_.held_frames;
+            stats_.cut_nodes = cut;
+            return last_firsts_.size();
+        }
         if (list.empty()) {
             // Nothing drawable. Either the cut is empty or every cell in it is
             // blank - a cold start, where nothing has reached the GPU yet. The
@@ -1050,6 +1080,7 @@ public:
             last_firsts_.clear();
             last_counts_.clear();
             draw_ranges_valid_ = true;
+            last_cut_complete_ = false;
             stats_.ranges_pushed = 0;
             stats_.cut_points = 0;
             stats_.stand_in_ranges = 0;
@@ -1078,6 +1109,7 @@ public:
         } else {
             ++stats_.range_pushes_skipped;
         }
+        last_cut_complete_ = !incomplete;
         last_firsts_ = list.firsts;
         last_counts_ = list.counts;
         draw_ranges_valid_ = true;
@@ -1271,6 +1303,9 @@ private:
     int base_levels_ = -1;
     double prefetch_ahead_ = 0.0;
     bool merge_ranges_ = false;
+    bool last_cut_complete_ = false; // only a complete displayed cut can be held
+    bool hold_incomplete_ = false;
+    int stalled_holds_ = 0;
     std::vector<uint64_t> prefetch_ids_;
     std::unordered_set<uint64_t> issued_;    // ids this streamer asked the cache for
     uint64_t prefetch_requested_ = 0;

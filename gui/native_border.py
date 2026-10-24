@@ -52,6 +52,7 @@ def apply_border(app, slot, percent=None, mode=None):
         if native is not None and native.native is not None:
             if not set_border(native.native.renderer_handle(), percent, mode):
                 raise RuntimeError('Native border update failed')
+            native.native.request_redraw()
     else:
         canvas = getattr(sections, 'views', {}).get(slot)
         if canvas is not None and canvas.backend._handle:

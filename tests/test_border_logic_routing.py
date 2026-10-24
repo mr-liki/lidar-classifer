@@ -1,9 +1,11 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from gui import unified_actor_manager as actors
 from gui import classification_tools
+from gui import native_border
 
 
 class _Dialog:
@@ -116,3 +118,47 @@ def test_brush_direct_rgb_poke_is_allowed_in_class_mode():
     assert classification_tools._section_brush_uses_class_rgb(
         app, 0, actor
     ) is True
+
+
+def _native_border_app():
+    redraw = Mock()
+    native = SimpleNamespace(renderer_handle=lambda: 17, request_redraw=redraw)
+    return SimpleNamespace(_lnt_main_view=SimpleNamespace(native=native)), redraw
+
+
+def test_native_main_border_updates_native_engine_then_requests_redraw(monkeypatch):
+    app, redraw = _native_border_app()
+    calls = []
+    monkeypatch.setattr(native_border, "settings_for", lambda *_: (0, 1))
+    monkeypatch.setattr(native_border, "set_border",
+                        lambda *args: calls.append(args) or True)
+    redraw.side_effect = lambda: calls.append("redraw")
+
+    assert native_border.apply_border(app, 0, 35, 2)
+    assert calls == [(17, 35.0, 2), "redraw"]
+    assert app.point_border_percent == 35
+    assert app._naksha_border_logic_modes[0] == 2
+
+
+def test_native_failed_border_update_does_not_request_a_frame(monkeypatch):
+    app, redraw = _native_border_app()
+    monkeypatch.setattr(native_border, "settings_for", lambda *_: (0, 1))
+    monkeypatch.setattr(native_border, "set_border", lambda *_: False)
+
+    with pytest.raises(RuntimeError, match="Native border update failed"):
+        native_border.apply_border(app, 0, 35, 1)
+    redraw.assert_not_called()
+
+
+def test_native_section_border_only_marks_its_native_canvas_dirty(monkeypatch):
+    main, redraw = _native_border_app()
+    canvas = SimpleNamespace(backend=SimpleNamespace(_handle=29), _dirty=False)
+    main._native_sections = SimpleNamespace(views={2: canvas})
+    pushed = Mock(return_value=True)
+    monkeypatch.setattr(native_border, "settings_for", lambda *_: (0, 1))
+    monkeypatch.setattr(native_border, "set_border", pushed)
+
+    assert native_border.apply_border(main, 2, 20, 0)
+    pushed.assert_called_once_with(29, 20.0, 0)
+    assert canvas._dirty
+    redraw.assert_not_called()
