@@ -27,20 +27,7 @@ from gui.undo_context_manager import get_undo_context_manager
 
 
 # ── SNT dialog button highlight ─────────────────────────────────────────
-# Keeps the File ▸ Attachments ▸ SNT ribbon button in a "medium bright white"
-# highlighted state while the Attach SNT window is visible, so users can see
-# the feature is still open / in use. Cleared when the dialog is hidden.
-_SNT_HIGHLIGHT_QSS = """
-QPushButton#ribbonButton[sntOpen="true"] {
-    background-color: #9aa0a6;
-    border: 1px solid #c8cdd2;
-    border-radius: 10px;
-}
-QPushButton#ribbonButton[sntOpen="true"]:hover {
-    background-color: #a8adb3;
-    border: 1px solid #d5dade;
-}
-"""
+# Use the normal ribbon checked state while the Attach SNT window is visible.
 
 
 def _find_snt_ribbon_button(app):
@@ -63,35 +50,29 @@ def _find_snt_ribbon_button(app):
 
 
 def _set_snt_button_highlight(app, on: bool) -> None:
-    """Toggle the SNT ribbon button highlight on/off (safe no-op on failure)."""
+    """Use the normal ribbon highlight while the SNT dialog is open."""
     try:
         btn = _find_snt_ribbon_button(app)
         if btn is None:
             return
-        btn.setProperty("sntOpen", True if on else False)
-        if on:
-            # Prepend our highlight QSS so it wins over the theme's inline style
-            # without wiping it (theme refresh reapplies via setStyleSheet).
-            existing = str(btn.styleSheet() or "")
-            if "sntOpen" not in existing:
-                btn.setStyleSheet(_SNT_HIGHLIGHT_QSS + existing)
-        else:
-            existing = str(btn.styleSheet() or "")
-            if "sntOpen" in existing:
-                btn.setStyleSheet(existing.replace(_SNT_HIGHLIGHT_QSS, ""))
-        # Force QSS re-evaluation of the dynamic property
-        try:
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-        except Exception:
-            pass
-        btn.update()
+        # Dialog visibility owns this state, so other tools and tab switches
+        # must not clear it through the section's active-button tracking.
+        section = btn.parentWidget()
+        while section is not None:
+            if getattr(section, "active_button", None) is btn:
+                section.active_button = None
+                break
+            section = section.parentWidget()
+        if btn.isChecked() != on:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(on)
+            btn.blockSignals(blocked)
     except Exception:
         pass
 
 
 class _SntDialogVisibilityFilter(QObject):
-    """Clears the SNT button highlight when the dialog is hidden/destroyed."""
+    """Syncs the SNT button highlight when the dialog is shown or hidden."""
 
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
@@ -120,13 +101,13 @@ def _track_snt_dialog_visibility(app, dlg) -> None:
     """Install the visibility filter (once) and light the SNT button."""
     try:
         if getattr(dlg, "_snt_btn_filter_installed", False):
-            _set_snt_button_highlight(app, True)
+            _set_snt_button_highlight(app, dlg.isVisible())
             return
         filt = _SntDialogVisibilityFilter(app, parent=dlg)
         dlg.installEventFilter(filt)
         dlg._snt_btn_filter = filt
         dlg._snt_btn_filter_installed = True
-        _set_snt_button_highlight(app, True)
+        _set_snt_button_highlight(app, dlg.isVisible())
     except Exception:
         pass
 
@@ -1044,7 +1025,8 @@ class FileRibbon(QWidget):
         attachments = RibbonSection("Attachments", self)
         attachments.add_button(" DXF", "📎", self._attach_dxf)
         attachments.add_button("DWG", "📐", self._attach_dwg, toggleable=False)
-        attachments.add_button("SNT", "🗂️", self._attach_snt, toggleable=False)
+        self.snt_btn = attachments.add_button("SNT", "🗂️", self._attach_snt, toggleable=False)
+        self.snt_btn.setCheckable(True)
         attachments.add_button("PRJ", "📋", self._identify_blocks)
         attachments.add_button("Verify", "🔍", self._verify_grid_labels)
 
