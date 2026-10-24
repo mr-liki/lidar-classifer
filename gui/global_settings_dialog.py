@@ -240,7 +240,7 @@ class GlobalSettingsDialog(QDialog):
         self.category_list = QListWidget()
         self.category_list.setObjectName("gsdSidebar")
         self.category_list.setFixedWidth(160)
-        for label in ("Theme", "Navigation", "Updates"):
+        for label in ("Theme", "Navigation", "Updates", "Performance"):
             item = QListWidgetItem(f"  {label}")
             item.setSizeHint(QSize(160, 32))
             self.category_list.addItem(item)
@@ -257,6 +257,7 @@ class GlobalSettingsDialog(QDialog):
         self._page_builders = (
             self._build_theme_page,
             self._build_navigation_page, self._build_updates_page,
+            self._build_performance_page,
         )
         for _ in self._page_builders:
             self.category_stack.addWidget(QWidget())
@@ -473,6 +474,45 @@ class GlobalSettingsDialog(QDialog):
         layout.addStretch()
         return page
 
+    def _build_performance_page(self):
+        """Keep Ground performance separate from classifications and rendering."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        group = QGroupBox("Ground Classification Performance")
+        form = QFormLayout(group)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        self.ground_workers_combo = QComboBox()
+        self.ground_workers_combo.addItem("1 worker - Compatibility", 1)
+        self.ground_workers_combo.addItem("2 workers - Recommended", 2)
+        self.ground_workers_combo.addItem("4 workers - Advanced (more RAM)", 4)
+        form.addRow("Ground CPU workers:", self.ground_workers_combo)
+
+        self.ground_gpu_checkbox = QCheckBox("Use experimental CUDA Ground distance filter")
+        form.addRow("GPU pilot:", self.ground_gpu_checkbox)
+
+        self.ground_cuda_status = QLabel()
+        self.ground_cuda_status.setObjectName("dialogCaption")
+        self.ground_cuda_status.setWordWrap(True)
+        form.addRow("CUDA status:", self.ground_cuda_status)
+
+        self.ground_performance_note = QLabel(
+            "Applies to new Ground classification runs; jobs already in progress are "
+            "not changed. GPU is optional and does not accelerate CPU TIN construction. "
+            "The original CPU classifier is used if CUDA is unavailable. "
+            "Classification thresholds and point data are never changed here."
+        )
+        self.ground_performance_note.setObjectName("dialogCaption")
+        self.ground_performance_note.setWordWrap(True)
+        layout.addWidget(group)
+        layout.addWidget(self.ground_performance_note)
+        layout.addStretch()
+        return page
+
     def _on_category_changed(self, index):
         if index < 0:
             return
@@ -493,7 +533,8 @@ class GlobalSettingsDialog(QDialog):
         if index in self._loaded_pages:
             return
         loaders = (self._load_theme_settings,
-                   self._load_navigation_settings, self._load_update_settings)
+                   self._load_navigation_settings, self._load_update_settings,
+                   self._load_performance_settings)
         self._loading = True
         try:
             loaders[index]()
@@ -510,6 +551,7 @@ class GlobalSettingsDialog(QDialog):
             0: ('theme_combo',),
             1: ('zoom_behavior_combo', 'panning_button_combo'),
             2: ('auto_check_updates_cb', 'auto_download_updates_cb', 'update_channel_combo'),
+            3: ('ground_workers_combo', 'ground_gpu_checkbox'),
         }
         for name in names[category]:
             widget = getattr(self, name)
@@ -568,6 +610,20 @@ class GlobalSettingsDialog(QDialog):
         channel_index = self.update_channel_combo.findData(self.update_manager.channel)
         self.update_channel_combo.setCurrentIndex(max(0, channel_index))
         self._refresh_update_page()
+
+    def _load_performance_settings(self):
+        from gui.ground_performance_settings import (
+            read_ground_preferences, cuda_readiness,
+        )
+        prefs = read_ground_preferences(self.settings)
+        index = self.ground_workers_combo.findData(prefs["workers"])
+        self.ground_workers_combo.setCurrentIndex(max(0, index))
+        ready, reason = cuda_readiness()
+        self.ground_gpu_checkbox.setEnabled(ready)
+        self.ground_gpu_checkbox.setChecked(bool(ready and prefs["gpu"]))
+        if not ready and prefs["gpu"]:
+            reason += " Previous GPU preference is suspended; CPU fallback is active."
+        self.ground_cuda_status.setText(reason)
 
     def _refresh_update_page(self):
         self.current_version_label.setText(APP_VERSION)
@@ -742,6 +798,18 @@ class GlobalSettingsDialog(QDialog):
             else:
                 self.app._pan_nav_suspended_button = None
 
+    def _save_performance_settings(self):
+        from gui.ground_performance_settings import (
+            save_ground_preferences, configure_ground_runtime,
+        )
+        workers = self.ground_workers_combo.currentData() or 2
+        gpu_enabled = self.ground_gpu_checkbox.isEnabled() and self.ground_gpu_checkbox.isChecked()
+        save_ground_preferences(self.settings, workers, gpu_enabled)
+        result = configure_ground_runtime(
+            settings=self.settings, respect_environment=False,
+        )
+        self.ground_cuda_status.setText(result["cuda_status"])
+
     def _save_update_settings(self):
         self.update_manager.set_preferences(
             self.auto_check_updates_cb.isChecked(),
@@ -762,6 +830,8 @@ class GlobalSettingsDialog(QDialog):
                 self._save_navigation_settings()
             if 2 in self._dirty_categories:
                 self._save_update_settings()
+            if 3 in self._dirty_categories:
+                self._save_performance_settings()
 
             self.settings.sync()
             self._dirty_categories.clear()
