@@ -3701,12 +3701,16 @@ class BlockRibbon(QWidget):
         layout.setSpacing(2)
 
         create_section = RibbonSection("Create", self)
-        create_section.add_button(
+        self._create_section = create_section
+        self.create_block_btn = create_section.add_button(
             "Create Block",
             "▦",
             self._show_block_creation_settings,
             toggleable=False,
         )
+        # Highlighted like Measure > Line, but the state belongs to the tool:
+        # checked exactly while the native Create Block dialog is open.
+        self.create_block_btn.setCheckable(True)
         create_section.add_button(
             "Create Cell",
             "◯",
@@ -3716,11 +3720,29 @@ class BlockRibbon(QWidget):
         layout.addWidget(create_section)
         layout.addStretch()
 
+    def sync_create_block_button(self):
+        """Create Block stays highlighted exactly while its native dialog is
+        open - whether it was opened here, closed with X / Esc, or hidden."""
+        btn = self.create_block_btn
+        if self._create_section.active_button is btn:
+            self._create_section.active_button = None   # owned by the dialog, not the section toggle
+        app = getattr(self, "app", None) or self.window()
+        dialog = getattr(app, "native_block_creation_dialog", None)
+        try:
+            active = dialog is not None and dialog.isVisible()
+        except RuntimeError:                            # dialog already deleted
+            active = False
+        if btn.isChecked() != active:
+            blocked = btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(blocked)
+
     def _show_block_creation_settings(self):
         try:
             app = getattr(self, "app", None) or self.window()
             from gui.native_create import show_native_block_dialog
             if show_native_block_dialog(app):
+                self.sync_create_block_button()
                 return
             existing = getattr(app, "block_creation_settings_dialog", None)
             

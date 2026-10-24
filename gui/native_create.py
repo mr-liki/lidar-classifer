@@ -594,6 +594,21 @@ class NativeBlockDialog(BlockEditRefreshMixin, _BaseDialog):
         self.controller.clear_blocks()
         super().reject()
 
+    # Show/hide cover every way the tool starts and ends (ribbon, X, Esc).
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_ribbon_button()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._sync_ribbon_button()
+
+    def _sync_ribbon_button(self):
+        ribbon = getattr(getattr(self.app, 'ribbon_manager', None), 'ribbons', {}).get('block')
+        sync = getattr(ribbon, 'sync_create_block_button', None)
+        if callable(sync):
+            sync()
+
     def reset(self):
         self.mode_box.setCurrentIndex(0); self.total.setValue(60.); self.above.setValue(1.)
         self.below.setValue(1.); self.distance.setValue(250.)
