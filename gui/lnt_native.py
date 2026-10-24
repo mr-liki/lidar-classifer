@@ -633,6 +633,11 @@ class NativeView:
         if self._ok() and hasattr(lib(), "lnt_view_set_point_budget"):
             lib().lnt_view_set_point_budget(c_void_p(self.h), int(points))
 
+    def set_upload_budget_ms(self, ms):
+        """Per-frame GPU upload time slice in ms (0 = unlimited; the view loop defaults to 1 ms)."""
+        if self._ok() and hasattr(lib(), "lnt_view_set_upload_budget_ms"):
+            lib().lnt_view_set_upload_budget_ms(c_void_p(self.h), c_double(ms))
+
     def set_clip_planes(self, planes):
         """GPU cross-section clip volume: up to 4 world-space (A, B, C, D) planes; a point
         is kept where A*x + B*y + C*z + D >= 0. None / empty switches clipping off.

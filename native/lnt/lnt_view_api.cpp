@@ -1351,6 +1351,14 @@ __declspec(dllexport) void lnt_view_set_point_budget(void* h, uint64_t points) {
     }
 }
 
+// Per-frame GPU upload time slice (0 = unlimited). The interactive loop applies its
+// own slice to the streamer every frame (1 ms by default), so it is set there. Small
+// while navigating so a move never stalls on uploads; larger while the camera is still
+// so a full-detail cut fills in quickly.
+__declspec(dllexport) void lnt_view_set_upload_budget_ms(void* h, double ms) {
+    if (View* v = static_cast<View*>(h)) v->loop.set_upload_budget_ms(ms);
+}
+
 // ---- section tools: point query, classification write-back, screen <-> world ---------
 // Collects every leaf point inside the closed world box [mn, mx]; returns the count, -1 on
 // error, -2 when it exceeds max_points (0 = unlimited). Fetch them with lnt_query_fetch.
