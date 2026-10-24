@@ -240,6 +240,8 @@ class TempFenceTool:
         self._watch_timer = None   # conversion-completion poller
         self._prev_cursor = None
         self._redo_stack = []      # vertices removed by Ctrl+Z (for Ctrl+Y)
+        self._native_preview = None
+        self._native_fence_overlay = None
         # Fence preview is a lightweight overlay transaction.  Keep one actor
         # alive and update its VTK buffers in place; rebuilding/removing actors
         # on every mouse move makes a 47M-point scene feel frozen.
@@ -281,11 +283,46 @@ class TempFenceTool:
         except Exception:
             return None
 
+    def _native_view(self):
+        view = getattr(self.app, "_lnt_main_view", None)
+        if (view is not None and getattr(view, "native", None) is not None
+                and getattr(view, "mode_2d", False)):
+            return view
+        return None
+
+    def _native_widget(self):
+        view = self._native_view()
+        return getattr(getattr(view, "owner", None), "vulkan_widget", None)
+
     # ------------------------------------------------------------------
     # Activation / deactivation
     # ------------------------------------------------------------------
     def activate(self):
         """Start (or restart) the tool. Idempotent — safe to call repeatedly."""
+        native_view = self._native_view()
+        if native_view is not None:
+            if self.active and getattr(native_view, "native_temp_fence", None) is self:
+                _safe_status(self.app, "Temp Fence: click to place fence vertices")
+                return
+            self._remove_observers()
+            from gui.native_zoom_preview import VulkanTempFencePreview
+            if self._native_preview is None:
+                self._native_preview = VulkanTempFencePreview(
+                    native_view, '__temp_fence_preview__')
+            if self._native_fence_overlay is None:
+                self._native_fence_overlay = VulkanTempFencePreview(
+                    native_view, '__temp_fence_final__')
+            native_view.native_temp_fence = self
+            self.active = True
+            widget = self._native_widget()
+            try:
+                self._prev_cursor = widget.cursor()
+                widget.setCursor(Qt.CrossCursor)
+            except Exception:
+                self._prev_cursor = None
+            _safe_status(self.app, "Temp Fence: left-click vertices, right-click to finish")
+            _builtin_print("[tempfence] native Vulkan capture active")
+            return
         inter = self._interactor()
         if inter is None:
             _safe_status(self.app, "⚠️ Temp Fence: no active 3D view")
@@ -332,7 +369,12 @@ class TempFenceTool:
         self._cancel_drawing()
         self._remove_observers()
         self.active = False
-        w = self._vtk_widget()
+        view = getattr(self.app, "_lnt_main_view", None)
+        native_widget = None
+        if view is not None and getattr(view, "native_temp_fence", None) is self:
+            native_widget = getattr(getattr(view, "owner", None), "vulkan_widget", None)
+            view.native_temp_fence = None
+        w = native_widget or self._vtk_widget()
         if w is not None and self._prev_cursor is not None:
             try:
                 w.setCursor(self._prev_cursor)
@@ -347,6 +389,11 @@ class TempFenceTool:
         except Exception:
             pass
         self.remove_fence()
+        for overlay in (self._native_preview, self._native_fence_overlay):
+            if overlay is not None:
+                overlay.shutdown()
+        self._native_preview = None
+        self._native_fence_overlay = None
 
     def _remove_observers(self):
         inter = self._observed_interactor
@@ -381,6 +428,82 @@ class TempFenceTool:
             return obj.GetEventPosition()
         except Exception:
             return (0, 0)
+
+    def _native_world(self, pos):
+        view = self._native_view()
+        if view is None:
+            return None
+        widget = self._native_widget()
+        ratio = widget.devicePixelRatioF() if widget is not None else 1.0
+        world = view.native.screen_to_world(float(pos.x()) * ratio,
+                                            float(pos.y()) * ratio)
+        if world is None:
+            return None
+        z = self._plane_z if self._plane_z is not None else float(world[2])
+        return float(world[0]), float(world[1]), float(z)
+
+    # Native LNT input-filter contract. The VTK observer path below remains
+    # unchanged for legacy point-cloud sessions.
+    def press(self, pos, button):
+        if not self.active or self._native_view() is None:
+            return False
+        if button == Qt.RightButton:
+            self._finalize()
+            return True
+        if button != Qt.LeftButton:
+            return False
+        world = self._native_world(pos)
+        if world is None:
+            _safe_status(self.app, "Temp Fence: cannot map this point in the top view")
+            return True
+        if not self._drawing:
+            self._teardown_previous()
+            self._drawing = True
+            self._points = []
+            self._plane_z = float(world[2])
+        world = (world[0], world[1], float(self._plane_z))
+        if not self._points or ((world[0] - self._points[-1][0]) ** 2
+                                + (world[1] - self._points[-1][1]) ** 2 > 1e-12):
+            self._points.append(world)
+            self._redo_stack.clear()
+            self._rebuild_preview()
+        return True
+
+    def move(self, pos):
+        if not self.active or self._native_view() is None:
+            return False
+        if self._drawing and self._points:
+            world = self._native_world(pos)
+            if world is not None:
+                self._rebuild_preview((world[0], world[1]))
+        return True
+
+    def release(self, pos, button):
+        return bool(self.active and button != Qt.MiddleButton)
+
+    def double_click(self, pos, button):
+        if self.active and button == Qt.LeftButton:
+            self._finalize()
+            return True
+        return False
+
+    def key(self, key):
+        if not self.active:
+            return False
+        if key == Qt.Key_Escape:
+            if self._drawing:
+                self._cancel_drawing()
+            else:
+                self.remove_fence()
+            return True
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._finalize()
+            return True
+        if key == Qt.Key_Z:
+            return self.undo_vertex()
+        if key == Qt.Key_Y:
+            return self.redo_vertex()
+        return False
 
     def _on_left_press(self, obj, evt):
         try:
@@ -639,6 +762,14 @@ class TempFenceTool:
         world units, so the snap tolerance automatically tightens.
         """
         try:
+            view = self._native_view()
+            if view is not None:
+                widget = self._native_widget()
+                ratio = widget.devicePixelRatioF() if widget is not None else 1.0
+                a = view.native.screen_to_world(0.0, 0.0)
+                b = view.native.screen_to_world(float(screen_pixels) * ratio, 0.0)
+                if a is not None and b is not None:
+                    return float(np.hypot(b[0] - a[0], b[1] - a[1]))
             w = self._vtk_widget()
             if w is None:
                 return None
@@ -849,6 +980,11 @@ class TempFenceTool:
             if not pts:
                 return
 
+            if self._native_preview is not None and self._native_view() is not None:
+                self._native_preview.set_polygon(
+                    [(p[0], p[1]) for p in self._points], cursor_xy)
+                return
+
             if self._preview_actor is None:
                 self._preview_actor = self._make_line_actor(pts, color=(0.4, 0.9, 1.0), width=2.0)
                 self._apply_fence_style(self._preview_actor)
@@ -875,6 +1011,8 @@ class TempFenceTool:
             self._remove_actor(self._preview_actor)
             self._preview_actor = None
             self._render()
+        if self._native_preview is not None:
+            self._native_preview.clear()
 
     def _snap_finalize_vertices(self, coords):
         """Snap the last vertex of a finalized polygon to a nearby target.
@@ -968,9 +1106,14 @@ class TempFenceTool:
             # Replace rule: new fence kills the old popup + old fence first.
             self._teardown_previous()
 
-            self._fence_actor = self._make_line_actor(outline, color=(1.0, 1.0, 0.0), width=2.5)
-            self._apply_fence_style(self._fence_actor)
-            self._add_actor(self._fence_actor)
+            if self._native_fence_overlay is not None and self._native_view() is not None:
+                self._native_fence_overlay.set_polygon(
+                    [(p[0], p[1]) for p in coords])
+            else:
+                self._fence_actor = self._make_line_actor(
+                    outline, color=(1.0, 1.0, 0.0), width=2.5)
+                self._apply_fence_style(self._fence_actor)
+                self._add_actor(self._fence_actor)
 
             self._fence = {
                 "type": "polygon",
@@ -1006,6 +1149,8 @@ class TempFenceTool:
         if self._fence_actor is not None:
             self._remove_actor(self._fence_actor)
             self._fence_actor = None
+        if self._native_fence_overlay is not None:
+            self._native_fence_overlay.clear()
         self._fence = None
         try:
             self.app.temp_fence = None
@@ -1020,6 +1165,8 @@ class TempFenceTool:
             self._remove_actor(self._fence_actor)
             self._fence_actor = None
             self._render()
+        if self._native_fence_overlay is not None:
+            self._native_fence_overlay.clear()
         self._fence = None
         try:
             self.app.temp_fence = None
@@ -1037,7 +1184,9 @@ class TempFenceTool:
             # and is discovered by _handle_app_minimized's ownership sweep.
             parent = self.app if isinstance(self.app, QWidget) else None
             self._popup = TempFencePopup(self, parent=parent)
-            self._popup.open_near(world_xyz, self._renderer(), self._vtk_widget())
+            widget = self._native_widget() or self._vtk_widget()
+            renderer = None if self._native_view() is not None else self._renderer()
+            self._popup.open_near(world_xyz, renderer, widget)
         except Exception as e:
             _builtin_print(f"⚠️ TempFenceTool: popup failed: {e}")
 

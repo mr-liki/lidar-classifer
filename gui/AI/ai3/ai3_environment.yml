@@ -1,0 +1,19 @@
+# Conda part of the AI model 3.0 runtime (installed by setup_ai3_runtime.py with micromamba).
+#
+# Why a separate environment at all: the engine needs PDAL (ground filter + height above ground)
+# and torch 2.4 / torch-geometric / numpy 1.26, none of which can live in the Naksha app's own
+# interpreter (numpy 2.2, torch 2.7, no PDAL). conda-forge is the only place PDAL's Python
+# bindings come as a Windows binary, so PDAL and its native libraries come from here and the
+# Python packages come from ai3_requirements*.txt afterwards.
+#
+# Versions are pinned to the set the engine was validated with.
+name: naksha_ai3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.21
+  - python-pdal=3.5.3
+  - libpdal-core=2.9.2
+  - gdal=3.11.4
+  - pyproj=3.7.1
+  - pip

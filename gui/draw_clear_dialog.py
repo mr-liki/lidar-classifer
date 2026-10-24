@@ -178,7 +178,14 @@ def show_draw_clear_dialog(app):
     """Only Draw > Clear uses this two-phase delete; classification Clear does not."""
     from gui.native_draw import get_native_draw
     # Existing Vulkan Draw may have been saved while the viewport was replaced.
-    draw = get_native_draw(app, create=True, allow_snt=True)
+    # Clear is allowed to inspect/delete the existing native document in 3D.
+    # Drawing creation remains 2D-only; this prevents a second, empty legacy
+    # controller from hiding the actual Vulkan drawings after a view switch.
+    draw = get_native_draw(
+        app, create=False, allow_snt=True, existing_any_mode=True
+    )
+    if draw is None:
+        draw = get_native_draw(app, create=True, allow_snt=True)
     digitizer = None if draw is not None else getattr(app, 'digitizer', None)
     if draw is None and digitizer is None:
         return 0

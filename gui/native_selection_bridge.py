@@ -492,8 +492,9 @@ class NativeSelectionController(QObject):
         try:p=self.draw.canvas.section_at(pos.x(),pos.y())
         except RuntimeError:return True
         if self._copy_mode and self._method=='snt_text':
-            self._place_snt_copies(p)
-            return True
+            # A stale placement flag from an older dialog must never paste an
+            # imported SNT label. SNT Text is selection + clipboard only.
+            self.exit_copy_mode()
         if self._move_mode or self._copy_mode:
             if not self.selection_manager.count():
                 feat=(self._text_pick(p) if self._method=='snt_text'
@@ -559,8 +560,7 @@ class NativeSelectionController(QObject):
         elif self._hover_feature is not None:
             self._set_hover_feature(None)
         if (self._gesture or self._start is not None or
-                self._offset_origin is not None or
-                (self._copy_mode and self._method=='snt_text')):
+                self._offset_origin is not None):
             self.draw._paint()
         return True
 
@@ -671,12 +671,8 @@ class NativeSelectionController(QObject):
                 pts=[a,(b[0],a[1]),b,(a[0],b[1]),a]
             shapes.append(('drawing_preview',pts,
                            {'type':'polyline','color':'#ffd54f','width':2}))
-        if self._method=='snt_text' and self._copy_mode and self._hover is not None:
-            # Live in-viewport paste preview at the cursor, retaining the world
-            # spacing of all selected labels. This is not yet a Draw history edit.
-            from gui.native_snt_text_copy import copy_group
-            for label in copy_group(self._snt_copy_sources[:200],self._hover):
-                shapes.append(('drawing_preview',label['coords'],label))
+        # SNT Text is read-only selection. Copy goes to the system clipboard,
+        # not to a native Draw paste ghost; never render duplicate label text.
         if self._method=='snt_text':
             # Outline true/approximated label bounds, so a selected label is
             # visibly highlighted even though imported SNT text stays read-only.
@@ -687,9 +683,14 @@ class NativeSelectionController(QObject):
                 pad=self.draw.canvas.world_per_pixel()*2.
                 if x0==x1:x0-=pad;x1+=pad
                 if y0==y1:y0-=pad;y1+=pad
-                shapes.append(('drawing_preview',[(x0,y0),(x1,y0),(x1,y1),
-                                                   (x0,y1),(x0,y0)],
-                               {'type':'polyline','color':'#ffbb32','width':2}))
+                # Highlight the ORIGINAL label's bounds only. Solid outline +
+                # low-alpha fill are not a movable/pasteable text preview.
+                shapes.append(('drawing',[(x0,y0),(x1,y0),(x1,y1),
+                                           (x0,y1),(x0,y0)],
+                               {'type':'polyline','color':'#ffbb32','width':2,
+                                'style':'solid','show_vertices':False,
+                                'fill_enabled':True,'fill_color':'#ffbb32',
+                                'fill_opacity':0.12}))
         if self._vertex_display:
             for feat in self.selection_manager.get_features()[:200]:
                 # Circle perimeter samples are rendering detail, not CAD vertices.
@@ -818,12 +819,13 @@ class NativeSelectionController(QObject):
                       if f.get('source')=='snt']
             if not selected:
                 return self.message('Select SNT text label(s) before Copy')
+            # Clipboard-only by design: keep ORIGINAL SNT labels selected and
+            # highlighted; never arm an editable Draw label/paste preview.
+            # exit_copy_mode also clears any stale placement state.
+            self.exit_copy_mode()
             self.copy_selected_snt_text_to_clipboard()
-            self._snt_copy_sources=list(selected)
-            self._copy_mode=True;self._move_mode=False;self._offset_origin=None
-            self.message(f'Copy {len(selected)} SNT label(s): move to the target '
-                         'position and left-click to paste (Escape cancels)')
-            self.draw._paint()
+            self.message(f'Copied {len(selected)} SNT text label(s) to clipboard; '
+                         'original labels remain highlighted')
             return True
         if not self.selection_manager.count():return self.message('Select geometry before Copy')
         self._copy_mode=True;self._move_mode=False;self._offset_origin=None

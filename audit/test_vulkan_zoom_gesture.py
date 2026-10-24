@@ -184,3 +184,121 @@ def test_zoom_activation_releases_native_draw_and_measure():
     assert tool.activate()
     view.drawing.cancel.assert_called_once()
     view.measurement.cancel.assert_called_once()
+
+
+def test_generated_elevation_mesh_owns_real_lnt_vulkan_surface(tmp_path):
+    if os.environ.get('NAKSHA_TEST_NATIVE_ZOOM') != '1':
+        pytest.skip('Set NAKSHA_TEST_NATIVE_ZOOM=1 for Windows Vulkan test')
+    import laspy
+    import numpy as np
+    from gui.elevation_models import ElevationModel, display_elevation_model_vulkan
+    from gui.lnt_native import NativeView, convert_las, MODE_CLASS
+    from gui.render_backend import VulkanRenderBackend
+
+    qt = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    viewport = QWidget(window)
+    window.setCentralWidget(viewport)
+    window.resize(640, 480)
+    window.show()
+    qt.processEvents()
+    las = laspy.LasData(laspy.LasHeader(point_format=7, version='1.4'))
+    las.x = np.linspace(0, 20, 400)
+    las.y = np.linspace(0, 20, 400)
+    las.z = np.linspace(1, 3, 400)
+    source, document = str(tmp_path / 'dem.las'), str(tmp_path / 'dem.lnt')
+    las.write(source)
+    assert convert_las(source, document)
+    native = NativeView(int(viewport.winId()), viewport.width(), viewport.height(),
+                        document, 64, 8.)
+    backend = VulkanRenderBackend()
+    assert backend.is_available()
+    backend._bind_signatures()
+    owner = SimpleNamespace(vulkan_widget=viewport, vulkan_backend=backend)
+    app = SimpleNamespace(render_backend=owner)
+    view = SimpleNamespace(native=native, owner=owner, app=app)
+    app._lnt_main_view = view
+    try:
+        grid = np.arange(25, dtype=np.float32).reshape(5, 5)
+        model = ElevationModel('DSM', grid, left=0., top=20., resolution=4.)
+        assert display_elevation_model_vulkan(app, model)
+        assert app._elevation_vulkan_surface['triangles'] == 32
+        for _ in range(5):
+            assert native.frame(.016) is not None
+        native.set_mode(MODE_CLASS)
+        native.frame(.016)
+    finally:
+        native.close()
+        window.close()
+        qt.processEvents()
+
+
+def test_temp_fence_gesture_uses_real_lnt_vulkan_overlay(tmp_path, monkeypatch):
+    if os.environ.get('NAKSHA_TEST_NATIVE_ZOOM') != '1':
+        pytest.skip('Set NAKSHA_TEST_NATIVE_ZOOM=1 for Windows Vulkan test')
+    import laspy
+    import numpy as np
+    from gui.lnt_native import NativeView, convert_las
+    from gui.render_backend import VulkanRenderBackend
+    from gui.temp_fence_tool import TempFenceTool
+    from gui.lnt_open import _InputFilter
+
+    qt = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    viewport = QWidget(window)
+    window.setCentralWidget(viewport)
+    window.resize(640, 480)
+    window.show()
+    qt.processEvents()
+    las = laspy.LasData(laspy.LasHeader(point_format=7, version='1.4'))
+    las.x = np.linspace(0, 500, 1000)
+    las.y = np.linspace(0, 500, 1000)
+    las.z = np.ones(1000)
+    source, document = str(tmp_path / 'fence.las'), str(tmp_path / 'fence.lnt')
+    las.write(source)
+    assert convert_las(source, document)
+    native = NativeView(int(viewport.winId()), viewport.width(), viewport.height(),
+                        document, 64, 8.)
+    backend = VulkanRenderBackend()
+    assert backend.is_available()
+    backend._bind_signatures()
+    owner = SimpleNamespace(vulkan_widget=viewport, vulkan_backend=backend)
+    window.render_backend = owner
+    view = QObject()
+    view.app = window
+    view.native = native
+    view.owner = owner
+    view.mode_2d = True
+    view.picker = None
+    view.drawing = view.measurement = view.classifier = None
+    window._lnt_main_view = view
+    popup_calls = []
+    tool = TempFenceTool(window)
+    monkeypatch.setattr(tool, '_show_popup', lambda centroid: popup_calls.append(centroid))
+    input_filter = _InputFilter(view)
+    viewport.installEventFilter(input_filter)
+    try:
+        tool.activate()
+        assert view.native_temp_fence is tool
+        QTest.mouseClick(viewport, Qt.LeftButton, pos=QPoint(100, 100))
+        QTest.mouseMove(viewport, QPoint(300, 100))
+        QTest.mouseClick(viewport, Qt.LeftButton, pos=QPoint(300, 100))
+        QTest.mouseClick(viewport, Qt.LeftButton, pos=QPoint(200, 300))
+        native.frame(.016)
+        preview_doc = tool._native_preview.layer.documents[tool._native_preview.key]
+        assert preview_doc['handles'][tool._native_preview.LAYER]._visible
+        QTest.mouseClick(viewport, Qt.RightButton, pos=QPoint(200, 300))
+        native.frame(.016)
+        assert window.temp_fence['_temp_fence'] is True
+        assert len(window.temp_fence['coords']) == 3
+        assert len(popup_calls) == 1
+        final_doc = tool._native_fence_overlay.layer.documents[
+            tool._native_fence_overlay.key]
+        assert final_doc['handles'][tool._native_fence_overlay.LAYER]._visible
+        assert not preview_doc['handles'][tool._native_preview.LAYER]._visible
+    finally:
+        tool.shutdown()
+        viewport.removeEventFilter(input_filter)
+        native.close()
+        window.close()
+        qt.processEvents()

@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - RandLaNet_base_run_FR.yaml
+
+logger:
+  comet:
+    experiment_name: "RandLaNet_base_run_FR-2xGPUs"
+
+trainer:
+  strategy: ddp_find_unused_parameters_false
+  # Replace by cpu to simulate multi-cpus training.
+  accelerator: gpu
+  devices: 2

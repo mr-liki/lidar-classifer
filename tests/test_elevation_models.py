@@ -5,6 +5,7 @@ from gui.elevation_models import (
     ElevationModelCancelled,
     ElevationModelError,
     build_elevation_model,
+    build_elevation_vulkan_mesh,
     render_elevation_relief_rgba,
     write_elevation_geotiff,
 )
@@ -121,6 +122,20 @@ def test_relief_renderer_adds_edge_shading_and_transparent_nodata():
     np.testing.assert_array_equal(shaded[0, 0], [0, 0, 0, 0])
     assert shaded[4, 4, 3] == 255
     assert np.any(shaded[..., :3] != flat[..., :3])
+
+
+def test_vulkan_mesh_preserves_nodata_holes_and_bounds_vertex_count():
+    grid = np.arange(100, dtype=np.float32).reshape(10, 10)
+    grid[4:6, 4:6] = np.nan
+    from gui.elevation_models import ElevationModel
+    model = ElevationModel("DSM", grid, left=100.0, top=200.0, resolution=2.0)
+    positions, faces, colors, stride = build_elevation_vulkan_mesh(model, max_vertices=25)
+    assert stride >= 2
+    assert len(positions) <= 36
+    assert faces.shape[1] == 3
+    assert colors.shape == (len(faces), 3)
+    assert np.isfinite(positions).all()
+    assert faces.min() >= 0 and faces.max() < len(positions)
 
 
 def test_geotiff_export_matches_sample_product_shape_and_metadata(tmp_path):

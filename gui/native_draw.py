@@ -2540,13 +2540,21 @@ def native_plan_view(app, allow_snt=False):
     return None
 
 
-def get_native_draw(app, create=False, allow_snt=False):
-    """Find Draw on Vulkan; explicit creation promotes an empty viewport."""
+def get_native_draw(app, create=False, allow_snt=False, existing_any_mode=False):
+    """Find Draw on Vulkan; explicit creation promotes an empty viewport.
+
+    ``existing_any_mode`` is intentionally read/delete-only: it exposes an
+    already-created controller while the LNT camera is in 3D, but never creates
+    one there. Editing and placement remain restricted to the 2D plan view.
+    """
     view = getattr(app, '_lnt_main_view', None)
 
     if view is not None:
-        if (getattr(view, 'native', None) is None or
-                not getattr(view, 'mode_2d', False)):
+        if getattr(view, 'native', None) is None:
+            return None
+        if not getattr(view, 'mode_2d', False):
+            if existing_any_mode and not create:
+                return getattr(view, 'drawing', None)
             return None
     else:
         owner = getattr(app, 'render_backend', None)

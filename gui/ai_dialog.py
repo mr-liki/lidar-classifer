@@ -26,6 +26,29 @@ from gui.AI.common.class_codes import (
 from gui.AI.common.ptc_mapping import (
     spin_codes_from_ptc_schema,
 )
+from gui.AI.common.ai3_availability import ai3_installation_status, ai3_missing_message
+
+
+def _require_ai3_engine(parent):
+    """Reject unavailable AI 3.0 without touching existing AI models or LiDAR."""
+    available, missing = ai3_installation_status()
+    if available:
+        return True
+    print(f"[AI3] unavailable, missing source modules: {', '.join(missing)}")
+    QMessageBox.warning(parent, "AI model 3.0 not installed", ai3_missing_message(missing))
+    return False
+
+
+def _report_ai3_import_error(parent, error):
+    """An AI3 module can exist yet fail to import its own dependencies."""
+    print(f"[AI3] source/import error: {error}")
+    QMessageBox.warning(
+        parent, "AI model 3.0 unavailable",
+        "AI model 3.0 is not ready to run.\n\n"
+        f"Module import failed: {error}\n\n"
+        "Restore the genuine AI 3.0 integration and its dependencies. "
+        "Basic, Advanced and Premium AI are unaffected.",
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # TerraScan MAC PARSER
@@ -248,6 +271,11 @@ class AIFenceRunDialog(QDialog):
         self.premium_radio.setMinimumHeight(26)
         self.ai3_radio = QRadioButton("Use AI model 3.0")
         self.ai3_radio.setMinimumHeight(26)
+        _ai3_ready, _ai3_missing = ai3_installation_status()
+        if not _ai3_ready:
+            self.ai3_radio.setText("Use AI model 3.0 (not installed)")
+            self.ai3_radio.setToolTip(ai3_missing_message(_ai3_missing))
+            self.ai3_radio.setEnabled(False)
 
         self.power_cb = QCheckBox("Enable Power Line Detection")
         self.power_cb.setChecked(False)
@@ -1072,6 +1100,8 @@ class AIFenceRunDialog(QDialog):
 
     def _accept_full_file(self):
         self._sync_model_state()
+        if self.ai_mode == "ai3" and not _require_ai3_engine(self):
+            return
 
         if not self._validate_advanced_target_classes():
             return
@@ -1086,6 +1116,8 @@ class AIFenceRunDialog(QDialog):
 
     def _accept_selected_fences(self):
         self._sync_model_state()
+        if self.ai_mode == "ai3" and not _require_ai3_engine(self):
+            return
 
         if not self._validate_advanced_target_classes():
             return
@@ -1506,6 +1538,11 @@ class ClassMappingDialog(QDialog):
             "Works on the full file or inside selected fences.\n"
             "The Center Line corridor option is not available with this model."
         )
+        _ai3_ready, _ai3_missing = ai3_installation_status()
+        if not _ai3_ready:
+            self._ai3_model_cb.setText("Use AI model 3.0 (not installed)")
+            self._ai3_model_cb.setToolTip(ai3_missing_message(_ai3_missing))
+            self._ai3_model_cb.setEnabled(False)
 
         engine_layout.addWidget(self._advanced_model_cb)
         engine_layout.addWidget(self._premium_model_cb)
@@ -2373,6 +2410,15 @@ class ClassMappingDialog(QDialog):
 
     def _on_ai3_toggle(self, checked: bool):
         """AI model 3.0 is exclusive with Advanced / Premium and has no CL corridor."""
+        if checked and not _require_ai3_engine(self):
+            # Some callers restore a saved checkbox state programmatically, even
+            # while the unavailable checkbox is disabled. Do not launch AI 3.0.
+            self._ai3_model_cb.blockSignals(True)
+            try:
+                self._ai3_model_cb.setChecked(False)
+            finally:
+                self._ai3_model_cb.blockSignals(False)
+            return
         if self._ground_uncat_ratio_spin is not None:
             # AI model 3.0 thins the ground at 20 % by default; the user can change it. Leaving the
             # model puts back the value the other engines had.
@@ -2383,11 +2429,25 @@ class ClassMappingDialog(QDialog):
             else:
                 self._ground_uncat_ratio_spin.setValue(int(self._ground_uncat_last_other))
         if self._ai3_ptc_hint is not None:
-            from gui.AI.ai3.ai3_ptc import applied_ptc_path, ptc_hint
-            ok = applied_ptc_path(self._app) is not None
-            self._ai3_ptc_hint.setText(ptc_hint(self._app))
-            self._ai3_ptc_hint.setStyleSheet("color: #2e7d32;" if ok else "color: #c62828;")
-            self._ai3_ptc_hint.setVisible(bool(checked))
+            if checked:
+                try:
+                    from gui.AI.ai3.ai3_ptc import applied_ptc_path, ptc_hint
+                except (ImportError, OSError) as exc:
+                    _report_ai3_import_error(self, exc)
+                    self._ai3_model_cb.blockSignals(True)
+                    try:
+                        self._ai3_model_cb.setChecked(False)
+                    finally:
+                        self._ai3_model_cb.blockSignals(False)
+                    if self._ground_uncat_ratio_spin is not None:
+                        self._ground_uncat_ratio_spin.setValue(int(self._ground_uncat_last_other))
+                    return
+                ok = applied_ptc_path(self._app) is not None
+                self._ai3_ptc_hint.setText(ptc_hint(self._app))
+                self._ai3_ptc_hint.setStyleSheet("color: #2e7d32;" if ok else "color: #c62828;")
+                self._ai3_ptc_hint.setVisible(True)
+            else:
+                self._ai3_ptc_hint.setVisible(False)
         if checked:
             for other in (self._advanced_model_cb, self._premium_model_cb):
                 if other is not None:
@@ -3015,15 +3075,25 @@ class ClassMappingDialog(QDialog):
             return
 
         if use_ai3:
+            if not _require_ai3_engine(self):
+                return
             # The engine takes the class-definition .ptc as its input: no applied PTC, no run.
-            from gui.AI.ai3.ai3_ptc import NEEDS_PTC_TEXT, NEEDS_PTC_TITLE, applied_ptc_path
+            try:
+                from gui.AI.ai3.ai3_ptc import NEEDS_PTC_TEXT, NEEDS_PTC_TITLE, applied_ptc_path
+            except (ImportError, OSError) as exc:
+                _report_ai3_import_error(self, exc)
+                return
             if applied_ptc_path(self._app) is None:
                 QMessageBox.warning(self, NEEDS_PTC_TITLE, NEEDS_PTC_TEXT)
                 return
 
             # The engine runs in its own environment on this computer; make sure it exists
             # (offering to set it up) before the user has configured a whole run.
-            from gui.AI.ai3.ai3_setup_dialog import ensure_runtime
+            try:
+                from gui.AI.ai3.ai3_setup_dialog import ensure_runtime
+            except (ImportError, OSError) as exc:
+                _report_ai3_import_error(self, exc)
+                return
             if not ensure_runtime(self):
                 return
 
@@ -3629,9 +3699,14 @@ class AIClassificationDialog(QDialog):
             # sections, class counts follow); the VTK refresh/sync must not run
             # on this full-cloud dataset.
             try:
-                bridge.commit()
+                written = bridge.commit()
+                if self.ai_mode == "ai3" and self.target_indices is None:
+                    print(f"[AI3-FULLFILE] LNT commit successful: "
+                          f"{written:,} class changes; Vulkan session retained", flush=True)
             except Exception as e:
                 print(f"AI finish .lnt write-back failed: {e}")
+                if self.ai_mode == "ai3" and self.target_indices is None:
+                    raise RuntimeError(f"AI3 LNT commit failed: {e}") from e
                 QMessageBox.critical(self, "AI Classification", str(e))
             try:
                 from gui.point_count_widget import refresh_point_statistics
@@ -3639,6 +3714,14 @@ class AIClassificationDialog(QDialog):
             except Exception:
                 pass
             return
+
+        # A native full-file AI job must never fall through to the VTK refresh
+        # if its bridge has disappeared; doing so loses the full-cloud identity
+        # and can show only an LOD-sized subset.
+        if self.ai_mode == "ai3" and self.target_indices is None:
+            view = getattr(self.app, "_lnt_main_view", None)
+            if view is not None and getattr(view, "native", None) is not None:
+                raise RuntimeError("AI3 cannot refresh: Vulkan/LNT bridge missing")
 
         self._auto_apply_active_ptc_palette()
 
@@ -3665,6 +3748,12 @@ class AIClassificationDialog(QDialog):
             print(f"AI finish drawing rebind skipped: {e}")
 
     def start_classification(self, data_dict):
+        # This protects direct callers that bypass the two model-selection dialogs.
+        if self.ai_mode == "ai3" and not _require_ai3_engine(self):
+            self.status_label.setText("AI model 3.0 is not installed")
+            self.cancel_btn.setEnabled(False)
+            self.close_btn.setEnabled(True)
+            return
         if getattr(self, "_classification_started", False):
             print("AI start ignored: classification is already running for this dialog.")
             return
@@ -3725,8 +3814,15 @@ class AIClassificationDialog(QDialog):
 
         if self.ai_mode == "ai3":
 
-            from gui.AI.ai3.ai3_worker import Ai3Worker
-            from gui.AI.ai3.ai3_controller import Ai3Controller
+            try:
+                from gui.AI.ai3.ai3_worker import Ai3Worker
+                from gui.AI.ai3.ai3_controller import Ai3Controller
+            except (ImportError, OSError) as exc:
+                _report_ai3_import_error(self, exc)
+                self.status_label.setText("AI model 3.0 failed to initialize")
+                self.cancel_btn.setEnabled(False)
+                self.close_btn.setEnabled(True)
+                return
 
             self.worker = Ai3Worker(
                 data_dict=data_dict,
@@ -3799,6 +3895,7 @@ class AIClassificationDialog(QDialog):
         self.worker.finished.connect(self.classification_finished)
         self.worker.error.connect(self.classification_error)
         self._run_started_at = time.perf_counter()
+        self._run_started_wall = time.time()  # AI3 output freshness, not a GPU timer
         self._current_stage = "Starting classification"
         self._elapsed_timer.start()
         self._update_elapsed_display()
@@ -4021,6 +4118,51 @@ class AIClassificationDialog(QDialog):
         except Exception as e:
             print(f"Fence output guard failed: {e}")
 
+    def _integrate_ai3_full_file_lnt(self):
+        """Reattach AI3's verified full-file LAZ result to the live source-order LNT.
+
+        The AI3 subprocess writes a full output file. A legacy VTK preview may
+        replace app.data with an LOD subset (and thereby defeat the native LNT
+        bridge). Fence mode intentionally remains on its existing code path.
+        """
+        if self.ai_mode != "ai3" or self.target_indices is not None:
+            return
+        view = getattr(self.app, "_lnt_main_view", None)
+        if view is None or getattr(view, "native", None) is None:
+            return  # ordinary non-LNT AI workflow is unchanged
+
+        from gui.lnt_ai_bridge import active_bridge
+        bridge = active_bridge(self.app)
+        if bridge is None or bridge.view is not view or bridge.dataset is None:
+            raise RuntimeError(
+                "AI3 completed, but the original Vulkan/LNT AI bridge is no "
+                "longer active. The AI output was NOT applied. Restart the "
+                "classification after verifying the session-lifetime patch."
+            )
+        source = bridge.dataset.get("_source_file_path")
+        previous = self._ai_undo_before_classes
+        if not source or previous is None:
+            raise RuntimeError("Cannot verify AI3: missing source path or undo snapshot")
+        expected = len(previous)
+        if len(bridge.node) != expected or len(bridge.on_disk) != expected:
+            raise RuntimeError("Native AI identity map does not cover the source cloud")
+
+        from gui.AI.common.ai3_fullfile_handoff import find_ai3_output, validated_classes
+        output = find_ai3_output(source, getattr(self, "_run_started_wall", None))
+        result = validated_classes(source, output, expected)
+        if result.size != expected:
+            raise RuntimeError("AI3 output has a different point count; nothing applied")
+        # Do not replace xyz, return fields, SNT, camera, or the resident LNT
+        # viewport. Change only source-order classification bytes, then use the
+        # same native .lnt write-back path as manual classification.
+        bridge.dataset["classification"] = result
+        self.app.data = bridge.dataset
+        self._ai3_full_file_verified = True
+        print(
+            f"[AI3-FULLFILE] verified {expected:,} source-order classes from "
+            f"{output}; native commit pending", flush=True,
+        )
+
     def classification_finished(self):
         if self._finish_handled:
             return
@@ -4038,6 +4180,25 @@ class AIClassificationDialog(QDialog):
         QApplication.processEvents()
 
         self._teardown_worker()
+
+        # AI3 full-file output is saved by its own subprocess. Import its
+        # verified source-order classes before undo, masks or native refresh;
+        # never silently paint a smaller VTK preview over the active LNT view.
+        try:
+            self._integrate_ai3_full_file_lnt()
+        except Exception as exc:
+            self._elapsed_timer.stop()
+            self._current_stage = "AI3 full-file handoff failed"
+            self.status_label.setText("AI3 result was not applied to the point cloud")
+            self.close_btn.setEnabled(True)
+            print(f"[AI3-FULLFILE] ABORT: {exc}", flush=True)
+            QMessageBox.critical(
+                self, "AI3 Result Not Applied",
+                f"AI3 produced an output, but applying it to the loaded LNT "
+                f"was stopped safely.\n\n{exc}\n\n"
+                "The loaded point cloud was not replaced by a partial VTK preview."
+            )
+            return
 
         self._apply_fence_output_guard()
         self._apply_advanced_target_class_filter()
@@ -4551,6 +4712,9 @@ def show_ai_classification_dialog(app):
             advanced_target_classes,
             selected_fence_drawings=None,
         ):
+            # Never set _ai_run_active or construct a worker for missing AI3 code.
+            if ai_mode == "ai3" and not _require_ai3_engine(None):
+                return
             advanced_config = dict(advanced_config or {})
             # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_RUNTIME
             if str(ai_mode).lower() in ("advanced", "premium", "ai3"):
@@ -4674,8 +4838,14 @@ def show_ai_classification_dialog(app):
 
                                 final_ai_mode = fence_dialog.ai_mode
                                 if final_ai_mode == "ai3":
-                                    from gui.AI.ai3.ai3_ptc import (
-                                        NEEDS_PTC_TEXT, NEEDS_PTC_TITLE, applied_ptc_path)
+                                    if not _require_ai3_engine(None):
+                                        return
+                                    try:
+                                        from gui.AI.ai3.ai3_ptc import (
+                                            NEEDS_PTC_TEXT, NEEDS_PTC_TITLE, applied_ptc_path)
+                                    except (ImportError, OSError) as exc:
+                                        _report_ai3_import_error(None, exc)
+                                        return
                                     if applied_ptc_path(app) is None:
                                         QMessageBox.warning(None, NEEDS_PTC_TITLE, NEEDS_PTC_TEXT)
                                         return

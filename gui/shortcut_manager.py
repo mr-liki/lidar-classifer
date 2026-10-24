@@ -2832,33 +2832,21 @@ class ShortcutManager(QWidget):
                 # Track modifier keys being held
                 if key == Qt.Key_Control:
                     self._pressed_modifiers.add("ctrl")
-                elif key == Qt.Key_Alt:
+                elif key in (Qt.Key_Alt, Qt.Key_AltGr):
                     self._pressed_modifiers.add("alt")
                 elif key == Qt.Key_Shift:
                     self._pressed_modifiers.add("shift")
-                
-                # Build modifier list from currently pressed modifiers
-                modifiers = []
-                if event.modifiers() & Qt.ControlModifier or "ctrl" in self._pressed_modifiers:
-                    if "ctrl" not in modifiers:
-                        modifiers.append("ctrl")
-                if event.modifiers() & Qt.AltModifier or "alt" in self._pressed_modifiers:
-                    if "alt" not in modifiers:
-                        modifiers.append("alt")
-                if event.modifiers() & Qt.ShiftModifier or "shift" in self._pressed_modifiers:
-                    if "shift" not in modifiers:
-                        modifiers.append("shift")
-                
-                # Sort modifiers in standard order
-                modifier_order = {"ctrl": 0, "alt": 1, "shift": 2}
-                modifiers.sort(key=lambda x: modifier_order.get(x, 99))
+
+                from gui.shortcut_key_state import qt_event_modifier_names
+                label = qt_event_modifier_names(event, Qt, self._pressed_modifiers)
+                modifiers = [] if label == "none" else label.split("+")
                 
                 # Determine the actual key (non-modifier)
                 key_text = ""
                 is_modifier_only = False
                 
                 # Check if it's ONLY a modifier key press
-                if key in (Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift):
+                if key in (Qt.Key_Control, Qt.Key_Alt, Qt.Key_AltGr, Qt.Key_Shift):
                     is_modifier_only = True
                     # Show modifiers being held
                     if modifiers:
@@ -2908,7 +2896,7 @@ class ShortcutManager(QWidget):
                     key = event.key()
                     if key == Qt.Key_Control:
                         self._pressed_modifiers.discard("ctrl")
-                    elif key == Qt.Key_Alt:
+                    elif key in (Qt.Key_Alt, Qt.Key_AltGr):
                         self._pressed_modifiers.discard("alt")
                     elif key == Qt.Key_Shift:
                         self._pressed_modifiers.discard("shift")

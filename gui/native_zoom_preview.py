@@ -12,6 +12,8 @@ class VulkanZoomPreview:
     KIND = '__tool_preview__'
     NAME = '__zoom_rectangle__'
     LAYER = '__zoom_rectangle__'
+    COLOR = (255, 165, 0)
+    LINEWEIGHT = 2
 
     def __init__(self, view):
         self.view = view
@@ -40,7 +42,8 @@ class VulkanZoomPreview:
                 document['gpu'][self.LAYER][0]['v_count'] != len(xyz)):
             result = self.layer.put_entities(self.KIND, self.NAME, [{
                 'type': 'polyline', 'points': xyz.tolist(),
-                'layer': self.LAYER, 'color': (255, 165, 0), '_lineweight': 2,
+                'layer': self.LAYER, 'color': self.COLOR,
+                '_lineweight': self.LINEWEIGHT,
             }])
             document = self.layer.documents.get(self.key)
             if not result or document is None or not document['gpu'].get(self.LAYER):
@@ -92,3 +95,14 @@ class VulkanSelectionPreview(VulkanZoomPreview):
         if len(xyz) < capacity:
             xyz = np.vstack([xyz, np.repeat(xyz[-1:], capacity - len(xyz), axis=0)])
         self._set_points(xyz)
+
+
+class VulkanTempFencePreview(VulkanSelectionPreview):
+    """Yellow temporary-classification fence on the native Vulkan canvas."""
+    COLOR = (255, 255, 0)
+    LINEWEIGHT = 3
+
+    def __init__(self, view, name):
+        self.NAME = str(name)
+        self.LAYER = str(name)
+        super().__init__(view)

@@ -30,8 +30,8 @@ class PremiumAIController:
 
     # Frozen strict-exact production contract.
     EXPECTED_SHA256 = {
-        "engine": "0572b623db2216fc07d896a1c67894908994476fa455368224f6e32817197ce4",
-        "v33": "925e3bdff08819455b6ea19bee423e250926baaae5a22a522c05d939d557aa7f",
+        "engine": "13914afed509615ce6615e2f326450a1e9d26fe1c681326c31116c6d0f8aa21c",
+        "v33": "3acb5ea43184a811517ece58a38e637d05dc86a9d218d629bfbf1fa78e2d069e",
         "phase15_worker": "cb6d021c9792c998f2bb6082f390546f874b7e9f3ba20dddb97bcc922ad68015",
         "scripted_fps": "870e82cf9c8a7bc596685c08858387c1b58ceb8ccafbc66dc0fd51de781fba93",
         "model": "ed36e6eba1802fa7a50c69792e2d212c522bdac3e2cb42ac4e8d3991945fbcbe",

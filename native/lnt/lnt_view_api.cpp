@@ -98,6 +98,7 @@ struct View {
     double init_sse = 8.0;
     uint32_t w = 1, h = 1;
     bool surface_requested = false;
+    bool external_surface = false;            // DTM/DSM uploaded by the GUI
     bool line_mode = false;
     std::vector<std::array<double, 3>> depth_samples;
     std::string surface_error;
@@ -1190,6 +1191,7 @@ __declspec(dllexport) void lnt_view_set_mode(void* h, int mode) {
         // Point presentation modes (including native view-space Depth) must
         // take ownership back from a previously selected surface/shading mesh.
         v->surface_requested = false;
+        v->external_surface = false;
         v->surface_urgent = false;
         v->eng.show_surface(false);
         v->eng.set_display_mode(mode);
@@ -1236,6 +1238,7 @@ __declspec(dllexport) int lnt_view_set_shading(void* h, const ShadingUniforms* c
         (!v->has_surface_light || (v->surface_elev && !v->surface_gpu_elev) ||
          std::memcmp(v->last_surface_light,config->light_direction,sizeof(v->last_surface_light))!=0);
     v->shading = *config;
+    v->external_surface = false;
     v->surface_requested = request_surface;
     if (!request_surface) {
         v->eng.show_surface(false);
@@ -1259,6 +1262,26 @@ __declspec(dllexport) int lnt_view_set_shading(void* h, const ShadingUniforms* c
             v->eng.show_surface(true)) v->surface_urgent=false;
         else v->surface_urgent=true;
     }
+    return 1;
+}
+
+// A generated DTM/DSM is uploaded through nkv_set_surface on this view's raw
+// renderer handle. Keep it authoritative until another display mode is chosen.
+__declspec(dllexport) int lnt_view_show_external_surface(void* h) {
+    View* v = static_cast<View*>(h);
+    if (!v) return 0;
+    if (v->surface_job_running) v->surface_cancel->store(true);
+    ++v->surface_gen;
+    if (v->lod) v->lod->deactivate(v->eng);
+    v->lod_mode_last = false;
+    v->external_surface = true;
+    v->surface_requested = true;
+    v->surface_urgent = false;
+    v->surface_ids.clear();
+    v->pending_surface_ids.clear();
+    v->loop.set_depth_enabled(false);
+    if (!v->eng.show_surface(true)) return 0;
+    v->frame_sig_valid = false;
     return 1;
 }
 // Surface feature: call AFTER lnt_view_set_shading(NormalShading). Same lit, streamed mesh,
@@ -1677,7 +1700,7 @@ __declspec(dllexport) int lnt_view_frame(void* h, float dt, LntViewStats* out) {
         const bool skip = v->view_is_idle();
         // Activate a finished upload before drawing, so the first completed
         // surface appears in this frame rather than one frame later.
-        if (v->surface_requested && !v->lod_mode_last) v->poll_surface();
+        if (v->surface_requested && !v->external_surface && !v->lod_mode_last) v->poll_surface();
         if (!skip) {
             if (!v->loop.render_frame(v->eng, v->scene, v->streamer, dt, !v->surface_requested)) {
                 std::fprintf(stderr, "[LNT] frame failed: %s\n", v->loop.error().c_str());
@@ -1691,7 +1714,7 @@ __declspec(dllexport) int lnt_view_frame(void* h, float dt, LntViewStats* out) {
                 v->pending_surface_method = -1;
             }
         }
-        const bool lod_mode = v->surface_requested && v->lod_eligible() && v->ensure_lod();
+        const bool lod_mode = v->surface_requested && !v->external_surface && v->lod_eligible() && v->ensure_lod();
         if (lod_mode) {
             if (!v->lod_mode_last) {
                 // Entering the tiled path: stop the cut builder; its mesh is released by
@@ -1729,7 +1752,7 @@ __declspec(dllexport) int lnt_view_frame(void* h, float dt, LntViewStats* out) {
             v->surface_ids.clear();
             v->surface_urgent = true;
         }
-        if (!skip && v->surface_requested && !v->lod_mode_last) {
+        if (!skip && v->surface_requested && !v->external_surface && !v->lod_mode_last) {
             const auto& ids = v->surface_cut();
             const auto surface_key=v->surface_key();
             if (ids != v->pending_surface_ids || surface_key!=v->pending_surface_key) {
