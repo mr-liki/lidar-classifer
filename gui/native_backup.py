@@ -103,7 +103,8 @@ def class_writes(app) -> int:
     """How many class records this session wrote into the native document."""
     view = getattr(app, "_lnt_main_view", None)
     native = getattr(view, "native", None) if view is not None else None
-    return int(getattr(native, "class_writes", 0) or 0)
+    store = getattr(app, '_lnt_section_store', None)
+    return int(getattr(native, "class_writes", 0) or 0) + int(getattr(store, 'deletion_revision', 0))
 
 
 def has_work(app) -> bool:
@@ -246,7 +247,7 @@ def export_backup(app, destination=None, *, progress=None, flush=True,
             pass
     result = native_save.write_pair(
         source, lnt, destination, mapping=mapping, cache=cache,
-        companion=False, drawings=drawings,
+        companion=False, drawings=drawings, deleted=native_save.pending_deletions(app),
         progress=progress or (lambda n, text: None),
     )
     _mark_current(app, destination)

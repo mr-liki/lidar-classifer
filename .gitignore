@@ -75,7 +75,8 @@ Thumbs.db
 cloth_nodes.txt
 .claude/
 .cwj_uploads/
-tests/
+tests/*
+!tests/test_native_point_deletion.py
 patch_backups/
 .commandcode/
 .workbuddy-ai/

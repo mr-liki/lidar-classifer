@@ -182,6 +182,7 @@ struct View {
     // below remains for the other surface paths (one visible class, legacy elevation colour,
     // engines without the tile arena).
     std::unique_ptr<surface_lod::Manager> lod;
+    SharedDeletionMask deleted_records = std::make_shared<const DeletionMask>();
     bool lod_failed = false;                 // arena or archive unusable this session
     bool lod_mode_last = false;              // last frame drew through the LOD path
     bool lod_changed = false;                // last update changed what is drawn
@@ -213,6 +214,7 @@ struct View {
         if (lod) return true;
         lod.reset(new surface_lod::Manager());
         lod->config.from_env();
+        lod->deleted_records = deleted_records;
         std::string e;
         if (!lod->open(rd, lnt_path, &cache.read_mutex(), &e)) {
             std::fprintf(stderr, "[LNT surface] viewport LOD unavailable: %s\n", e.c_str());
@@ -456,7 +458,7 @@ struct View {
                                         SurfaceParams params, uint64_t gen,
                                         std::shared_ptr<NodeMeshCache> cache,
                                         std::vector<std::unique_ptr<Reader>>* readers,
-                                        std::shared_ptr<std::atomic<bool>> cancel, SurfaceKey key) {
+                                        std::shared_ptr<std::atomic<bool>> cancel, SurfaceKey key, SharedDeletionMask deleted) {
         SurfaceJob job;
         job.ids = ids;
         job.gen = gen;
@@ -473,9 +475,11 @@ struct View {
                     job.error="invalid full-detail surface leaf selection";return job;
                 }
                 job.source_points+=node->point_count;
+                auto omitted = deleted->find(id);
+                if (omitted != deleted->end()) job.source_points -= omitted->second.size();
             }
             // Only whole-file meshes are persisted, independently of point LOD.
-            if(!directory->is_collection() && job.source_points==directory->directory().total_points) {
+            if(deleted->empty() && !directory->is_collection() && job.source_points==directory->directory().total_points) {
                 job.settings_hash=embedded_surface::settings_digest(params,ids);
                 embedded_surface::Digest expected{};bool loaded=false;
                 const auto cache_start=std::chrono::steady_clock::now();
@@ -578,6 +582,7 @@ struct View {
                             if (node && rd.read_node_points(*node, pts) && pts.size()==node->point_count) {
                                 tile->pts.reserve(pts.size());
                                 for (const RawPoint& p : pts) {
+                                    if (record_deleted(deleted, node->node_id, uint32_t(&p - pts.data()))) continue;
                                     tile->classes.set(p.classification);
                                     tile->pts.push_back({p.x, p.y, p.z, p.classification,
                                                          p.r, p.g, p.b, p.intensity});
@@ -609,7 +614,7 @@ struct View {
             std::vector<const SurfaceTile*> tiles;
             tiles.reserve(ids.size());
             for (const auto& t : sampled) if (t && !t->pts.empty()) tiles.push_back(t.get());
-            if (tiles.empty()) return job;
+            if (tiles.empty()) { job.ok = true; return job; }
             std::bitset<256> classes;
             for (const auto* tile : tiles) classes |= tile->classes;
             for (unsigned k=0; k<256; ++k) if (!params.class_visible[k]) classes.reset(k);
@@ -784,7 +789,7 @@ struct View {
         surface_cancel = std::make_shared<std::atomic<bool>>(false);
         surface_job = std::async(std::launch::async, &View::build_surface_job,
                                  &rd, ids, make_surface_params(), surface_gen,
-                                 node_cache, &surface_readers, surface_cancel,surface_key());
+                                 node_cache, &surface_readers, surface_cancel,surface_key(), deleted_records);
         surface_job_running = true;
         surface_error.clear();
         std::fprintf(stderr,"[LNT surface] preparing surface (%zu source leaves; checking embedded mesh first)\n",ids.size());
@@ -862,7 +867,7 @@ struct View {
                      crisp ? "crisp-engine-lit" : (pending_surface_method ? "barycentric" : "facet"),
                      (unsigned long long)job.source_points,(unsigned long long)job.mesh.visible_points,
                      (unsigned long long)(job.mesh.coverage_positions.size()/3));
-        if(!rd.is_collection() && (!job.embedded_hit || job.embedded_legacy) && job.source_points==rd.directory().total_points &&
+        if(deleted_records->empty() && !rd.is_collection() && (!job.embedded_hit || job.embedded_legacy) && job.source_points==rd.directory().total_points &&
            (!surface_save.valid() || surface_save.wait_for(std::chrono::seconds(0))==std::future_status::ready)) {
             const auto path=lnt_path;const auto offset=embedded_surface::base_end(rd);
             surface_save=std::async(std::launch::async,[path,offset,job=std::move(job)]() mutable {
@@ -1489,6 +1494,41 @@ __declspec(dllexport) int lnt_preview_classes(void* h, const uint32_t* node_idx,
         return 0;
     }
     return 1;
+}
+
+// Replace session-only exclusions. No payload or class byte is written.
+__declspec(dllexport) int lnt_view_set_deleted(void* h, const uint32_t* node_idx,
+        const uint32_t* local_idx, const uint8_t* classes, uint64_t n) {
+    View* v = static_cast<View*>(h);
+    if (!v || (n && (!node_idx || !local_idx || !classes))) return 0;
+    try {
+        std::vector<uint32_t> touched;
+        std::vector<SectionRecordEdit> records;
+        std::string error;
+        // A sparse class preview can have cached an unverified ancestor stride
+        // miss. Resolve this complete exclusion set independently every time.
+        SectionEditIndex deletion_index;
+        if (!section_set_classes(v->rd, deletion_index, &v->cache.read_mutex(), node_idx,
+                local_idx, classes, n, touched, error, nullptr, &records, true, nullptr)) return 0;
+        auto mask = std::make_shared<DeletionMask>();
+        for (const auto& r : records) (*mask)[v->rd.nodes()[r.node].node_id].push_back(r.local);
+        for (auto& kv : *mask) {
+            auto& a = kv.second;
+            std::sort(a.begin(), a.end());
+            a.erase(std::unique(a.begin(), a.end()), a.end());
+        }
+        if (v->surface_job_running) v->surface_cancel->store(true);
+        v->deleted_records = mask;
+        v->streamer.set_deleted_records(mask);
+        if (v->lod) v->lod->deactivate(v->eng);
+        v->lod.reset();
+        v->lod_mode_last = false;
+        v->lod_failed = false;
+        v->node_cache = std::make_shared<View::NodeMeshCache>();
+        v->invalidate_surface();
+        v->frame_sig_valid = false;
+        return 1;
+    } catch (...) { return 0; }
 }
 
 // 2D plan view only: window pixel (device pixels, y down) <-> world XY on the plane

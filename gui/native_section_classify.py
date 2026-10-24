@@ -1805,6 +1805,9 @@ class SectionClassifier:
                 mask &= in_view
                 selected_rows = np.flatnonzero(mask)
             indices = canvas.indices[selected_rows]
+        store = getattr(self.app, '_lnt_section_store', None)
+        if store is not None and hasattr(store, 'live_rows'):
+            indices = store.live_rows(indices)
         visible = self._visible_classes()
         if visible is not None and indices.size:
             classes = self.app.data["classification"]

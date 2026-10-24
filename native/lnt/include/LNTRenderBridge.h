@@ -244,7 +244,7 @@ inline bool LntScene::plan(Reader& reader, std::string& err) {
     gpu_capacity_points_ = next_gpu_point_ = 0;
 
     if (!reader.ok()) { err = "reader is not open: " + reader.error(); return false; }
-    if (reader.get_total_nodes() == 0) { err = "file has no nodes"; return false; }
+    if (reader.get_total_nodes() == 0 && reader.get_total_points() != 0) { err = "file has no nodes"; return false; }
 
     // ---- render origin, pinned from the file BEFORE any upload -------------
     const BoundingBox env = reader.get_bounds();
@@ -255,7 +255,7 @@ inline bool LntScene::plan(Reader& reader, std::string& err) {
 
     uint64_t total = 0;
     for (const LNTNodeEntry& e : reader.nodes()) total += e.point_count;
-    if (total == 0) { err = "every node is empty"; return false; }
+    if (total == 0 && reader.get_total_points() != 0) { err = "every node is empty"; return false; }
     if (total > 0xFFFFFFFFull) {
         err = "arena would need " + std::to_string(total) +
               " point offsets, past the 32-bit draw-range ABI limit";
@@ -279,7 +279,7 @@ inline bool LntScene::plan(Reader& reader, std::string& err) {
         if (t.leaf) { leaf_points_ += t.count; ++leaf_tiles_; }
         else        { lod_points_  += t.count; ++lod_tiles_; }
     }
-    planned_points_ = total;
+    planned_points_ = std::max<uint64_t>(1, total); // empty saved documents still own a native arena
     planned_ = true;
     return true;
 }

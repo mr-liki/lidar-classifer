@@ -4,9 +4,8 @@ Block and Shape gestures are drawn by the Vulkan vector pass; candidate records 
 section store (exact leaf records with class + XYZ).  Selection is a set of
 store rows (file identities), counted into the Identify ribbon.
 
-Delete on native is intentionally read-only-safe: points are reclassified
-to Noise -- the reversible, undoable equivalent -- because the append-only
-.lnt octree has no record removal.
+Pending deletions are separate native record exclusions. Only explicit Save
+compacts the LAS/LAZ and its LNT companion.
 """
 from __future__ import annotations
 
@@ -51,6 +50,7 @@ class NativeSelectRect:
         measurement = getattr(self.view, 'measurement', None)
         if measurement is not None and measurement.active:
             measurement.cancel()
+        self.deactivate_selection()
         self.active = True
         self.start = self.current = None
         self.dragging = False
@@ -64,6 +64,7 @@ class NativeSelectRect:
 
     def set_pick_method(self, method):
         if method in ("Block", "Shape"):
+            self.deactivate_selection()
             self.pick_method = method
             self.start = self.current = None
             self.dragging = False
@@ -82,6 +83,7 @@ class NativeSelectRect:
 
     def shutdown(self):
         """Hide the GPU preview before its Vulkan view disappears."""
+        self.deactivate_selection()
         self.active = False
         self.start = self.current = None
         self.dragging = False
@@ -97,6 +99,7 @@ class NativeSelectRect:
             canvas._closed = True
 
     def deactivate(self):
+        self.deactivate_selection()
         self.active = False
         self.start = self.current = None
         self.dragging = False
@@ -108,6 +111,11 @@ class NativeSelectRect:
             pass
 
     def deactivate_selection(self):
+        if self._overlay is not None:
+            try:
+                self._overlay.clear()
+            except (RuntimeError, ReferenceError):
+                pass
         self.selected_rows = np.empty(0, dtype=np.int64)
         self._update_count()
 
@@ -123,6 +131,8 @@ class NativeSelectRect:
             w = self._canvas().section_at(pos.x(), pos.y())
         except Exception:
             return False
+        if not self.dragging and not self.vertices:
+            self.deactivate_selection()
         if self.pick_method == "Shape":
             self.vertices.append(w)
             self.current = w
@@ -224,7 +234,7 @@ class NativeSelectRect:
         self.dragging = False
         a, b = self.start, self.current
         self.start = self.current = None
-        self._paint()
+        self.deactivate_selection()
         if a is None or b is None:
             return
         x0, x1 = sorted((float(a[0]), float(b[0])))
@@ -232,18 +242,22 @@ class NativeSelectRect:
         if x1 - x0 < 1e-9 or y1 - y0 < 1e-9:
             self._paint()
             return
+        self._overlay_for(self._canvas()).set_rectangle(a, b)
         self._query_box(x0, x1, y0, y1)
+        self._confirm_selection()
 
     def _finish_shape(self):
         poly = list(self.vertices)
         self.vertices = []
-        self._paint()
+        self.deactivate_selection()
         if len(poly) < 3:
             return
+        self._overlay_for(self._canvas()).set_polygon(poly)
         p = np.asarray(poly, dtype=np.float64)
         self._query_box(float(p[:, 0].min()), float(p[:, 0].max()),
                         float(p[:, 1].min()), float(p[:, 1].max()),
                         polygon=p)
+        self._confirm_selection()
 
     def _query_box(self, x0, x1, y0, y1, polygon=None):
         # A failed/new query must never leave an older deletion target armed.
@@ -289,11 +303,12 @@ class NativeSelectRect:
                 from gui.class_slots import stored_palette  # noqa: PLC0415
                 vis = [int(c) for c, i in stored_palette(self.app, palette).items()
                        if isinstance(i, dict) and i.get("show", True)]
-                if vis:
-                    cls = np.asarray(store.data["classification"])[rows]
-                    keep &= np.isin(cls, np.asarray(vis))
+                cls = np.asarray(store.data["classification"])[rows]
+                keep &= np.isin(cls, np.asarray(vis))
         except Exception:
             pass
+        if hasattr(store, 'deleted'):
+            keep &= ~store.deleted[rows]
         self.selected_rows = rows[keep]
         self._update_count()
 
@@ -316,62 +331,52 @@ class NativeSelectRect:
     def selected_count(self):
         return int(self.selected_rows.size)
 
-    # ---- delete (reclassify-to-noise, undoable) -----------------------------
-    def delete_selected_points(self):
-        if self.selected_rows.size == 0:
-            try:
-                self.app.statusBar().showMessage("Nothing selected", 2500)
-            except Exception:
-                pass
+    def _confirm_selection(self):
+        if not self.selected_count:
             return
-        from gui.lnt_section_bridge import get_store  # noqa: PLC0415
+        from gui.lnt_section_bridge import get_store
+        store = get_store(self.app)
+        try:
+            self._overlay_for(self._canvas()).set_selected_points(store.data['xyz'][self.selected_rows])
+            # Present outline and highlights before entering the modal confirmation.
+            self.view.native.frame(0.0)
+        except Exception as exc:
+            self.deactivate_selection()
+            self.app.statusBar().showMessage(f'Selection highlight failed: {exc}', 5000)
+            return
+        self.delete_selected_points()
+
+    def delete_selected_points(self):
+        if not self.selected_count:
+            return
+        from gui.lnt_section_bridge import get_store
         store = get_store(self.app)
         if store is None:
             return
-        n = int(self.selected_rows.size)
+        rows = store.live_rows(self.selected_rows)
+        if not len(rows):
+            self.deactivate_selection()
+            return
         reply = QMessageBox.question(
-            self.app, "Delete Selection",
-            f"Move {n:,} selected points to Noise (class 7)?\n"
-            "Native clouds are append-only: this is the reversible, undoable "
-            "equivalent of deletion.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            self.app, 'Delete Selection',
+            f'Delete {len(rows):,} selected points?\n'
+            'You can undo this change. Points are permanently removed only when you save.',
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        rows = np.asarray(self.selected_rows, dtype=np.int64)
         try:
-            cur = np.asarray(store.data["classification"])
-            old = cur[rows].copy()
-            new = np.full(rows.size, 7, dtype=np.uint8)
-            cur[rows] = new
+            store.set_deleted(rows)
         except Exception as exc:
-            try:
-                self.app.statusBar().showMessage(f"Delete failed: {exc}", 3000)
-            except Exception:
-                pass
+            self.app.statusBar().showMessage(f'Delete failed: {exc}', 5000)
             return
-        try:
-            from gui.native_tiled_runner import push_native_undo  # noqa: PLC0415
-            push_native_undo(self.app, rows, old, new)
-        except Exception:
-            pass
-        try:
-            store.show(rows, old)
-        except Exception:
-            pass
-        try:
-            store.flush()
-        except Exception:
-            pass
-        try:
-            sections = getattr(self.app, "_native_sections", None)
-            if sections is not None:
-                sections.refresh_edits(force=True, changed=(rows, old), show_main=False)
-        except Exception:
-            pass
-        self.selected_rows = np.empty(0, dtype=np.int64)
-        self._update_count()
-        try:
-            self.app.statusBar().showMessage(
-                f"Moved {n:,} points to Noise (Ctrl+Z to undo)", 4000)
-        except Exception:
-            pass
+        entry = {'deleted_rows': rows.copy()}
+        if not hasattr(self.app, 'undo_stack'):
+            self.app.undo_stack = []
+        self.app.undo_stack.append(entry)
+        from gui.memory_manager import trim_undo_stack
+        trim_undo_stack(self.app)
+        if hasattr(self.app, 'redo_stack'):
+            self.app.redo_stack.clear()
+        self.deactivate_selection()
+        self.app.statusBar().showMessage(
+            f'Deleted {len(rows):,} points (Ctrl+Z to undo; Save to make permanent)', 5000)
