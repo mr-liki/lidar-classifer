@@ -8,9 +8,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QInputDialog
 
 from gui.native_selection_targets import (
-    close_freehand, snap_draft_closure, editable_draw, parallel_line_source,
+    snap_draft_closure, editable_draw, parallel_line_source,
     drawn_open_line_source,
 )
+from gui.freehand_release_geometry import close_freehand_to_start
 from gui.native_stroke_geometry import (
     catmull_rom_vtk, drop_consecutive_duplicates, snap_endpoint_near_start,
 )
@@ -131,9 +132,8 @@ class NativeDraw:
         self._snt_pick_index = None
         self._snt_pick_token = None
         self._snap_target = None
-        # VTK Freehand: left release pauses, another drag resumes, right-click
-        # commits. Keep per-drag checkpoints so Undo never deletes a finished
-        # figure while a Freehand draft remains pending.
+        # Freehand samples only while the left button is held. Release commits
+        # once; existing undo history remains a single completed Draw action.
         self._freehand_before_drag = None
         self._freehand_undo_strokes = []
         self._freehand_redo_strokes = []
@@ -551,8 +551,7 @@ class NativeDraw:
         if self.tool == 'centerline':
             return 'Native Centerline: click two different open line features'
         if self.tool == 'freehand':
-            return ('Native Freehand: left-drag to draw, release to pause, '
-                    'drag to resume, right-click to finish')
+            return 'Native Freehand: press/drag left button; release to snap and finish'
         return f'Native {self.tool}: click a position'
 
     def active(self):
@@ -1440,38 +1439,44 @@ class NativeDraw:
         tolerance = max(self.canvas.world_per_pixel() * 12., 1e-9)
         return best if best is not None and best[0] <= tolerance else None
 
-    def _freehand_end_snap(self, force=False):
-        """Preview a magnetic LAST point without changing any raw samples.
+    def _freehand_endpoint_candidates(self, point, tolerance):
+        """Only real drawing/SNT start and end points; never interior projections."""
+        try:
+            for feature in self._near_scene(point, tolerance):
+                if feature.get('source') == 'native' and not editable_draw(
+                        feature.get('drawing')):
+                    continue
+                if feature.get('type') == 'circle':
+                    continue  # Circle center and radius control are not endpoints.
+                coords = feature.get('coords')
+                if coords is None:
+                    continue
+                if feature.get('source') == 'native' and feature.get('type') == 'curve':
+                    controls = feature.get('drawing', {}).get('coords')
+                    if controls is not None:
+                        coords = controls
+                if len(coords) >= 2:
+                    yield coords[0]
+                    yield coords[-1]
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            # A detaching SNT document must not prevent finishing a native draw.
+            return
 
-        Completed native/SNT geometry is queried at most every 50 ms while
-        dragging; the final right-click always recomputes exact world coords.
-        """
-        if len(self.points) < 2:
+    def _freehand_end_snap(self, force=False):
+        """Preview the return-to-start target for Freehand only."""
+        if len(self.points) < 3 or len({(float(p[0]), float(p[1]))
+                                            for p in self.points}) < 3:
             self._snap_target = None
             return None
-        endpoint = self.points[-1]
-        tolerance = max(self.canvas.world_per_pixel() * 14., 1e-9)
-        own_start = snap_endpoint_near_start(self.points, endpoint, tolerance)
-        if own_start != endpoint:
-            self._snap_target = tuple(own_start[:2])
-            return self._snap_target
-        now = time.monotonic()
-        if not force and now - self._freehand_last_snap_at < .05:
-            return self._snap_target
-        self._freehand_last_snap_at = now
-        digitizer = getattr(self.app, 'digitizer', None)
-        explicit = bool(digitizer is not None and getattr(digitizer, 'snap_enabled', False))
-        mode = (getattr(digitizer, 'snap_mode', None) or 'nearby') if explicit else 'nearby'
-        candidate = self._snap_at(endpoint, mode, tolerance) if mode in (
-            'nearby', 'keypoint', 'midpoint', 'center', 'intercept') else None
-        self._snap_target = (tuple(candidate) if candidate is not None and
-                             tuple(candidate) != tuple(endpoint) else None)
+        self._snap_target = tuple(self.points[0])
         return self._snap_target
 
     def _finish_freehand(self):
-        """VTK parity: commit only on right-click, after any paused drag(s)."""
+        """Finish left-release as one closed Freehand, regardless of release XY."""
         self.dragging = False
-        if len(self.points) < 2:
+        pts = drop_consecutive_duplicates(self.points)
+        pts, closed = close_freehand_to_start(pts)
+        if not closed:
             self.points.clear()
             self.hover = None
             self._snap_target = None
@@ -1480,19 +1485,6 @@ class NativeDraw:
             self._freehand_redo_strokes.clear()
             self._paint()
             return False
-        pts = drop_consecutive_duplicates(self.points)
-        # At commit: bypass the preview throttle, magnetize only final sample.
-        self.points = pts
-        endpoint = self._freehand_end_snap(force=True)
-        if endpoint is not None and endpoint != pts[-1]:
-            # Two-point strokes are permitted as open lines. Do not snap the
-            # endpoint onto their own start and create a zero-length feature.
-            if len(pts) > 2 or endpoint != pts[0]:
-                pts[-1] = endpoint
-        pts = drop_consecutive_duplicates(pts)
-        if len(pts) < 2:
-            return False
-        pts = close_freehand(pts, max(self.canvas.world_per_pixel() * 14., 1e-9))
         return self._commit('freehand', pts)
 
     def _finish(self):
@@ -1529,7 +1521,11 @@ class NativeDraw:
             return self._commit_native_text_move(pos) if button == Qt.LeftButton else False
         # Existing text is editable on right-click even when the Text tool is
         # still armed. Never hijack Right-click Finish for another Draw tool.
-        if button == Qt.RightButton and self.tool in ('text', 'select'):
+        if (button == Qt.RightButton and self.tool in ('text', 'select')
+                and not (self.tool == 'select' and self._selection_bridge is not None
+                         and getattr(self._selection_bridge, '_extend_mode', None) is not None)):
+            # Only during a vertex Extend transaction does right-click belong
+            # to the Extend cancel handler rather than the text context menu.
             if self.try_text_context(pos):
                 return True
         if self.tool == 'select' and self._selection_bridge is not None:
@@ -1575,8 +1571,8 @@ class NativeDraw:
         if button != Qt.LeftButton:
             return False
         if self.tool == 'freehand':
-            # A second drag RESUMES this pending stroke, as in original VTK.
-            # Scene snapping is applied only to the very first sample.
+            # Each left press starts a new stroke after the prior release commits.
+            # Snap the starting sample once, never smooth away interior samples.
             try:
                 p = (self._point(pos) if not self.points else
                      self.canvas.section_at(pos.x(), pos.y()))
@@ -1976,12 +1972,10 @@ class NativeDraw:
                 pass  # Keep existing samples if the viewport is unavailable.
             self.dragging = False
             self.hover = None
-            self._freehand_undo_strokes.append(self._freehand_before_drag or [])
-            self._freehand_before_drag = None
-            self._freehand_end_snap(force=True)
-            self._paint()
+            finished = self._finish_freehand()
             self.app.statusBar().showMessage(
-                'Freehand paused: left-drag to resume; right-click to close/finish', 4000)
+                'Freehand finished on left-button release' if finished
+                else 'Freehand stroke too short; nothing saved', 4000)
             return True
         return self.tool in ('line', 'rectangle', 'circle')
 

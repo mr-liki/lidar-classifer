@@ -376,6 +376,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         # Active Vulkan uses a dedicated selection controller attached to the
         # visible native Draw overlay; VTK keeps the existing ElementSelectTool.
         self._native_selection = None
+        self._extend_measure_source = None
+        self._extend_measured_m = None
         try:
             from gui.native_draw import get_native_draw
             draw = get_native_draw(app, create=True)
@@ -507,12 +509,26 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             "right-click to delete it."
         )
         self.btn_extend.setToolTip(
-            "Select Line / SmartLine, then enter distance to extend selected segment/chain."
+            "RESHAPE the SAME open Line/SmartLine/Polyline, never create a new line. "
+            "360 Free: click and move ANY vertex. Fixed: drag an existing vertex "
+            "along an incident edge. Distance: click a vertex, choose an edge "
+            "and enter an exact length. After completion the cyan highlight "
+            "goes off and the original drawn color returns."
         )
+        # Exactly THREE modes under ONE existing Extend button. Each edits a
+        # real vertex of the same entity; no legacy fourth menu command.
+        self._extend_menu = QMenu(self.btn_extend)
+        for label, mode in (
+            ("360 Free Extend", "free"),
+            ("Same Direction Extend", "fixed"),
+            ("Distance Extend (Type Value)", "distance_vertex"),
+        ):
+            action = self._extend_menu.addAction(label)
+            action.triggered.connect(lambda checked=False, m=mode: self._on_extend(m))
+        self.btn_extend.setMenu(self._extend_menu)
         self.btn_move.clicked.connect(self._on_move)
         self.btn_copy.clicked.connect(self._on_copy)
         self.btn_intersect.clicked.connect(self._on_intersect)
-        self.btn_extend.clicked.connect(self._on_extend)
         root.addLayout(edit_row)
 
         # ── By Class ──────────────────────────────────────────────
@@ -594,6 +610,9 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         footer.addWidget(self.lbl_count, 1)
         self.lbl_measure_total = QLabel("Measured Total: 0.000 m")
         self.lbl_measure_total.setObjectName("countLabel")
+        self.lbl_measure_total.setToolTip(
+            "Selected measurement total, or the full final length of the "
+            "edge modified by Extend (matching Measure -> Line).")
         footer.addWidget(self.lbl_measure_total, 1)
         close_btn = QPushButton("Close")
         close_btn.setMinimumHeight(28)
@@ -712,8 +731,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         return getattr(digitizer, "selection_manager", None)
 
     def _connect_selection_signal(self):
+        self._bind_extend_measurement(self._get_tool())
         if self._native_selection is not None:
             mgr = self._selection_manager()
+            self._native_selection.pick_completed.connect(self._on_native_pick_completed)
             mgr.selection_changed.connect(self._on_selection_count)
             mgr.selection_changed.connect(self._on_drawings_changed)
             self._on_selection_count(mgr.count())
@@ -731,12 +752,72 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         except Exception as e:
             print(f"⚠️ SelectionModeDialog could not bind selection_changed: {e}")
 
+    def _on_native_pick_completed(self):
+        """One completed Vulkan pick uses one activation of its method chip."""
+        controller = self._native_selection
+        method = self._method
+        if not self._pick_enabled or controller is None:
+            return
+        if method not in ('individual', 'block', 'shape', 'cline', 'snt_text'):
+            return
+        # Defer until Qt finishes the entire mouse event/drag dispatch.
+        def disarm():
+            if (self._native_selection is not controller or not self._pick_enabled
+                    or self._method != method or not controller.is_active()):
+                return
+            controller.finish_pick_once()
+            self._pick_enabled = False
+            for button in self._method_group.buttons():
+                button.setChecked(False)
+            self.lbl_count.setText(f'Selection: {controller.selection_manager.count()}')
+        QTimer.singleShot(0, disarm)
+
+    def _bind_extend_measurement(self, controller):
+        """Follow the CURRENT native/VTK Extend controller, without polling."""
+        previous = self._extend_measure_source
+        if previous is controller:
+            return
+        if previous is not None:
+            try:
+                previous.extend_measurement_changed.disconnect(
+                    self._on_extend_measurement)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+        self._extend_measure_source = None
+        if controller is not None and hasattr(controller, 'extend_measurement_changed'):
+            controller.extend_measurement_changed.connect(self._on_extend_measurement)
+            self._extend_measure_source = controller
+
+    def _on_extend_measurement(self, metres, is_final):
+        """Show final edited-edge length in the existing Measured Total."""
+        import math
+        if metres is None:
+            self._extend_measured_m = None  # cancellation, not a completed edit
+        else:
+            try:
+                value = float(metres)
+            except (ValueError, TypeError):
+                return
+            if not math.isfinite(value) or value < 0:
+                return
+            self._extend_measured_m = value
+        self._refresh_measurement_total()
+
+    def _clear_extend_measurement(self):
+        self._extend_measured_m = None
+        self._refresh_measurement_total()
+
     def _on_drawings_changed(self, *_):
         """Called whenever the drawings list changes (delete, undo, add)."""
         self._refresh_tool_counts()
         self._refresh_measurement_total()
 
     def _on_selection_count(self, count):
+        # A NEW non-Extend selection restores the normal measurement readout.
+        controller = self._get_tool()
+        if (count > 0 and self._extend_measured_m is not None and
+                getattr(controller, '_extend_mode', None) is None):
+            self._extend_measured_m = None
         if self._native_selection is not None and self._method=='snt_text':
             self.lbl_count.setText(f'SNT Text Selection: {count}')
         else:
@@ -744,6 +825,10 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         self._refresh_measurement_total()
 
     def _refresh_measurement_total(self):
+        if self._extend_measured_m is not None:
+            self.lbl_measure_total.setText(
+                f'Measured Total: {self._extend_measured_m:.3f} m')
+            return
         # The Vulkan Measure Line/Path overlay has no VTK measurement actors;
         # report selected native measurements from its world-space vertices.
         native=getattr(self,'_native_selection',None)
@@ -814,6 +899,8 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
                 current is not None and draw is current.draw):
             return
         if current is not None:
+            try: current.pick_completed.disconnect(self._on_native_pick_completed)
+            except (RuntimeError, TypeError): pass
             for slot in (self._on_selection_count, self._on_drawings_changed):
                 try: current.selection_manager.selection_changed.disconnect(slot)
                 except (RuntimeError, TypeError): pass
@@ -881,6 +968,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             if digitizer is not None:
                 digitizer.deactivate_element_select_tool()
         self.lbl_count.setText('Selection: 0')
+        self._extend_measured_m = None
         self._refresh_measurement_total()
 
     def suspend_pick_interaction(self):
@@ -907,6 +995,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         key = btn.property("method_key")
         if not key:
             return
+        self._clear_extend_measurement()
 
         self._refresh_native_controller()
         tool = self._get_tool()
@@ -1218,6 +1307,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             print(f"⚠️ Select All failed: {e}")
 
     def _on_deselect(self):
+        self._clear_extend_measurement()
         self._refresh_native_controller()
         if self._native_selection is not None:
             self._native_selection.exit_copy_mode() if self._native_selection._copy_mode else None
@@ -1294,7 +1384,16 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
             self.btn_intersect.setChecked(False)
             self.lbl_count.setText(f"Selection: {self._current_selection_count()}")
 
+    def _resume_native_edit_from_selection(self):
+        """A disarmed one-shot pick can still be edited from the panel."""
+        tool = self._native_selection
+        if tool is None or tool.is_active() or not tool.selection_manager.count():
+            return
+        tool.activate(self._method)
+
     def _on_move(self):
+        if self.btn_move.isChecked():
+            self._resume_native_edit_from_selection()
         tool = self._get_tool()
         if tool is None or not tool.is_active():
             self.btn_move.setChecked(False)
@@ -1327,6 +1426,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _on_copy(self):
         self._refresh_native_controller()
+        self._resume_native_edit_from_selection()
         self._deactivate_intersect_if_needed()
         tool = self._get_tool()
         if tool is None or not tool.is_active():
@@ -1338,6 +1438,7 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
 
     def _on_intersect(self):
         if self._native_selection is not None:
+            self._resume_native_edit_from_selection()
             tool=self._native_selection
             if tool._intersect_mode:
                 tool.exit_intersect_mode(commit=True)
@@ -1375,40 +1476,28 @@ class SelectionModeDialog(MinimizableDialogMixin, QDialog):
         except Exception:
             return 0
 
-    def _on_extend(self):
-        """
-        Simple Extend:
-        Select Line / SmartLine first, then enter distance.
-        """
-        if self._native_selection is not None:
-            self._native_selection.extend()
-            return
-        self._deactivate_intersect_if_needed()
-        digitizer = getattr(self.app, "digitizer", None)
-        if digitizer is None:
+    def _on_extend(self, mode="free"):
+        """Exactly three vertex-reshape modes for the same existing line."""
+        self._refresh_native_controller()
+        self._bind_extend_measurement(self._get_tool())
+        if mode in ("free", "fixed", "distance_vertex"):
+            if self._native_selection is not None:
+                tool = self._native_selection
+                if not tool.begin_vertex_extend(mode):
+                    return
+            else:
+                tool = self._get_tool()
+                if tool is None:
+                    return
+                if not tool.begin_vertex_extend(mode):
+                    return
+            # A vertex Extend transaction owns canvas clicks until it finishes.
+            # The pick-method buttons must not suggest Individual/Block is armed.
+            self._pick_enabled = False
+            for btn in self._method_group.buttons():
+                btn.setChecked(False)
             return
 
-        if not hasattr(digitizer, "extend_selected_element_distance_command"):
-            try:
-                self.app.statusBar().showMessage(
-                    "Extend command is not available in digitizer",
-                    2500,
-                )
-            except Exception:
-                pass
-            return
-
-        try:
-            digitizer.extend_selected_element_distance_command()
-        except Exception as e:
-            print(f"⚠️ Extend failed: {e}")
-            try:
-                self.app.statusBar().showMessage(
-                    f"Extend failed: {e}",
-                    2500,
-                )
-            except Exception:
-                pass
 
     def _selected_fence_shapes(self):
         """Use the *active* renderer's selection and real drawn world geometry.
